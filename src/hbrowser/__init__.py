@@ -1,3 +1,3 @@
-__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver"]
+__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver", "Tag"]
 
-from .browser import DriverPass, EHDriver, ExHDriver, HVDriver
+from .browser import DriverPass, EHDriver, ExHDriver, HVDriver, Tag

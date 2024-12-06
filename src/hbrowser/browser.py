@@ -1,4 +1,4 @@
-__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver"]
+__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver", "Tag"]
 
 
 import os
