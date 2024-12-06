@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hbrowser"
+version = "0.0.2"
+description = "A tool for browsing tasks on e-h/exh-websites."
+readme = "README.md"
+authors = [{ name = "Kuan-Lun Wang" }]
+license = { text = "GNU Affero General Public License v3" }
+dependencies = [
+    "webdriver-manager>=4.0.2",
+    "fake-useragent>=1.5.1",
+    "h2h-galleryinfo-parser>=0.2.2",
+    "selenium>=4.27.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kuan-Lun/hbrowser"
+Source = "https://github.com/Kuan-Lun/hbrowser"
+Tracker = "https://github.com/Kuan-Lun/hbrowser/issues"
+
+[tool.setuptools]
+packages = ["hbrowser"]
+package-dir = { hbrowser = "src/hbrowser" }
+package-data = { hbrowser = ["py.typed"] }
