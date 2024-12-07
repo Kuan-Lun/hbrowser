@@ -509,7 +509,14 @@ class EHDriver(Driver):
             gallerywindow = self.driver.current_window_handle
             existing_windows = set(self.driver.window_handles)
             key = "//a[contains(text(), 'Archive Download')]"
-            self.driver.find_element(By.XPATH, key).click()
+            try:
+                self.driver.find_element(By.XPATH, key).click()
+            except NoSuchElementException:
+                print("NoSuchElementException")
+                self.driver.close()
+                self.driver.switch_to.window(gallerywindow)
+                print("Retry again.")
+                return self.download(gallery)
             WebDriverWait(self.driver, 10).until(
                 partial(find_new_window, existing_windows)
             )
