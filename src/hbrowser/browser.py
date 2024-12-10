@@ -546,6 +546,12 @@ class EHDriver(Driver):
                     or EC.presence_of_element_located((By.XPATH, waitkey))(driver)
                 )
             except TimeoutException:
+                with open(
+                    os.path.join(os.path.dirname(__file__), "error.txt"),
+                    "w",
+                    errors="ignore",
+                ) as f:
+                    f.write(self.driver.page_source)
                 print("TimeoutException")
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
