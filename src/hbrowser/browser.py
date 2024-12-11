@@ -544,18 +544,28 @@ class EHDriver(Driver):
                     )(driver)
                     or EC.presence_of_element_located((By.XPATH, failkey))(driver)
                     or EC.presence_of_element_located((By.XPATH, waitkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, successkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, failkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, waitkey))(driver)
                 )
             except TimeoutException:
-                with open(
-                    os.path.join(os.path.dirname(__file__), "error.txt"),
-                    "w",
-                    errors="ignore",
-                ) as f:
-                    f.write(self.driver.page_source)
+                if (
+                    "Cannot start download: Insufficient funds"
+                    in self.driver.page_source
+                ):
+                    print("Insufficient funds. Retry after 4 hours.")
+                    retrytime = 4 * 60 * 60  # 4 hours
+                else:
+                    with open(
+                        os.path.join(".", "error.txt"), "w", errors="ignore"
+                    ) as f:
+                        f.write(self.driver.page_source)
+                    retrytime = 1 * 60  # 1 minute1
                 print("TimeoutException")
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
                 print("Retry again.")
+                time.sleep(retrytime)
                 return self.download(gallery)
             try:
                 self.driver.find_element(By.XPATH, successkey)
