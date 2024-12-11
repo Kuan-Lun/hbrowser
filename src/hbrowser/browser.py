@@ -544,13 +544,12 @@ class EHDriver(Driver):
                     )(driver)
                     or EC.presence_of_element_located((By.XPATH, failkey))(driver)
                     or EC.presence_of_element_located((By.XPATH, waitkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, successkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, failkey))(driver)
+                    or EC.visibility_of_element_located((By.XPATH, waitkey))(driver)
                 )
             except TimeoutException:
-                with open(
-                    os.path.join(os.path.dirname(__file__), "error.txt"),
-                    "w",
-                    errors="ignore",
-                ) as f:
+                with open(os.path.join(".", "error.txt"), "w", errors="ignore") as f:
                     f.write(self.driver.page_source)
                 print("TimeoutException")
                 self.driver.close()
