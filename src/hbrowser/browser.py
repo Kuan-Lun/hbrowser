@@ -28,6 +28,8 @@ from selenium.common.exceptions import (
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
+from .exceptions import ClientOfflineException, InsufficientFundsException
+
 
 def beep_os_independent():
     if sys.platform.startswith("linux") or sys.platform == "darwin":
@@ -496,6 +498,29 @@ class EHDriver(Driver):
         return result
 
     def download(self, gallery: GalleryURLParser) -> bool:
+        def _check_ekey(driver, ekey: str):
+            return EC.presence_of_element_located((By.XPATH, ekey))(
+                driver
+            ) or EC.visibility_of_element_located((By.XPATH, ekey))(driver)
+
+        def check_download_success_by_element(driver):
+            ekey = "//p[contains(text(), 'Downloads should start processing within a couple of minutes.')]"
+            return _check_ekey(driver, ekey)
+
+        def check_client_offline_by_element(driver):
+            ekey = "//p[contains(text(), 'Your H@H client appears to be offline.')]"
+            try:
+                _check_ekey(driver, ekey)
+            except NoSuchElementException:
+                raise ClientOfflineException()
+
+        def check_insufficient_funds_by_element(driver):
+            ekey = "//p[contains(text(), 'Cannot start download: Insufficient funds')]"
+            try:
+                _check_ekey(driver, ekey)
+            except NoSuchElementException:
+                raise InsufficientFundsException()
+
         self.get(gallery.url)
         try:
             xpath_query_list = [
@@ -532,58 +557,26 @@ class EHDriver(Driver):
             self.driver.find_element(By.XPATH, key).click()
 
             # 確認是否連接 H@H
-            successkey = "//p[contains(text(), 'Downloads should start processing within a couple of minutes.')]"
-            failkey = "//p[contains(text(), 'Your H@H client appears to be offline.')]"
-            waitkey = (
-                "//p[contains(text(), 'Cannot start download: Insufficient funds')]"
-            )
             try:
                 WebDriverWait(self.driver, 10).until(
-                    lambda driver: EC.presence_of_element_located(
-                        (By.XPATH, successkey)
-                    )(driver)
-                    or EC.presence_of_element_located((By.XPATH, failkey))(driver)
-                    or EC.presence_of_element_located((By.XPATH, waitkey))(driver)
-                    or EC.visibility_of_element_located((By.XPATH, successkey))(driver)
-                    or EC.visibility_of_element_located((By.XPATH, failkey))(driver)
-                    or EC.visibility_of_element_located((By.XPATH, waitkey))(driver)
+                    lambda driver: check_download_success_by_element(driver)
+                    or check_client_offline_by_element(driver)
+                    or check_insufficient_funds_by_element(driver)
                 )
-            except TimeoutException:
                 if (
                     "Cannot start download: Insufficient funds"
                     in self.driver.page_source
                 ):
-                    print("Insufficient funds. Retry after 4 hours.")
-                    retrytime = 4 * 60 * 60  # 4 hours
-                else:
-                    with open(
-                        os.path.join(".", "error.txt"), "w", errors="ignore"
-                    ) as f:
-                        f.write(self.driver.page_source)
-                    retrytime = 1 * 60  # 1 minute1
+                    raise NoSuchElementException()
+            except TimeoutException:
+                with open(os.path.join(".", "error.txt"), "w", errors="ignore") as f:
+                    f.write(self.driver.page_source)
+                retrytime = 1 * 60  # 1 minute1
                 print("TimeoutException")
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
                 print("Retry again.")
                 time.sleep(retrytime)
-                return self.download(gallery)
-            try:
-                self.driver.find_element(By.XPATH, successkey)
-            except NoSuchElementException:
-                try:
-                    self.driver.find_element(By.XPATH, failkey)
-                    print("H@H client appears to be offline. Retry after 30 minutes.")
-                    retrytime = 30 * 60  # 30 minutes
-                except NoSuchElementException:
-                    print("Insufficient funds. Retry after 4 hours.")
-                    retrytime = 4 * 60 * 60  # 4 hours
-                self.driver.close()
-                time.sleep(random())
-                self.driver.switch_to.window(gallerywindow)
-                try:
-                    time.sleep(retrytime)
-                except KeyboardInterrupt:
-                    print("Sleep is interrupted. Continue.")
                 return self.download(gallery)
             if len(self.driver.current_window_handle) > 1:
                 self.driver.close()

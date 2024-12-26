@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.0.7"
+version = "0.0.10"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = { text = "GNU Affero General Public License v3" }
 dependencies = [
     "webdriver-manager>=4.0.2",
-    "fake-useragent>=1.5.1",
+    "fake-useragent>=2.0.3",
     "h2h-galleryinfo-parser>=0.2.2",
     "selenium>=4.27.1",
 ]
