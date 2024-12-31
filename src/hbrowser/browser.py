@@ -1,4 +1,4 @@
-__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver", "Tag"]
+__all__ = ["DriverPass", "EHDriver", "ExHDriver", "HVDriver", "Tag", "StatThreshold"]
 
 
 import os
@@ -621,6 +621,63 @@ searchxpath_fun = lambda srclist: " | ".join(
 )
 
 
+class StatThreshold:
+    def __init__(
+        self,
+        hp: tuple[int, int],
+        mp: tuple[int, int],
+        sp: tuple[int, int],
+        overcharge: tuple[int, int],
+        countmonster: tuple[int, int],
+    ) -> None:
+        if len(hp) != 2:
+            raise ValueError("hp should be a list with 2 elements.")
+
+        if len(mp) != 2:
+            raise ValueError("mp should be a list with 2 elements.")
+
+        if len(sp) != 2:
+            raise ValueError("sp should be a list with 2 elements.")
+
+        if len(overcharge) != 2:
+            raise ValueError("overcharge should be a list with 2 elements.")
+
+        if len(countmonster) != 2:
+            raise ValueError("countmonster should be a list with 2 elements.")
+
+        self.hp = hp
+        self.mp = mp
+        self.sp = sp
+        self.overcharge = overcharge
+        self.countmonster = countmonster
+
+
+class BSItems(ABC):
+    def __init__(
+        self,
+        consumables: list[str] = list(),
+        materials: list[str] = list(),
+        trophies: list[str] = list(),
+        artifacts: list[str] = list(),
+        figures: list[str] = list(),
+        monster_items: list[str] = list(),
+    ) -> None:
+        self.consumables = consumables
+        self.materials = materials
+        self.trophies = trophies
+        self.artifacts = artifacts
+        self.figures = figures
+        self.monster_items = monster_items
+
+
+class SellItems(BSItems):
+    pass
+
+
+class BuyItems(BSItems):
+    pass
+
+
 class HVDriver(EHDriver):
     def _setname(self) -> str:
         return "HentaiVerse"
@@ -631,16 +688,16 @@ class HVDriver(EHDriver):
     def goisekai(self) -> None:
         self.get(self.url["HentaiVerse isekai"])
 
-    def battle(self) -> None:
-        def ponychart() -> bool:
-            try:
-                self.driver.find_element(By.ID, "riddlesubmit")
-            except NoSuchElementException:
-                return False
-            beep_os_independent()
-            time.sleep(60)
+    def ponychartcheck(self) -> bool:
+        try:
+            self.driver.find_element(By.ID, "riddlesubmit")
+        except NoSuchElementException:
             return False
+        beep_os_independent()
+        time.sleep(20)
+        return True
 
+    def battle(self, statthreshold: StatThreshold) -> None:
         def click2newlog(element: WebElement) -> None:
             html = self.driver.find_element(By.ID, "textlog").get_attribute("outerHTML")
             actions = ActionChains(self.driver)
@@ -737,7 +794,7 @@ class HVDriver(EHDriver):
         def checkstat(key: str) -> bool:
             match key:
                 case "HP":
-                    if getrate("HP") < 50:
+                    if getrate("HP") < statthreshold.hp[0]:
                         for fun in [
                             partial(clickitem, "Health Potion"),
                             partial(clickskill, "Cure"),
@@ -745,7 +802,7 @@ class HVDriver(EHDriver):
                             partial(clickitem, "Health Elixir"),
                             partial(clickitem, "Last Elixir"),
                         ]:
-                            if getrate("HP") < 50:
+                            if getrate("HP") < statthreshold.hp[0]:
                                 if not fun():
                                     continue
                                 return True
@@ -757,7 +814,7 @@ class HVDriver(EHDriver):
                         return clickitem("Health Draught")
 
                 case "MP":
-                    if getrate("MP") < 50:
+                    if getrate("MP") < statthreshold.mp[0]:
                         for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]:
                             if clickitem(key):
                                 return True
@@ -768,7 +825,7 @@ class HVDriver(EHDriver):
                     except NoSuchElementException:
                         return clickitem("Mana Draught")
                 case "SP":
-                    if getrate("SP") < 50:
+                    if getrate("SP") < statthreshold.sp[0]:
                         for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]:
                             if clickitem(key):
                                 return True
@@ -782,15 +839,10 @@ class HVDriver(EHDriver):
                     clickspirit = partial(
                         click2newlog, self.driver.find_element(By.ID, "ckey_spirit")
                     )
-                    if getrate("Overcharge") > 240 and getrate("SP") > 50:
-                        try:
-                            self.driver.find_element(
-                                By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
-                            )
-                        except NoSuchElementException:
-                            clickspirit()
-                            return True
-                    if countmonster() >= 5 and getrate("Overcharge") < 180:
+                    if (
+                        countmonster() >= statthreshold.countmonster[1]
+                        and getrate("Overcharge") < statthreshold.overcharge[0]
+                    ):
                         try:
                             self.driver.find_element(
                                 By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
@@ -799,6 +851,17 @@ class HVDriver(EHDriver):
                             return True
                         except NoSuchElementException:
                             return False
+                    if (
+                        getrate("Overcharge") > statthreshold.overcharge[1]
+                        and getrate("SP") > statthreshold.sp[0]
+                    ):
+                        try:
+                            self.driver.find_element(
+                                By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
+                            )
+                        except NoSuchElementException:
+                            clickspirit()
+                            return True
             return False
 
         def nextbattle() -> bool:
@@ -810,6 +873,7 @@ class HVDriver(EHDriver):
                             [
                                 "/y/battle/arenacontinue.png",
                                 "/y/battle/grindfestcontinue.png",
+                                "/y/battle/itemworldcontinue.png",
                             ]
                         ),
                     )
@@ -840,7 +904,7 @@ class HVDriver(EHDriver):
                     self.driver.find_element(
                         By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
                     )
-                    if countmonster() >= 5:
+                    if countmonster() >= statthreshold.countmonster[1]:
                         clickskill("Orbital Friendship Cannon", iswait=False)
                 except NoSuchElementException:
                     pass
@@ -878,8 +942,7 @@ class HVDriver(EHDriver):
             print("arenacontinue")
             if nextbattle():
                 continue
-            print("ponychart")
-            if ponychart():
+            if self.ponychartcheck():
                 continue
             try:
                 self.driver.find_element(
@@ -926,7 +989,7 @@ class HVDriver(EHDriver):
         actions = ActionChains(self.driver)
         actions.move_to_element(ending).click().perform()
 
-    def loetterycheck(self) -> None:
+    def loetterycheck(self, num: int) -> None:
         self.gohomepage()
 
         for lettory in ["Weapon Lottery", "Armor Lottery"]:
@@ -957,10 +1020,10 @@ class HVDriver(EHDriver):
             numbers = re.findall(r"[\d,]+", html_element.text)
             buy_number = numbers[0].replace(",", "")
 
-            if int(buy_number) < 200 and int(currently_number) > (200 * 1000):
+            if int(buy_number) < num and int(currently_number) > (num * 1000):
                 html_element = self.driver.find_element(By.ID, "ticket_temp")
                 html_element.clear()
-                html_element.send_keys(200 - int(buy_number))
+                html_element.send_keys(num - int(buy_number))
                 self.driver.execute_script("submit_buy()")
 
     def monstercheck(self) -> None:
@@ -998,7 +1061,7 @@ class HVDriver(EHDriver):
                 )
                 self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
 
-    def marketcheck(self) -> None:
+    def marketcheck(self, sellitems: SellItems) -> None:
         def marketpage() -> None:
             # 進入 Market
             self.get("https://hentaiverse.org/?s=Bazaar&ss=mk")
@@ -1065,89 +1128,18 @@ class HVDriver(EHDriver):
         )
 
         marketurl = dict()
-        itemlist = dict()
         # Consumables
         marketurl["Consumables"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=co"
         )
-        itemlist["Consumables"] = [
-            "Energy Drink",
-            "Caffeinated Candy",
-            "Last Elixir",
-            "Flower Vase",
-            "Bubble-Gum",
-        ]
         # Materials
         marketurl["Materials"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=ma"
         )
-        itemlist["Materials"] = [
-            "Low-Grade Cloth",
-            "Mid-Grade Cloth",
-            "High-Grade Cloth",
-            "Low-Grade Leather",
-            "Mid-Grade Leather",
-            "High-Grade Leather",
-            "Low-Grade Metals",
-            "Mid-Grade Metals",
-            "High-Grade Metals",
-            "Low-Grade Wood",
-            "Mid-Grade Wood",
-            "High-Grade Wood",
-            "Crystallized Phazon",
-            "Shade Fragment",
-            "Repurposed Actuator",
-            "Defense Matrix Modulator",
-            "Binding of Slaughter",
-            "Binding of Balance",
-            "Binding of Destruction",
-            "Binding of Focus",
-            "Binding of Protection",
-            "Binding of the Fleet",
-            "Binding of the Barrier",
-            "Binding of the Nimble",
-            "Binding of the Elementalist",
-            "Binding of the Heaven-sent",
-            "Binding of the Demon-fiend",
-            "Binding of the Curse-weaver",
-            "Binding of the Earth-walker",
-            "Binding of Surtr",
-            "Binding of Niflheim",
-            "Binding of Mjolnir",
-            "Binding of Freyr",
-            "Binding of Heimdall",
-            "Binding of Fenrir",
-            "Binding of Dampening",
-            "Binding of Stoneskin",
-            "Binding of Deflection",
-            "Binding of the Fire-eater",
-            "Binding of the Frost-born",
-            "Binding of the Thunder-child",
-            "Binding of the Wind-waker",
-            "Binding of the Thrice-blessed",
-            "Binding of the Spirit-ward",
-            "Binding of the Ox",
-            "Binding of the Raccoon",
-            "Binding of the Cheetah",
-            "Binding of the Turtle",
-            "Binding of the Fox",
-            "Binding of the Owl",
-            "Binding of Warding",
-            "Binding of Negation",
-            "Binding of Isaac",
-            "Binding of Friendship",
-            "Legendary Weapon Core",
-            "Legendary Staff Core",
-            "Legendary Armor Core",
-            "Voidseeker Shard",
-            "Aether Shard",
-            "Featherweight Shard",
-            "Amnesia Shard",
-        ]
         # Monster Items
-        # marketurl['Monster Items'] = 'https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=mo'
-        # itemidlist['Monster Items'] = [50001, 50002, 50003, 50004, 50005, 50006]#,
-        #                                #50011, 50012, 50013, 50014, 50015, 50016]
+        marketurl["Monster Items"] = (
+            "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=mo"
+        )
 
         filterpage("Browse Items", ischangeurl=True)
         for marketkey in marketurl:
@@ -1157,7 +1149,22 @@ class HVDriver(EHDriver):
             tr_elements = self.driver.find_elements(By.XPATH, "//tr")
             for idx, tr_element in enumerate(tr_elements[1:]):
                 itemname = tr_element.find_element(By.XPATH, ".//td[1]").text
-                if itemname not in itemlist[marketkey]:
+                match marketkey:
+                    case "Consumables":
+                        thecheckitemlist = sellitems.consumables
+                    case "Materials":
+                        thecheckitemlist = sellitems.materials
+                    case "Trophies":
+                        thecheckitemlist = sellitems.trophies
+                    case "Artifacts":
+                        thecheckitemlist = sellitems.artifacts
+                    case "Figures":
+                        thecheckitemlist = sellitems.figures
+                    case "Monster Items":
+                        thecheckitemlist = sellitems.monster_items
+                    case _:
+                        raise KeyError()
+                if itemname not in thecheckitemlist:
                     continue
                 if itempage():
                     continue
