@@ -1,19 +1,21 @@
 __all__ = [
+    "beep_os_independent",
     "DriverPass",
     "EHDriver",
     "ExHDriver",
-    "HVDriver",
     "Tag",
+    "HVDriver",
     "SellItems",
+    "BattleDriver",
     "StatThreshold",
 ]
 
-from .browser import (
+from .beep import beep_os_independent
+from .gallery import (
     DriverPass,
     EHDriver,
     ExHDriver,
-    HVDriver,
     Tag,
-    SellItems,
-    StatThreshold,
 )
+from .hv import HVDriver, SellItems
+from .hv_battle import BattleDriver, StatThreshold
