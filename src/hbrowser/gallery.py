@@ -540,16 +540,20 @@ class EHDriver(Driver):
 
             # 確認是否連接 H@H
             try:
-                WebDriverWait(self.driver, 10).until(
-                    lambda driver: check_download_success_by_element(driver)
-                    or check_client_offline_by_element(driver)
-                    or check_insufficient_funds_by_element(driver)
-                )
-                if (
-                    "Cannot start download: Insufficient funds"
-                    in self.driver.page_source
-                ):
-                    raise NoSuchElementException()
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        lambda driver: check_download_success_by_element(driver)
+                        or check_client_offline_by_element(driver)
+                        or check_insufficient_funds_by_element(driver)
+                    )
+                except TimeoutException:
+                    if (
+                        "Cannot start download: Insufficient funds"
+                        in self.driver.page_source
+                    ):
+                        raise InsufficientFundsException()
+                    else:
+                        raise TimeoutException()
             except TimeoutException:
                 with open(os.path.join(".", "error.txt"), "w", errors="ignore") as f:
                     f.write(self.driver.page_source)
