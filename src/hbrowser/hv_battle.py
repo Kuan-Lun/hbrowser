@@ -2,7 +2,10 @@ import time
 import re
 from functools import partial
 
-from selenium.common.exceptions import NoSuchElementException, JavascriptException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    ElementNotInteractableException,
+)
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
@@ -131,6 +134,10 @@ class BattleDriver(HVDriver):
             return False
 
     def click_skill(self, key: str, iswait=True) -> bool:
+        def click_skill_menue():
+            button = self.driver.find_element(By.ID, "ckey_skill")
+            button.click()
+
         def click_this_skill(skillstring: str) -> None:
             element = self.driver.find_element(By.XPATH, skillstring)
             if iswait:
@@ -145,18 +152,12 @@ class BattleDriver(HVDriver):
         )
         try:
             click_this_skill(skillstring)
-        except JavascriptException:
-            element = self.driver.find_element(
-                By.XPATH, searchxpath_fun(["/y/battle/skill_n.png"])
-            )
-            element.click()
+        except ElementNotInteractableException:
+            click_skill_menue()
             try:
                 click_this_skill(skillstring)
-            except JavascriptException:
-                element = self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/battle/sbsel_spells_n.png"])
-                )
-                element.click()
+            except ElementNotInteractableException:
+                click_skill_menue()
                 click_this_skill(skillstring)
         except NoSuchElementException:
             return False
