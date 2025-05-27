@@ -1,5 +1,4 @@
 import time
-import re
 from functools import partial
 
 from selenium.common.exceptions import (
@@ -10,8 +9,16 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 
-from .beep import beep_os_independent
 from .hv import HVDriver, searchxpath_fun
+from .hv_battle_statprovider import (
+    StatProviderHP,
+    StatProviderMP,
+    StatProviderSP,
+    StatProviderOvercharge,
+)
+from .hv_battle_ponychart import PonyChart
+from .hv_battle_item import ItemProvider
+from .hv_battle_actionmanager import ElementActionManager
 
 
 class StatThreshold:
@@ -50,89 +57,6 @@ class BattleDriver(HVDriver):
         self.statthreshold = statthreshold
         self.with_ofc = "isekai" not in self.driver.current_url
 
-    def check_ponychart(self) -> bool:
-        try:
-            self.driver.find_element(By.ID, "riddlesubmit")
-        except NoSuchElementException:
-            return False
-        beep_os_independent()
-        time.sleep(20)
-        return True
-
-    def _get_stat_rate(self, key: str) -> float:
-        match key:
-            case "HP":
-                searchxpath = searchxpath_fun(
-                    ["/y/bar_bgreen.png", "/y/bar_dgreen.png"]
-                )
-                factor = 100
-            case "MP":
-                searchxpath = searchxpath_fun(["/y/bar_blue.png"])
-                factor = 100
-            case "SP":
-                searchxpath = searchxpath_fun(["/y/bar_red.png"])
-                factor = 100
-            case "Overcharge":
-                searchxpath = searchxpath_fun(["/y/bar_orange.png"])
-                factor = 250
-
-        img_element = self.driver.find_element(By.XPATH, searchxpath)
-        style_attribute = img_element.get_attribute("style")
-        width_value_match = re.search(r"width:\s*(\d+)px", style_attribute)
-        if width_value_match is None:
-            raise ValueError("width_value_match is None")
-        width_value_match = width_value_match.group(1)  # type: ignore
-        return factor * (int(width_value_match) - 1) / (414 - 1)  # type: ignore
-
-    def get_hp(self) -> float:
-        return self._get_stat_rate("HP")
-
-    def get_mp(self) -> float:
-        return self._get_stat_rate("MP")
-
-    def get_sp(self) -> float:
-        return self._get_stat_rate("SP")
-
-    def get_overcharge(self) -> float:
-        return self._get_stat_rate("Overcharge")
-
-    def _click2newlog(self, element: WebElement) -> None:
-        html = self.driver.find_element(By.ID, "textlog").get_attribute("outerHTML")
-        actions = ActionChains(self.driver)
-        actions.move_to_element(element).click().perform()
-        time.sleep(0.01)
-        n: float = 0
-        while html == self.driver.find_element(By.ID, "textlog").get_attribute(
-            "outerHTML"
-        ):
-            time.sleep(0.01)
-            n += 0.01
-            if n == 10:
-                raise TimeoutError("I don't know what happened.")
-
-    def click_item(self, key: str) -> bool:
-        try:
-            element = self.driver.find_element(
-                By.XPATH,
-                searchxpath_fun(["/y/battle/items_n.png"]),
-            )
-            element.click()
-        except NoSuchElementException:
-            return False
-
-        try:
-            self._click2newlog(
-                self.driver.find_element(
-                    By.XPATH,
-                    "//div[@class=\"fc2 fal fcb\"]/div[contains(text(), '{key}')]".format(
-                        key=key
-                    ),
-                )
-            )
-            return True
-        except NoSuchElementException:
-            return False
-
     def click_skill(self, key: str, iswait=True) -> bool:
         def click_skill_menue():
             button = self.driver.find_element(By.ID, "ckey_skill")
@@ -141,7 +65,7 @@ class BattleDriver(HVDriver):
         def click_this_skill(skillstring: str) -> None:
             element = self.driver.find_element(By.XPATH, skillstring)
             if iswait:
-                self._click2newlog(element)
+                ElementActionManager(self).click_and_wait_log(element)
             else:
                 actions = ActionChains(self.driver)
                 actions.move_to_element(element).click().perform()
@@ -164,66 +88,68 @@ class BattleDriver(HVDriver):
         return True
 
     def check_hp(self) -> bool:
-        if self.get_hp() < self.statthreshold.hp[0]:
+        if StatProviderHP(self).get_percent() < self.statthreshold.hp[0]:
             for fun in [
                 partial(self.click_skill, "Full-Cure"),
-                partial(self.click_item, "Health Potion"),
-                partial(self.click_item, "Health Elixir"),
-                partial(self.click_item, "Last Elixir"),
+                partial(ItemProvider(self).use, "Health Potion"),
+                partial(ItemProvider(self).use, "Health Elixir"),
+                partial(ItemProvider(self).use, "Last Elixir"),
                 partial(self.click_skill, "Cure"),
             ]:
-                if self.get_hp() < self.statthreshold.hp[0]:
+                if StatProviderHP(self).get_percent() < self.statthreshold.hp[0]:
                     if not fun():
                         continue
                     return True
 
-        if self.get_hp() < self.statthreshold.hp[1]:
+        if StatProviderHP(self).get_percent() < self.statthreshold.hp[1]:
             for fun in [
                 partial(self.click_skill, "Cure"),
                 partial(self.click_skill, "Full-Cure"),
-                partial(self.click_item, "Health Potion"),
-                partial(self.click_item, "Health Elixir"),
-                partial(self.click_item, "Last Elixir"),
+                partial(ItemProvider(self).use, "Health Potion"),
+                partial(ItemProvider(self).use, "Health Elixir"),
+                partial(ItemProvider(self).use, "Last Elixir"),
             ]:
-                if self.get_hp() < self.statthreshold.hp[1]:
+                if StatProviderHP(self).get_percent() < self.statthreshold.hp[1]:
                     if not fun():
                         continue
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/healthpot.png"]))
         except NoSuchElementException:
-            return self.click_item("Health Draught")
+            return ItemProvider(self).use("Health Draught")
         return False
 
     def check_mp(self) -> bool:
-        if self.get_mp() < self.statthreshold.mp[0]:
+        if StatProviderMP(self).get_percent() < self.statthreshold.mp[0]:
             for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]:
-                if self.click_item(key):
+                if ItemProvider(self).use(key):
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/manapot.png"]))
         except NoSuchElementException:
-            return self.click_item("Mana Draught")
+            return ItemProvider(self).use("Mana Draught")
         return False
 
     def check_sp(self) -> bool:
-        if self.get_sp() < self.statthreshold.sp[0]:
+        if StatProviderSP(self).get_percent() < self.statthreshold.sp[0]:
             for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]:
-                if self.click_item(key):
+                if ItemProvider(self).use(key):
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/spiritpot.png"]))
         except NoSuchElementException:
-            return self.click_item("Spirit Draught")
+            return ItemProvider(self).use("Spirit Draught")
         return False
 
     def check_overcharge(self) -> bool:
         clickspirit = partial(
-            self._click2newlog, self.driver.find_element(By.ID, "ckey_spirit")
+            ElementActionManager(self).click_and_wait_log,
+            self.driver.find_element(By.ID, "ckey_spirit"),
         )
         if (
             self.count_monster() >= self.statthreshold.countmonster[1]
-            and self.get_overcharge() < self.statthreshold.overcharge[0]
+            and StatProviderOvercharge(self).get_percent()
+            < self.statthreshold.overcharge[0]
         ):
             try:
                 self.driver.find_element(
@@ -234,8 +160,9 @@ class BattleDriver(HVDriver):
             except NoSuchElementException:
                 return False
         if (
-            self.get_overcharge() > self.statthreshold.overcharge[1]
-            and self.get_sp() > self.statthreshold.sp[0]
+            StatProviderOvercharge(self).get_percent()
+            > self.statthreshold.overcharge[1]
+            and StatProviderSP(self).get_percent() > self.statthreshold.sp[0]
         ):
             try:
                 self.driver.find_element(
@@ -264,7 +191,7 @@ class BattleDriver(HVDriver):
 
     def go_next_floor(self) -> bool:
         try:
-            self._click2newlog(
+            ElementActionManager(self).click_and_wait_log(
                 self.driver.find_element(
                     By.XPATH,
                     searchxpath_fun(
@@ -281,7 +208,7 @@ class BattleDriver(HVDriver):
             return False
 
     def click_ofc(self) -> None:
-        if self.with_ofc and (self.get_overcharge() > 220):
+        if self.with_ofc and (StatProviderOvercharge(self).get_percent() > 220):
             try:
                 self.driver.find_element(
                     By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
@@ -301,7 +228,7 @@ class BattleDriver(HVDriver):
                         n=n
                     ),
                 )
-                if self.get_mp() > self.statthreshold.mp[1]:
+                if StatProviderMP(self).get_percent() > self.statthreshold.mp[1]:
                     try:
                         self.driver.find_element(
                             By.XPATH,
@@ -312,7 +239,7 @@ class BattleDriver(HVDriver):
                         self.click_skill("Imperil", iswait=False)
                     except NoSuchElementException:
                         pass
-                self._click2newlog(
+                ElementActionManager(self).click_and_wait_log(
                     self.driver.find_element(
                         By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
                     )
@@ -338,7 +265,7 @@ class BattleDriver(HVDriver):
             if self.go_next_floor():
                 continue
 
-            if self.check_ponychart():
+            if PonyChart(self).check():
                 continue
 
             if self.finish_battle():
