@@ -19,6 +19,17 @@ from .hv_battle_statprovider import (
 from .hv_battle_ponychart import PonyChart
 from .hv_battle_item import ItemProvider
 from .hv_battle_actionmanager import ElementActionManager
+from .hv_battle_skillmanager import SkillManager
+
+
+def return_false_on_nosuch(fun):
+    def wrapper(*args, **kwargs):
+        try:
+            return fun(*args, **kwargs)
+        except NoSuchElementException:
+            return False
+
+    return wrapper
 
 
 class StatThreshold:
@@ -57,90 +68,92 @@ class BattleDriver(HVDriver):
         self.statthreshold = statthreshold
         self.with_ofc = "isekai" not in self.driver.current_url
 
+    @property
+    def _skillmanager(self) -> SkillManager:
+        return SkillManager(self)
+
     def click_skill(self, key: str, iswait=True) -> bool:
-        def click_skill_menue():
-            button = self.driver.find_element(By.ID, "ckey_skill")
-            button.click()
+        return self._skillmanager.cast(key, iswait=iswait)
 
-        def click_this_skill(skillstring: str) -> None:
-            element = self.driver.find_element(By.XPATH, skillstring)
-            if iswait:
-                ElementActionManager(self).click_and_wait_log(element)
-            else:
-                actions = ActionChains(self.driver)
-                actions.move_to_element(element).click().perform()
-                time.sleep(0.01)
+    def get_stat_percent(self, stat: str) -> float:
+        match stat.lower():
+            case "hp":
+                value = StatProviderHP(self).get_percent()
+            case "mp":
+                value = StatProviderMP(self).get_percent()
+            case "sp":
+                value = StatProviderSP(self).get_percent()
+            case "overcharge":
+                value = StatProviderOvercharge(self).get_percent()
+            case _:
+                raise ValueError(f"Unknown stat: {stat}")
+        return value
 
-        skillstring = "//div[not(@style)]/div/div[contains(text(), '{key}')]".format(
-            key=key
-        )
-        try:
-            click_this_skill(skillstring)
-        except ElementNotInteractableException:
-            click_skill_menue()
-            try:
-                click_this_skill(skillstring)
-            except ElementNotInteractableException:
-                click_skill_menue()
-                click_this_skill(skillstring)
-        except NoSuchElementException:
-            return False
-        return True
+    @property
+    def _itemprovider(self) -> ItemProvider:
+        return ItemProvider(self)
 
+    def use_item(self, key: str) -> bool:
+        return self._itemprovider.use(key)
+
+    @return_false_on_nosuch
     def check_hp(self) -> bool:
-        if StatProviderHP(self).get_percent() < self.statthreshold.hp[0]:
+        if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
             for fun in [
                 partial(self.click_skill, "Full-Cure"),
-                partial(ItemProvider(self).use, "Health Potion"),
-                partial(ItemProvider(self).use, "Health Elixir"),
-                partial(ItemProvider(self).use, "Last Elixir"),
+                partial(self.use_item, "Health Potion"),
+                partial(self.use_item, "Health Elixir"),
+                partial(self.use_item, "Last Elixir"),
                 partial(self.click_skill, "Cure"),
             ]:
-                if StatProviderHP(self).get_percent() < self.statthreshold.hp[0]:
+                if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
                     if not fun():
                         continue
                     return True
 
-        if StatProviderHP(self).get_percent() < self.statthreshold.hp[1]:
+        if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
             for fun in [
                 partial(self.click_skill, "Cure"),
                 partial(self.click_skill, "Full-Cure"),
-                partial(ItemProvider(self).use, "Health Potion"),
-                partial(ItemProvider(self).use, "Health Elixir"),
-                partial(ItemProvider(self).use, "Last Elixir"),
+                partial(self.use_item, "Health Potion"),
+                partial(self.use_item, "Health Elixir"),
+                partial(self.use_item, "Last Elixir"),
             ]:
-                if StatProviderHP(self).get_percent() < self.statthreshold.hp[1]:
+                if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
                     if not fun():
                         continue
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/healthpot.png"]))
         except NoSuchElementException:
-            return ItemProvider(self).use("Health Draught")
+            return self.use_item("Health Draught")
         return False
 
+    @return_false_on_nosuch
     def check_mp(self) -> bool:
-        if StatProviderMP(self).get_percent() < self.statthreshold.mp[0]:
+        if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
             for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]:
-                if ItemProvider(self).use(key):
+                if self.use_item(key):
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/manapot.png"]))
         except NoSuchElementException:
-            return ItemProvider(self).use("Mana Draught")
+            return self.use_item("Mana Draught")
         return False
 
+    @return_false_on_nosuch
     def check_sp(self) -> bool:
-        if StatProviderSP(self).get_percent() < self.statthreshold.sp[0]:
+        if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
             for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]:
-                if ItemProvider(self).use(key):
+                if self.use_item(key):
                     return True
         try:
             self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/spiritpot.png"]))
         except NoSuchElementException:
-            return ItemProvider(self).use("Spirit Draught")
+            return self.use_item("Spirit Draught")
         return False
 
+    @return_false_on_nosuch
     def check_overcharge(self) -> bool:
         clickspirit = partial(
             ElementActionManager(self).click_and_wait_log,
@@ -148,8 +161,7 @@ class BattleDriver(HVDriver):
         )
         if (
             self.count_monster() >= self.statthreshold.countmonster[1]
-            and StatProviderOvercharge(self).get_percent()
-            < self.statthreshold.overcharge[0]
+            and self.get_stat_percent("overcharge") < self.statthreshold.overcharge[0]
         ):
             try:
                 self.driver.find_element(
@@ -160,9 +172,8 @@ class BattleDriver(HVDriver):
             except NoSuchElementException:
                 return False
         if (
-            StatProviderOvercharge(self).get_percent()
-            > self.statthreshold.overcharge[1]
-            and StatProviderSP(self).get_percent() > self.statthreshold.sp[0]
+            self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1]
+            and self.get_stat_percent("sp") > self.statthreshold.sp[0]
         ):
             try:
                 self.driver.find_element(
@@ -208,7 +219,7 @@ class BattleDriver(HVDriver):
             return False
 
     def click_ofc(self) -> None:
-        if self.with_ofc and (StatProviderOvercharge(self).get_percent() > 220):
+        if self.with_ofc and (self.get_stat_percent("overcharge") > 220):
             try:
                 self.driver.find_element(
                     By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
@@ -228,7 +239,7 @@ class BattleDriver(HVDriver):
                         n=n
                     ),
                 )
-                if StatProviderMP(self).get_percent() > self.statthreshold.mp[1]:
+                if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
                     try:
                         self.driver.find_element(
                             By.XPATH,
