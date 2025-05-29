@@ -37,10 +37,13 @@ class SkillManager:
             ElementActionManager(self.hvdriver).click(element)
 
     def cast(self, key: str, iswait=True) -> bool:
+        if self._checked_skills[key] == "missing":
+            return False
+
         skill_xpath = self._get_skill_xpath(key)
 
         if key not in self._checked_skills:
-            self._get_skill_status(key)
+            self.get_skill_status(key)
 
         match self._checked_skills[key]:
             case "missing":
@@ -63,18 +66,18 @@ class SkillManager:
             case _:
                 raise ValueError(f"Unknown skill status: {self._checked_skills[key]}")
 
-    def _get_skill_status(self, key: str) -> str:
+    def get_skill_status(self, key: str) -> str:
         """
         回傳 'missing'（未擁有）、'available'（可用）、'unavailable'（不可用）
         """
 
-        skill_xpath = self._get_skill_xpath(key)
-        try:
-            element = self.driver.find_element(By.XPATH, skill_xpath)
-            style = element.get_attribute("style") or ""
-            if "opacity" in style:
-                opacity = float(style.split("opacity:")[1].split(";")[0])
-                return "unavailable" if opacity < 1 else "available"
-            return "available"
-        except NoSuchElementException:
+        elementlist = self.driver.find_elements(By.XPATH, self._get_skill_xpath(key))
+        if not elementlist:
+            self._checked_skills[key] = "missing"
             return "missing"
+
+        style = elementlist[0].get_attribute("style") or ""
+        if "opacity" in style:
+            opacity = float(style.split("opacity:")[1].split(";")[0])
+            return "unavailable" if opacity < 1 else "available"
+        return "available"

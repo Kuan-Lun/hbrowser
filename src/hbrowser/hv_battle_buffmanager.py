@@ -44,11 +44,9 @@ class BuffManager:
         """
         Check if the buff is active.
         """
-        try:
-            self.driver.find_element(By.XPATH, searchxpath_fun([BUFF2ICON[key]]))
-            return True
-        except NoSuchElementException:
-            return False
+        return (
+            self.driver.find_elements(By.XPATH, searchxpath_fun([BUFF2ICON[key]])) != []
+        )
 
     def apply_buff(self, key: str) -> bool:
         """

@@ -18,11 +18,7 @@ class PonyChart:
         return self.hvdriver.driver
 
     def _check(self) -> bool:
-        try:
-            self.driver.find_element(By.ID, "ponychart")
-        except NoSuchElementException:
-            return False
-        return True
+        return self.driver.find_elements(By.ID, "ponychart") != []
 
     def check(self) -> bool:
         isponychart: bool = self._check()
