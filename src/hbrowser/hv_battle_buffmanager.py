@@ -25,11 +25,11 @@ BUFF2ICON = {
     "Spirit Draught": "/y/e/spiritpot.png",
     # Skill icons
     "Absorb": "/y/e/absorb.png",
-    "Heartseeker": "/y/e/channeling.png",
+    "Heartseeker": "/y/e/heartseeker.png",
     "Regen": "/y/e/regen.png",
 }
 
-BUFF2ICON = {v: k for k, v in BUFF2ICON.items()}
+ICONBUFF = {v: k for k, v in BUFF2ICON.items()}
 
 
 class BuffManager:
@@ -59,14 +59,10 @@ class BuffManager:
 
         if key in ITEM_BUFFS:
             item_provider = ItemProvider(self.hvdriver)
-            if item_provider.use(key):
-                return True
-            return False
+            return item_provider.use(key)
 
         if key in SKILL_BUFFS:
             skill_manager = SkillManager(self.hvdriver)
-            if skill_manager.cast(key):
-                return True
-            return False
+            return skill_manager.cast(key)
 
         raise ValueError(f"Unknown buff key: {key}")
