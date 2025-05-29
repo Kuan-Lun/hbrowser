@@ -1,13 +1,10 @@
-import time
 from functools import partial
 
 from selenium.common.exceptions import (
     NoSuchElementException,
-    ElementNotInteractableException,
 )
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
 
 from .hv import HVDriver, searchxpath_fun
 from .hv_battle_statprovider import (
@@ -17,9 +14,10 @@ from .hv_battle_statprovider import (
     StatProviderOvercharge,
 )
 from .hv_battle_ponychart import PonyChart
-from .hv_battle_item import ItemProvider
+from .hv_battle_itemprovider import ItemProvider
 from .hv_battle_actionmanager import ElementActionManager
 from .hv_battle_skillmanager import SkillManager
+from .hv_battle_buffmanager import BuffManager
 
 
 def return_false_on_nosuch(fun):
@@ -96,6 +94,9 @@ class BattleDriver(HVDriver):
     def use_item(self, key: str) -> bool:
         return self._itemprovider.use(key)
 
+    def apply_buff(self, key: str) -> bool:
+        return BuffManager(self).apply_buff(key)
+
     @return_false_on_nosuch
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
@@ -123,10 +124,6 @@ class BattleDriver(HVDriver):
                     if not fun():
                         continue
                     return True
-        try:
-            self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/healthpot.png"]))
-        except NoSuchElementException:
-            return self.use_item("Health Draught")
         return False
 
     @return_false_on_nosuch
@@ -135,10 +132,6 @@ class BattleDriver(HVDriver):
             for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]:
                 if self.use_item(key):
                     return True
-        try:
-            self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/manapot.png"]))
-        except NoSuchElementException:
-            return self.use_item("Mana Draught")
         return False
 
     @return_false_on_nosuch
@@ -147,10 +140,6 @@ class BattleDriver(HVDriver):
             for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]:
                 if self.use_item(key):
                     return True
-        try:
-            self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/spiritpot.png"]))
-        except NoSuchElementException:
-            return self.use_item("Spirit Draught")
         return False
 
     @return_false_on_nosuch
@@ -273,40 +262,26 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         while True:
-            if self.go_next_floor():
-                continue
-
-            if PonyChart(self).check():
-                continue
-
             if self.finish_battle():
                 break
 
-            iscontinue = False
-            for fun in [
-                self.check_hp,
-                self.check_mp,
-                self.check_sp,
-                self.check_overcharge,
-            ]:
-                iscontinue |= fun()
-                if iscontinue:
-                    break
-            if iscontinue:
-                continue
-
-            try:
-                self.driver.find_element(By.XPATH, searchxpath_fun(["/y/e/regen.png"]))
-            except NoSuchElementException:
-                self.click_skill("Regen")
-                continue
-
-            try:
-                self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/e/heartseeker.png"])
-                )
-            except NoSuchElementException:
-                self.click_skill("Heartseeker")
+            if any(
+                fun()
+                for fun in [
+                    self.go_next_floor,
+                    PonyChart(self).check,
+                    self.check_hp,
+                    self.check_mp,
+                    self.check_sp,
+                    self.check_overcharge,
+                    partial(self.apply_buff, "Health Draught"),
+                    partial(self.apply_buff, "Mana Draught"),
+                    partial(self.apply_buff, "Spirit Draught"),
+                    partial(self.apply_buff, "Regen"),
+                    partial(self.apply_buff, "Absorb"),
+                    partial(self.apply_buff, "Heartseeker"),
+                ]
+            ):
                 continue
 
             try:
