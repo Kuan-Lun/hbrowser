@@ -2,7 +2,7 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 
-from .hv_battle import HVDriver, searchxpath_fun
+from .hv import HVDriver, searchxpath_fun
 from .hv_battle_skillmanager import SkillManager
 from .hv_battle_itemprovider import ItemProvider
 

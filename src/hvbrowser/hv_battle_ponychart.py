@@ -1,12 +1,10 @@
 import time
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoSuchElementException,
-)
 from selenium.webdriver.remote.webdriver import WebDriver
 
+from hbrowser.beep import beep_os_independent
+
 from .hv import HVDriver
-from .beep import beep_os_independent
 
 
 class PonyChart:

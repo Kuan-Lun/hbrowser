@@ -7,7 +7,7 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 
-from .gallery import EHDriver
+from hbrowser.gallery import EHDriver
 
 
 genxpath = lambda imagepath: '//img[@src="{imagepath}"]'.format(imagepath=imagepath)

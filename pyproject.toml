@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.2.9"
+version = "0.3.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -29,6 +29,6 @@ Source = "https://github.com/Kuan-Lun/hbrowser"
 Tracker = "https://github.com/Kuan-Lun/hbrowser/issues"
 
 [tool.setuptools]
-packages = ["hbrowser"]
-package-dir = { hbrowser = "src/hbrowser" }
+packages = ["hbrowser", "hvbrowser"]
+package-dir = { hbrowser = "src/hbrowser", hvbrowser = "src/hvbrowser" }
 package-data = { hbrowser = ["py.typed"] }
