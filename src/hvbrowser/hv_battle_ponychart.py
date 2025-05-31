@@ -24,6 +24,7 @@ class PonyChart:
             return isponychart
 
         beep_os_independent()
+        time.sleep(5)
 
         waitlimit: float = 100
         while waitlimit > 0 and self._check():
