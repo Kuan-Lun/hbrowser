@@ -4,6 +4,7 @@ from selenium.webdriver.common.by import By
 from .hv import HVDriver, searchxpath_fun
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_item_provider import ItemProvider
+from .hv_battle_action_manager import ElementActionManager
 
 ITEM_BUFFS = {
     "Health Draught",
@@ -26,6 +27,8 @@ BUFF2ICON = {
     "Absorb": "/y/e/absorb.png",
     "Heartseeker": "/y/e/heartseeker.png",
     "Regen": "/y/e/regen.png",
+    # Spirit icon
+    "Spirit Stance": "/y/battle/spirit_a.png",
 }
 
 ICONBUFF = {v: k for k, v in BUFF2ICON.items()}
@@ -61,5 +64,11 @@ class BuffManager:
         if key in SKILL_BUFFS:
             skill_manager = SkillManager(self.hvdriver)
             return skill_manager.cast(key)
+
+        if key == "Spirit Stance":
+            ElementActionManager(self.hvdriver).click_and_wait_log(
+                self.driver.find_element(By.ID, "ckey_spirit")
+            )
+            return True
 
         raise ValueError(f"Unknown buff key: {key}")

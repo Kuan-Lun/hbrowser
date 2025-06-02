@@ -73,3 +73,16 @@ class StatProviderOvercharge(StatProvider):
     @property
     def searchxpath(self) -> str:
         return searchxpath_fun(["/y/bar_orange.png"])
+
+    def get_spirit_stance_status(self) -> str:
+        if self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
+        ):
+            return "activated"
+
+        if self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/battle/spirit_n.png"])
+        ):
+            return "inactive"
+
+        return "charging"

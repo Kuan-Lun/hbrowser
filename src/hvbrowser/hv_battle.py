@@ -87,6 +87,10 @@ class BattleDriver(HVDriver):
         return value
 
     @property
+    def is_with_spirit_stance(self) -> bool:
+        return StatProviderOvercharge(self).get_spirit_stance_status() == "activated"
+
+    @property
     def _itemprovider(self) -> ItemProvider:
         return ItemProvider(self)
 
@@ -159,33 +163,25 @@ class BattleDriver(HVDriver):
 
     @return_false_on_nosuch
     def check_overcharge(self) -> bool:
-        clickspirit = partial(
-            ElementActionManager(self).click_and_wait_log,
-            self.driver.find_element(By.ID, "ckey_spirit"),
-        )
-        if (
-            self.monster_alive_count >= self.statthreshold.countmonster[1]
-            and self.get_stat_percent("overcharge") < self.statthreshold.overcharge[0]
+        if any(
+            [
+                self.monster_alive_count >= self.statthreshold.countmonster[1],
+                self.get_stat_percent("overcharge") < self.statthreshold.overcharge[0],
+            ]
         ):
-            try:
-                self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
-                )
-                clickspirit()
-                return True
-            except NoSuchElementException:
+            if self.is_with_spirit_stance:
+                return self.apply_buff("Spirit Stance")
+            else:
                 return False
-        if (
-            self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1]
-            and self.get_stat_percent("sp") > self.statthreshold.sp[0]
+
+        if any(
+            [
+                self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1],
+                self.get_stat_percent("sp") > self.statthreshold.sp[0],
+                not self.is_with_spirit_stance,
+            ]
         ):
-            try:
-                self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
-                )
-            except NoSuchElementException:
-                clickspirit()
-                return True
+            return self.apply_buff("Spirit Stance")
         return False
 
     def go_next_floor(self) -> bool:
@@ -207,15 +203,15 @@ class BattleDriver(HVDriver):
             return False
 
     def click_ofc(self) -> None:
-        if self.with_ofc and (self.get_stat_percent("overcharge") > 220):
-            try:
-                self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
-                )
-                if self.monster_alive_count >= self.statthreshold.countmonster[1]:
-                    self.click_skill("Orbital Friendship Cannon", iswait=False)
-            except NoSuchElementException:
-                pass
+        if any(
+            [
+                self.with_ofc,
+                self.get_stat_percent("overcharge") > 220,
+                self.is_with_spirit_stance,
+                self.monster_alive_count >= self.statthreshold.countmonster[1],
+            ]
+        ):
+            self.click_skill("Orbital Friendship Cannon", iswait=False)
 
     def attack_monster(self, n: int) -> bool:
         elements = self.driver.find_elements(
@@ -234,7 +230,7 @@ class BattleDriver(HVDriver):
         monster_alive_ids = self.monster_alive_ids
 
         monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
-            "weaken"
+            "Weaken"
         )
         for n in monster_alive_ids:
             if n not in monster_with_weaken:
@@ -244,7 +240,7 @@ class BattleDriver(HVDriver):
 
         if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
             monster_with_imperil = (
-                self._monsterstatusmanager.get_monster_ids_with_debuff("imperil")
+                self._monsterstatusmanager.get_monster_ids_with_debuff("Imperil")
             )
         else:
             monster_with_imperil = monster_alive_ids
@@ -256,15 +252,15 @@ class BattleDriver(HVDriver):
         return False
 
     def finish_battle(self) -> bool:
-        try:
-            ending = self.driver.find_element(
-                By.XPATH, searchxpath_fun(["/y/battle/finishbattle.png"])
-            )
-            actions = ActionChains(self.driver)
-            actions.move_to_element(ending).click().perform()
-            return True
-        except NoSuchElementException:
+        elements = self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/battle/finishbattle.png"])
+        )
+
+        if not elements:
             return False
+
+        ActionChains(self.driver).move_to_element(elements[0]).click().perform()
+        return True
 
     def battle(self) -> None:
         while True:

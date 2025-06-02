@@ -6,8 +6,8 @@ from .hv import HVDriver
 
 # Debuff 名稱對應圖示檔名
 BUFF_ICON_MAP = {
-    "imperil": ["imperil.png"],
-    "weaken": ["weaken.png"],
+    "Imperil": ["imperil.png"],
+    "Weaken": ["weaken.png"],
     # 你可以繼續擴充
 }
 
