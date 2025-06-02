@@ -2,8 +2,8 @@ from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 
 from .hv import HVDriver, searchxpath_fun
-from .hv_battle_skillmanager import SkillManager
-from .hv_battle_itemprovider import ItemProvider
+from .hv_battle_skill_manager import SkillManager
+from .hv_battle_item_provider import ItemProvider
 
 ITEM_BUFFS = {
     "Health Draught",

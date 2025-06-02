@@ -7,17 +7,18 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 
 from .hv import HVDriver, searchxpath_fun
-from .hv_battle_statprovider import (
+from .hv_battle_stat_provider import (
     StatProviderHP,
     StatProviderMP,
     StatProviderSP,
     StatProviderOvercharge,
 )
 from .hv_battle_ponychart import PonyChart
-from .hv_battle_itemprovider import ItemProvider
-from .hv_battle_actionmanager import ElementActionManager
-from .hv_battle_skillmanager import SkillManager
-from .hv_battle_buffmanager import BuffManager
+from .hv_battle_item_provider import ItemProvider
+from .hv_battle_action_manager import ElementActionManager
+from .hv_battle_skill_manager import SkillManager
+from .hv_battle_buff_manager import BuffManager
+from .hv_battle_monster_status_manager import MonsterStatusManager
 
 
 def return_false_on_nosuch(fun):
@@ -94,8 +95,24 @@ class BattleDriver(HVDriver):
     def use_item(self, key: str) -> bool:
         return self._itemprovider.use(key)
 
+    @property
+    def _buffmanager(self) -> BuffManager:
+        return BuffManager(self)
+
     def apply_buff(self, key: str) -> bool:
-        return BuffManager(self).apply_buff(key)
+        return self._buffmanager.apply_buff(key)
+
+    @property
+    def _monsterstatusmanager(self) -> MonsterStatusManager:
+        return MonsterStatusManager(self)
+
+    @property
+    def monster_alive_count(self) -> int:
+        return self._monsterstatusmanager.alive_count
+
+    @property
+    def monster_alive_ids(self) -> list[int]:
+        return self._monsterstatusmanager.alive_monster_ids
 
     @return_false_on_nosuch
     def check_hp(self) -> bool:
@@ -149,7 +166,7 @@ class BattleDriver(HVDriver):
             self.driver.find_element(By.ID, "ckey_spirit"),
         )
         if (
-            self.count_monster() >= self.statthreshold.countmonster[1]
+            self.monster_alive_count >= self.statthreshold.countmonster[1]
             and self.get_stat_percent("overcharge") < self.statthreshold.overcharge[0]
         ):
             try:
@@ -172,22 +189,6 @@ class BattleDriver(HVDriver):
                 clickspirit()
                 return True
         return False
-
-    def count_monster(self) -> int:
-        count = 0
-        for n in range(10):
-            count += (
-                len(
-                    self.driver.find_elements(
-                        By.XPATH,
-                        '//div[@id="mkey_{n}" and not(.//img[@src="/y/s/nbardead.png"]) and not(.//img[@src="/isekai/y/s/nbardead.png"])]'.format(
-                            n=n
-                        ),
-                    )
-                )
-                > 0
-            )
-        return count
 
     def go_next_floor(self) -> bool:
         try:
@@ -213,40 +214,39 @@ class BattleDriver(HVDriver):
                 self.driver.find_element(
                     By.XPATH, searchxpath_fun(["/y/battle/spirit_a.png"])
                 )
-                if self.count_monster() >= self.statthreshold.countmonster[1]:
+                if self.monster_alive_count >= self.statthreshold.countmonster[1]:
                     self.click_skill("Orbital Friendship Cannon", iswait=False)
             except NoSuchElementException:
                 pass
 
     def attack(self) -> bool:
         self.click_ofc()
-        for n in [2, 1, 3, 5, 4, 6, 8, 7, 9, 0]:
-            try:
-                self.driver.find_element(
-                    By.XPATH,
-                    '//div[@id="mkey_{n}" and not(.//img[@src="/y/s/nbardead.png"]) and not(.//img[@src="/isekai/y/s/nbardead.png"])]'.format(
-                        n=n
-                    ),
-                )
+
+        monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
+            "weaken"
+        )
+        for n in self.monster_alive_ids:
+            if n not in monster_with_weaken:
                 if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
-                    try:
+                    self.click_skill("Weaken", iswait=False)
+                    ElementActionManager(self).click_and_wait_log(
                         self.driver.find_element(
-                            By.XPATH,
-                            '//div[@id="mkey_{n}" and not(.//img[@src="/y/e/imperil.png"]) and not(.//img[@src="/isekai/y/e/imperil.png"])]'.format(
-                                n=n
-                            ),
+                            By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
                         )
-                        self.click_skill("Imperil", iswait=False)
-                    except NoSuchElementException:
-                        pass
-                ElementActionManager(self).click_and_wait_log(
-                    self.driver.find_element(
-                        By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
                     )
-                )
-                return True
-            except NoSuchElementException:
-                pass
+                    return True
+
+        monster_with_imperil = self._monsterstatusmanager.get_monster_ids_with_debuff(
+            "imperil"
+        )
+        for n in self.monster_alive_ids:
+            if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
+                if n not in monster_with_imperil:
+                    self.click_skill("Imperil", iswait=False)
+            ElementActionManager(self).click_and_wait_log(
+                self.driver.find_element(By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n))
+            )
+            return True
         return False
 
     def finish_battle(self) -> bool:

@@ -4,7 +4,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 
 from .hv import HVDriver, searchxpath_fun
-from .hv_battle_actionmanager import ElementActionManager
+from .hv_battle_action_manager import ElementActionManager
 
 
 class ItemProvider:
