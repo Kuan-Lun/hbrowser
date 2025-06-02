@@ -1,10 +1,12 @@
 import time
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.common.exceptions import NoSuchElementException
 
 from hbrowser.beep import beep_os_independent
 
 from .hv import HVDriver
+from .hv_battle_stat_provider import StatProviderHP
 
 
 class PonyChart:
@@ -16,7 +18,16 @@ class PonyChart:
         return self.hvdriver.driver
 
     def _check(self) -> bool:
-        return self.driver.find_elements(By.ID, "ponychart") != []
+        isponchart = self.driver.find_elements(By.ID, "ponychart") != []
+        if isponchart:
+            return True
+
+        # if PonyChart is not found, it may be because the page has not loaded yet.
+        try:
+            StatProviderHP(self.hvdriver).get_percent()
+            return False
+        except NoSuchElementException:
+            return True
 
     def check(self) -> bool:
         isponychart: bool = self._check()
@@ -29,6 +40,9 @@ class PonyChart:
         while waitlimit > 0 and self._check():
             time.sleep(0.1)
             waitlimit -= 0.1
+
+        if waitlimit <= 0:
+            print("PonyChart check timeout, please check your network connection.")
 
         time.sleep(1)
 

@@ -14,4 +14,4 @@ def beep_os_independent():
         import time
 
         winsound.MessageBeep()  # 使用 winsound 模块发出默认提示音
-        time.sleep(5)
+        time.sleep(10)
