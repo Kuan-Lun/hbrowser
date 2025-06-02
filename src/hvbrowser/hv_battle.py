@@ -219,33 +219,41 @@ class BattleDriver(HVDriver):
             except NoSuchElementException:
                 pass
 
+    def attack_monster(self, n: int) -> bool:
+        elements = self.driver.find_elements(
+            By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
+        )
+
+        if not elements:
+            return False
+
+        ElementActionManager(self).click_and_wait_log(elements[0])
+        return True
+
     def attack(self) -> bool:
         self.click_ofc()
+
+        monster_alive_ids = self.monster_alive_ids
 
         monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
             "weaken"
         )
-        for n in self.monster_alive_ids:
+        for n in monster_alive_ids:
             if n not in monster_with_weaken:
-                if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
-                    self.click_skill("Weaken", iswait=False)
-                    ElementActionManager(self).click_and_wait_log(
-                        self.driver.find_element(
-                            By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
-                        )
-                    )
-                    return True
+                self.click_skill("Weaken", iswait=False)
+                self.attack_monster(n)
+                return True
 
-        monster_with_imperil = self._monsterstatusmanager.get_monster_ids_with_debuff(
-            "imperil"
-        )
-        for n in self.monster_alive_ids:
-            if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
-                if n not in monster_with_imperil:
-                    self.click_skill("Imperil", iswait=False)
-            ElementActionManager(self).click_and_wait_log(
-                self.driver.find_element(By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n))
+        if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
+            monster_with_imperil = (
+                self._monsterstatusmanager.get_monster_ids_with_debuff("imperil")
             )
+        else:
+            monster_with_imperil = monster_alive_ids
+        for n in monster_alive_ids:
+            if n not in monster_with_imperil:
+                self.click_skill("Imperil", iswait=False)
+            self.attack_monster(n)
             return True
         return False
 
