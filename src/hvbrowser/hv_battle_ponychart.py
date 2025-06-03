@@ -18,16 +18,7 @@ class PonyChart:
         return self.hvdriver.driver
 
     def _check(self) -> bool:
-        isponchart = self.driver.find_elements(By.ID, "ponychart") != []
-        if isponchart:
-            return True
-
-        # if PonyChart is not found, it may be because the page has not loaded yet.
-        try:
-            StatProviderHP(self.hvdriver).get_percent()
-            return False
-        except NoSuchElementException:
-            return True
+        return self.driver.find_elements(By.ID, "riddlesubmit") != []
 
     def check(self) -> bool:
         isponychart: bool = self._check()
