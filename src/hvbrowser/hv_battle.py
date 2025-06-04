@@ -119,46 +119,51 @@ class BattleDriver(HVDriver):
     @return_false_on_nosuch
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
-            for fun in [
-                partial(self.click_skill, "Full-Cure"),
-                partial(self.use_item, "Health Potion"),
-                partial(self.use_item, "Health Elixir"),
-                partial(self.use_item, "Last Elixir"),
-                partial(self.click_skill, "Cure"),
-            ]:
-                if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
-                    if not fun():
-                        continue
-                    return True
+            if any(
+                [
+                    self.click_skill("Full-Cure"),
+                    self.use_item("Health Potion"),
+                    self.use_item("Health Elixir"),
+                    self.use_item("Last Elixir"),
+                    self.click_skill("Cure"),
+                ]
+            ):
+                return True
 
-        if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
-            for fun in [
-                partial(self.click_skill, "Cure"),
-                partial(self.click_skill, "Full-Cure"),
-                partial(self.use_item, "Health Potion"),
-                partial(self.use_item, "Health Elixir"),
-                partial(self.use_item, "Last Elixir"),
-            ]:
-                if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
-                    if not fun():
-                        continue
-                    return True
+        if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
+            if any(
+                [
+                    self.click_skill("Cure"),
+                    self.click_skill("Full-Cure"),
+                    self.use_item("Health Potion"),
+                    self.use_item("Health Elixir"),
+                    self.use_item("Last Elixir"),
+                ]
+            ):
+                return True
+
         return False
 
     @return_false_on_nosuch
     def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
-            for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]:
-                if self.use_item(key):
-                    return True
+            return any(
+                [
+                    self.use_item(key)
+                    for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]
+                ]
+            )
         return False
 
     @return_false_on_nosuch
     def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
-            for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]:
-                if self.use_item(key):
-                    return True
+            return any(
+                [
+                    self.use_item(key)
+                    for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]
+                ]
+            )
         return False
 
     @return_false_on_nosuch
@@ -185,33 +190,20 @@ class BattleDriver(HVDriver):
         return False
 
     def go_next_floor(self) -> bool:
-        try:
-            ElementActionManager(self).click_and_wait_log(
-                self.driver.find_element(
-                    By.XPATH,
-                    searchxpath_fun(
-                        [
-                            "/y/battle/arenacontinue.png",
-                            "/y/battle/grindfestcontinue.png",
-                            "/y/battle/itemworldcontinue.png",
-                        ]
-                    ),
-                )
-            )
-            return True
-        except NoSuchElementException:
-            return False
+        continue_images = [
+            "/y/battle/arenacontinue.png",
+            "/y/battle/grindfestcontinue.png",
+            "/y/battle/itemworldcontinue.png",
+        ]
+        continue_elements = self.driver.find_elements(
+            By.XPATH, searchxpath_fun(continue_images)
+        )
 
-    def click_ofc(self) -> None:
-        if any(
-            [
-                self.with_ofc,
-                self.get_stat_percent("overcharge") > 220,
-                self.is_with_spirit_stance,
-                self.monster_alive_count >= self.statthreshold.countmonster[1],
-            ]
-        ):
-            self.click_skill("Orbital Friendship Cannon", iswait=False)
+        if continue_elements:
+            ElementActionManager(self).click_and_wait_log(continue_elements[0])
+            return True
+        else:
+            return False
 
     def attack_monster(self, n: int) -> bool:
         elements = self.driver.find_elements(
@@ -225,10 +217,21 @@ class BattleDriver(HVDriver):
         return True
 
     def attack(self) -> bool:
-        self.click_ofc()
+        # Check if Orbital Friendship Cannon can be used
+        if any(
+            [
+                self.with_ofc,
+                self.get_stat_percent("overcharge") > 220,
+                self.is_with_spirit_stance,
+                self.monster_alive_count >= self.statthreshold.countmonster[1],
+            ]
+        ):
+            self.click_skill("Orbital Friendship Cannon", iswait=False)
 
+        # Get the list of alive monster IDs
         monster_alive_ids = self.monster_alive_ids
 
+        # Get the list of monster IDs that are not debuffed with Weaken
         monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
             "Weaken"
         )
@@ -238,6 +241,7 @@ class BattleDriver(HVDriver):
                 self.attack_monster(n)
                 return True
 
+        # Get the list of monster IDs that are not debuffed with Imperil
         if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
             monster_with_imperil = (
                 self._monsterstatusmanager.get_monster_ids_with_debuff("Imperil")
@@ -286,14 +290,12 @@ class BattleDriver(HVDriver):
             ):
                 continue
 
-            try:
-                self.driver.find_element(
-                    By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
-                )
+            channeling_elements = self.driver.find_elements(
+                By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
+            )
+            if channeling_elements:
                 self.click_skill("Heartseeker")
                 continue
-            except NoSuchElementException:
-                pass
 
             if self.attack():
                 continue
