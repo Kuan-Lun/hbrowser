@@ -189,6 +189,7 @@ class BattleDriver(HVDriver):
             return self.apply_buff("Spirit Stance")
         return False
 
+    @return_false_on_nosuch
     def go_next_floor(self) -> bool:
         continue_images = [
             "/y/battle/arenacontinue.png",
