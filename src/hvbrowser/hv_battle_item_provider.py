@@ -51,8 +51,8 @@ class ItemProvider:
 
         item_button_list = self.driver.find_elements(
             By.XPATH,
-            "//div[@class=\"fc2 fal fcb\"]/div[contains(text(), '{key}')]".format(
-                key=item
+            "//div[@id and @onclick and div[@class='fc2 fal fcb']/div[text()='{item_name}']]".format(
+                item_name=item
             ),
         )
         if not item_button_list:
