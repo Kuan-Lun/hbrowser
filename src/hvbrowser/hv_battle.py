@@ -48,6 +48,15 @@ def return_false_on_nosuch(fun):
     return wrapper
 
 
+def create_last_weakened_monster_id(fun):
+    def wrapper(self, *args, **kwargs):
+        if not hasattr(self, "last_weakened_monster_id"):
+            self.last_weakened_monster_id = -1
+        return fun(self, *args, **kwargs)
+
+    return wrapper
+
+
 class StatThreshold:
     def __init__(
         self,
@@ -162,13 +171,17 @@ class BattleDriver(HVDriver):
 
     @return_false_on_nosuch
     def check_mp(self) -> bool:
-        if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
+        if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
+            return self.use_item("Mana Potion")
+
+        if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
             return any(
                 [
                     self.use_item(key)
                     for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]
                 ]
             )
+
         return False
 
     @return_false_on_nosuch
@@ -218,6 +231,7 @@ class BattleDriver(HVDriver):
 
         if continue_elements:
             ElementActionManager(self).click_and_wait_log(continue_elements[0])
+            self.last_weakened_monster_id = -1
             return True
         else:
             return False
@@ -233,6 +247,7 @@ class BattleDriver(HVDriver):
         ElementActionManager(self).click_and_wait_log(elements[0])
         return True
 
+    @create_last_weakened_monster_id
     def attack(self) -> bool:
         # Check if Orbital Friendship Cannon can be used
         if any(
@@ -252,17 +267,20 @@ class BattleDriver(HVDriver):
         monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
             "Weaken"
         )
-        if any(
+        if all(
             [
                 monster_alive_ids,
                 len(monster_alive_ids) > 3,
-                len(monster_with_weaken) / len(monster_alive_ids) < 0.75,
+                len(monster_with_weaken) / len(monster_alive_ids) < 0.7,
             ]
         ):
             for n in monster_alive_ids:
-                if n not in monster_with_weaken:
+                if all(
+                    [n not in monster_with_weaken, n != self.last_weakened_monster_id]
+                ):
                     self.click_skill("Weaken", iswait=False)
                     self.attack_monster(n)
+                    self.last_weakened_monster_id = n
                     return True
 
         # Get the list of monster IDs that are not debuffed with Imperil
