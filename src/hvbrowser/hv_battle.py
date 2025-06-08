@@ -250,7 +250,7 @@ class BattleDriver(HVDriver):
     @create_last_weakened_monster_id
     def attack(self) -> bool:
         # Check if Orbital Friendship Cannon can be used
-        if any(
+        if all(
             [
                 self.with_ofc,
                 self.get_stat_percent("overcharge") > 220,
