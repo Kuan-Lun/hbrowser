@@ -49,11 +49,11 @@ class BuffManager:
             self.driver.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
         )
 
-    def apply_buff(self, key: str) -> bool:
+    def apply_buff(self, key: str, force: bool) -> bool:
         """
         Apply the buff if it is not already active.
         """
-        if self.has_buff(key):
+        if all([not force, self.has_buff(key)]):
             return False
 
         if key == "Absorb":

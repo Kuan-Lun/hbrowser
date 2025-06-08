@@ -129,8 +129,8 @@ class BattleDriver(HVDriver):
     def _buffmanager(self) -> BuffManager:
         return BuffManager(self)
 
-    def apply_buff(self, key: str) -> bool:
-        return self._buffmanager.apply_buff(key)
+    def apply_buff(self, key: str, force: bool = False) -> bool:
+        return self._buffmanager.apply_buff(key, force=force)
 
     @property
     def _monsterstatusmanager(self) -> MonsterStatusManager:
@@ -197,18 +197,18 @@ class BattleDriver(HVDriver):
 
     @return_false_on_nosuch
     def check_overcharge(self) -> bool:
-        if any(
-            [
-                self.monster_alive_count >= self.statthreshold.countmonster[1],
-                self.get_stat_percent("overcharge") < self.statthreshold.overcharge[0],
-            ]
-        ):
-            if self.is_with_spirit_stance:
-                return self.apply_buff("Spirit Stance")
-            else:
-                return False
+        if self.is_with_spirit_stance:
+            # If Spirit Stance is active, check if Overcharge and SP are below thresholds
+            if any(
+                [
+                    self.get_stat_percent("overcharge")
+                    < self.statthreshold.overcharge[0],
+                    self.get_stat_percent("sp") < self.statthreshold.sp[0],
+                ]
+            ):
+                return self.apply_buff("Spirit Stance", force=True)
 
-        if any(
+        if all(
             [
                 self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1],
                 self.get_stat_percent("sp") > self.statthreshold.sp[0],
@@ -336,7 +336,7 @@ class BattleDriver(HVDriver):
                 By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
             )
             if channeling_elements:
-                self.click_skill("Heartseeker")
+                self.apply_buff("Heartseeker", force=True)
                 continue
 
             if self.attack():
