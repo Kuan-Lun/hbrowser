@@ -11,9 +11,12 @@ from hbrowser.gallery import EHDriver
 
 
 genxpath = lambda imagepath: '//img[@src="{imagepath}"]'.format(imagepath=imagepath)
-searchxpath_fun = lambda srclist: " | ".join(
-    [genxpath(s + imagepath) for imagepath in srclist for s in ["", "/isekai"]]
-)
+
+
+def searchxpath_fun(srclist: list | tuple | set) -> str:
+    return " | ".join(
+        [genxpath(s + imagepath) for imagepath in srclist for s in ["", "/isekai"]]
+    )
 
 
 class BSItems(ABC):

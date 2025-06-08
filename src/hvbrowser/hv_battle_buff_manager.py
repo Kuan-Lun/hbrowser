@@ -10,6 +10,7 @@ ITEM_BUFFS = {
     "Health Draught",
     "Mana Draught",
     "Spirit Draught",
+    "Scroll of Absorption",
 }
 
 SKILL_BUFFS = {
@@ -18,20 +19,18 @@ SKILL_BUFFS = {
     "Regen",
 }
 
-BUFF2ICON = {
+BUFF2ICONS = {
     # Item icons
-    "Health Draught": "/y/e/healthpot.png",
-    "Mana Draught": "/y/e/manapot.png",
-    "Spirit Draught": "/y/e/spiritpot.png",
+    "Health Draught": {"/y/e/healthpot.png"},
+    "Mana Draught": {"/y/e/manapot.png"},
+    "Spirit Draught": {"/y/e/spiritpot.png"},
     # Skill icons
-    "Absorb": "/y/e/absorb.png",
-    "Heartseeker": "/y/e/heartseeker.png",
-    "Regen": "/y/e/regen.png",
+    "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
+    "Heartseeker": {"/y/e/heartseeker.png"},
+    "Regen": {"/y/e/regen.png"},
     # Spirit icon
-    "Spirit Stance": "/y/battle/spirit_a.png",
+    "Spirit Stance": {"/y/battle/spirit_a.png"},
 }
-
-ICONBUFF = {v: k for k, v in BUFF2ICON.items()}
 
 
 class BuffManager:
@@ -47,7 +46,7 @@ class BuffManager:
         Check if the buff is active.
         """
         return (
-            self.driver.find_elements(By.XPATH, searchxpath_fun([BUFF2ICON[key]])) != []
+            self.driver.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
         )
 
     def apply_buff(self, key: str) -> bool:
@@ -57,13 +56,17 @@ class BuffManager:
         if self.has_buff(key):
             return False
 
+        if key == "Absorb":
+            if ItemProvider(self.hvdriver).use("Scroll of Absorption"):
+                return True
+            else:
+                return SkillManager(self.hvdriver).cast(key)
+
         if key in ITEM_BUFFS:
-            item_provider = ItemProvider(self.hvdriver)
-            return item_provider.use(key)
+            return ItemProvider(self.hvdriver).use(key)
 
         if key in SKILL_BUFFS:
-            skill_manager = SkillManager(self.hvdriver)
-            return skill_manager.cast(key)
+            return SkillManager(self.hvdriver).cast(key)
 
         if key == "Spirit Stance":
             ElementActionManager(self.hvdriver).click_and_wait_log(
