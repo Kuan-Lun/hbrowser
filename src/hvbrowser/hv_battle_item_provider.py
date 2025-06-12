@@ -26,8 +26,9 @@ class ItemProvider:
             return "not_found"
 
         item_divs = self.driver.find_elements(By.XPATH, f"//div/div[text()='{item}']")
-        if all([not item_divs, item not in GEM_ITEMS]):
-            self._checked_items[item] = "not_found"
+        if not item_divs:
+            if item not in GEM_ITEMS:
+                self._checked_items[item] = "not_found"
             return "not_found"
 
         for div in item_divs:
