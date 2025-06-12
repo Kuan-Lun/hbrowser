@@ -11,9 +11,13 @@ from .hv import HVDriver
 class LogProvider:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver: HVDriver = driver
-        self.prev_lines: deque[str] = deque(maxlen=100)
+        self._reset_prev_lines()
         self.current_round = 0
+        self.prev_round = 0
         self.total_round = 0
+
+    def _reset_prev_lines(self) -> None:
+        self.prev_lines: deque[str] = deque(maxlen=1000)
 
     @property
     def driver(self) -> WebDriver:
@@ -31,6 +35,9 @@ class LogProvider:
                 match = re.search(r"Round (\d+) / (\d+)", line)
                 if match:
                     self.current_round = int(match.group(1))
+                    if self.prev_round != self.current_round:
+                        self.prev_round = self.current_round
+                        self._reset_prev_lines()
                     self.total_round = int(match.group(2))
 
     def get_new_logs(self) -> list[str]:
