@@ -158,6 +158,7 @@ class BattleDriver(HVDriver):
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
             if any(
                 [
+                    self.use_item("Health Gem"),
                     self.click_skill("Full-Cure"),
                     self.use_item("Health Potion"),
                     self.use_item("Health Elixir"),
@@ -170,6 +171,7 @@ class BattleDriver(HVDriver):
         if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
             if any(
                 [
+                    self.use_item("Health Gem"),
                     self.click_skill("Cure"),
                     self.use_item("Health Potion"),
                 ]
@@ -187,7 +189,7 @@ class BattleDriver(HVDriver):
             return any(
                 [
                     self.use_item(key)
-                    for key in ["Mana Potion", "Mana Elixir", "Last Elixir"]
+                    for key in ["Mana Gem", "Mana Potion", "Mana Elixir", "Last Elixir"]
                 ]
             )
 
@@ -199,7 +201,12 @@ class BattleDriver(HVDriver):
             return any(
                 [
                     self.use_item(key)
-                    for key in ["Spirit Potion", "Spirit Elixir", "Last Elixir"]
+                    for key in [
+                        "Spirit Gem",
+                        "Spirit Potion",
+                        "Spirit Elixir",
+                        "Last Elixir",
+                    ]
                 ]
             )
         return False

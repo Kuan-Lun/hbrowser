@@ -6,6 +6,8 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from .hv import HVDriver, searchxpath_fun
 from .hv_battle_action_manager import ElementActionManager
 
+GEM_ITEMS = {"Health Gem", "Mana Gem", "Spirit Gem"}
+
 
 class ItemProvider:
     def __init__(self, driver: HVDriver) -> None:
@@ -24,7 +26,7 @@ class ItemProvider:
             return "not_found"
 
         item_divs = self.driver.find_elements(By.XPATH, f"//div/div[text()='{item}']")
-        if not item_divs:
+        if all([not item_divs, item not in GEM_ITEMS]):
             self._checked_items[item] = "not_found"
             return "not_found"
 
