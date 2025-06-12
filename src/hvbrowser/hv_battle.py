@@ -17,6 +17,7 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_monster_status_manager import MonsterStatusManager
+from .hv_battle_log import LogProvider
 
 
 def interleave_even_odd(nums):
@@ -92,6 +93,7 @@ class BattleDriver(HVDriver):
     def set_battle_parameters(self, statthreshold: StatThreshold) -> None:
         self.statthreshold = statthreshold
         self.with_ofc = "isekai" not in self.driver.current_url
+        self._logprovider = LogProvider(self)
 
     @property
     def _skillmanager(self) -> SkillManager:
@@ -113,6 +115,13 @@ class BattleDriver(HVDriver):
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
         return value
+
+    @property
+    def new_logs(self) -> list[str]:
+        new_logs = self._logprovider.get_new_logs()
+        # 固定寬度，假設最大 3 位數
+        round_str = f"Round {self._logprovider.current_round:>3} / {self._logprovider.total_round:<3}"
+        return [f"{round_str} {line}" for line in new_logs]
 
     @property
     def is_with_spirit_stance(self) -> bool:
@@ -310,6 +319,9 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         while True:
+            # Print the current round logs
+            [print(log) for log in self.new_logs]
+
             if self.finish_battle():
                 break
 
