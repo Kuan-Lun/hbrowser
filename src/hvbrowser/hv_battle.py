@@ -139,6 +139,23 @@ class BattleDriver(HVDriver):
         return BuffManager(self)
 
     def apply_buff(self, key: str, force: bool = False) -> bool:
+        if not force:
+            match key:
+                case "Health Draught":
+                    if self.get_stat_percent("hp") < 90:
+                        return self.apply_buff("Health Draught")
+                    else:
+                        return False
+                case "Mana Draught":
+                    if self.get_stat_percent("mp") < 90:
+                        return self.apply_buff("Mana Draught")
+                    else:
+                        return False
+                case "Spirit Draught":
+                    if self.get_stat_percent("sp") < 90:
+                        return self.apply_buff("Spirit Draught")
+                    else:
+                        return False
         return self._buffmanager.apply_buff(key, force=force)
 
     @property
