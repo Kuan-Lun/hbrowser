@@ -139,24 +139,25 @@ class BattleDriver(HVDriver):
         return BuffManager(self)
 
     def apply_buff(self, key: str, force: bool = False) -> bool:
+        apply_buff = partial(self._buffmanager.apply_buff, key=key, force=force)
         if not force:
             match key:
                 case "Health Draught":
                     if self.get_stat_percent("hp") < 90:
-                        return self.apply_buff("Health Draught")
+                        return apply_buff()
                     else:
                         return False
                 case "Mana Draught":
                     if self.get_stat_percent("mp") < 90:
-                        return self.apply_buff("Mana Draught")
+                        return apply_buff()
                     else:
                         return False
                 case "Spirit Draught":
                     if self.get_stat_percent("sp") < 90:
-                        return self.apply_buff("Spirit Draught")
+                        return apply_buff()
                     else:
                         return False
-        return self._buffmanager.apply_buff(key, force=force)
+        return apply_buff()
 
     @property
     def _monsterstatusmanager(self) -> MonsterStatusManager:
