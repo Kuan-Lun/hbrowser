@@ -58,3 +58,15 @@ class MonsterStatusManager:
             for el in elements
             if (id_ := el.get_attribute("id")) is not None
         ]
+
+    def get_monster_id_by_name(self, name: str) -> int:
+        """
+        根據怪物名稱取得對應的 monster id（如 mkey_0 會回傳 0）。
+        """
+        xpath = f'//div[starts-with(@id, "mkey_")][.//div[text()="{name}"]]'
+        el = self.driver.find_element(By.XPATH, xpath)
+        if el is not None:
+            id_ = el.get_attribute("id")
+            if id_ and id_.startswith("mkey_"):
+                return int(id_.removeprefix("mkey_"))
+        return -1

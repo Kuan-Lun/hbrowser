@@ -171,6 +171,12 @@ class BattleDriver(HVDriver):
     def monster_alive_ids(self) -> list[int]:
         return self._monsterstatusmanager.alive_monster_ids
 
+    def get_monster_id_by_name(self, name: str) -> int:
+        """
+        根據怪物名稱取得對應的 monster id（如 mkey_0 會回傳 0）。
+        """
+        return self._monsterstatusmanager.get_monster_id_by_name(name)
+
     @return_false_on_nosuch
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
@@ -296,6 +302,13 @@ class BattleDriver(HVDriver):
 
         # Get the list of alive monster IDs
         monster_alive_ids = interleave_even_odd(self.monster_alive_ids)
+        for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][-1::-1]:
+            monster_id = self.get_monster_id_by_name(monster_name)
+            if monster_id in monster_alive_ids:
+                monster_alive_ids = (
+                    monster_alive_ids[monster_alive_ids.index(monster_id) :]
+                    + monster_alive_ids[: monster_alive_ids.index(monster_id)]
+                )
 
         # Get the list of monster IDs that are not debuffed with Weaken
         monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
