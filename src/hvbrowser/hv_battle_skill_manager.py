@@ -1,5 +1,7 @@
+import re
 from collections import defaultdict
 
+from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -81,3 +83,22 @@ class SkillManager:
             opacity = float(style.split("opacity:")[1].split(";")[0])
             return "unavailable" if opacity < 1 else "available"
         return "available"
+
+    def get_skill_mp_cost_by_name(self, skill_name: str) -> int:
+        """
+        根據技能名稱（如 'Haste' 或 'Weaken'）從 HTML 片段中找出對應的數值。
+        """
+        page_source = self.hvdriver.driver.page_source
+        soup = BeautifulSoup(page_source, "html.parser")
+        for div in soup.find_all("div"):
+            if not hasattr(div, "get"):
+                continue
+            onmouseover = div.get("onmouseover", "")
+            # 用正則找技能名稱和數值
+            pattern = r"set_infopane_spell\('{}',.*?,.*?,\s*(\d+),".format(
+                re.escape(skill_name)
+            )
+            match = re.search(pattern, onmouseover)
+            if match:
+                return int(match.group(1))
+        return 0

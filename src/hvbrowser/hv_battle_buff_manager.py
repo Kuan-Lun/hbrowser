@@ -1,3 +1,6 @@
+import re
+
+from bs4 import BeautifulSoup
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 
@@ -44,6 +47,31 @@ class BuffManager:
     @property
     def driver(self) -> WebElement:
         return self.hvdriver.driver
+
+    def get_buff_remaining_turns(self, key: str) -> int:
+        """
+        Get the remaining turns of the buff.
+        Returns 0 if the buff is not active.
+        """
+
+        if self.has_buff(key) is False:
+            return 0
+
+        src_values = BUFF2ICONS[key]
+        soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
+        results = {}
+        for img in soup.find_all("img"):
+            if not hasattr(img, "get"):
+                continue
+            src = img.get("src", "")
+            if src in src_values:
+                onmouseover = img.get("onmouseover", "")
+                match = re.search(
+                    r"set_infopane_effect\([^,]+,[^,]+,(\d+)\)", onmouseover
+                )
+                if match:
+                    results[src] = int(match.group(1))
+        return results.get(next(iter(src_values)), 0)
 
     def has_buff(self, key: str) -> bool:
         """

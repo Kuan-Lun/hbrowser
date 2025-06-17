@@ -1,4 +1,5 @@
 from functools import partial
+from collections import defaultdict
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -386,7 +387,15 @@ class BattleDriver(HVDriver):
                 By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
             )
             if channeling_elements:
-                self.apply_buff("Heartseeker", force=True)
+                skill_names = ["Regen", "Heartseeker"]
+                to_use_skill: tuple[str, float] = (skill_names[0], 0)
+                for skill_name in skill_names:
+                    turn = self._buffmanager.get_buff_remaining_turns(skill_name)
+                    cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
+                    if turn and to_use_skill[1] < (cost / turn):
+                        to_use_skill = (skill_name, cost / turn)
+
+                self.apply_buff(to_use_skill[0], force=True)
                 continue
 
             if self.attack():
