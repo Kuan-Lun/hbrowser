@@ -17,6 +17,7 @@ SKILL_BUFFS = {
     "Absorb",
     "Heartseeker",
     "Regen",
+    "Shadow Veil",
 }
 
 BUFF2ICONS = {
@@ -28,6 +29,7 @@ BUFF2ICONS = {
     "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
     "Heartseeker": {"/y/e/heartseeker.png"},
     "Regen": {"/y/e/regen.png"},
+    "Shadow Veil": {"/y/e/shadowveil.png"},
     # Spirit icon
     "Spirit Stance": {"/y/battle/spirit_a.png"},
 }
@@ -36,6 +38,8 @@ BUFF2ICONS = {
 class BuffManager:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver: HVDriver = driver
+        self._item_provider: ItemProvider = ItemProvider(self.hvdriver)
+        self._skill_manager: SkillManager = SkillManager(self.hvdriver)
 
     @property
     def driver(self) -> WebElement:
@@ -57,16 +61,17 @@ class BuffManager:
             return False
 
         if key == "Absorb":
-            if ItemProvider(self.hvdriver).use("Scroll of Absorption"):
+            if self._item_provider.use("Scroll of Absorption"):
                 return True
             else:
-                return SkillManager(self.hvdriver).cast(key)
+                return self._skill_manager.cast(key)
 
         if key in ITEM_BUFFS:
-            return ItemProvider(self.hvdriver).use(key)
+            return self._item_provider.use(key)
 
         if key in SKILL_BUFFS:
-            return SkillManager(self.hvdriver).cast(key)
+            self._item_provider.use("Mystic Gem")
+            return self._skill_manager.cast(key)
 
         if key == "Spirit Stance":
             ElementActionManager(self.hvdriver).click_and_wait_log(
