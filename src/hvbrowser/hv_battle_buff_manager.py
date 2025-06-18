@@ -77,8 +77,9 @@ class BuffManager:
         """
         Check if the buff is active.
         """
+        pane_effects = self.driver.find_element(By.ID, "pane_effects")
         return (
-            self.driver.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
+            pane_effects.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
         )
 
     def apply_buff(self, key: str, force: bool) -> bool:
