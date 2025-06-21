@@ -19,6 +19,7 @@ class SkillManager:
         # missing_skills: list[str] = []
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
+        self.skills_cost: dict[str, int] = defaultdict(int)
 
     @property
     def driver(self) -> WebDriver:
@@ -41,6 +42,10 @@ class SkillManager:
     def cast(self, key: str, iswait=True) -> bool:
         if self._checked_skills[key] == "missing":
             return False
+
+        self.skills_cost[key] = max(
+            self.get_skill_mp_cost_by_name(key), self.skills_cost[key]
+        )
 
         skill_xpath = self._get_skill_xpath(key)
 
@@ -100,5 +105,7 @@ class SkillManager:
             )
             match = re.search(pattern, onmouseover)
             if match:
-                return int(match.group(1))
-        return 0
+                self.skills_cost[skill_name] = max(
+                    int(match.group(1)), self.skills_cost[skill_name]
+                )
+        return self.skills_cost[skill_name]
