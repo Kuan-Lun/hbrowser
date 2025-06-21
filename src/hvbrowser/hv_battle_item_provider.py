@@ -44,13 +44,21 @@ class ItemProvider:
         if self.get_item_status(item) == "unavailable":
             return False
 
-        item_menu_list = self.driver.find_elements(
+        if not self.driver.find_elements(
             By.XPATH,
-            searchxpath_fun(["/y/battle/items_n.png"]),
-        )
-        if not item_menu_list:
+            searchxpath_fun(["/y/battle/items_n.png", "/y/battle/items_s.png"]),
+        ):
             return False
-        ElementActionManager(self.hvdriver).click(item_menu_list[0])
+
+        if not self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/battle/items_s.png"])
+        ):
+            item_menu_list = self.driver.find_elements(
+                By.XPATH, searchxpath_fun(["/y/battle/items_n.png"])
+            )
+            if not item_menu_list:
+                return False
+            ElementActionManager(self.hvdriver).click(item_menu_list[0])
 
         item_button_list = self.driver.find_elements(
             By.XPATH,

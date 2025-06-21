@@ -209,25 +209,50 @@ class BattleDriver(HVDriver):
 
     @return_false_on_nosuch
     def check_mp(self) -> bool:
-        if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
-            if any([self.use_item(key) for key in ["Mana Gem", "Mana Potion"]]):
+        if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
+            if any(
+                [
+                    self.use_item("Mana Gem"),
+                    self.use_item("Mana Potion"),
+                    self.use_item("Mana Elixir"),
+                    self.use_item("Last Elixir"),
+                ]
+            ):
                 return True
 
-        if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
-            if any([self.use_item(key) for key in ["Mana Elixir", "Last Elixir"]]):
+        if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
+            if any(
+                [
+                    self.use_item("Mana Gem"),
+                    self.use_item("Mana Potion"),
+                ]
+            ):
                 return True
 
         return False
 
     @return_false_on_nosuch
     def check_sp(self) -> bool:
-        if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
-            if any([self.use_item(key) for key in ["Spirit Gem", "Spirit Potion"]]):
+        if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
+            if any(
+                [
+                    self.use_item("Spirit Gem"),
+                    self.use_item("Spirit Potion"),
+                    self.use_item("Spirit Elixir"),
+                    self.use_item("Last Elixir"),
+                ]
+            ):
                 return True
 
-        if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
-            if any([self.use_item(key) for key in ["Spirit Elixir", "Last Elixir"]]):
+        if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
+            if any(
+                [
+                    self.use_item("Spirit Gem"),
+                    self.use_item("Spirit Potion"),
+                ]
+            ):
                 return True
+
         return False
 
     @return_false_on_nosuch
