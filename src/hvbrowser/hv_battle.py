@@ -210,20 +210,24 @@ class BattleDriver(HVDriver):
     @return_false_on_nosuch
     def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
-            return any([self.use_item(key) for key in ["Mana Gem", "Mana Potion"]])
+            if any([self.use_item(key) for key in ["Mana Gem", "Mana Potion"]]):
+                return True
 
         if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
-            return any([self.use_item(key) for key in ["Mana Elixir", "Last Elixir"]])
+            if any([self.use_item(key) for key in ["Mana Elixir", "Last Elixir"]]):
+                return True
 
         return False
 
     @return_false_on_nosuch
     def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
-            return any([self.use_item(key) for key in ["Spirit Gem", "Spirit Potion"]])
+            if any([self.use_item(key) for key in ["Spirit Gem", "Spirit Potion"]]):
+                return True
 
         if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
-            return any([self.use_item(key) for key in ["Spirit Elixir", "Last Elixir"]])
+            if any([self.use_item(key) for key in ["Spirit Elixir", "Last Elixir"]]):
+                return True
         return False
 
     @return_false_on_nosuch
