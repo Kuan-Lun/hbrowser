@@ -14,6 +14,7 @@ ITEM_BUFFS = {
     "Mana Draught",
     "Spirit Draught",
     "Scroll of Absorption",
+    "Scroll of Life",
 }
 
 SKILL_BUFFS = {
@@ -21,6 +22,7 @@ SKILL_BUFFS = {
     "Heartseeker",
     "Regen",
     "Shadow Veil",
+    "Spark of Life",
 }
 
 BUFF2ICONS = {
@@ -28,11 +30,13 @@ BUFF2ICONS = {
     "Health Draught": {"/y/e/healthpot.png"},
     "Mana Draught": {"/y/e/manapot.png"},
     "Spirit Draught": {"/y/e/spiritpot.png"},
+    "Scroll of Life": {"/y/e/sparklife_scroll.png"},
     # Skill icons
     "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
     "Heartseeker": {"/y/e/heartseeker.png"},
     "Regen": {"/y/e/regen.png"},
     "Shadow Veil": {"/y/e/shadowveil.png"},
+    "Spark of Life": {"/y/e/sparklife.png", "/y/e/sparklife_scroll.png"},
     # Spirit icon
     "Spirit Stance": {"/y/battle/spirit_a.png"},
 }
@@ -91,6 +95,12 @@ class BuffManager:
 
         if key == "Absorb":
             if self._item_provider.use("Scroll of Absorption"):
+                return True
+            else:
+                return self._skill_manager.cast(key)
+
+        if key == "Spark of Life":
+            if self._item_provider.use("Scroll of Life"):
                 return True
             else:
                 return self._skill_manager.cast(key)

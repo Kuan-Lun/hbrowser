@@ -377,6 +377,7 @@ class BattleDriver(HVDriver):
                     partial(self.apply_buff, "Mana Draught"),
                     partial(self.apply_buff, "Spirit Draught"),
                     partial(self.apply_buff, "Regen"),
+                    partial(self.apply_buff, "Scroll of Life"),
                     partial(self.apply_buff, "Absorb"),
                     partial(self.apply_buff, "Heartseeker"),
                 ]
