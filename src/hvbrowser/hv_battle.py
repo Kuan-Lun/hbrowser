@@ -212,7 +212,7 @@ class BattleDriver(HVDriver):
         if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
             return self.use_item("Mana Potion")
 
-        if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
+        if self.get_stat_percent("mp") < self.statthreshold.hp[0]:
             return any(
                 [
                     self.use_item(key)
