@@ -95,6 +95,7 @@ class BattleDriver(HVDriver):
         self.statthreshold = statthreshold
         self.with_ofc = "isekai" not in self.driver.current_url
         self._logprovider = LogProvider(self)
+        self.turn = -1
 
     @property
     def _skillmanager(self) -> SkillManager:
@@ -121,8 +122,9 @@ class BattleDriver(HVDriver):
     def new_logs(self) -> list[str]:
         new_logs = self._logprovider.get_new_logs()
         # 固定寬度，假設最大 3 位數
+        turn_str = f"Turn {self.turn:>5}"
         round_str = f"Round {self._logprovider.current_round:>3} / {self._logprovider.total_round:<3}"
-        return [f"{round_str} {line}" for line in new_logs]
+        return [f"{turn_str} {round_str} {line}" for line in new_logs]
 
     @property
     def is_with_spirit_stance(self) -> bool:
@@ -358,6 +360,7 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         while True:
+            self.turn += 1
             # Print the current round logs
             [print(log) for log in self.new_logs]
 
