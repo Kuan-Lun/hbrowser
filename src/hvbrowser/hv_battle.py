@@ -373,18 +373,17 @@ class BattleDriver(HVDriver):
         )
         if channeling_elements:
             skill_names = ["Regen", "Heartseeker"]
-            to_use_skill: tuple[str, float] = (skill_names[0], 0)
+            skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:
                 remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
                 refresh_turns = self._buffmanager.skill2turn[skill_name]
                 skill_cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
-                remaining_values = (
+                skill2remaining[skill_name] = (
                     (refresh_turns - remaining_turns) * refresh_turns / skill_cost
                 )
-                if to_use_skill[1] < remaining_values:
-                    to_use_skill = (skill_name, remaining_values)
+            to_use_skill_name = max(skill2remaining, key=lambda k: skill2remaining[k])
 
-            self.apply_buff(to_use_skill[0], force=True)
+            self.apply_buff(to_use_skill_name, force=True)
             return True
 
         return False
