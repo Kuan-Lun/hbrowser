@@ -6,7 +6,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from .hv import HVDriver, searchxpath_fun
 from .hv_battle_action_manager import ElementActionManager
 
-GEM_ITEMS = {"Health Gem", "Mana Gem", "Spirit Gem"}
+GEM_ITEMS = {"Mystic Gem", "Health Gem", "Mana Gem", "Spirit Gem"}
 
 
 class ItemProvider:

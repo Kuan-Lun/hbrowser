@@ -19,7 +19,7 @@ class SkillManager:
         # missing_skills: list[str] = []
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
-        self.skills_cost: dict[str, int] = defaultdict(int)
+        self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
 
     @property
     def driver(self) -> WebDriver:

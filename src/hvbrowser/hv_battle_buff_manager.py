@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict
 
 from bs4 import BeautifulSoup
 from selenium.webdriver.remote.webelement import WebElement
@@ -47,6 +48,7 @@ class BuffManager:
         self.hvdriver: HVDriver = driver
         self._item_provider: ItemProvider = ItemProvider(self.hvdriver)
         self._skill_manager: SkillManager = SkillManager(self.hvdriver)
+        self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
 
     @property
     def driver(self) -> WebElement:
@@ -75,7 +77,15 @@ class BuffManager:
                 )
                 if match:
                     results[src] = int(match.group(1))
-        return results.get(next(iter(src_values)), 0)
+        turns = results.get(next(iter(src_values)), 0)
+        self.skill2turn[key] = max(self.skill2turn[key], turns)
+        return turns
+
+    def _cast_skill(self, key: str) -> bool:
+        iscast = self._skill_manager.cast(key)
+        if iscast:
+            self.get_buff_remaining_turns(key)
+        return iscast
 
     def has_buff(self, key: str) -> bool:
         """
@@ -97,20 +107,20 @@ class BuffManager:
             if self._item_provider.use("Scroll of Absorption"):
                 return True
             else:
-                return self._skill_manager.cast(key)
+                return self._cast_skill(key)
 
         if key == "Spark of Life":
             if self._item_provider.use("Scroll of Life"):
                 return True
             else:
-                return self._skill_manager.cast(key)
+                return self._cast_skill(key)
 
         if key in ITEM_BUFFS:
             return self._item_provider.use(key)
 
         if key in SKILL_BUFFS:
             self._item_provider.use("Mystic Gem")
-            return self._skill_manager.cast(key)
+            return self._cast_skill(key)
 
         if key == "Spirit Stance":
             ElementActionManager(self.hvdriver).click_and_wait_log(

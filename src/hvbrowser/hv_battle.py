@@ -95,11 +95,11 @@ class BattleDriver(HVDriver):
         self.statthreshold = statthreshold
         self.with_ofc = "isekai" not in self.driver.current_url
         self._logprovider = LogProvider(self)
+        self._itemprovider = ItemProvider(self)
+        self._skillmanager = SkillManager(self)
+        self._buffmanager = BuffManager(self)
+        self._monsterstatusmanager = MonsterStatusManager(self)
         self.turn = -1
-
-    @property
-    def _skillmanager(self) -> SkillManager:
-        return SkillManager(self)
 
     def click_skill(self, key: str, iswait=True) -> bool:
         return self._skillmanager.cast(key, iswait=iswait)
@@ -130,16 +130,8 @@ class BattleDriver(HVDriver):
     def is_with_spirit_stance(self) -> bool:
         return StatProviderOvercharge(self).get_spirit_stance_status() == "activated"
 
-    @property
-    def _itemprovider(self) -> ItemProvider:
-        return ItemProvider(self)
-
     def use_item(self, key: str) -> bool:
         return self._itemprovider.use(key)
-
-    @property
-    def _buffmanager(self) -> BuffManager:
-        return BuffManager(self)
 
     def apply_buff(self, key: str, force: bool = False) -> bool:
         apply_buff = partial(self._buffmanager.apply_buff, key=key, force=force)
@@ -161,10 +153,6 @@ class BattleDriver(HVDriver):
                     else:
                         return False
         return apply_buff()
-
-    @property
-    def _monsterstatusmanager(self) -> MonsterStatusManager:
-        return MonsterStatusManager(self)
 
     @property
     def monster_alive_count(self) -> int:
@@ -411,10 +399,18 @@ class BattleDriver(HVDriver):
                 skill_names = ["Regen", "Heartseeker"]
                 to_use_skill: tuple[str, float] = (skill_names[0], 0)
                 for skill_name in skill_names:
-                    turn = self._buffmanager.get_buff_remaining_turns(skill_name)
-                    cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
-                    if turn and to_use_skill[1] < (cost / turn):
-                        to_use_skill = (skill_name, cost / turn)
+                    remaining_turns = self._buffmanager.get_buff_remaining_turns(
+                        skill_name
+                    )
+                    refresh_turns = self._buffmanager.skill2turn[skill_name]
+                    skill_cost = self._skillmanager.get_skill_mp_cost_by_name(
+                        skill_name
+                    )
+                    remaining_values = (
+                        (refresh_turns - remaining_turns) * refresh_turns / skill_cost
+                    )
+                    if to_use_skill[1] < remaining_values:
+                        to_use_skill = (skill_name, remaining_values)
 
                 self.apply_buff(to_use_skill[0], force=True)
                 continue
