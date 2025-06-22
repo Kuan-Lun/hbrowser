@@ -367,6 +367,28 @@ class BattleDriver(HVDriver):
         ActionChains(self.driver).move_to_element(elements[0]).click().perform()
         return True
 
+    def use_channeling(self) -> bool:
+        channeling_elements = self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
+        )
+        if channeling_elements:
+            skill_names = ["Regen", "Heartseeker"]
+            to_use_skill: tuple[str, float] = (skill_names[0], 0)
+            for skill_name in skill_names:
+                remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
+                refresh_turns = self._buffmanager.skill2turn[skill_name]
+                skill_cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
+                remaining_values = (
+                    (refresh_turns - remaining_turns) * refresh_turns / skill_cost
+                )
+                if to_use_skill[1] < remaining_values:
+                    to_use_skill = (skill_name, remaining_values)
+
+            self.apply_buff(to_use_skill[0], force=True)
+            return True
+
+        return False
+
     def battle_in_turn(self) -> str:
         self.turn += 1
         # Print the current round logs
@@ -395,23 +417,7 @@ class BattleDriver(HVDriver):
         ):
             return "continue"
 
-        channeling_elements = self.driver.find_elements(
-            By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
-        )
-        if channeling_elements:
-            skill_names = ["Regen", "Heartseeker"]
-            to_use_skill: tuple[str, float] = (skill_names[0], 0)
-            for skill_name in skill_names:
-                remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
-                refresh_turns = self._buffmanager.skill2turn[skill_name]
-                skill_cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
-                remaining_values = (
-                    (refresh_turns - remaining_turns) * refresh_turns / skill_cost
-                )
-                if to_use_skill[1] < remaining_values:
-                    to_use_skill = (skill_name, remaining_values)
-
-            self.apply_buff(to_use_skill[0], force=True)
+        if self.use_channeling():
             return "continue"
 
         if self.attack():
