@@ -1,5 +1,6 @@
+import threading
 from functools import partial
-from collections import defaultdict
+from time import sleep
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -59,6 +60,41 @@ def create_last_weakened_monster_id(fun):
     return wrapper
 
 
+class PauseController:
+    def __init__(self):
+        self.pause_event = threading.Event()
+        self.quit_event = threading.Event()
+        self.listener_thread = threading.Thread(target=self.input_listener, daemon=True)
+        self.listener_thread.start()
+
+    def input_listener(self):
+        while not self.quit_event.is_set():
+            cmd = input().strip().lower()
+            if cmd == "pass":
+                print("Paused. Type 'continue' to resume or 'quit' to exit.")
+                self.pause_event.set()
+                while True:
+                    cmd2 = input().strip().lower()
+                    if cmd2 == "continue":
+                        self.pause_event.clear()
+                        print("Resumed.")
+                        break
+                    elif cmd2 == "quit":
+                        self.quit_event.set()
+                        print("Exiting.")
+                        break
+
+    def pauseable(self, func):
+        def wrapper(*args, **kwargs):
+            while not self.quit_event.is_set():
+                if self.pause_event.is_set():
+                    sleep(0.5)
+                    continue
+                return func(*args, **kwargs)
+
+        return wrapper
+
+
 class StatThreshold:
     def __init__(
         self,
@@ -91,15 +127,19 @@ class StatThreshold:
 
 
 class BattleDriver(HVDriver):
-    def set_battle_parameters(self, statthreshold: StatThreshold) -> None:
-        self.statthreshold = statthreshold
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.with_ofc = "isekai" not in self.driver.current_url
         self._logprovider = LogProvider(self)
         self._itemprovider = ItemProvider(self)
         self._skillmanager = SkillManager(self)
         self._buffmanager = BuffManager(self)
         self._monsterstatusmanager = MonsterStatusManager(self)
+        self.controller = PauseController()
         self.turn = -1
+
+    def set_battle_parameters(self, statthreshold: StatThreshold) -> None:
+        self.statthreshold = statthreshold
 
     def click_skill(self, key: str, iswait=True) -> bool:
         return self._skillmanager.cast(key, iswait=iswait)
@@ -363,57 +403,64 @@ class BattleDriver(HVDriver):
         ActionChains(self.driver).move_to_element(elements[0]).click().perform()
         return True
 
+    def battle_in_turn(self) -> str:
+        self.turn += 1
+        # Print the current round logs
+        [print(log) for log in self.new_logs]
+
+        if self.finish_battle():
+            return "break"
+
+        if any(
+            fun()
+            for fun in [
+                self.go_next_floor,
+                PonyChart(self).check,
+                self.check_hp,
+                self.check_mp,
+                self.check_sp,
+                self.check_overcharge,
+                partial(self.apply_buff, "Health Draught"),
+                partial(self.apply_buff, "Mana Draught"),
+                partial(self.apply_buff, "Spirit Draught"),
+                partial(self.apply_buff, "Regen"),
+                partial(self.apply_buff, "Scroll of Life"),
+                partial(self.apply_buff, "Absorb"),
+                partial(self.apply_buff, "Heartseeker"),
+            ]
+        ):
+            return "continue"
+
+        channeling_elements = self.driver.find_elements(
+            By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
+        )
+        if channeling_elements:
+            skill_names = ["Regen", "Heartseeker"]
+            to_use_skill: tuple[str, float] = (skill_names[0], 0)
+            for skill_name in skill_names:
+                remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
+                refresh_turns = self._buffmanager.skill2turn[skill_name]
+                skill_cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
+                remaining_values = (
+                    (refresh_turns - remaining_turns) * refresh_turns / skill_cost
+                )
+                if to_use_skill[1] < remaining_values:
+                    to_use_skill = (skill_name, remaining_values)
+
+            self.apply_buff(to_use_skill[0], force=True)
+            return "continue"
+
+        if self.attack():
+            return "continue"
+
+        return "continue"
+
     def battle(self) -> None:
         while True:
-            self.turn += 1
-            # Print the current round logs
-            [print(log) for log in self.new_logs]
-
-            if self.finish_battle():
-                break
-
-            if any(
-                fun()
-                for fun in [
-                    self.go_next_floor,
-                    PonyChart(self).check,
-                    self.check_hp,
-                    self.check_mp,
-                    self.check_sp,
-                    self.check_overcharge,
-                    partial(self.apply_buff, "Health Draught"),
-                    partial(self.apply_buff, "Mana Draught"),
-                    partial(self.apply_buff, "Spirit Draught"),
-                    partial(self.apply_buff, "Regen"),
-                    partial(self.apply_buff, "Scroll of Life"),
-                    partial(self.apply_buff, "Absorb"),
-                    partial(self.apply_buff, "Heartseeker"),
-                ]
-            ):
-                continue
-
-            channeling_elements = self.driver.find_elements(
-                By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
-            )
-            if channeling_elements:
-                skill_names = ["Regen", "Heartseeker"]
-                to_use_skill: tuple[str, float] = (skill_names[0], 0)
-                for skill_name in skill_names:
-                    remaining_turns = self._buffmanager.get_buff_remaining_turns(
-                        skill_name
-                    )
-                    refresh_turns = self._buffmanager.skill2turn[skill_name]
-                    skill_cost = self._skillmanager.get_skill_mp_cost_by_name(
-                        skill_name
-                    )
-                    remaining_values = (
-                        (refresh_turns - remaining_turns) * refresh_turns / skill_cost
-                    )
-                    if to_use_skill[1] < remaining_values:
-                        to_use_skill = (skill_name, remaining_values)
-
-                self.apply_buff(to_use_skill[0], force=True)
-                continue
-
-            if self.attack():
-                continue
+            match self.controller.pauseable(self.battle_in_turn)():
+                case "break":
+                    break
+                case "continue":
+                    continue
+                case _:
+                    raise ValueError("Unexpected return value from battle_in_turn.")
