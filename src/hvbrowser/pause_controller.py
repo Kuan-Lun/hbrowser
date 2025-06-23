@@ -12,7 +12,7 @@ class PauseController:
     def input_listener(self):
         while not self.quit_event.is_set():
             cmd = input().strip().lower()
-            if cmd == "pass":
+            if cmd == "pause":
                 print("Paused. Type 'continue' to resume or 'quit' to exit.")
                 self.pause_event.set()
                 while True:
