@@ -99,7 +99,7 @@ class BattleDriver(HVDriver):
         self._skillmanager = SkillManager(self)
         self._buffmanager = BuffManager(self)
         self._monsterstatusmanager = MonsterStatusManager(self)
-        self.controller = PauseController()
+        self.pausecontroller = PauseController()
         self.turn = -1
 
     def set_battle_parameters(self, statthreshold: StatThreshold) -> None:
@@ -426,7 +426,7 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         while True:
-            match self.controller.pauseable(self.battle_in_turn)():
+            match self.pausecontroller.pauseable(self.battle_in_turn)():
                 case "break":
                     break
                 case "continue":
