@@ -391,7 +391,7 @@ class BattleDriver(HVDriver):
     def battle_in_turn(self) -> str:
         self.turn += 1
         # Print the current round logs
-        [print(log) for log in self.new_logs]
+        print("\n".join(self.new_logs))
 
         if self.finish_battle():
             return "break"
