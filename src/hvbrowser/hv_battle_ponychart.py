@@ -30,6 +30,7 @@ class PonyChart:
         waitlimit: float = 100
         while waitlimit > 0 and self._check():
             time.sleep(0.1)
+            beep_os_independent()
             waitlimit -= 0.1
 
         if waitlimit <= 0:
