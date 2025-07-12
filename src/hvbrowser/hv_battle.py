@@ -315,7 +315,7 @@ class BattleDriver(HVDriver):
                 )
 
         # Get the list of monster IDs that are not debuffed with the specified debuffs
-        for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence"]:
+        for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence", "Drain"]:
             monster_with_debuff = (
                 self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
             )

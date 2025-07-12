@@ -12,6 +12,7 @@ BUFF_ICON_MAP = {
     "Slow": ["slow.png"],
     "MagNet": ["magnet.png"],
     "Silence": ["silence.png"],
+    "Drain": ["drainhp.png"],
     # 你可以繼續擴充
 }
 
