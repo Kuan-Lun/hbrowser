@@ -1,5 +1,6 @@
 from functools import partial
 from collections import defaultdict
+from random import random
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -348,6 +349,8 @@ class BattleDriver(HVDriver):
             if n not in monster_with_imperil:
                 if n == self.last_debuff_monster_id["Imperil"]:
                     # If the last debuffed monster is the same, attack it directly
+                    if random() < 0.5:
+                        self.click_skill("Imperil", iswait=False)
                     self.attack_monster(n)
                 else:
                     self.click_skill("Imperil", iswait=False)
