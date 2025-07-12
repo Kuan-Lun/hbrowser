@@ -8,6 +8,9 @@ from .hv import HVDriver
 BUFF_ICON_MAP = {
     "Imperil": ["imperil.png"],
     "Weaken": ["weaken.png"],
+    "Blind": ["blind.png"],
+    "Slow": ["slow.png"],
+    "MagNet": ["magnet.png"],
     # 你可以繼續擴充
 }
 
