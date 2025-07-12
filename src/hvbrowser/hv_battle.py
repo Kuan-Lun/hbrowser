@@ -159,6 +159,10 @@ class BattleDriver(HVDriver):
     def monster_alive_ids(self) -> list[int]:
         return self._monsterstatusmanager.alive_monster_ids
 
+    @property
+    def system_monster_alive_ids(self) -> list[int]:
+        return self._monsterstatusmanager.alive_system_monster_ids
+
     def get_monster_id_by_name(self, name: str) -> int:
         """
         根據怪物名稱取得對應的 monster id（如 mkey_0 會回傳 0）。
@@ -306,6 +310,12 @@ class BattleDriver(HVDriver):
 
         # Get the list of alive monster IDs
         monster_alive_ids = interleave_even_odd(self.monster_alive_ids)
+        if len(self.system_monster_alive_ids):
+            monster_id = self.system_monster_alive_ids[0]
+            monster_alive_ids = (
+                monster_alive_ids[monster_alive_ids.index(monster_id) :]
+                + monster_alive_ids[: monster_alive_ids.index(monster_id)]
+            )
         for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][-1::-1]:
             monster_id = self.get_monster_id_by_name(monster_name)
             if monster_id in monster_alive_ids:

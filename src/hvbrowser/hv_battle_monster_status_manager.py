@@ -49,6 +49,20 @@ class MonsterStatusManager:
             if (id_ := el.get_attribute("id")) is not None
         ]
 
+    @property
+    def alive_system_monster_ids(self) -> list[int]:
+        """Returns a list of system monster IDs in the battle that have style attribute."""
+        # 基於 ALIVE_MONSTER_XPATH 再加上有 style 設定的條件
+        elements = self.driver.find_elements(
+            By.XPATH,
+            f"({self.ALIVE_MONSTER_XPATH})[@style]",
+        )
+        return [
+            int(id_.removeprefix("mkey_"))
+            for el in elements
+            if (id_ := el.get_attribute("id")) is not None
+        ]
+
     def get_monster_ids_with_debuff(self, debuff: str) -> list[int]:
         """Returns a list of monster IDs that have the specified debuff."""
         icons = BUFF_ICON_MAP.get(debuff, [f"{debuff}.png"])
