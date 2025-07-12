@@ -1,4 +1,5 @@
 from functools import partial
+from collections import defaultdict
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -46,15 +47,6 @@ def return_false_on_nosuch(fun):
             return fun(*args, **kwargs)
         except NoSuchElementException:
             return False
-
-    return wrapper
-
-
-def create_last_weakened_monster_id(fun):
-    def wrapper(self, *args, **kwargs):
-        if not hasattr(self, "last_weakened_monster_id"):
-            self.last_weakened_monster_id = -1
-        return fun(self, *args, **kwargs)
 
     return wrapper
 
@@ -283,7 +275,7 @@ class BattleDriver(HVDriver):
 
         if continue_elements:
             ElementActionManager(self).click_and_wait_log(continue_elements[0])
-            self.last_weakened_monster_id = -1
+            self._create_last_debuff_monster_id()
             return True
         else:
             return False
@@ -299,7 +291,6 @@ class BattleDriver(HVDriver):
         ElementActionManager(self).click_and_wait_log(elements[0])
         return True
 
-    @create_last_weakened_monster_id
     def attack(self) -> bool:
         # Check if Orbital Friendship Cannon can be used
         if all(
@@ -322,25 +313,29 @@ class BattleDriver(HVDriver):
                     + monster_alive_ids[: monster_alive_ids.index(monster_id)]
                 )
 
-        # Get the list of monster IDs that are not debuffed with Weaken
-        monster_with_weaken = self._monsterstatusmanager.get_monster_ids_with_debuff(
-            "Weaken"
-        )
-        if all(
-            [
-                monster_alive_ids,
-                len(monster_alive_ids) > 3,
-                len(monster_with_weaken) / len(monster_alive_ids) < 0.7,
-            ]
-        ):
-            for n in monster_alive_ids:
-                if all(
-                    [n not in monster_with_weaken, n != self.last_weakened_monster_id]
-                ):
-                    self.click_skill("Weaken", iswait=False)
-                    self.attack_monster(n)
-                    self.last_weakened_monster_id = n
-                    return True
+        # Get the list of monster IDs that are not debuffed with the specified debuffs
+        for debuff in ["Weaken", "Slow", "Blind", "MagNet"]:
+            monster_with_debuff = (
+                self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+            )
+            if all(
+                [
+                    monster_alive_ids,
+                    len(monster_alive_ids) > 3,
+                    len(monster_with_debuff) / len(monster_alive_ids) < 0.7,
+                ]
+            ):
+                for n in monster_alive_ids:
+                    if all(
+                        [
+                            n not in monster_with_debuff,
+                            n != self.last_debuff_monster_id[debuff],
+                        ]
+                    ):
+                        self.click_skill(debuff, iswait=False)
+                        self.attack_monster(n)
+                        self.last_debuff_monster_id[debuff] = n
+                        return True
 
         # Get the list of monster IDs that are not debuffed with Imperil
         if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
@@ -424,7 +419,12 @@ class BattleDriver(HVDriver):
 
         return "continue"
 
+    def _create_last_debuff_monster_id(self) -> None:
+        self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
+
     def battle(self) -> None:
+        self._create_last_debuff_monster_id()
+
         while True:
             match self.pausecontroller.pauseable(self.battle_in_turn)():
                 case "break":
