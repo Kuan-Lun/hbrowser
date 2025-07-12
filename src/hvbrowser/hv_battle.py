@@ -346,8 +346,16 @@ class BattleDriver(HVDriver):
             monster_with_imperil = monster_alive_ids
         for n in monster_alive_ids:
             if n not in monster_with_imperil:
-                self.click_skill("Imperil", iswait=False)
-            self.attack_monster(n)
+                if n == self.last_debuff_monster_id["Imperil"]:
+                    # If the last debuffed monster is the same, attack it directly
+                    self.attack_monster(n)
+                else:
+                    self.click_skill("Imperil", iswait=False)
+                    self.attack_monster(n)
+                    self.last_debuff_monster_id["Imperil"] = n
+            else:
+                self.last_debuff_monster_id["Imperil"] = -1
+                self.attack_monster(n)
             return True
         return False
 
