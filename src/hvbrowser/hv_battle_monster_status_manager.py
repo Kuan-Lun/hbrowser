@@ -11,6 +11,7 @@ BUFF_ICON_MAP = {
     "Blind": ["blind.png"],
     "Slow": ["slow.png"],
     "MagNet": ["magnet.png"],
+    "Silence": ["silence.png"],
     # 你可以繼續擴充
 }
 
