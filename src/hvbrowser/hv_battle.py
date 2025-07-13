@@ -325,28 +325,29 @@ class BattleDriver(HVDriver):
                 )
 
         # Get the list of monster IDs that are not debuffed with the specified debuffs
-        for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence", "Drain"]:
-            monster_with_debuff = (
-                self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
-            )
-            if all(
-                [
-                    monster_alive_ids,
-                    len(monster_alive_ids) > 3,
-                    len(monster_with_debuff) / len(monster_alive_ids) < 0.7,
-                ]
-            ):
-                for n in monster_alive_ids:
-                    if all(
-                        [
-                            n not in monster_with_debuff,
-                            n != self.last_debuff_monster_id[debuff],
-                        ]
-                    ):
-                        self.click_skill(debuff, iswait=False)
-                        self.attack_monster(n)
-                        self.last_debuff_monster_id[debuff] = n
-                        return True
+        if all(
+            [
+                monster_alive_ids,
+                len(monster_alive_ids) > 3,
+                self.get_stat_percent("mp") > self.statthreshold.mp[1],
+            ]
+        ):
+            for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence", "Drain"]:
+                monster_with_debuff = (
+                    self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+                )
+                if len(monster_with_debuff) / len(monster_alive_ids) < 0.7:
+                    for n in monster_alive_ids:
+                        if all(
+                            [
+                                n not in monster_with_debuff,
+                                n != self.last_debuff_monster_id[debuff],
+                            ]
+                        ):
+                            self.click_skill(debuff, iswait=False)
+                            self.attack_monster(n)
+                            self.last_debuff_monster_id[debuff] = n
+                            return True
 
         # Get the list of monster IDs that are not debuffed with Imperil
         if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
