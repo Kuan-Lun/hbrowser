@@ -95,10 +95,15 @@ class BattleDriver(HVDriver):
         self.pausecontroller = PauseController()
         self.turn = -1
 
-    def set_battle_parameters(self, statthreshold: StatThreshold) -> None:
+    def set_battle_parameters(
+        self, statthreshold: StatThreshold, forbidden_skills: list[list]
+    ) -> None:
         self.statthreshold = statthreshold
+        self.forbidden_skills = forbidden_skills
 
     def click_skill(self, key: str, iswait=True) -> bool:
+        if key in self.forbidden_skills:
+            return False
         return self._skillmanager.cast(key, iswait=iswait)
 
     def get_stat_percent(self, stat: str) -> float:
