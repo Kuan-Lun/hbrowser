@@ -338,6 +338,8 @@ class BattleDriver(HVDriver):
             ]
         ):
             for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence", "Drain"]:
+                if debuff in self.forbidden_skills:
+                    continue
                 monster_with_debuff = (
                     self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
                 )
