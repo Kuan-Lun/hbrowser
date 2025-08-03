@@ -11,6 +11,7 @@ from .hv_battle_log import LogProvider
 class ElementActionManager:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver: HVDriver = driver
+        self.log_provider = LogProvider(self.hvdriver)
 
     @property
     def driver(self) -> WebDriver:
@@ -21,13 +22,21 @@ class ElementActionManager:
         actions.move_to_element(element).click().perform()
 
     def click_and_wait_log(self, element: WebElement) -> None:
-        log_provider = LogProvider(self.hvdriver)
-        html = log_provider.get()
+        html = self.log_provider.get()
         self.click(element)
-        time.sleep(0.001)
+
+        # 優化 1: 減少初始等待時間
+        time.sleep(0.05)  # 從 0.1 減少到 0.05
+
         n: float = 0
-        while html == log_provider.get():
-            time.sleep(0.001)
-            n += 0.001
-            if n == 1000:
+        check_interval = 0.05  # 優化 2: 減少檢查間隔
+        max_wait_time = 5.0  # 優化 3: 減少最大等待時間
+
+        while html == self.log_provider.get():
+            time.sleep(check_interval)
+            n += check_interval
+            if n >= max_wait_time:
                 raise TimeoutError("I don't know what happened.")
+
+        # 優化 4: 確保至少有一些變化後再繼續
+        time.sleep(0.01)  # 很短的穩定等待
