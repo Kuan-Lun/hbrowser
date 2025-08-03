@@ -93,10 +93,18 @@ class BattleDriver(HVDriver):
         self._buffmanager = BuffManager(self)
         self._monsterstatusmanager = MonsterStatusManager(self)
         self.pausecontroller = PauseController()
+        self._stat_provider_hp = StatProviderHP(self)
+        self._stat_provider_mp = StatProviderMP(self)
+        self._stat_provider_sp = StatProviderSP(self)
+        self._stat_provider_overcharge = StatProviderOvercharge(self)
         self.turn = -1
 
     def clear_cache(self) -> None:
         self._monsterstatusmanager.clear_cache()
+        self._stat_provider_hp.clear_cache()
+        self._stat_provider_mp.clear_cache()
+        self._stat_provider_sp.clear_cache()
+        self._stat_provider_overcharge.clear_cache()
 
     def set_battle_parameters(
         self, statthreshold: StatThreshold, forbidden_skills: list[list]
@@ -112,13 +120,13 @@ class BattleDriver(HVDriver):
     def get_stat_percent(self, stat: str) -> float:
         match stat.lower():
             case "hp":
-                value = StatProviderHP(self).get_percent()
+                value = self._stat_provider_hp.get_percent()
             case "mp":
-                value = StatProviderMP(self).get_percent()
+                value = self._stat_provider_mp.get_percent()
             case "sp":
-                value = StatProviderSP(self).get_percent()
+                value = self._stat_provider_sp.get_percent()
             case "overcharge":
-                value = StatProviderOvercharge(self).get_percent()
+                value = self._stat_provider_overcharge.get_percent()
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
         return value
