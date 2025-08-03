@@ -21,12 +21,13 @@ class ElementActionManager:
         actions.move_to_element(element).click().perform()
 
     def click_and_wait_log(self, element: WebElement) -> None:
-        html = LogProvider(self.hvdriver).get()
+        log_provider = LogProvider(self.hvdriver)
+        html = log_provider.get()
         self.click(element)
-        time.sleep(0.01)
+        time.sleep(0.001)
         n: float = 0
-        while html == LogProvider(self.hvdriver).get():
-            time.sleep(0.01)
-            n += 0.01
-            if n == 10:
+        while html == log_provider.get():
+            time.sleep(0.001)
+            n += 0.001
+            if n == 1000:
                 raise TimeoutError("I don't know what happened.")
