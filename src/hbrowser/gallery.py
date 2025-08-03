@@ -20,6 +20,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.remote.webelement import WebElement
 
 from .exceptions import ClientOfflineException, InsufficientFundsException
 
@@ -196,6 +197,13 @@ class Driver(ABC):
         url = self.url[self.name]
         if not matchurl(self.driver.current_url, url):
             self.get(url)
+
+    def find_element_chain(self, *selectors: tuple[str, str]) -> WebElement:
+        """通過選擇器鏈逐步查找元素，每次在前一個元素的基礎上查找下一個"""
+        element = self.driver
+        for by, value in selectors:
+            element = element.find_element(by, value)
+        return element
 
     def __init__(
         self,
