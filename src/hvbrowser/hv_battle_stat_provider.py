@@ -26,7 +26,14 @@ class StatProvider(ABC):
         pass
 
     def get_percent(self) -> float:
-        img_element = self.driver.find_element(By.XPATH, self.searchxpath)
+        img_element = self.hvdriver.find_element_chain(
+            (By.ID, "csp"),
+            (By.ID, "mainpane"),
+            (By.ID, "battle_main"),
+            (By.ID, "battle_left"),
+            (By.ID, "pane_vitals"),
+            (By.XPATH, self.searchxpath),
+        )
         style_attribute = str(img_element.get_attribute("style"))
         width_value_match = re.search(r"width:\s*(\d+)px", style_attribute)
         if width_value_match is None:
