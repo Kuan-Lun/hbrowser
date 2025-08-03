@@ -19,7 +19,7 @@ BUFF_ICON_MAP = {
 
 class MonsterStatusManager:
     # 保留原始的 XPath 邏輯以確保正確性，但進行性能優化
-    BASE_XPATH = '/div[@id="csp"]/div[@id="mainpane"]/div[@id="battle_main"]/div[@id="battle_right"]/div[@id="pane_monster"]'
+    BASE_XPATH = '//div[@id="csp"]/div[@id="mainpane"]/div[@id="battle_main"]/div[@id="battle_right"]/div[@id="pane_monster"]'
     ALIVE_MONSTER_XPATH = f'{BASE_XPATH}/div[starts-with(@id, "mkey_") and not(.//img[@src="/y/s/nbardead.png"]) and not(.//img[@src="/isekai/y/s/nbardead.png"])]'
     MONSTER_CSS_SELECTOR = '#csp #mainpane #battle_right #pane_monster div[id^="mkey_"]'  # 用於快速查找所有怪物
     DEAD_IMG_SRCS = ["/y/s/nbardead.png", "/isekai/y/s/nbardead.png"]
@@ -49,11 +49,12 @@ class MonsterStatusManager:
             By.XPATH,
             self.ALIVE_MONSTER_XPATH,
         )
-        return [
+        result = [
             int(id_.removeprefix("mkey_"))
             for el in elements
             if (id_ := el.get_attribute("id")) is not None
         ]
+        return result
 
     @property
     def alive_system_monster_ids(self) -> list[int]:
