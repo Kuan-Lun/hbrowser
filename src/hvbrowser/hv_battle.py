@@ -95,6 +95,9 @@ class BattleDriver(HVDriver):
         self.pausecontroller = PauseController()
         self.turn = -1
 
+    def clear_cache(self) -> None:
+        self._monsterstatusmanager.clear_cache()
+
     def set_battle_parameters(
         self, statthreshold: StatThreshold, forbidden_skills: list[list]
     ) -> None:
@@ -414,6 +417,7 @@ class BattleDriver(HVDriver):
 
     def battle_in_turn(self) -> str:
         self.turn += 1
+        self.clear_cache()
         # Print the current round logs
         print("\n".join(self.new_logs))
 
