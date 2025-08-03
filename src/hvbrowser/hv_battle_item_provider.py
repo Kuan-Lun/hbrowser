@@ -1,7 +1,7 @@
 from collections import defaultdict
 
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webdriver import WebDriver, WebElement
 
 from .hv import HVDriver, searchxpath_fun
 from .hv_battle_action_manager import ElementActionManager
@@ -18,6 +18,48 @@ class ItemProvider:
     def driver(self) -> WebDriver:
         return self.hvdriver.driver
 
+    @property
+    def items_menu_web_element(self) -> WebElement:
+        return self.hvdriver.find_element_chain(
+            (By.ID, "csp"),
+            (By.ID, "mainpane"),
+            (By.ID, "battle_main"),
+            (By.ID, "battle_left"),
+            (By.ID, "pane_action"),
+            (By.ID, "ckey_items"),
+        )
+
+    def click_items_menu(self) -> None:
+        ElementActionManager(self.hvdriver).click(self.items_menu_web_element)
+
+    def is_open_items_menu(self) -> bool:
+        """
+        Check if the items menu is open.
+        """
+        items_menum = (
+            self.hvdriver.find_element_chain(
+                (By.ID, "csp"),
+                (By.ID, "mainpane"),
+                (By.ID, "battle_main"),
+                (By.ID, "battle_left"),
+                (By.ID, "pane_action"),
+                (By.ID, "ckey_items"),
+            ).get_attribute("src")
+            or ""
+        )
+        return "items_s.png" in items_menum
+
+    def get_pane_items(self) -> WebElement:
+        if not self.is_open_items_menu():
+            self.click_items_menu()
+        return self.hvdriver.find_element_chain(
+            (By.ID, "csp"),
+            (By.ID, "mainpane"),
+            (By.ID, "battle_main"),
+            (By.ID, "battle_left"),
+            (By.ID, "pane_item"),
+        )
+
     def get_item_status(self, item: str) -> str:
         """
         回傳 'available', 'unavailable', 'not_found'
@@ -25,7 +67,9 @@ class ItemProvider:
         if self._checked_items[item] == "not_found":
             return "not_found"
 
-        item_divs = self.driver.find_elements(By.XPATH, f"//div/div[text()='{item}']")
+        item_divs = self.get_pane_items().find_elements(
+            By.XPATH, f"//div/div[text()='{item}']"
+        )
         if not item_divs:
             if item not in GEM_ITEMS:
                 self._checked_items[item] = "not_found"
@@ -44,23 +88,10 @@ class ItemProvider:
         if self.get_item_status(item) == "unavailable":
             return False
 
-        if not self.driver.find_elements(
-            By.XPATH,
-            searchxpath_fun(["/y/battle/items_n.png", "/y/battle/items_s.png"]),
-        ):
-            return False
+        if not self.is_open_items_menu():
+            self.click_items_menu()
 
-        if not self.driver.find_elements(
-            By.XPATH, searchxpath_fun(["/y/battle/items_s.png"])
-        ):
-            item_menu_list = self.driver.find_elements(
-                By.XPATH, searchxpath_fun(["/y/battle/items_n.png"])
-            )
-            if not item_menu_list:
-                return False
-            ElementActionManager(self.hvdriver).click(item_menu_list[0])
-
-        item_button_list = self.driver.find_elements(
+        item_button_list = self.get_pane_items().find_elements(
             By.XPATH,
             "//div[@id and @onclick and div[@class='fc2 fal fcb']/div[text()='{item_name}']]".format(
                 item_name=item
