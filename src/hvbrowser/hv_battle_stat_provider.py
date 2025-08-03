@@ -27,10 +27,6 @@ class StatProvider(ABC):
 
     def get_percent(self) -> float:
         img_element = self.hvdriver.find_element_chain(
-            (By.ID, "csp"),
-            (By.ID, "mainpane"),
-            (By.ID, "battle_main"),
-            (By.ID, "battle_left"),
             (By.ID, "pane_vitals"),
             (By.XPATH, self.searchxpath),
         )

@@ -91,12 +91,7 @@ class BuffManager:
         """
         Check if the buff is active.
         """
-        pane_effects = self.hvdriver.find_element_chain(
-            (By.ID, "csp"),
-            (By.ID, "mainpane"),
-            (By.ID, "battle_top"),
-            (By.ID, "pane_effects"),
-        )
+        pane_effects = self.hvdriver.driver.find_element(By.ID, "pane_effects")
         return (
             pane_effects.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
         )
