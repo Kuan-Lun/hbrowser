@@ -7,9 +7,21 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from .hv import HVDriver, searchxpath_fun
 
 
+class StatCache:
+    def __init__(self):
+        self.percent = -1.0
+
+    def clear(self):
+        self.percent = -1.0
+
+
 class StatProvider(ABC):
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver = driver
+        self.cache = StatCache()
+
+    def clear_cache(self) -> None:
+        self.cache.clear()
 
     @property
     def driver(self) -> WebDriver:
@@ -26,16 +38,18 @@ class StatProvider(ABC):
         pass
 
     def get_percent(self) -> float:
-        img_element = self.hvdriver.find_element_chain(
-            (By.ID, "pane_vitals"),
-            (By.XPATH, self.searchxpath),
-        )
-        style_attribute = str(img_element.get_attribute("style"))
-        width_value_match = re.search(r"width:\s*(\d+)px", style_attribute)
-        if width_value_match is None:
-            raise ValueError("width_value_match is None")
-        width_value_match = width_value_match.group(1)  # type: ignore
-        return self._factor * (int(width_value_match) - 1) / (414 - 1)  # type: ignore
+        if self.cache.percent == -1.0:
+            img_element = self.hvdriver.find_element_chain(
+                (By.ID, "pane_vitals"),
+                (By.XPATH, self.searchxpath),
+            )
+            style_attribute = str(img_element.get_attribute("style"))
+            width_value_match = re.search(r"width:\s*(\d+)px", style_attribute)
+            if width_value_match is None:
+                raise ValueError("width_value_match is None")
+            width_value_match = width_value_match.group(1)  # type: ignore
+            self.cache.percent = self._factor * (int(width_value_match) - 1) / (414 - 1)  # type: ignore
+        return self.cache.percent
 
 
 class StatProviderHP(StatProvider):
