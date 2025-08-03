@@ -24,7 +24,14 @@ class LogProvider:
         return self.hvdriver.driver
 
     def get(self) -> str:
-        result = self.driver.find_element(By.ID, "textlog").get_attribute("outerHTML")
+        result = self.hvdriver.find_element_chain(
+            (By.ID, "csp"),
+            (By.ID, "mainpane"),
+            (By.ID, "battle_main"),
+            (By.ID, "battle_left"),
+            (By.ID, "pane_log"),
+            (By.ID, "textlog"),
+        ).get_attribute("outerHTML")
         if result is None:
             return ""
         return result
