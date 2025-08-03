@@ -19,8 +19,9 @@ BUFF_ICON_MAP = {
 
 class MonsterStatusManager:
     # 保留原始的 XPath 邏輯以確保正確性，但進行性能優化
-    ALIVE_MONSTER_XPATH = '//div[starts-with(@id, "mkey_") and not(.//img[@src="/y/s/nbardead.png"]) and not(.//img[@src="/isekai/y/s/nbardead.png"])]'
-    MONSTER_CSS_SELECTOR = 'div[id^="mkey_"]'  # 用於快速查找所有怪物
+    BASE_XPATH = '/div[@id="csp"]/div[@id="mainpane"]/div[@id="battle_main"]/div[@id="battle_right"]/div[@id="pane_monster"]'
+    ALIVE_MONSTER_XPATH = f'{BASE_XPATH}/div[starts-with(@id, "mkey_") and not(.//img[@src="/y/s/nbardead.png"]) and not(.//img[@src="/isekai/y/s/nbardead.png"])]'
+    MONSTER_CSS_SELECTOR = '#csp #mainpane #battle_right #pane_monster div[id^="mkey_"]'  # 用於快速查找所有怪物
     DEAD_IMG_SRCS = ["/y/s/nbardead.png", "/isekai/y/s/nbardead.png"]
 
     def __init__(self, driver: HVDriver) -> None:
@@ -88,7 +89,9 @@ class MonsterStatusManager:
         根據怪物名稱取得對應的 monster id（如 mkey_0 會回傳 0）。
         """
         # 使用原始 XPath 邏輯確保正確性
-        xpath = f'//div[starts-with(@id, "mkey_")][.//div[text()="{name}"]]'
+        xpath = (
+            f'{self.BASE_XPATH}/div[starts-with(@id, "mkey_")][.//div[text()="{name}"]]'
+        )
         elements = self.driver.find_elements(By.XPATH, xpath)
         if elements:
             id_ = elements[0].get_attribute("id")
