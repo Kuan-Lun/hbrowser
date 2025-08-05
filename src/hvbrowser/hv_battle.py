@@ -101,6 +101,7 @@ class BattleDriver(HVDriver):
         super().__init__(*args, **kwargs)
 
         self.battle_dashboard = BattleDashBoard(self)
+        self.element_action_manager = ElementActionManager(self)
 
         self.with_ofc = "isekai" not in self.driver.current_url
         self._logprovider = LogProvider(self)
@@ -313,7 +314,7 @@ class BattleDriver(HVDriver):
         )
 
         if continue_elements:
-            ElementActionManager(self).click_and_wait_log(continue_elements[0])
+            self.element_action_manager.click_and_wait_log(continue_elements[0])
             self._create_last_debuff_monster_id()
             return True
         else:
@@ -327,7 +328,7 @@ class BattleDriver(HVDriver):
         if not elements:
             return False
 
-        ElementActionManager(self).click_and_wait_log(elements[0])
+        self.element_action_manager.click_and_wait_log(elements[0])
         return True
 
     def attack(self) -> bool:
@@ -429,10 +430,7 @@ class BattleDriver(HVDriver):
         return True
 
     def use_channeling(self) -> bool:
-        channeling_elements = self.driver.find_elements(
-            By.XPATH, searchxpath_fun(["/y/e/channeling.png"])
-        )
-        if channeling_elements:
+        if "Channeling" in self.battle_dashboard.character.buffs:
             skill_names = ["Regen", "Heartseeker"]
             skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:
@@ -489,6 +487,12 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         self._create_last_debuff_monster_id()
+        partial_click_skill_menu = partial(
+            self.element_action_manager.click,
+            self.driver.find_element(By.ID, "ckey_skill"),
+        )
+        partial_click_skill_menu()
+        partial_click_skill_menu()
 
         while True:
             match self.pausecontroller.pauseable(self.battle_in_turn)():
