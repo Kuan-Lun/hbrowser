@@ -18,14 +18,17 @@ class SkillManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
         self.hvdriver: HVDriver = driver
         self.battle_dashboard: BattleDashBoard = battle_dashboard
-        self.skill_spirit = (
-            self.battle_dashboard.character.spirit.skills
-            | self.battle_dashboard.character.spirit.spells
-        )
         # missing_skills: list[str] = []
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
+
+    @property
+    def skill_spirit(self):
+        return (
+            self.battle_dashboard.character.spirit.skills
+            | self.battle_dashboard.character.spirit.spells
+        )
 
     @property
     def driver(self) -> WebDriver:
@@ -46,12 +49,6 @@ class SkillManager:
             ElementActionManager(self.hvdriver).click(element)
 
     def cast(self, key: str, iswait=True) -> bool:
-        # 重新獲取最新的技能/法術字典
-        self.skill_spirit = (
-            self.battle_dashboard.character.spirit.skills
-            | self.battle_dashboard.character.spirit.spells
-        )
-
         # 先檢查技能狀態
         if key not in self._checked_skills:
             self.get_skill_status(key)
