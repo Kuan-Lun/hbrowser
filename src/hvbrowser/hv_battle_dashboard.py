@@ -358,7 +358,7 @@ class MonsterList:
                     width_match = re.search(r"width:(\d+)px", bar_style)
                     if width_match:
                         width = int(width_match.group(1))
-                        health_value = width / 120  # 怪物血条最大宽度为 120
+                        health_value = width / 120 * 100  # 怪物血条最大宽度为 120
                     break
 
         monster.vitals["Health"] = health_value
@@ -397,7 +397,7 @@ class MonsterList:
                     width_match = re.search(r"width:(\d+)px", style)
                     if width_match:
                         width = int(width_match.group(1))
-                        spirit_value = width / 120
+                        spirit_value = width / 120 * 100
                     break
 
             if spirit_value == -1:
