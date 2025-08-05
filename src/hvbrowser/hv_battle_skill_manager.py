@@ -11,11 +11,17 @@ from selenium.webdriver.remote.webdriver import WebDriver
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
+from .hv_battle_dashboard import BattleDashBoard
 
 
 class SkillManager:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
         self.hvdriver: HVDriver = driver
+        self.battle_dashboard: BattleDashBoard = battle_dashboard
+        self.skill_spirit = (
+            self.battle_dashboard.character.spirit.skills
+            | self.battle_dashboard.character.spirit.spells
+        )
         # missing_skills: list[str] = []
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
@@ -40,6 +46,16 @@ class SkillManager:
             ElementActionManager(self.hvdriver).click(element)
 
     def cast(self, key: str, iswait=True) -> bool:
+        # 重新獲取最新的技能/法術字典
+        self.skill_spirit = (
+            self.battle_dashboard.character.spirit.skills
+            | self.battle_dashboard.character.spirit.spells
+        )
+
+        # 先檢查技能狀態
+        if key not in self._checked_skills:
+            self.get_skill_status(key)
+
         if self._checked_skills[key] == "missing":
             return False
 
@@ -48,9 +64,6 @@ class SkillManager:
         )
 
         skill_xpath = self._get_skill_xpath(key)
-
-        if key not in self._checked_skills:
-            self.get_skill_status(key)
 
         match self._checked_skills[key]:
             case "missing":
@@ -78,34 +91,20 @@ class SkillManager:
         回傳 'missing'（未擁有）、'available'（可用）、'unavailable'（不可用）
         """
 
-        elementlist = self.driver.find_elements(By.XPATH, self._get_skill_xpath(key))
-        if not elementlist:
-            self._checked_skills[key] = "missing"
-            return "missing"
-
-        style = elementlist[0].get_attribute("style") or ""
-        if "opacity" in style:
-            opacity = float(style.split("opacity:")[1].split(";")[0])
-            return "unavailable" if opacity < 1 else "available"
-        return "available"
+        self._checked_skills[key] = (
+            self.skill_spirit[key].status if key in self.skill_spirit else "missing"
+        )
+        return self._checked_skills[key]
 
     def get_skill_mp_cost_by_name(self, skill_name: str) -> int:
         """
         根據技能名稱（如 'Haste' 或 'Weaken'）從 HTML 片段中找出對應的數值。
         """
-        page_source = self.hvdriver.driver.page_source
-        soup = BeautifulSoup(page_source, "html.parser")
-        for div in soup.find_all("div"):
-            if not hasattr(div, "get"):
-                continue
-            onmouseover = div.get("onmouseover", "")
-            # 用正則找技能名稱和數值
-            pattern = r"set_infopane_spell\('{}',.*?,.*?,\s*(\d+),".format(
-                re.escape(skill_name)
-            )
-            match = re.search(pattern, onmouseover)
-            if match:
-                self.skills_cost[skill_name] = max(
-                    int(match.group(1)), self.skills_cost[skill_name]
-                )
+
+        if self.get_skill_status(skill_name) == "missing":
+            raise ValueError(f"Skill '{skill_name}' is missing.")
+
+        self.skills_cost[skill_name] = max(
+            self.skill_spirit[skill_name].cost, self.skills_cost[skill_name]
+        )
         return self.skills_cost[skill_name]

@@ -20,7 +20,20 @@ from .hv_battle_skill_manager import SkillManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_monster_status_manager import MonsterStatusManager
 from .hv_battle_log import LogProvider
+from .hv_battle_dashboard import BattleDashBoard
 from .pause_controller import PauseController
+
+monster_debuff_to_character_skill = {
+    "Imperiled": "Imperil",
+    "Weakened": "Weaken",
+    "Slowed": "Slow",
+    "Asleep": "Sleep",
+    "Confused": "Confuse",
+    "Magically Snared": "MagNet",
+    "Blinded": "Blind",
+    "Vital Theft": "Drain",
+    "Silenced": "Silence",
+}
 
 
 def interleave_even_odd(nums):
@@ -86,12 +99,15 @@ class StatThreshold:
 class BattleDriver(HVDriver):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
+        self.battle_dashboard = BattleDashBoard(self)
+
         self.with_ofc = "isekai" not in self.driver.current_url
         self._logprovider = LogProvider(self)
         self._itemprovider = ItemProvider(self)
-        self._skillmanager = SkillManager(self)
-        self._buffmanager = BuffManager(self)
-        self._monsterstatusmanager = MonsterStatusManager(self)
+        self._skillmanager = SkillManager(self, self.battle_dashboard)
+        self._buffmanager = BuffManager(self, self.battle_dashboard)
+        self._monsterstatusmanager = MonsterStatusManager(self, self.battle_dashboard)
         self.pausecontroller = PauseController()
         self._stat_provider_hp = StatProviderHP(self)
         self._stat_provider_mp = StatProviderMP(self)
@@ -100,6 +116,8 @@ class BattleDriver(HVDriver):
         self.turn = -1
 
     def clear_cache(self) -> None:
+        # 重新解析戰鬥儀表板以獲取最新的怪物狀態
+        self.battle_dashboard.refresh()
         self._monsterstatusmanager.clear_cache()
         self._stat_provider_hp.clear_cache()
         self._stat_provider_mp.clear_cache()
@@ -343,26 +361,34 @@ class BattleDriver(HVDriver):
         # Get the list of monster IDs that are not debuffed with the specified debuffs
         if all(
             [
-                monster_alive_ids,
                 len(monster_alive_ids) > 3,
                 self.get_stat_percent("mp") > self.statthreshold.mp[1],
             ]
         ):
-            for debuff in ["Weaken", "Slow", "Blind", "MagNet", "Silence", "Drain"]:
+            for debuff in [
+                "Weakened",
+                "Slowed",
+                "Blinded",
+                "Magically Snared",
+                "Silenced",
+                "Vital Theft",
+            ]:
                 if debuff in self.forbidden_skills:
                     continue
-                monster_with_debuff = (
-                    self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
-                )
-                if len(monster_with_debuff) / len(monster_alive_ids) < 0.7:
-                    for n in monster_alive_ids:
-                        if all(
-                            [
-                                n not in monster_with_debuff,
-                                n != self.last_debuff_monster_id[debuff],
-                            ]
-                        ):
-                            self.click_skill(debuff, iswait=False)
+                monster_without_debuff = [
+                    n
+                    for n in monster_alive_ids
+                    if n
+                    not in self._monsterstatusmanager.get_monster_ids_with_debuff(
+                        debuff
+                    )
+                ]
+                if len(monster_without_debuff) / len(monster_alive_ids) > 0.3:
+                    for n in monster_without_debuff:
+                        if n != self.last_debuff_monster_id[debuff]:
+                            self.click_skill(
+                                monster_debuff_to_character_skill[debuff], iswait=False
+                            )
                             self.attack_monster(n)
                             self.last_debuff_monster_id[debuff] = n
                             return True
@@ -370,13 +396,13 @@ class BattleDriver(HVDriver):
         # Get the list of monster IDs that are not debuffed with Imperil
         if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
             monster_with_imperil = (
-                self._monsterstatusmanager.get_monster_ids_with_debuff("Imperil")
+                self._monsterstatusmanager.get_monster_ids_with_debuff("Imperiled")
             )
         else:
             monster_with_imperil = monster_alive_ids
         for n in monster_alive_ids:
             if n not in monster_with_imperil:
-                if n == self.last_debuff_monster_id["Imperil"]:
+                if n == self.last_debuff_monster_id["Imperiled"]:
                     # If the last debuffed monster is the same, attack it directly
                     if random() < 0.5:
                         self.click_skill("Imperil", iswait=False)
@@ -384,9 +410,9 @@ class BattleDriver(HVDriver):
                 else:
                     self.click_skill("Imperil", iswait=False)
                     self.attack_monster(n)
-                    self.last_debuff_monster_id["Imperil"] = n
+                    self.last_debuff_monster_id["Imperiled"] = n
             else:
-                self.last_debuff_monster_id["Imperil"] = -1
+                self.last_debuff_monster_id["Imperiled"] = -1
                 self.attack_monster(n)
             return True
         return False
@@ -432,25 +458,23 @@ class BattleDriver(HVDriver):
         if self.finish_battle():
             return "break"
 
-        if any(
-            fun()
-            for fun in [
-                self.go_next_floor,
-                PonyChart(self).check,
-                self.check_hp,
-                self.check_mp,
-                self.check_sp,
-                self.check_overcharge,
-                partial(self.apply_buff, "Health Draught"),
-                partial(self.apply_buff, "Mana Draught"),
-                partial(self.apply_buff, "Spirit Draught"),
-                partial(self.apply_buff, "Regen"),
-                partial(self.apply_buff, "Scroll of Life"),
-                partial(self.apply_buff, "Absorb"),
-                partial(self.apply_buff, "Heartseeker"),
-            ]
-        ):
-            return "continue"
+        for fun in [
+            self.go_next_floor,
+            PonyChart(self).check,
+            self.check_hp,
+            self.check_mp,
+            self.check_sp,
+            self.check_overcharge,
+            partial(self.apply_buff, "Health Draught"),
+            partial(self.apply_buff, "Mana Draught"),
+            partial(self.apply_buff, "Spirit Draught"),
+            partial(self.apply_buff, "Regen"),
+            partial(self.apply_buff, "Scroll of Life"),
+            partial(self.apply_buff, "Absorb"),
+            partial(self.apply_buff, "Heartseeker"),
+        ]:
+            if fun():
+                return "continue"
 
         if self.use_channeling():
             return "continue"
@@ -458,7 +482,7 @@ class BattleDriver(HVDriver):
         if self.attack():
             return "continue"
 
-        return "continue"
+        return "break"
 
     def _create_last_debuff_monster_id(self) -> None:
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)

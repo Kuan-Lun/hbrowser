@@ -1,14 +1,15 @@
 import re
 from collections import defaultdict
+from typing import Union
 
-from bs4 import BeautifulSoup
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 
-from .hv import HVDriver, searchxpath_fun
+from .hv import HVDriver
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_action_manager import ElementActionManager
+from .hv_battle_dashboard import BattleDashBoard
 
 ITEM_BUFFS = {
     "Health Draught",
@@ -44,17 +45,20 @@ BUFF2ICONS = {
 
 
 class BuffManager:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
         self.hvdriver: HVDriver = driver
+        self.battle_dashboard: BattleDashBoard = battle_dashboard
         self._item_provider: ItemProvider = ItemProvider(self.hvdriver)
-        self._skill_manager: SkillManager = SkillManager(self.hvdriver)
+        self._skill_manager: SkillManager = SkillManager(
+            self.hvdriver, self.battle_dashboard
+        )
         self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
 
     @property
     def driver(self) -> WebElement:
         return self.hvdriver.driver
 
-    def get_buff_remaining_turns(self, key: str) -> int:
+    def get_buff_remaining_turns(self, key: str) -> Union[int, float]:
         """
         Get the remaining turns of the buff.
         Returns 0 if the buff is not active.
@@ -63,21 +67,7 @@ class BuffManager:
         if self.has_buff(key) is False:
             return 0
 
-        src_values = BUFF2ICONS[key]
-        soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
-        results = {}
-        for img in soup.find_all("img"):
-            if not hasattr(img, "get"):
-                continue
-            src = img.get("src", "")
-            if src in src_values:
-                onmouseover = img.get("onmouseover", "")
-                match = re.search(
-                    r"set_infopane_effect\([^,]+,[^,]+,(\d+)\)", onmouseover
-                )
-                if match:
-                    results[src] = int(match.group(1))
-        turns = results.get(next(iter(src_values)), 0)
+        turns = int(self.battle_dashboard.character.buffs[key])
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
 
@@ -91,10 +81,8 @@ class BuffManager:
         """
         Check if the buff is active.
         """
-        pane_effects = self.hvdriver.driver.find_element(By.ID, "pane_effects")
-        return (
-            pane_effects.find_elements(By.XPATH, searchxpath_fun(BUFF2ICONS[key])) != []
-        )
+
+        return key in self.battle_dashboard.character.buffs
 
     def apply_buff(self, key: str, force: bool) -> bool:
         """
