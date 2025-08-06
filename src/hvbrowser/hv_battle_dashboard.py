@@ -320,7 +320,7 @@ class MonsterList:
 
         for monster_div in monster_divs:
             monster = self._parse_single_monster(monster_div)
-            if monster and monster.id > 0:
+            if monster:
                 self.monsters[monster.id] = monster
 
     def _parse_single_monster(self, monster_div) -> Optional[Monster]:
