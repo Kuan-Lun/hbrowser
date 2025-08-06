@@ -70,6 +70,57 @@ class Spirit:
         self.spells: Dict[str, SpiritData] = {}
 
 
+class CharacterVitals:
+    def __init__(self, soup: BeautifulSoup):
+        self.hp: float = 0.0
+        self.mp: float = 0.0
+        self.sp: float = 0.0
+        self.overcharge: float = 0.0
+        self._parse_vitals(soup)
+
+    def _parse_vitals(self, soup: BeautifulSoup) -> None:
+        """解析角色的生命值、法力值等信息"""
+        pane_vitals = soup.find("div", id="pane_vitals")
+        if not pane_vitals or not hasattr(pane_vitals, "find"):
+            return
+
+        # 查找生命值条 (bar_dgreen.png)
+        health_bar = pane_vitals.find("img", src=re.compile(r"bar_dgreen\.png"))
+        if health_bar:
+            style = health_bar.get("style", "")
+            width_match = re.search(r"width:(\d+)px", style)
+            if width_match:
+                width = int(width_match.group(1))
+                self.hp = width / 414 * 100
+
+        # 查找法力值条 (bar_blue.png)
+        mana_bar = pane_vitals.find("img", src=re.compile(r"bar_blue\.png"))
+        if mana_bar:
+            style = mana_bar.get("style", "")
+            width_match = re.search(r"width:(\d+)px", style)
+            if width_match:
+                width = int(width_match.group(1))
+                self.mp = width / 414 * 100
+
+        # 查找精神值条 (bar_red.png)
+        spirit_bar = pane_vitals.find("img", src=re.compile(r"bar_red\.png"))
+        if spirit_bar:
+            style = spirit_bar.get("style", "")
+            width_match = re.search(r"width:(\d+)px", style)
+            if width_match:
+                width = int(width_match.group(1))
+                self.sp = width / 414 * 100
+
+        # 查找过充值条 (bar_orange.png)
+        overcharge_bar = pane_vitals.find("img", src=re.compile(r"bar_orange\.png"))
+        if overcharge_bar:
+            style = overcharge_bar.get("style", "")
+            width_match = re.search(r"width:(\d+)px", style)
+            if width_match:
+                width = int(width_match.group(1))
+                self.overcharge = width / 414 * 100
+
+
 class Character:
     """角色类，解析并存储角色的所有信息"""
 
@@ -82,11 +133,10 @@ class Character:
         """
         self.soup = BeautifulSoup(page_source, "html.parser")
         self.buffs: Dict[str, Union[float, int]] = {}
-        self.vitals: Dict[str, float] = {}
+        self.vitals: CharacterVitals = CharacterVitals(self.soup)
         self.spirit = Spirit()
 
         self._parse_buffs()
-        self._parse_vitals()
         self._parse_skills_and_spells()
 
     def _parse_buffs(self):
@@ -149,48 +199,6 @@ class Character:
                         buff_name = "Scroll of Life"
 
                     self.buffs[buff_name] = duration
-
-    def _parse_vitals(self):
-        """解析角色的生命值、法力值等信息"""
-        pane_vitals = self.soup.find("div", id="pane_vitals")
-        if not pane_vitals:
-            return
-
-        # 查找生命值条 (bar_dgreen.png)
-        health_bar = pane_vitals.find("img", src=re.compile(r"bar_dgreen\.png"))
-        if health_bar:
-            style = health_bar.get("style", "")
-            width_match = re.search(r"width:(\d+)px", style)
-            if width_match:
-                width = int(width_match.group(1))
-                self.vitals["Health"] = width / 414 * 100
-
-        # 查找法力值条 (bar_blue.png)
-        mana_bar = pane_vitals.find("img", src=re.compile(r"bar_blue\.png"))
-        if mana_bar:
-            style = mana_bar.get("style", "")
-            width_match = re.search(r"width:(\d+)px", style)
-            if width_match:
-                width = int(width_match.group(1))
-                self.vitals["Mana"] = width / 414 * 100
-
-        # 查找精神值条 (bar_red.png)
-        spirit_bar = pane_vitals.find("img", src=re.compile(r"bar_red\.png"))
-        if spirit_bar:
-            style = spirit_bar.get("style", "")
-            width_match = re.search(r"width:(\d+)px", style)
-            if width_match:
-                width = int(width_match.group(1))
-                self.vitals["Spirit"] = width / 414 * 100
-
-        # 查找过充值条 (bar_orange.png)
-        overcharge_bar = pane_vitals.find("img", src=re.compile(r"bar_orange\.png"))
-        if overcharge_bar:
-            style = overcharge_bar.get("style", "")
-            width_match = re.search(r"width:(\d+)px", style)
-            if width_match:
-                width = int(width_match.group(1))
-                self.vitals["Overcharge"] = width / 414 * 100
 
     def _parse_skills_and_spells(self):
         """解析角色的技能和法术"""
@@ -448,9 +456,14 @@ class MonsterList:
 class BattleDashBoard:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver: HVDriver = driver
-        self.character = Character(self.hvdriver.driver.page_source)
-        self.monster_list = MonsterList(self.hvdriver.driver.page_source)
+        self.refresh()
 
     def refresh(self):
         self.character = Character(self.hvdriver.driver.page_source)
         self.monster_list = MonsterList(self.hvdriver.driver.page_source)
+        self.log = self.get_current_log()
+
+    def get_current_log(self) -> str:
+        soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
+        textlog_element = soup.find(id="textlog")
+        return str(textlog_element) if textlog_element else ""
