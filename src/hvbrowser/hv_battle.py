@@ -1,5 +1,5 @@
 from functools import partial
-from collections import defaultdict
+from collections import defaultdict, deque
 from random import random
 
 from selenium.common.exceptions import NoSuchElementException
@@ -7,12 +7,6 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 
 from .hv import HVDriver, searchxpath_fun
-from .hv_battle_stat_provider import (
-    StatProviderHP,
-    StatProviderMP,
-    StatProviderSP,
-    StatProviderOvercharge,
-)
 from .hv_battle_ponychart import PonyChart
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_action_manager import ElementActionManager
@@ -34,25 +28,6 @@ monster_debuff_to_character_skill = {
     "Vital Theft": "Drain",
     "Silenced": "Silence",
 }
-
-
-def interleave_even_odd(nums):
-    if 0 in nums:
-        nums = sorted(nums[:-1]) + [0]  # 0在最後
-    else:
-        nums = sorted(nums)
-    even = nums[::2]
-    odd = nums[1::2]
-    result = []
-    i = j = 0
-    for k in range(len(nums)):
-        if k % 2 == 0 and i < len(even):
-            result.append(even[i])
-            i += 1
-        elif j < len(odd):
-            result.append(odd[j])
-            j += 1
-    return result
 
 
 def return_false_on_nosuch(fun):
@@ -175,22 +150,8 @@ class BattleDriver(HVDriver):
         return apply_buff()
 
     @property
-    def monster_alive_count(self) -> int:
-        return self._monsterstatusmanager.alive_count
-
-    @property
-    def monster_alive_ids(self) -> list[int]:
-        return self._monsterstatusmanager.alive_monster_ids
-
-    @property
     def system_monster_alive_ids(self) -> list[int]:
         return self._monsterstatusmanager.alive_system_monster_ids
-
-    def get_monster_id_by_name(self, name: str) -> int:
-        """
-        根據怪物名稱取得對應的 monster id（如 mkey_0 會回傳 0）。
-        """
-        return self._monsterstatusmanager.get_monster_id_by_name(name)
 
     @return_false_on_nosuch
     def check_hp(self) -> bool:
@@ -314,32 +275,41 @@ class BattleDriver(HVDriver):
         return True
 
     def attack(self) -> bool:
+        base_monster_ids = [1, 3, 5, 7, 9, 2, 4, 6, 8, 0]
+
+        def base_monster_ids_starting_with(n: int) -> list[int]:
+            """Returns a list of monster IDs starting with the given number."""
+            return (
+                base_monster_ids[base_monster_ids.index(n) :]
+                + base_monster_ids[: base_monster_ids.index(n)]
+            )
+
+        def resort_monster_alive_ids(bmlist: list[int]) -> list[int]:
+            """Returns a list of monster IDs starting with the given number."""
+            return [
+                id
+                for id in bmlist
+                if id in self._monsterstatusmanager.alive_monster_ids
+            ]
+
         # Check if Orbital Friendship Cannon can be used
         if all(
             [
                 self.with_ofc,
                 self.get_stat_percent("overcharge") > 220,
                 self._buffmanager.has_buff("Spirit Stance"),
-                self.monster_alive_count >= self.statthreshold.countmonster[1],
+                self._monsterstatusmanager.alive_count
+                >= self.statthreshold.countmonster[1],
+                self._skillmanager.get_skill_status("Orbital Friendship Cannon")
+                == "available",
             ]
         ):
             self.click_skill("Orbital Friendship Cannon", iswait=False)
+            self.attack_monster(self._monsterstatusmanager.alive_monster_ids[0])
+            return True
 
         # Get the list of alive monster IDs
-        monster_alive_ids = interleave_even_odd(self.monster_alive_ids)
-        if len(self.system_monster_alive_ids):
-            monster_id = self.system_monster_alive_ids[0]
-            monster_alive_ids = (
-                monster_alive_ids[monster_alive_ids.index(monster_id) :]
-                + monster_alive_ids[: monster_alive_ids.index(monster_id)]
-            )
-        for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][-1::-1]:
-            monster_id = self.get_monster_id_by_name(monster_name)
-            if monster_id in monster_alive_ids:
-                monster_alive_ids = (
-                    monster_alive_ids[monster_alive_ids.index(monster_id) :]
-                    + monster_alive_ids[: monster_alive_ids.index(monster_id)]
-                )
+        monster_alive_ids = resort_monster_alive_ids(base_monster_ids)
 
         # Get the list of monster IDs that are not debuffed with the specified debuffs
         if all(
@@ -384,22 +354,33 @@ class BattleDriver(HVDriver):
             )
         else:
             monster_with_imperil = monster_alive_ids
-        for n in monster_alive_ids:
-            if n not in monster_with_imperil:
-                if n == self.last_debuff_monster_id["Imperiled"]:
-                    # If the last debuffed monster is the same, attack it directly
-                    if random() < 0.5:
-                        self.click_skill("Imperil", iswait=False)
-                    self.attack_monster(n)
-                else:
+
+        if len(self.system_monster_alive_ids):
+            monster_alive_ids = resort_monster_alive_ids(
+                base_monster_ids_starting_with(self.system_monster_alive_ids[0])
+            )
+        for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][::-1]:
+            monster_id = self._monsterstatusmanager.get_monster_id_by_name(monster_name)
+            if monster_id in monster_alive_ids:
+                monster_alive_ids = resort_monster_alive_ids(
+                    base_monster_ids_starting_with(monster_id)
+                )
+
+        n = monster_alive_ids[0]
+        if n in monster_with_imperil:
+            self.last_debuff_monster_id["Imperiled"] = -1
+            self.attack_monster(n)
+        else:
+            if n == self.last_debuff_monster_id["Imperiled"]:
+                # If the last debuffed monster is the same, attack it directly
+                if random() < 0.5:
                     self.click_skill("Imperil", iswait=False)
-                    self.attack_monster(n)
-                    self.last_debuff_monster_id["Imperiled"] = n
-            else:
-                self.last_debuff_monster_id["Imperiled"] = -1
                 self.attack_monster(n)
-            return True
-        return False
+            else:
+                self.click_skill("Imperil", iswait=False)
+                self.attack_monster(n)
+                self.last_debuff_monster_id["Imperiled"] = n
+        return True
 
     def finish_battle(self) -> bool:
         elements = self.driver.find_elements(
