@@ -62,9 +62,7 @@ class SpiritData:
         self.cooldown = cooldown
 
 
-class Spirit:
-    """角色精神技能和法术的容器"""
-
+class SkillBook:
     def __init__(self):
         self.skills: Dict[str, SpiritData] = {}
         self.spells: Dict[str, SpiritData] = {}
@@ -118,7 +116,7 @@ class CharacterVitals:
             width_match = re.search(r"width:(\d+)px", style)
             if width_match:
                 width = int(width_match.group(1))
-                self.overcharge = width / 414 * 100
+                self.overcharge = width / 414 * 250
 
 
 class Character:
@@ -134,13 +132,18 @@ class Character:
         self.soup = BeautifulSoup(page_source, "html.parser")
         self.buffs: Dict[str, Union[float, int]] = {}
         self.vitals: CharacterVitals = CharacterVitals(self.soup)
-        self.spirit = Spirit()
+        self.skillbook = SkillBook()
 
         self._parse_buffs()
         self._parse_skills_and_spells()
 
     def _parse_buffs(self):
         """解析角色的 buff 效果"""
+        # <img id="ckey_spirit" onclick="battle.lock_action(this,0,'spirit')" onmouseover="battle.set_infopane('Spirit')" src="/isekai/y/battle/spirit_n.png">
+        spirit_img = self.soup.find("img", id="ckey_spirit")
+        if spirit_img and "spirit_a.png" in spirit_img.get("src", ""):
+            self.buffs["Spirit Stance"] = float("inf")
+
         pane_effects = self.soup.find("div", id="pane_effects")
         if not pane_effects:
             return
@@ -270,9 +273,9 @@ class Character:
             cooldown=cooldown,
         )
         if is_skill:
-            self.spirit.skills[name] = skill_data
+            self.skillbook.skills[name] = skill_data
         else:
-            self.spirit.spells[name] = skill_data
+            self.skillbook.spells[name] = skill_data
 
 
 class Monster:
