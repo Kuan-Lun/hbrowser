@@ -195,75 +195,69 @@ class BattleDriver(HVDriver):
     @return_false_on_nosuch
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
-            if any(
-                [
-                    self.use_item("Health Gem"),
-                    self.click_skill("Full-Cure"),
-                    self.use_item("Health Potion"),
-                    self.use_item("Health Elixir"),
-                    self.use_item("Last Elixir"),
-                    self.click_skill("Cure"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Health Gem"),
+                partial(self.click_skill, "Full-Cure"),
+                partial(self.use_item, "Health Potion"),
+                partial(self.use_item, "Health Elixir"),
+                partial(self.use_item, "Last Elixir"),
+                partial(self.click_skill, "Cure"),
+            ]:
+                if fun():
+                    return True
 
         if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
-            if any(
-                [
-                    self.use_item("Health Gem"),
-                    self.click_skill("Cure"),
-                    self.use_item("Health Potion"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Health Gem"),
+                partial(self.click_skill, "Cure"),
+                partial(self.use_item, "Health Potion"),
+            ]:
+                if fun():
+                    return True
 
         return False
 
     @return_false_on_nosuch
     def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
-            if any(
-                [
-                    self.use_item("Mana Gem"),
-                    self.use_item("Mana Potion"),
-                    self.use_item("Mana Elixir"),
-                    self.use_item("Last Elixir"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Mana Gem"),
+                partial(self.use_item, "Mana Potion"),
+                partial(self.use_item, "Mana Elixir"),
+                partial(self.use_item, "Last Elixir"),
+            ]:
+                if fun():
+                    return True
 
         if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
-            if any(
-                [
-                    self.use_item("Mana Gem"),
-                    self.use_item("Mana Potion"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Mana Gem"),
+                partial(self.use_item, "Mana Potion"),
+            ]:
+                if fun():
+                    return True
 
         return False
 
     @return_false_on_nosuch
     def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
-            if any(
-                [
-                    self.use_item("Spirit Gem"),
-                    self.use_item("Spirit Potion"),
-                    self.use_item("Spirit Elixir"),
-                    self.use_item("Last Elixir"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Spirit Gem"),
+                partial(self.use_item, "Spirit Potion"),
+                partial(self.use_item, "Spirit Elixir"),
+                partial(self.use_item, "Last Elixir"),
+            ]:
+                if fun():
+                    return True
 
         if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
-            if any(
-                [
-                    self.use_item("Spirit Gem"),
-                    self.use_item("Spirit Potion"),
-                ]
-            ):
-                return True
+            for fun in [
+                partial(self.use_item, "Spirit Gem"),
+                partial(self.use_item, "Spirit Potion"),
+            ]:
+                if fun():
+                    return True
 
         return False
 
@@ -354,14 +348,15 @@ class BattleDriver(HVDriver):
                 self.get_stat_percent("mp") > self.statthreshold.mp[1],
             ]
         ):
-            for debuff in [
+            monster_debuff_list = [
                 "Weakened",
                 "Slowed",
                 "Blinded",
                 "Magically Snared",
                 "Silenced",
                 "Vital Theft",
-            ]:
+            ]
+            for debuff in monster_debuff_list:
                 if debuff in self.forbidden_skills:
                     continue
                 monster_without_debuff = [
