@@ -101,29 +101,21 @@ class BattleDriver(HVDriver):
         super().__init__(*args, **kwargs)
 
         self.battle_dashboard = BattleDashBoard(self)
-        self.element_action_manager = ElementActionManager(self)
+        self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
 
         self.with_ofc = "isekai" not in self.driver.current_url
-        self._logprovider = LogProvider(self)
-        self._itemprovider = ItemProvider(self)
+        self._logprovider = LogProvider(self, self.battle_dashboard)
+        self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
         self._monsterstatusmanager = MonsterStatusManager(self, self.battle_dashboard)
         self.pausecontroller = PauseController()
-        self._stat_provider_hp = StatProviderHP(self)
-        self._stat_provider_mp = StatProviderMP(self)
-        self._stat_provider_sp = StatProviderSP(self)
-        self._stat_provider_overcharge = StatProviderOvercharge(self)
         self.turn = -1
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
         self.battle_dashboard.refresh()
         self._monsterstatusmanager.clear_cache()
-        self._stat_provider_hp.clear_cache()
-        self._stat_provider_mp.clear_cache()
-        self._stat_provider_sp.clear_cache()
-        self._stat_provider_overcharge.clear_cache()
 
     def set_battle_parameters(
         self, statthreshold: StatThreshold, forbidden_skills: list[list]
@@ -139,13 +131,13 @@ class BattleDriver(HVDriver):
     def get_stat_percent(self, stat: str) -> float:
         match stat.lower():
             case "hp":
-                value = self._stat_provider_hp.get_percent()
+                value = self.battle_dashboard.character.vitals.hp
             case "mp":
-                value = self._stat_provider_mp.get_percent()
+                value = self.battle_dashboard.character.vitals.mp
             case "sp":
-                value = self._stat_provider_sp.get_percent()
+                value = self.battle_dashboard.character.vitals.sp
             case "overcharge":
-                value = self._stat_provider_overcharge.get_percent()
+                value = self.battle_dashboard.character.vitals.overcharge
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
         return value
