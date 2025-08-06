@@ -46,10 +46,11 @@ BUFF2ICONS = {
 
 class BuffManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
-        self.hvdriver: HVDriver = driver
-        self.battle_dashboard: BattleDashBoard = battle_dashboard
-        self._item_provider: ItemProvider = ItemProvider(self.hvdriver)
-        self._skill_manager: SkillManager = SkillManager(
+        self.hvdriver = driver
+        self.battle_dashboard = battle_dashboard
+        self._item_provider = ItemProvider(self.hvdriver, self.battle_dashboard)
+        self._skill_manager = SkillManager(self.hvdriver, self.battle_dashboard)
+        self.element_action_manager = ElementActionManager(
             self.hvdriver, self.battle_dashboard
         )
         self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
@@ -111,7 +112,7 @@ class BuffManager:
             return self._cast_skill(key)
 
         if key == "Spirit Stance":
-            ElementActionManager(self.hvdriver).click_and_wait_log(
+            self.element_action_manager.click_and_wait_log(
                 self.driver.find_element(By.ID, "ckey_spirit")
             )
             return True
