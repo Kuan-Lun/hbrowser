@@ -5,13 +5,13 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.remote.webdriver import WebDriver
 
 from .hv import HVDriver
-from .hv_battle_log import LogProvider
+from .hv_battle_dashboard import BattleDashBoard
 
 
 class ElementActionManager:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
         self.hvdriver: HVDriver = driver
-        self.log_provider = LogProvider(self.hvdriver)
+        self.battle_dashboard: BattleDashBoard = battle_dashboard
 
     @property
     def driver(self) -> WebDriver:
@@ -22,7 +22,7 @@ class ElementActionManager:
         actions.move_to_element(element).click().perform()
 
     def click_and_wait_log(self, element: WebElement) -> None:
-        html = self.log_provider.get()
+        html = self.battle_dashboard.get_current_log()
         self.click(element)
 
         # 優化 1: 減少初始等待時間
@@ -32,7 +32,7 @@ class ElementActionManager:
         check_interval = 0.05  # 優化 2: 減少檢查間隔
         max_wait_time = 5.0  # 優化 3: 減少最大等待時間
 
-        while html == self.log_provider.get():
+        while html == self.battle_dashboard.get_current_log():
             time.sleep(check_interval)
             n += check_interval
             if n >= max_wait_time:
