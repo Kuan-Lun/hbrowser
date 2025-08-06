@@ -10,8 +10,8 @@ from .hv_battle_dashboard import BattleDashBoard
 
 class ElementActionManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
-        self.hvdriver: HVDriver = driver
-        self.battle_dashboard: BattleDashBoard = battle_dashboard
+        self.hvdriver = driver
+        self.battle_dashboard = battle_dashboard
 
     @property
     def driver(self) -> WebDriver:
