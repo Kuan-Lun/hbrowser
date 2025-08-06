@@ -49,12 +49,7 @@ class PonyChart:
         filename = f"pony_chart_{timestamp}.png"
         filepath = os.path.join(pony_chart_dir, filename)
 
-        # 如果是相對路徑或本地檔案，使用 selenium 截圖
-        if img_src.startswith("./") or not img_src.startswith("http"):
-            # 對 img 元素進行截圖
-            img_element.screenshot(filepath)
-        else:
-            raise ValueError("Unsupported image source format.")
+        img_element.screenshot(filepath)
 
     def _check(self) -> bool:
         return self.driver.find_elements(By.ID, "riddlesubmit") != []
