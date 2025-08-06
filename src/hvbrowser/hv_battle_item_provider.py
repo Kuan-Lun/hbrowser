@@ -3,15 +3,20 @@ from collections import defaultdict
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver, WebElement
 
-from .hv import HVDriver, searchxpath_fun
+from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
+from .hv_battle_dashboard import BattleDashBoard
 
 GEM_ITEMS = {"Mystic Gem", "Health Gem", "Mana Gem", "Spirit Gem"}
 
 
 class ItemProvider:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
         self.hvdriver: HVDriver = driver
+        self.battle_dashboard: BattleDashBoard = battle_dashboard
+        self.element_action_manager = ElementActionManager(
+            self.hvdriver, self.battle_dashboard
+        )
         self._checked_items: dict[str, str] = defaultdict(lambda: "available")
 
     @property
@@ -23,7 +28,7 @@ class ItemProvider:
         return self.hvdriver.driver.find_element(By.ID, "ckey_items")
 
     def click_items_menu(self) -> None:
-        ElementActionManager(self.hvdriver).click(self.items_menu_web_element)
+        self.element_action_manager.click(self.items_menu_web_element)
 
     def is_open_items_menu(self) -> bool:
         """
@@ -78,5 +83,5 @@ class ItemProvider:
         if not self.is_open_items_menu():
             self.click_items_menu()
             item_button_list = self.get_item_elements(item)
-        ElementActionManager(self.hvdriver).click_and_wait_log(item_button_list[0])
+        self.element_action_manager.click_and_wait_log(item_button_list[0])
         return True
