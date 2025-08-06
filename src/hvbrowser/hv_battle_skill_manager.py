@@ -16,8 +16,11 @@ from .hv_battle_dashboard import BattleDashBoard
 
 class SkillManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
-        self.hvdriver: HVDriver = driver
-        self.battle_dashboard: BattleDashBoard = battle_dashboard
+        self.hvdriver = driver
+        self.battle_dashboard = battle_dashboard
+        self.element_action_manager = ElementActionManager(
+            self.hvdriver, self.battle_dashboard
+        )
         # missing_skills: list[str] = []
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
@@ -44,9 +47,9 @@ class SkillManager:
     def _click_skill(self, skill_xpath: str, iswait: bool):
         element = self.driver.find_element(By.XPATH, skill_xpath)
         if iswait:
-            ElementActionManager(self.hvdriver).click_and_wait_log(element)
+            self.element_action_manager.click_and_wait_log(element)
         else:
-            ElementActionManager(self.hvdriver).click(element)
+            self.element_action_manager.click(element)
 
     def cast(self, key: str, iswait=True) -> bool:
         # 先檢查技能狀態
