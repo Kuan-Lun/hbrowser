@@ -29,8 +29,8 @@ class SkillManager:
     @property
     def skill_spirit(self):
         return (
-            self.battle_dashboard.character.spirit.skills
-            | self.battle_dashboard.character.spirit.spells
+            self.battle_dashboard.character.skillbook.skills
+            | self.battle_dashboard.character.skillbook.spells
         )
 
     @property
