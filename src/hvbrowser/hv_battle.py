@@ -150,10 +150,6 @@ class BattleDriver(HVDriver):
         round_str = f"Round {self._logprovider.current_round:>3} / {self._logprovider.total_round:<3}"
         return [f"{turn_str} {round_str} {line}" for line in new_logs]
 
-    @property
-    def is_with_spirit_stance(self) -> bool:
-        return StatProviderOvercharge(self).get_spirit_stance_status() == "activated"
-
     def use_item(self, key: str) -> bool:
         return self._itemprovider.use(key)
 
@@ -273,7 +269,7 @@ class BattleDriver(HVDriver):
 
     @return_false_on_nosuch
     def check_overcharge(self) -> bool:
-        if self.is_with_spirit_stance:
+        if self._buffmanager.has_buff("Spirit Stance"):
             # If Spirit Stance is active, check if Overcharge and SP are below thresholds
             if any(
                 [
@@ -288,7 +284,7 @@ class BattleDriver(HVDriver):
             [
                 self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1],
                 self.get_stat_percent("sp") > self.statthreshold.sp[0],
-                not self.is_with_spirit_stance,
+                not self._buffmanager.has_buff("Spirit Stance"),
             ]
         ):
             return self.apply_buff("Spirit Stance")
@@ -329,7 +325,7 @@ class BattleDriver(HVDriver):
             [
                 self.with_ofc,
                 self.get_stat_percent("overcharge") > 220,
-                self.is_with_spirit_stance,
+                self._buffmanager.has_buff("Spirit Stance"),
                 self.monster_alive_count >= self.statthreshold.countmonster[1],
             ]
         ):
