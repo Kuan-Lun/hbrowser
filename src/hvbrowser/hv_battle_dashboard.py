@@ -278,20 +278,29 @@ class Character:
             self.skillbook.spells[name] = skill_data
 
 
+class MonsterVitals:
+    """怪物的生命值、法力值、精神值等信息"""
+
+    def __init__(self, health, mana, spirit):
+        self.health: float = health
+        self.mana: float = mana
+        self.spirit: float = spirit
+
+
 class Monster:
     """怪物类"""
 
     def __init__(self):
         self.id: int = 0
         self.name: str = ""
-        self.vitals: Dict[str, float] = {}
+        self.vitals: MonsterVitals = MonsterVitals(0, 0, 0)
         self.buffs: Dict[str, int] = {}
         self.is_system: bool = False
 
     @property
     def is_alive(self) -> bool:
         """检查怪物是否存活"""
-        return self.vitals.get("Health", -1) != -1
+        return self.vitals.health != -1
 
 
 class MonsterList:
@@ -372,8 +381,6 @@ class MonsterList:
                         health_value = width / 120 * 100  # 怪物血条最大宽度为 120
                     break
 
-        monster.vitals["Health"] = health_value
-
         # 解析法力值条
         mana_bars = monster_div.find_all("img", src=re.compile(r"nbarblue\.png"))
         mana_value: float = -1
@@ -392,8 +399,6 @@ class MonsterList:
 
             if mana_value == -1:
                 mana_value = 0  # 活着的怪物如果没有法力条，设为 0
-
-        monster.vitals["Mana"] = mana_value
 
         # 解析精神值条
         spirit_bars = monster_div.find_all("img", src=re.compile(r"nbarred\.png"))
@@ -414,7 +419,9 @@ class MonsterList:
             if spirit_value == -1:
                 spirit_value = 0  # 活着的怪物如果没有精神条，设为 0
 
-        monster.vitals["Spirit"] = spirit_value
+        monster.vitals = MonsterVitals(
+            health=health_value, mana=mana_value, spirit=spirit_value
+        )
 
         # 解析 buff 效果
         buff_container = monster_div.find("div", class_="btm6")
