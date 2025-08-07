@@ -17,7 +17,7 @@ from .hv_battle_log import LogProvider
 from .hv_battle_dashboard import BattleDashBoard
 from .pause_controller import PauseController
 
-monster_debuff_to_character_skill = {
+MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
     "Imperiled": "Imperil",
     "Weakened": "Weaken",
     "Slowed": "Slow",
@@ -86,11 +86,17 @@ class BattleDriver(HVDriver):
         self._monsterstatusmanager = MonsterStatusManager(self, self.battle_dashboard)
         self.pausecontroller = PauseController()
         self.turn = -1
+        self.round = -1
+        self.pround = -1
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
         self.battle_dashboard.refresh()
         self._monsterstatusmanager.clear_cache()
+        self.round = self._logprovider.current_round
+
+    def reset_pround(self) -> None:
+        self.pround = self.round
 
     def set_battle_parameters(
         self, statthreshold: StatThreshold, forbidden_skills: list[list]
@@ -263,6 +269,22 @@ class BattleDriver(HVDriver):
         else:
             return False
 
+    def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
+        debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
+        if debuff_skill in self.forbidden_skills:
+            return False
+
+        monster_ids_with_debuff = (
+            self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+        ) + [self.last_debuff_monster_id[debuff]]
+        for num in nums:
+            if num not in monster_ids_with_debuff:
+                self.click_skill(debuff_skill, iswait=False)
+                self.attack_monster(num)
+                self.last_debuff_monster_id[debuff] = num
+                return True
+        return False
+
     def attack_monster(self, n: int) -> bool:
         elements = self.driver.find_elements(
             By.XPATH, '//div[@id="mkey_{n}"]'.format(n=n)
@@ -286,23 +308,34 @@ class BattleDriver(HVDriver):
 
         def resort_monster_alive_ids(bmlist: list[int]) -> list[int]:
             """Returns a list of monster IDs starting with the given number."""
-            return [
+            monster_alive_ids = [
                 id
                 for id in bmlist
                 if id in self._monsterstatusmanager.alive_monster_ids
             ]
+            if len(self.system_monster_alive_ids):
+                monster_alive_ids = resort_monster_alive_ids(
+                    base_monster_ids_starting_with(self.system_monster_alive_ids[0])
+                )
+            for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][::-1]:
+                monster_id = self._monsterstatusmanager.get_monster_id_by_name(
+                    monster_name
+                )
+                if monster_id in monster_alive_ids:
+                    monster_alive_ids = resort_monster_alive_ids(
+                        base_monster_ids_starting_with(monster_id)
+                    )
+            return monster_alive_ids
 
         # Check if Orbital Friendship Cannon can be used
-        if all(
-            [
-                self.with_ofc,
-                self.get_stat_percent("overcharge") > 220,
-                self._buffmanager.has_buff("Spirit Stance"),
-                self._monsterstatusmanager.alive_count
-                >= self.statthreshold.countmonster[1],
-                self._skillmanager.get_skill_status("Orbital Friendship Cannon")
-                == "available",
-            ]
+        if (
+            self.with_ofc
+            and self.get_stat_percent("overcharge") > 220
+            and self._buffmanager.has_buff("Spirit Stance")
+            and self._monsterstatusmanager.alive_count
+            >= self.statthreshold.countmonster[1]
+            and self._skillmanager.get_skill_status("Orbital Friendship Cannon")
+            == "available"
         ):
             self.click_skill("Orbital Friendship Cannon", iswait=False)
             self.attack_monster(self._monsterstatusmanager.alive_monster_ids[0])
@@ -312,62 +345,47 @@ class BattleDriver(HVDriver):
         monster_alive_ids = resort_monster_alive_ids(base_monster_ids)
 
         # Get the list of monster IDs that are not debuffed with the specified debuffs
-        if all(
-            [
-                len(monster_alive_ids) > 3,
-                self.get_stat_percent("mp") > self.statthreshold.mp[1],
-            ]
+        if (
+            len(monster_alive_ids) > 3
+            and self.get_stat_percent("mp") > self.statthreshold.mp[1]
         ):
-            monster_debuff_list = [
-                "Weakened",
-                "Slowed",
-                "Blinded",
-                "Magically Snared",
-                "Silenced",
-                "Vital Theft",
-            ]
-            for debuff in monster_debuff_list:
-                if debuff in self.forbidden_skills:
+            for debuff in MONSTER_DEBUFF_TO_CHARACTER_SKILL:
+                if debuff in ["Imperiled"]:
                     continue
-                monster_without_debuff = [
-                    n
-                    for n in monster_alive_ids
-                    if n
-                    not in self._monsterstatusmanager.get_monster_ids_with_debuff(
-                        debuff
+                if (
+                    len(monster_alive_ids)
+                    - len(
+                        self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
                     )
-                ]
-                if len(monster_without_debuff) / len(monster_alive_ids) > 0.3:
-                    for n in monster_without_debuff:
-                        if n != self.last_debuff_monster_id[debuff]:
-                            self.click_skill(
-                                monster_debuff_to_character_skill[debuff], iswait=False
-                            )
-                            self.attack_monster(n)
-                            self.last_debuff_monster_id[debuff] = n
-                            return True
+                    < 3
+                ):
+                    continue
+                if self.debuff_monster(debuff, monster_alive_ids):
+                    return True
 
         # Get the list of monster IDs that are not debuffed with Imperil
-        if self.get_stat_percent("mp") > self.statthreshold.mp[1]:
+        if (
+            "Imperil" in self.forbidden_skills
+            and self.get_stat_percent("mp") > self.statthreshold.mp[1]
+        ):
             monster_with_imperil = (
                 self._monsterstatusmanager.get_monster_ids_with_debuff("Imperiled")
             )
         else:
             monster_with_imperil = monster_alive_ids
 
-        if len(self.system_monster_alive_ids):
-            monster_alive_ids = resort_monster_alive_ids(
-                base_monster_ids_starting_with(self.system_monster_alive_ids[0])
-            )
-        for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][::-1]:
-            monster_id = self._monsterstatusmanager.get_monster_id_by_name(monster_name)
-            if monster_id in monster_alive_ids:
-                monster_alive_ids = resort_monster_alive_ids(
-                    base_monster_ids_starting_with(monster_id)
-                )
-
         n = monster_alive_ids[0]
         if n in monster_with_imperil:
+            if self.get_stat_percent("overcharge") > 200 and self._buffmanager.has_buff(
+                "Spirit Stance"
+            ):
+                monster_health = self.battle_dashboard.monster_list[n].vitals.health
+                if self._skillmanager.get_skill_status("Vital Strike"):
+                    self.click_skill("Vital Strike", iswait=False)
+                if monster_health < 25 and self._skillmanager.get_skill_status(
+                    "Merciful Blow"
+                ):
+                    self.click_skill("Merciful Blow", iswait=False)
             self.last_debuff_monster_id["Imperiled"] = -1
             self.attack_monster(n)
         else:
