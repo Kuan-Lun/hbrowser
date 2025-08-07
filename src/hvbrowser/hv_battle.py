@@ -1,5 +1,5 @@
 from functools import partial
-from collections import defaultdict, deque
+from collections import defaultdict
 from random import random
 
 from selenium.common.exceptions import NoSuchElementException
