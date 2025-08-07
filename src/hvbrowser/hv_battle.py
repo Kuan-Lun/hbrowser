@@ -30,16 +30,6 @@ MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
 }
 
 
-def return_false_on_nosuch(fun):
-    def wrapper(*args, **kwargs):
-        try:
-            return fun(*args, **kwargs)
-        except NoSuchElementException:
-            return False
-
-    return wrapper
-
-
 class StatThreshold:
     def __init__(
         self,
@@ -159,7 +149,6 @@ class BattleDriver(HVDriver):
     def system_monster_alive_ids(self) -> list[int]:
         return self._monsterstatusmanager.alive_system_monster_ids
 
-    @return_false_on_nosuch
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
             for fun in [
@@ -184,7 +173,6 @@ class BattleDriver(HVDriver):
 
         return False
 
-    @return_false_on_nosuch
     def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
             for fun in [
@@ -206,7 +194,6 @@ class BattleDriver(HVDriver):
 
         return False
 
-    @return_false_on_nosuch
     def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
             for fun in [
@@ -228,7 +215,6 @@ class BattleDriver(HVDriver):
 
         return False
 
-    @return_false_on_nosuch
     def check_overcharge(self) -> bool:
         if self._buffmanager.has_buff("Spirit Stance"):
             # If Spirit Stance is active, check if Overcharge and SP are below thresholds
@@ -251,16 +237,8 @@ class BattleDriver(HVDriver):
             return self.apply_buff("Spirit Stance")
         return False
 
-    @return_false_on_nosuch
     def go_next_floor(self) -> bool:
-        continue_images = [
-            "/y/battle/arenacontinue.png",
-            "/y/battle/grindfestcontinue.png",
-            "/y/battle/itemworldcontinue.png",
-        ]
-        continue_elements = self.driver.find_elements(
-            By.XPATH, searchxpath_fun(continue_images)
-        )
+        continue_elements = self.driver.find_elements(By.ID, "btcp")
 
         if continue_elements:
             self.element_action_manager.click_and_wait_log(continue_elements[0])
@@ -405,17 +383,6 @@ class BattleDriver(HVDriver):
                 self.last_debuff_monster_id["Imperiled"] = n
         return True
 
-    def finish_battle(self) -> bool:
-        elements = self.driver.find_elements(
-            By.XPATH, searchxpath_fun(["/y/battle/finishbattle.png"])
-        )
-
-        if not elements:
-            return False
-
-        ActionChains(self.driver).move_to_element(elements[0]).click().perform()
-        return True
-
     def use_channeling(self) -> bool:
         if "Channeling" in self.battle_dashboard.character.buffs:
             skill_names = ["Regen", "Heartseeker"]
@@ -440,9 +407,6 @@ class BattleDriver(HVDriver):
         # Print the current round logs
         print("\n".join(self.new_logs))
 
-        if self.finish_battle():
-            return "break"
-
         for fun in [
             self.go_next_floor,
             PonyChart(self).check,
@@ -450,13 +414,13 @@ class BattleDriver(HVDriver):
             self.check_mp,
             self.check_sp,
             self.check_overcharge,
-            partial(self.apply_buff, "Health Draught"),
-            partial(self.apply_buff, "Mana Draught"),
-            partial(self.apply_buff, "Spirit Draught"),
-            partial(self.apply_buff, "Regen"),
-            partial(self.apply_buff, "Scroll of Life"),
-            partial(self.apply_buff, "Absorb"),
-            partial(self.apply_buff, "Heartseeker"),
+            lambda: self.apply_buff("Health Draught"),
+            lambda: self.apply_buff("Mana Draught"),
+            lambda: self.apply_buff("Spirit Draught"),
+            lambda: self.apply_buff("Regen"),
+            lambda: self.apply_buff("Scroll of Life"),
+            lambda: self.apply_buff("Absorb"),
+            lambda: self.apply_buff("Heartseeker"),
         ]:
             if fun():
                 return "continue"
