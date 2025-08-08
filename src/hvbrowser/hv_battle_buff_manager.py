@@ -17,6 +17,7 @@ ITEM_BUFFS = {
     "Spirit Draught",
     "Scroll of Absorption",
     "Scroll of Life",
+    "Scroll of Protection",
 }
 
 SKILL_BUFFS = {
@@ -33,6 +34,7 @@ BUFF2ICONS = {
     "Mana Draught": {"/y/e/manapot.png"},
     "Spirit Draught": {"/y/e/spiritpot.png"},
     "Scroll of Life": {"/y/e/sparklife_scroll.png"},
+    "Scroll of Protection": {"/y/e/protection_scroll.png"},
     # Skill icons
     "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
     "Heartseeker": {"/y/e/heartseeker.png"},
@@ -41,6 +43,12 @@ BUFF2ICONS = {
     "Spark of Life": {"/y/e/sparklife.png", "/y/e/sparklife_scroll.png"},
     # Spirit icon
     "Spirit Stance": {"/y/battle/spirit_a.png"},
+}
+
+BUFF2ITEMS = {
+    "Absorb": ["Scroll of Absorption"],
+    "Protection": ["Scroll of Protection"],
+    "Spark of Life": ["Scroll of Life"],
 }
 
 
@@ -83,7 +91,20 @@ class BuffManager:
         Check if the buff is active.
         """
 
-        return key in self.battle_dashboard.character.buffs
+        return (
+            key in self.battle_dashboard.character.buffs
+            and self.battle_dashboard.character.buffs[key] > 0
+        )
+
+    def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
+        """
+        Apply buff that can be cast from both item and skill.
+        Try item first, fallback to skill if item fails.
+        """
+        if self._item_provider.use(item_name):
+            return True
+        else:
+            return self._cast_skill(key)
 
     def apply_buff(self, key: str, force: bool) -> bool:
         """
@@ -92,17 +113,13 @@ class BuffManager:
         if all([not force, self.has_buff(key)]):
             return False
 
-        if key == "Absorb":
-            if self._item_provider.use("Scroll of Absorption"):
+        # Special cases
+        match key:
+            case "Spirit Stance":
+                self.element_action_manager.click_and_wait_log(
+                    self.driver.find_element(By.ID, "ckey_spirit")
+                )
                 return True
-            else:
-                return self._cast_skill(key)
-
-        if key == "Spark of Life":
-            if self._item_provider.use("Scroll of Life"):
-                return True
-            else:
-                return self._cast_skill(key)
 
         if key in ITEM_BUFFS:
             return self._item_provider.use(key)
@@ -110,11 +127,5 @@ class BuffManager:
         if key in SKILL_BUFFS:
             self._item_provider.use("Mystic Gem")
             return self._cast_skill(key)
-
-        if key == "Spirit Stance":
-            self.element_action_manager.click_and_wait_log(
-                self.driver.find_element(By.ID, "ckey_spirit")
-            )
-            return True
 
         raise ValueError(f"Unknown buff key: {key}")
