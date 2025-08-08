@@ -420,6 +420,7 @@ class BattleDriver(HVDriver):
             lambda: self.apply_buff("Regen"),
             lambda: self.apply_buff("Scroll of Life"),
             lambda: self.apply_buff("Absorb"),
+            lambda: self.apply_buff("Scroll of Protection"),
             lambda: self.apply_buff("Heartseeker"),
         ]:
             if fun():
