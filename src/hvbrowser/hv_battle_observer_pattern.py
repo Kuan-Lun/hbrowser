@@ -554,7 +554,7 @@ def parse_monsters(soup: BeautifulSoup) -> MonsterList:
         # 收集結果
         for future in futures:
             monster = future.result()
-            if monster and monster.id != 0:  # 確保解析成功且有有效ID
+            if monster and monster.id >= 0:  # 確保解析成功且有有效ID（包含ID為0的怪物）
                 monster_list.monsters[monster.id] = monster
 
     return monster_list
