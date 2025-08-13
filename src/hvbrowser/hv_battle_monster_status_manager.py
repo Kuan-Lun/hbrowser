@@ -1,5 +1,5 @@
 from .hv import HVDriver
-from .hv_battle_dashboard import BattleDashBoard
+from .hv_battle_observer_pattern import BattleDashboard
 
 
 # Debuff 名稱對應圖示檔名
@@ -31,7 +31,7 @@ class MonsterStatusCache:
 
 
 class MonsterStatusManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.battle_dashboard = battle_dashboard
         self.cache = MonsterStatusCache()
 
@@ -67,7 +67,7 @@ class MonsterStatusManager:
         if debuff not in self.cache.buff2ids:
             self.cache.buff2ids[debuff] = []
             for monster_id, monster in self.battle_dashboard.monster_list.items():
-                if monster.is_alive and debuff in monster.buffs:
+                if monster.is_alive and debuff in monster.buffs.buffs:
                     self.cache.buff2ids[debuff].append(monster_id)
 
         return self.cache.buff2ids[debuff]

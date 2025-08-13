@@ -1,7 +1,5 @@
-import re
 from collections import defaultdict
 
-from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -11,11 +9,15 @@ from selenium.webdriver.remote.webdriver import WebDriver
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
-from .hv_battle_dashboard import BattleDashBoard
+from .hv_battle_observer_pattern import BattleDashboard
 
 
 class SkillManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
+    def __init__(
+        self,
+        driver: HVDriver,
+        battle_dashboard: BattleDashboard,
+    ) -> None:
         self.hvdriver = driver
         self.battle_dashboard = battle_dashboard
         self.element_action_manager = ElementActionManager(
@@ -25,13 +27,6 @@ class SkillManager:
         # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
-
-    @property
-    def skill_spirit(self):
-        return (
-            self.battle_dashboard.character.skillbook.skills
-            | self.battle_dashboard.character.skillbook.spells
-        )
 
     @property
     def driver(self) -> WebDriver:
@@ -92,7 +87,9 @@ class SkillManager:
         """
 
         self._checked_skills[key] = (
-            self.skill_spirit[key].status if key in self.skill_spirit else "missing"
+            self.battle_dashboard.character_skillbook.skills_and_spells[key].status
+            if key in self.battle_dashboard.character_skillbook.skills_and_spells
+            else "missing"
         )
         return self._checked_skills[key]
 
@@ -105,6 +102,9 @@ class SkillManager:
             raise ValueError(f"Skill '{skill_name}' is missing.")
 
         self.skills_cost[skill_name] = max(
-            self.skill_spirit[skill_name].cost, self.skills_cost[skill_name]
+            self.battle_dashboard.character_skillbook.skills_and_spells[
+                skill_name
+            ].cost,
+            self.skills_cost[skill_name],
         )
         return self.skills_cost[skill_name]

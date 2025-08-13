@@ -1,15 +1,17 @@
 import time
+from copy import deepcopy
 
-from selenium.webdriver.remote.webelement import WebElement
+from bs4 import BeautifulSoup
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
 
 from .hv import HVDriver
-from .hv_battle_dashboard import BattleDashBoard
+from .hv_battle_observer_pattern import BattleDashboard
 
 
 class ElementActionManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.hvdriver = driver
         self.battle_dashboard = battle_dashboard
 
@@ -22,7 +24,8 @@ class ElementActionManager:
         actions.move_to_element(element).click().perform()
 
     def click_and_wait_log(self, element: WebElement) -> None:
-        html = self.battle_dashboard.get_current_log()
+        soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
+        html = self.battle_dashboard.log_entries.get_new_lines(soup)
         self.click(element)
 
         # 優化 1: 減少初始等待時間
@@ -32,11 +35,14 @@ class ElementActionManager:
         check_interval = 0.05  # 優化 2: 減少檢查間隔
         max_wait_time = 5.0  # 優化 3: 減少最大等待時間
 
-        while html == self.battle_dashboard.get_current_log():
+        while html == self.battle_dashboard.log_entries.get_new_lines(
+            BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
+        ):
             time.sleep(check_interval)
             n += check_interval
             if n >= max_wait_time:
                 raise TimeoutError("I don't know what happened.")
+        # self.battle_dashboard.update()
 
         # 優化 4: 確保至少有一些變化後再繼續
         time.sleep(0.01)  # 很短的穩定等待

@@ -11,9 +11,10 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_monster_status_manager import MonsterStatusManager
-from .hv_battle_log import LogProvider
-from .hv_battle_dashboard import BattleDashBoard
+
+# from .hv_battle_dashboard import BattleDashBoard
 from .pause_controller import PauseController
+from .hv_battle_observer_pattern import BattleDashboard
 
 MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
     "Imperiled": "Imperil",
@@ -63,11 +64,10 @@ class BattleDriver(HVDriver):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.battle_dashboard = BattleDashBoard(self)
+        self.battle_dashboard = BattleDashboard(self)
         self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
 
         self.with_ofc = "isekai" not in self.driver.current_url
-        self._logprovider = LogProvider(self, self.battle_dashboard)
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
@@ -79,9 +79,9 @@ class BattleDriver(HVDriver):
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
-        self.battle_dashboard.refresh()
         self._monsterstatusmanager.clear_cache()
-        self.round = self._logprovider.current_round
+        self.round = self.battle_dashboard.log_entries.current_round
+        self.battle_dashboard.update()
 
     def reset_pround(self) -> None:
         self.pround = self.round
@@ -100,23 +100,23 @@ class BattleDriver(HVDriver):
     def get_stat_percent(self, stat: str) -> float:
         match stat.lower():
             case "hp":
-                value = self.battle_dashboard.character.vitals.hp
+                value = self.battle_dashboard.character_vitals.hp
             case "mp":
-                value = self.battle_dashboard.character.vitals.mp
+                value = self.battle_dashboard.character_vitals.mp
             case "sp":
-                value = self.battle_dashboard.character.vitals.sp
+                value = self.battle_dashboard.character_vitals.sp
             case "overcharge":
-                value = self.battle_dashboard.character.vitals.overcharge
+                value = self.battle_dashboard.character_vitals.overcharge
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
         return value
 
     @property
     def new_logs(self) -> list[str]:
-        new_logs = self._logprovider.get_new_logs()
+        new_logs = self.battle_dashboard.log_entries.current_lines
         # 固定寬度，假設最大 3 位數
         turn_str = f"Turn {self.turn:>5}"
-        round_str = f"Round {self._logprovider.current_round:>3} / {self._logprovider.total_round:<3}"
+        round_str = f"Round {self.battle_dashboard.log_entries.current_round:>3} / {self.battle_dashboard.log_entries.total_round:<3}"
         return [f"{turn_str} {round_str} {line}" for line in new_logs]
 
     def use_item(self, key: str) -> bool:
@@ -357,7 +357,9 @@ class BattleDriver(HVDriver):
             if self.get_stat_percent("overcharge") > 200 and self._buffmanager.has_buff(
                 "Spirit Stance"
             ):
-                monster_health = self.battle_dashboard.monster_list[n].vitals.health
+                monster_health = self.battle_dashboard.monster_list.monsters[
+                    n
+                ].vitals.health
                 if monster_health < 25 and self._skillmanager.get_skill_status(
                     "Merciful Blow"
                 ):
@@ -382,7 +384,7 @@ class BattleDriver(HVDriver):
         return True
 
     def use_channeling(self) -> bool:
-        if "Channeling" in self.battle_dashboard.character.buffs:
+        if "Channeling" in self.battle_dashboard.character_buffs.buffs:
             skill_names = ["Regen", "Heartseeker"]
             skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:

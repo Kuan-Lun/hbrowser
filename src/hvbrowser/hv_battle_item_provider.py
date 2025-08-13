@@ -5,17 +5,16 @@ from selenium.webdriver.remote.webdriver import WebDriver, WebElement
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
-from .hv_battle_dashboard import BattleDashBoard
+from .hv_battle_observer_pattern import BattleDashboard
 
 GEM_ITEMS = {"Mystic Gem", "Health Gem", "Mana Gem", "Spirit Gem"}
 
 
 class ItemProvider:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.hvdriver: HVDriver = driver
-        self.battle_dashboard: BattleDashBoard = battle_dashboard
         self.element_action_manager = ElementActionManager(
-            self.hvdriver, self.battle_dashboard
+            self.hvdriver, battle_dashboard
         )
         self._checked_items: dict[str, str] = defaultdict(lambda: "available")
 

@@ -8,7 +8,7 @@ from .hv import HVDriver
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_action_manager import ElementActionManager
-from .hv_battle_dashboard import BattleDashBoard
+from .hv_battle_observer_pattern import BattleDashboard
 
 ITEM_BUFFS = {
     "Health Draught",
@@ -52,7 +52,7 @@ BUFF2ITEMS = {
 
 
 class BuffManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
+    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.hvdriver = driver
         self.battle_dashboard = battle_dashboard
         self._item_provider = ItemProvider(self.hvdriver, self.battle_dashboard)
@@ -75,7 +75,7 @@ class BuffManager:
         if self.has_buff(key) is False:
             return 0
 
-        turns = int(self.battle_dashboard.character.buffs[key])
+        turns = int(self.battle_dashboard.character_buffs.buffs[key])
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
 
@@ -91,8 +91,8 @@ class BuffManager:
         """
 
         return (
-            key in self.battle_dashboard.character.buffs
-            and self.battle_dashboard.character.buffs[key] > 0
+            key in self.battle_dashboard.character_buffs.buffs
+            and self.battle_dashboard.character_buffs.buffs[key] >= 0
         )
 
     def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
