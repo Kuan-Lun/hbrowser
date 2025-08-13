@@ -35,16 +35,11 @@ class MonsterStatusCache:
 
 class MonsterStatusManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashBoard) -> None:
-        self.hvdriver: HVDriver = driver
         self.battle_dashboard = battle_dashboard
         self.cache = MonsterStatusCache()
 
     def clear_cache(self) -> None:
         self.cache.clear()
-
-    @property
-    def driver(self) -> WebDriver:
-        return self.hvdriver.driver
 
     @property
     def alive_count(self) -> int:
