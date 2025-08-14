@@ -171,8 +171,8 @@ def parse_vitals(soup: BeautifulSoup) -> CharacterVitals:
     sp = 0.0
     overcharge = 0.0
 
-    # 查找生命值條 (bar_dgreen.png)
-    health_bar = pane_vitals.find("img", src=re.compile(r"bar_dgreen\.png"))
+    # 查找生命值條 (bar_bgreen.png 或 bar_dgreen.png)
+    health_bar = pane_vitals.find("img", src=re.compile(r"bar_[bd]green\.png"))
     if health_bar:
         style = health_bar.get("style", "")
         width_match = re.search(r"width:(\d+)px", style)
