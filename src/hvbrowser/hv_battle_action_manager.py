@@ -23,7 +23,7 @@ class ElementActionManager:
         actions = ActionChains(self.driver)
         actions.move_to_element(element).click().perform()
 
-    def click_and_wait_log(self, element: WebElement) -> None:
+    def click_and_wait_log(self, element: WebElement, is_retry=True) -> None:
         soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
         html = self.battle_dashboard.log_entries.get_new_lines(soup)
         self.click(element)
@@ -41,8 +41,10 @@ class ElementActionManager:
             time.sleep(check_interval)
             n += check_interval
             if n >= max_wait_time:
-                raise TimeoutError("I don't know what happened.")
-        # self.battle_dashboard.update()
+                if is_retry:
+                    self.click_and_wait_log(element, is_retry=False)
+                else:
+                    raise TimeoutError("I don't know what happened.")
 
         # 優化 4: 確保至少有一些變化後再繼續
         time.sleep(0.01)  # 很短的穩定等待
