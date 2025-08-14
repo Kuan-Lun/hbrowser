@@ -42,7 +42,8 @@ class ElementActionManager:
             n += check_interval
             if n >= max_wait_time:
                 if is_retry:
-                    self.click_and_wait_log(element, is_retry=False)
+                    self.hvdriver.driver.refresh()
+                    return self.click_and_wait_log(element, is_retry=False)
                 else:
                     raise TimeoutError("I don't know what happened.")
 
