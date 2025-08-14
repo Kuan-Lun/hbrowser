@@ -23,8 +23,6 @@ class SkillManager:
         self.element_action_manager = ElementActionManager(
             self.hvdriver, self.battle_dashboard
         )
-        # missing_skills: list[str] = []
-        # owned_skills: list[str] = []
         self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
 
@@ -38,6 +36,18 @@ class SkillManager:
     def _click_skill_menu(self):
         button = self.driver.find_element(By.ID, "ckey_skill")
         button.click()
+
+    def open_skills_menu(self):
+        if "display: none;" == self.driver.find_element(
+            By.ID, "pane_skill"
+        ).get_attribute("style"):
+            self._click_skill_menu()
+
+    def open_spells_menu(self):
+        if "display: none;" == self.driver.find_element(
+            By.ID, "pane_magic"
+        ).get_attribute("style"):
+            self._click_skill_menu()
 
     def _click_skill(self, skill_xpath: str, iswait: bool):
         element = self.driver.find_element(By.XPATH, skill_xpath)
@@ -58,25 +68,20 @@ class SkillManager:
             self.get_skill_mp_cost_by_name(key), self.skills_cost[key]
         )
 
-        skill_xpath = self._get_skill_xpath(key)
-
         match self._checked_skills[key]:
             case "missing":
                 return False
             case "unavailable":
                 return False
             case "available":
-                try:
-                    self._click_skill(skill_xpath, iswait)
-                except ElementNotInteractableException:
-                    self._click_skill_menu()
-                    try:
-                        self._click_skill(skill_xpath, iswait)
-                    except ElementNotInteractableException:
-                        self._click_skill_menu()
-                        self._click_skill(skill_xpath, iswait)
-                except NoSuchElementException:
-                    return False
+                if key in self.battle_dashboard.character_skillbook.skills:
+                    self.open_skills_menu()
+                    self.open_skills_menu()
+                if key in self.battle_dashboard.character_skillbook.spells:
+                    self.open_spells_menu()
+                    self.open_spells_menu()
+                skill_xpath = self._get_skill_xpath(key)
+                self._click_skill(skill_xpath, iswait)
                 return True
             case _:
                 raise ValueError(f"Unknown skill status: {self._checked_skills[key]}")
