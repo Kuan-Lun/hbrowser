@@ -42,12 +42,14 @@ class SkillManager:
             By.ID, "pane_skill"
         ).get_attribute("style"):
             self._click_skill_menu()
+            self.open_skills_menu()
 
     def open_spells_menu(self):
         if "display: none;" == self.driver.find_element(
             By.ID, "pane_magic"
         ).get_attribute("style"):
             self._click_skill_menu()
+            self.open_spells_menu()
 
     def _click_skill(self, skill_xpath: str, iswait: bool):
         element = self.driver.find_element(By.XPATH, skill_xpath)
@@ -76,9 +78,7 @@ class SkillManager:
             case "available":
                 if key in self.battle_dashboard.character_skillbook.skills:
                     self.open_skills_menu()
-                    self.open_skills_menu()
                 if key in self.battle_dashboard.character_skillbook.spells:
-                    self.open_spells_menu()
                     self.open_spells_menu()
                 skill_xpath = self._get_skill_xpath(key)
                 self._click_skill(skill_xpath, iswait)
