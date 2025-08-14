@@ -364,7 +364,9 @@ class BattleDriver(HVDriver):
                     "Merciful Blow"
                 ):
                     self.attack_monster_by_skill(n, "Merciful Blow")
-                elif self._skillmanager.get_skill_status("Vital Strike"):
+                elif monster_health > 5 and self._skillmanager.get_skill_status(
+                    "Vital Strike"
+                ):
                     self.attack_monster_by_skill(n, "Vital Strike")
             else:
                 self.attack_monster(n)
