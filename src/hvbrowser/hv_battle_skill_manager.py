@@ -1,10 +1,6 @@
 from collections import defaultdict
 
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    ElementNotInteractableException,
-)
 from selenium.webdriver.remote.webdriver import WebDriver
 
 from .hv import HVDriver
