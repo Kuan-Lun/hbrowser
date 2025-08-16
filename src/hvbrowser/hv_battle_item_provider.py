@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver, WebElement
 
