@@ -79,7 +79,6 @@ class BattleDriver(HVDriver):
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
-        self._monsterstatusmanager.clear_cache()
         self.round = self.battle_dashboard.log_entries.current_round
         self.battle_dashboard.update()
 
@@ -100,13 +99,13 @@ class BattleDriver(HVDriver):
     def get_stat_percent(self, stat: str) -> float:
         match stat.lower():
             case "hp":
-                value = self.battle_dashboard.character_vitals.hp
+                value = self.battle_dashboard.snap.player.hp_percent
             case "mp":
-                value = self.battle_dashboard.character_vitals.mp
+                value = self.battle_dashboard.snap.player.mp_percent
             case "sp":
-                value = self.battle_dashboard.character_vitals.sp
+                value = self.battle_dashboard.snap.player.sp_percent
             case "overcharge":
-                value = self.battle_dashboard.character_vitals.overcharge
+                value = self.battle_dashboard.snap.player.overcharge_value
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
         return value
@@ -310,8 +309,11 @@ class BattleDriver(HVDriver):
             and self._buffmanager.has_buff("Spirit Stance")
             and self._monsterstatusmanager.alive_count
             >= self.statthreshold.countmonster[1]
-            and self._skillmanager.get_skill_status("Orbital Friendship Cannon")
-            == "available"
+            and "Orbital Friendship Cannon"
+            in self.battle_dashboard.snap.abilities.skills
+            and self.battle_dashboard.snap.abilities.skills[
+                "Orbital Friendship Cannon"
+            ].available
         ):
             self.attack_monster_by_skill(
                 self._monsterstatusmanager.alive_monster_ids[0],
@@ -357,15 +359,21 @@ class BattleDriver(HVDriver):
             if self.get_stat_percent("overcharge") > 200 and self._buffmanager.has_buff(
                 "Spirit Stance"
             ):
-                monster_health = self.battle_dashboard.monster_list.monsters[
-                    n
-                ].vitals.health
-                if monster_health < 25 and self._skillmanager.get_skill_status(
-                    "Merciful Blow"
+                monster_health = self.battle_dashboard.snap.monsters[n].hp_percent
+                if (
+                    monster_health < 25
+                    and "Merciful Blow" in self.battle_dashboard.snap.abilities.skills
+                    and self.battle_dashboard.snap.abilities.skills[
+                        "Merciful Blow"
+                    ].available
                 ):
                     self.attack_monster_by_skill(n, "Merciful Blow")
-                elif monster_health > 5 and self._skillmanager.get_skill_status(
-                    "Vital Strike"
+                elif (
+                    monster_health > 5
+                    and "Vital Strike" in self.battle_dashboard.snap.abilities.skills
+                    and self.battle_dashboard.snap.abilities.skills[
+                        "Vital Strike"
+                    ].available
                 ):
                     self.attack_monster_by_skill(n, "Vital Strike")
             else:
@@ -386,13 +394,15 @@ class BattleDriver(HVDriver):
         return True
 
     def use_channeling(self) -> bool:
-        if "Channeling" in self.battle_dashboard.character_buffs.buffs:
+        if "Channeling" in self.battle_dashboard.snap.player.buffs:
             skill_names = ["Regen", "Heartseeker"]
             skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:
                 remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
                 refresh_turns = self._buffmanager.skill2turn[skill_name]
-                skill_cost = self._skillmanager.get_skill_mp_cost_by_name(skill_name)
+                skill_cost = self._skillmanager.get_max_skill_mp_cost_by_name(
+                    skill_name
+                )
                 skill2remaining[skill_name] = (
                     (refresh_turns - remaining_turns) * refresh_turns / skill_cost
                 )
@@ -421,6 +431,7 @@ class BattleDriver(HVDriver):
             lambda: self.apply_buff("Spirit Draught"),
             lambda: self.apply_buff("Regen"),
             lambda: self.apply_buff("Scroll of Life"),
+            lambda: self.apply_buff("Scroll of Absorption"),
             lambda: self.apply_buff("Absorb"),
             lambda: self.apply_buff("Scroll of Protection"),
             lambda: self.apply_buff("Heartseeker"),

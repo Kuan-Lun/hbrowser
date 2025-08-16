@@ -23,7 +23,6 @@ class SkillManager:
         self.element_action_manager = ElementActionManager(
             self.hvdriver, self.battle_dashboard
         )
-        self._checked_skills: dict[str, str] = defaultdict(lambda: "available")
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
 
     @property
@@ -59,57 +58,37 @@ class SkillManager:
             self.element_action_manager.click(element)
 
     def cast(self, key: str, iswait=True) -> bool:
-        # 先檢查技能狀態
-        if key not in self._checked_skills:
-            self.get_skill_status(key)
-
-        if self._checked_skills[key] == "missing":
+        if key not in self.get_skills_and_spells():
             return False
 
         self.skills_cost[key] = max(
-            self.get_skill_mp_cost_by_name(key), self.skills_cost[key]
+            self.get_max_skill_mp_cost_by_name(key), self.skills_cost[key]
         )
 
-        match self._checked_skills[key]:
-            case "missing":
-                return False
-            case "unavailable":
-                return False
-            case "available":
-                if key in self.battle_dashboard.character_skillbook.skills:
-                    self.open_skills_menu()
-                if key in self.battle_dashboard.character_skillbook.spells:
-                    self.open_spells_menu()
-                skill_xpath = self._get_skill_xpath(key)
-                self._click_skill(skill_xpath, iswait)
-                return True
-            case _:
-                raise ValueError(f"Unknown skill status: {self._checked_skills[key]}")
+        if self.get_skills_and_spells()[key].available:
+            if key in self.battle_dashboard.snap.abilities.skills:
+                self.open_skills_menu()
+            if key in self.battle_dashboard.snap.abilities.spells:
+                self.open_spells_menu()
+            skill_xpath = self._get_skill_xpath(key)
+            self._click_skill(skill_xpath, iswait)
+            return True
+        else:
+            return False
 
-    def get_skill_status(self, key: str) -> str:
-        """
-        回傳 'missing'（未擁有）、'available'（可用）、'unavailable'（不可用）
-        """
-
-        self._checked_skills[key] = (
-            self.battle_dashboard.character_skillbook.skills_and_spells[key].status
-            if key in self.battle_dashboard.character_skillbook.skills_and_spells
-            else "missing"
+    def get_skills_and_spells(self):
+        return (
+            self.battle_dashboard.snap.abilities.skills
+            | self.battle_dashboard.snap.abilities.spells
         )
-        return self._checked_skills[key]
 
-    def get_skill_mp_cost_by_name(self, skill_name: str) -> int:
+    def get_max_skill_mp_cost_by_name(self, skill_name: str) -> int:
         """
         根據技能名稱（如 'Haste' 或 'Weaken'）從 HTML 片段中找出對應的數值。
         """
 
-        if self.get_skill_status(skill_name) == "missing":
-            raise ValueError(f"Skill '{skill_name}' is missing.")
-
         self.skills_cost[skill_name] = max(
-            self.battle_dashboard.character_skillbook.skills_and_spells[
-                skill_name
-            ].cost,
+            self.get_skills_and_spells()[skill_name].cost,
             self.skills_cost[skill_name],
         )
         return self.skills_cost[skill_name]

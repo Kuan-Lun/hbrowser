@@ -1,7 +1,6 @@
 import time
-from copy import deepcopy
 
-from bs4 import BeautifulSoup
+from hv_bie import parse_snapshot
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
@@ -24,8 +23,9 @@ class ElementActionManager:
         actions.move_to_element(element).click().perform()
 
     def click_and_wait_log(self, element: WebElement, is_retry=True) -> None:
-        soup = BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
-        html = self.battle_dashboard.log_entries.get_new_lines(soup)
+        html = self.battle_dashboard.log_entries.get_new_lines(
+            parse_snapshot(self.hvdriver.driver.page_source)
+        )
         self.click(element)
 
         # 優化 1: 減少初始等待時間
@@ -36,7 +36,7 @@ class ElementActionManager:
         max_wait_time = 5.0  # 優化 3: 減少最大等待時間
 
         while html == self.battle_dashboard.log_entries.get_new_lines(
-            BeautifulSoup(self.hvdriver.driver.page_source, "html.parser")
+            parse_snapshot(self.hvdriver.driver.page_source)
         ):
             time.sleep(check_interval)
             n += check_interval

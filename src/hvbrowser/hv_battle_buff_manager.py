@@ -19,6 +19,24 @@ ITEM_BUFFS = {
     "Scroll of Protection",
 }
 
+SKILLS_TO_CHARACTER_BUFFS = {
+    "Absorb": "Absorbing Ward",
+    "Scroll of Absorption": "Absorbing Ward",
+    "Scroll of Protection": "Protection",
+    "Scroll of Life": "Spark of Life",
+    "Health Draught": "Regeneration",
+    "Mana Draught": "Replenishment",
+    "Spirit Draught": "Refreshment",
+}
+
+AutoCast_BUFFS = {
+    "Spark of Life",
+    "Spirit Shield",
+    "Shadow Veil",
+    "Protection",
+    "Hastened",
+}
+
 SKILL_BUFFS = {
     "Absorb",
     "Heartseeker",
@@ -27,28 +45,28 @@ SKILL_BUFFS = {
     "Spark of Life",
 }
 
-BUFF2ICONS = {
-    # Item icons
-    "Health Draught": {"/y/e/healthpot.png"},
-    "Mana Draught": {"/y/e/manapot.png"},
-    "Spirit Draught": {"/y/e/spiritpot.png"},
-    "Scroll of Life": {"/y/e/sparklife_scroll.png"},
-    "Scroll of Protection": {"/y/e/protection_scroll.png"},
-    # Skill icons
-    "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
-    "Heartseeker": {"/y/e/heartseeker.png"},
-    "Regen": {"/y/e/regen.png"},
-    "Shadow Veil": {"/y/e/shadowveil.png"},
-    "Spark of Life": {"/y/e/sparklife.png", "/y/e/sparklife_scroll.png"},
-    # Spirit icon
-    "Spirit Stance": {"/y/battle/spirit_a.png"},
-}
+# BUFF2ICONS = {
+#     # Item icons
+#     "Health Draught": {"/y/e/healthpot.png"},
+#     "Mana Draught": {"/y/e/manapot.png"},
+#     "Spirit Draught": {"/y/e/spiritpot.png"},
+#     "Scroll of Life": {"/y/e/sparklife_scroll.png"},
+#     "Scroll of Protection": {"/y/e/protection_scroll.png"},
+#     # Skill icons
+#     "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
+#     "Heartseeker": {"/y/e/heartseeker.png"},
+#     "Regen": {"/y/e/regen.png"},
+#     "Shadow Veil": {"/y/e/shadowveil.png"},
+#     "Spark of Life": {"/y/e/sparklife.png", "/y/e/sparklife_scroll.png"},
+#     # Spirit icon
+#     "Spirit Stance": {"/y/battle/spirit_a.png"},
+# }
 
-BUFF2ITEMS = {
-    "Absorb": ["Scroll of Absorption"],
-    "Protection": ["Scroll of Protection"],
-    "Spark of Life": ["Scroll of Life"],
-}
+# BUFF2ITEMS = {
+#     "Absorb": ["Scroll of Absorption"],
+#     "Protection": ["Scroll of Protection"],
+#     "Spark of Life": ["Scroll of Life"],
+# }
 
 
 class BuffManager:
@@ -75,7 +93,8 @@ class BuffManager:
         if self.has_buff(key) is False:
             return 0
 
-        turns = int(self.battle_dashboard.character_buffs.buffs[key])
+        remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
+        turns = int(remaining_turns)
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
 
@@ -89,11 +108,15 @@ class BuffManager:
         """
         Check if the buff is active.
         """
+        if not key in self.battle_dashboard.snap.player.buffs:
+            return False
 
-        return (
-            key in self.battle_dashboard.character_buffs.buffs
-            and self.battle_dashboard.character_buffs.buffs[key] >= 0
-        )
+        remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
+
+        if key in AutoCast_BUFFS:
+            return float("inf") > remaining_turns >= 0
+        else:
+            return remaining_turns >= 0
 
     def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
         """
@@ -109,7 +132,11 @@ class BuffManager:
         """
         Apply the buff if it is not already active.
         """
-        if all([not force, self.has_buff(key)]):
+        if key in SKILLS_TO_CHARACTER_BUFFS:
+            buff_key = SKILLS_TO_CHARACTER_BUFFS[key]
+        else:
+            buff_key = key
+        if all([not force, self.has_buff(buff_key)]):
             return False
 
         # Special cases
