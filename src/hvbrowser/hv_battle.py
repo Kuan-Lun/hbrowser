@@ -94,7 +94,8 @@ class BattleDriver(HVDriver):
     def click_skill(self, key: str, iswait=True) -> bool:
         if key in self.forbidden_skills:
             return False
-        return self._skillmanager.cast(key, iswait=iswait)
+        result = self._skillmanager.cast(key, iswait=iswait)
+        return result
 
     def get_stat_percent(self, stat: str) -> float:
         match stat.lower():
@@ -270,9 +271,9 @@ class BattleDriver(HVDriver):
         self.element_action_manager.click_and_wait_log(elements[0])
         return True
 
-    def attack_monster_by_skill(self, n: int, skill_name: str):
+    def attack_monster_by_skill(self, n: int, skill_name: str) -> bool:
         self.click_skill(skill_name, iswait=False)
-        self.attack_monster(n)
+        return self.attack_monster(n)
 
     def attack(self) -> bool:
         base_monster_ids = [1, 3, 5, 7, 9, 2, 4, 6, 8, 0]
@@ -332,13 +333,10 @@ class BattleDriver(HVDriver):
             for debuff in MONSTER_DEBUFF_TO_CHARACTER_SKILL:
                 if debuff in ["Imperiled"]:
                     continue
-                if (
-                    len(monster_alive_ids)
-                    - len(
-                        self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
-                    )
-                    < 3
-                ):
+                debuffed_monsters = (
+                    self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+                )
+                if len(monster_alive_ids) - len(debuffed_monsters) < 3:
                     continue
                 if self.debuff_monster(debuff, monster_alive_ids):
                     return True
@@ -376,6 +374,8 @@ class BattleDriver(HVDriver):
                     ].available
                 ):
                     self.attack_monster_by_skill(n, "Vital Strike")
+                else:
+                    self.attack_monster(n)
             else:
                 self.attack_monster(n)
             self.last_debuff_monster_id["Imperiled"] = -1
@@ -413,11 +413,12 @@ class BattleDriver(HVDriver):
 
         return False
 
-    def battle_in_turn(self) -> str:
+    def battle_in_turn(self) -> bool:
         self.turn += 1
         self.clear_cache()
         # Print the current round logs
-        print("\n".join(self.new_logs))
+        if self.new_logs:
+            print("\n".join(self.new_logs))
 
         for fun in [
             self.go_next_floor,
@@ -435,17 +436,13 @@ class BattleDriver(HVDriver):
             lambda: self.apply_buff("Absorb"),
             lambda: self.apply_buff("Scroll of Protection"),
             lambda: self.apply_buff("Heartseeker"),
+            self.use_channeling,
+            self.attack,
         ]:
             if fun():
-                return "continue"
+                return True
 
-        if self.use_channeling():
-            return "continue"
-
-        if self.attack():
-            return "continue"
-
-        return "break"
+        return False
 
     def _create_last_debuff_monster_id(self) -> None:
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
@@ -460,10 +457,5 @@ class BattleDriver(HVDriver):
         partial_click_skill_menu()
 
         while True:
-            match self.pausecontroller.pauseable(self.battle_in_turn)():
-                case "break":
-                    break
-                case "continue":
-                    continue
-                case _:
-                    raise ValueError("Unexpected return value from battle_in_turn.")
+            if not self.pausecontroller.pauseable(self.battle_in_turn)():
+                break
