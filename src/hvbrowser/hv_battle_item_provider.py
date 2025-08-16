@@ -13,10 +13,10 @@ GEM_ITEMS = {"Mystic Gem", "Health Gem", "Mana Gem", "Spirit Gem"}
 class ItemProvider:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.hvdriver: HVDriver = driver
+        self.battle_dashboard = battle_dashboard
         self.element_action_manager = ElementActionManager(
             self.hvdriver, battle_dashboard
         )
-        self._checked_items: dict[str, str] = defaultdict(lambda: "available")
 
     @property
     def driver(self) -> WebDriver:
@@ -39,27 +39,6 @@ class ItemProvider:
     def get_pane_items(self) -> WebElement:
         return self.hvdriver.driver.find_element(By.ID, "pane_item")
 
-    def get_item_status(self, item: str) -> str:
-        """
-        回傳 'available', 'unavailable', 'not_found'
-        """
-        if self._checked_items[item] == "not_found":
-            return "not_found"
-
-        item_divs = self.get_pane_items().find_elements(
-            By.XPATH, f"//div/div[text()='{item}']"
-        )
-        if not item_divs:
-            if item not in GEM_ITEMS:
-                self._checked_items[item] = "not_found"
-            return "not_found"
-
-        for div in item_divs:
-            parent = div.find_element(By.XPATH, "./ancestor::div[2]")
-            if parent.get_attribute("id") and parent.get_attribute("onclick"):
-                return "available"
-        return "unavailable"
-
     def get_item_elements(self, item: str) -> list[WebElement]:
         return self.get_pane_items().find_elements(
             By.XPATH,
@@ -69,10 +48,10 @@ class ItemProvider:
         )
 
     def use(self, item: str) -> bool:
-        if self._checked_items[item] == "not_found":
+        if item not in self.battle_dashboard.snap.items.items:
             return False
 
-        if self.get_item_status(item) == "unavailable":
+        if not self.battle_dashboard.snap.items.items[item].available:
             return False
 
         item_button_list = self.get_item_elements(item)
