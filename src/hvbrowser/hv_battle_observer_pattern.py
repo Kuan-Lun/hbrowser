@@ -9,6 +9,19 @@ from hv_bie.types import BattleSnapshot
 from .hv import HVDriver
 
 
+class DefaultMinusOneDict(dict):
+    """A dict that returns -1 for missing keys without inserting them."""
+
+    def __missing__(self, key):  # type: ignore[override]
+        return -1
+
+    def get(self, key, default=None):  # type: ignore[override]
+        # By default, behave like __getitem__ and return -1 for missing keys
+        if default is None:
+            return self[key]
+        return super().get(key, default)
+
+
 class Observer(ABC):
     @abstractmethod
     def update(self, snap: BattleSnapshot) -> None:
@@ -32,6 +45,19 @@ class BattleSubject:
         self.snap = parse_snapshot(self._hvdriver.driver.page_source)
         for observer in self._observers:
             observer.update(self.snap)
+
+
+@dataclass
+class OverviewMonsters:
+    alive_monster: list[int] = field(default_factory=list)
+    alive_system_monster: list[int] = field(default_factory=list)
+    alive_monster_with_buff: dict[str, list[int]] = field(default_factory=dict)
+    alive_monster_name: dict[str, int] = field(default_factory=DefaultMinusOneDict)
+
+
+class ExtendedBattleSnapshot(BattleSnapshot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
 
 @dataclass
@@ -70,6 +96,7 @@ class BattleDashboard:
         self._hvdriver = driver
         self.battle_subject = BattleSubject(driver)
         self.snap = self.battle_subject.snap
+        self.overview_monsters = OverviewMonsters()
         self.log_entries: LogEntry = LogEntry()
         self.battle_subject.attach(self.log_entries)
         self.update()
@@ -77,3 +104,28 @@ class BattleDashboard:
     def update(self):
         self.battle_subject.notify()
         self.snap = self.battle_subject.snap
+        self.update_overview_monsters()
+
+    def update_overview_monsters(self):
+        self.overview_monsters.alive_monster = [
+            monster.slot_index
+            for monster in self.snap.monsters.values()
+            if monster.alive
+        ]
+        self.overview_monsters.alive_system_monster = [
+            monster.slot_index
+            for monster in self.snap.monsters.values()
+            if monster.alive and monster.system_monster_type
+        ]
+        self.overview_monsters.alive_monster_with_buff = {
+            buff: [
+                monster.slot_index
+                for monster in self.snap.monsters.values()
+                if monster.alive and buff in monster.buffs
+            ]
+            for buff in set(
+                buff
+                for monster in self.snap.monsters.values()
+                for buff in monster.buffs
+            )
+        }

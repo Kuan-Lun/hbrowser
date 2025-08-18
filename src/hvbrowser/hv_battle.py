@@ -10,7 +10,6 @@ from .hv_battle_item_provider import ItemProvider
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_buff_manager import BuffManager
-from .hv_battle_monster_status_manager import MonsterStatusManager
 
 # from .hv_battle_dashboard import BattleDashBoard
 from .pause_controller import PauseController
@@ -71,7 +70,6 @@ class BattleDriver(HVDriver):
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
-        self._monsterstatusmanager = MonsterStatusManager(self, self.battle_dashboard)
         self.pausecontroller = PauseController()
         self.turn = -1
         self.round = -1
@@ -142,10 +140,6 @@ class BattleDriver(HVDriver):
                     else:
                         return False
         return apply_buff()
-
-    @property
-    def system_monster_alive_ids(self) -> list[int]:
-        return self._monsterstatusmanager.alive_system_monster_ids
 
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
@@ -251,7 +245,9 @@ class BattleDriver(HVDriver):
             return False
 
         monster_ids_with_debuff = (
-            self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+            self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(
+                debuff, []
+            )
         ) + [self.last_debuff_monster_id[debuff]]
         for num in nums:
             if num not in monster_ids_with_debuff:
@@ -287,16 +283,17 @@ class BattleDriver(HVDriver):
             monster_alive_ids = [
                 id
                 for id in bmlist
-                if id in self._monsterstatusmanager.alive_monster_ids
+                if id in self.battle_dashboard.overview_monsters.alive_monster
             ]
-            if len(self.system_monster_alive_ids):
+            if len(self.battle_dashboard.overview_monsters.alive_monster):
                 monster_alive_ids = monster_ids_starting_with(
-                    monster_alive_ids, self.system_monster_alive_ids[0]
+                    monster_alive_ids,
+                    self.battle_dashboard.overview_monsters.alive_monster[0],
                 )
             for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][::-1]:
-                monster_id = self._monsterstatusmanager.get_monster_id_by_name(
+                monster_id = self.battle_dashboard.overview_monsters.alive_monster_name[
                     monster_name
-                )
+                ]
                 if monster_id in monster_alive_ids:
                     monster_alive_ids = monster_ids_starting_with(
                         monster_alive_ids, monster_id
@@ -308,7 +305,7 @@ class BattleDriver(HVDriver):
             self.with_ofc
             and self.get_stat_percent("overcharge") > 220
             and self._buffmanager.has_buff("Spirit Stance")
-            and self._monsterstatusmanager.alive_count
+            and len(self.battle_dashboard.overview_monsters.alive_monster)
             >= self.statthreshold.countmonster[1]
             and "Orbital Friendship Cannon"
             in self.battle_dashboard.snap.abilities.skills
@@ -317,7 +314,7 @@ class BattleDriver(HVDriver):
             ].available
         ):
             self.attack_monster_by_skill(
-                self._monsterstatusmanager.alive_monster_ids[0],
+                self.battle_dashboard.overview_monsters.alive_monster[0],
                 "Orbital Friendship Cannon",
             )
             return True
@@ -334,7 +331,9 @@ class BattleDriver(HVDriver):
                 if debuff in ["Imperiled"]:
                     continue
                 debuffed_monsters = (
-                    self._monsterstatusmanager.get_monster_ids_with_debuff(debuff)
+                    self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(
+                        debuff, []
+                    )
                 )
                 if len(monster_alive_ids) - len(debuffed_monsters) < 3:
                     continue
@@ -347,51 +346,57 @@ class BattleDriver(HVDriver):
             and self.get_stat_percent("mp") > self.statthreshold.mp[1]
         ):
             monster_with_imperil = (
-                self._monsterstatusmanager.get_monster_ids_with_debuff("Imperiled")
+                self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(
+                    "Imperiled", []
+                )
             )
         else:
             monster_with_imperil = monster_alive_ids
 
-        n = monster_alive_ids[0]
-        if n in monster_with_imperil:
-            if self.get_stat_percent("overcharge") > 200 and self._buffmanager.has_buff(
-                "Spirit Stance"
-            ):
-                monster_health = self.battle_dashboard.snap.monsters[n].hp_percent
-                if (
-                    monster_health < 25
-                    and "Merciful Blow" in self.battle_dashboard.snap.abilities.skills
-                    and self.battle_dashboard.snap.abilities.skills[
-                        "Merciful Blow"
-                    ].available
-                ):
-                    self.attack_monster_by_skill(n, "Merciful Blow")
-                elif (
-                    monster_health > 5
-                    and "Vital Strike" in self.battle_dashboard.snap.abilities.skills
-                    and self.battle_dashboard.snap.abilities.skills[
-                        "Vital Strike"
-                    ].available
-                ):
-                    self.attack_monster_by_skill(n, "Vital Strike")
+        if monster_alive_ids:
+            n = monster_alive_ids[0]
+            if n in monster_with_imperil:
+                if self.get_stat_percent(
+                    "overcharge"
+                ) > 200 and self._buffmanager.has_buff("Spirit Stance"):
+                    monster_health = self.battle_dashboard.snap.monsters[n].hp_percent
+                    if (
+                        monster_health < 25
+                        and "Merciful Blow"
+                        in self.battle_dashboard.snap.abilities.skills
+                        and self.battle_dashboard.snap.abilities.skills[
+                            "Merciful Blow"
+                        ].available
+                    ):
+                        self.attack_monster_by_skill(n, "Merciful Blow")
+                    elif (
+                        monster_health > 5
+                        and "Vital Strike"
+                        in self.battle_dashboard.snap.abilities.skills
+                        and self.battle_dashboard.snap.abilities.skills[
+                            "Vital Strike"
+                        ].available
+                    ):
+                        self.attack_monster_by_skill(n, "Vital Strike")
+                    else:
+                        self.attack_monster(n)
                 else:
                     self.attack_monster(n)
+                self.last_debuff_monster_id["Imperiled"] = -1
             else:
-                self.attack_monster(n)
-            self.last_debuff_monster_id["Imperiled"] = -1
+                if n == self.last_debuff_monster_id["Imperiled"]:
+                    if random() < 0.5:
+                        self.attack_monster_by_skill(n, "Imperil")
+                    else:
+                        self.attack_monster(n)
+                else:
+                    self.attack_monster_by_skill(
+                        n, MONSTER_DEBUFF_TO_CHARACTER_SKILL["Imperiled"]
+                    )
+                    self.last_debuff_monster_id["Imperiled"] = n
+            return True
         else:
-            if n == self.last_debuff_monster_id["Imperiled"]:
-                # If the last debuffed monster is the same, attack it directly
-                if random() < 0.5:
-                    self.attack_monster_by_skill(n, "Imperil")
-                else:
-                    self.attack_monster(n)
-            else:
-                self.attack_monster_by_skill(
-                    n, MONSTER_DEBUFF_TO_CHARACTER_SKILL["Imperiled"]
-                )
-                self.last_debuff_monster_id["Imperiled"] = n
-        return True
+            return False
 
     def use_channeling(self) -> bool:
         if "Channeling" in self.battle_dashboard.snap.player.buffs:
