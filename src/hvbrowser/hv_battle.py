@@ -121,6 +121,8 @@ class BattleDriver(HVDriver):
         return self._itemprovider.use(key)
 
     def apply_buff(self, key: str, force: bool = False) -> bool:
+        if key in self.forbidden_skills:
+            return False
         apply_buff = partial(self._buffmanager.apply_buff, key=key, force=force)
         if not force:
             match key:
