@@ -293,6 +293,11 @@ class BattleDriver(HVDriver):
                     self.battle_dashboard.overview_monsters.alive_monster[0],
                 )
             for monster_name in ["Yggdrasil", "Skuld", "Urd", "Verdandi"][::-1]:
+                if (
+                    monster_name
+                    not in self.battle_dashboard.overview_monsters.alive_monster_name
+                ):
+                    continue
                 monster_id = self.battle_dashboard.overview_monsters.alive_monster_name[
                     monster_name
                 ]
