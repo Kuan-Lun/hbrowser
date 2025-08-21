@@ -129,3 +129,8 @@ class BattleDashboard:
                 for buff in monster.buffs
             )
         }
+        self.overview_monsters.alive_monster_name = {
+            monster.name: monster.slot_index
+            for monster in self.snap.monsters.values()
+            if monster.alive
+        }
