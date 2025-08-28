@@ -142,8 +142,9 @@ class BuffManager:
         # Special cases
         match key:
             case "Spirit Stance":
-                self.element_action_manager.click_and_wait_log(
-                    self.driver.find_element(By.ID, "ckey_spirit")
+                # Use locator-based resilient click; Spirit Stance toggles instantly
+                self.element_action_manager.click_and_wait_log_locator(
+                    By.ID, "ckey_spirit"
                 )
                 return True
 

@@ -25,7 +25,10 @@ class ItemProvider:
         return self.hvdriver.driver.find_element(By.ID, "ckey_items")
 
     def click_items_menu(self) -> None:
-        self.element_action_manager.click(self.items_menu_web_element)
+        # Resilient click to mitigate stale menu button
+        self.element_action_manager.click_resilient(
+            lambda: self.hvdriver.driver.find_element(By.ID, "ckey_items")
+        )
 
     def is_open_items_menu(self) -> bool:
         """
@@ -59,5 +62,11 @@ class ItemProvider:
         if not self.is_open_items_menu():
             self.click_items_menu()
             item_button_list = self.get_item_elements(item)
-        self.element_action_manager.click_and_wait_log(item_button_list[0])
+        # Use locator-based click (derive unique locator via first element's id attribute if present)
+        target = item_button_list[0]
+        item_id = target.get_attribute("id")
+        if item_id:
+            self.element_action_manager.click_and_wait_log_locator(By.ID, item_id)
+        else:
+            raise ValueError("Item ID not found")
         return True

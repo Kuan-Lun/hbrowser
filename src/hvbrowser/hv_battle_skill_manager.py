@@ -2,6 +2,7 @@ from collections import defaultdict
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.common.exceptions import StaleElementReferenceException
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
@@ -29,29 +30,55 @@ class SkillManager:
         return f"//div[not(@style)]/div/div[contains(text(), '{key}')]"
 
     def _click_skill_menu(self):
-        button = self.driver.find_element(By.ID, "ckey_skill")
-        button.click()
+        # Use resilient locator-based click
+        try:
+            self.element_action_manager.click_resilient(
+                lambda: self.driver.find_element(By.ID, "ckey_skill")
+            )
+        except StaleElementReferenceException:
+            # One more direct attempt (DOM might have re-rendered menu container)
+            self.element_action_manager.click_resilient(
+                lambda: self.driver.find_element(By.ID, "ckey_skill")
+            )
 
     def open_skills_menu(self):
-        if "display: none;" == self.driver.find_element(
-            By.ID, "pane_skill"
-        ).get_attribute("style"):
-            self._click_skill_menu()
-            self.open_skills_menu()
+        attempts = 0
+        while True:
+            style = self.driver.find_element(By.ID, "pane_skill").get_attribute("style")
+            if style != "display: none;":
+                break
+            if attempts >= 5:  # safety cap
+                break
+            try:
+                self._click_skill_menu()
+            except StaleElementReferenceException:
+                pass
+            attempts += 1
 
     def open_spells_menu(self):
-        if "display: none;" == self.driver.find_element(
-            By.ID, "pane_magic"
-        ).get_attribute("style"):
-            self._click_skill_menu()
-            self.open_spells_menu()
+        attempts = 0
+        while True:
+            style = self.driver.find_element(By.ID, "pane_magic").get_attribute("style")
+            if style != "display: none;":
+                break
+            if attempts >= 5:
+                break
+            try:
+                self._click_skill_menu()
+            except StaleElementReferenceException:
+                pass
+            attempts += 1
 
     def _click_skill(self, skill_xpath: str, iswait: bool):
-        element = self.driver.find_element(By.XPATH, skill_xpath)
         if iswait:
-            self.element_action_manager.click_and_wait_log(element)
+            # Use locator-based wait+click so stale elements are re-found
+            self.element_action_manager.click_and_wait_log_locator(
+                By.XPATH, skill_xpath
+            )
         else:
-            self.element_action_manager.click(element)
+            self.element_action_manager.click_resilient(
+                lambda: self.driver.find_element(By.XPATH, skill_xpath)
+            )
 
     def cast(self, key: str, iswait=True) -> bool:
         if key not in self.get_skills_and_spells():

@@ -1,4 +1,5 @@
 from functools import partial
+import time
 from collections import defaultdict
 from random import random
 
@@ -232,14 +233,12 @@ class BattleDriver(HVDriver):
         return False
 
     def go_next_floor(self) -> bool:
-        continue_elements = self.driver.find_elements(By.ID, "btcp")
-
-        if continue_elements:
-            self.element_action_manager.click_and_wait_log(continue_elements[0])
+        # Use locator-based click to avoid stale element caching
+        if self.driver.find_elements(By.ID, "btcp"):
+            self.element_action_manager.click_and_wait_log_locator(By.ID, "btcp")
             self._create_last_debuff_monster_id()
             return True
-        else:
-            return False
+        return False
 
     def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
@@ -261,12 +260,10 @@ class BattleDriver(HVDriver):
         return False
 
     def attack_monster(self, n: int) -> bool:
-        elements = self.driver.find_elements(By.ID, "mkey_{n}".format(n=n))
-
-        if not elements:
+        element_id = f"mkey_{n}"
+        if not self.driver.find_elements(By.ID, element_id):
             return False
-
-        self.element_action_manager.click_and_wait_log(elements[0])
+        self.element_action_manager.click_and_wait_log_locator(By.ID, element_id)
         return True
 
     def attack_monster_by_skill(self, n: int, skill_name: str) -> bool:
@@ -461,12 +458,16 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         self._create_last_debuff_monster_id()
-        partial_click_skill_menu = partial(
-            self.element_action_manager.click,
-            self.driver.find_element(By.ID, "ckey_skill"),
-        )
-        partial_click_skill_menu()
-        partial_click_skill_menu()
+        # Open skill menu twice using resilient locator-based click (no element caching & no log wait)
+        from selenium.webdriver.common.by import (
+            By as _By,
+        )  # local import to avoid top-level clutter
+
+        for _ in range(2):
+            self.element_action_manager.click_resilient(
+                lambda: self.driver.find_element(_By.ID, "ckey_skill")
+            )
+            time.sleep(0.05)
 
         while True:
             if not self.pausecontroller.pauseable(self.battle_in_turn)():
