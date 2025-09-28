@@ -24,7 +24,7 @@ def beep_os_independent():
         if sys.platform == "darwin":
             # macOS: 使用 AppleScript 的系统蜂鸣，更稳定
             # 若 osascript 不可用，则回退到 ASCII 铃声
-            exit_code = os.system('say -v Alex "RiddleMaster event! Solve it now!"')
+            exit_code = os.system('say -v Alex "Warning"')
             if exit_code == 0:
                 return
             # 回退：继续走到通用分支
