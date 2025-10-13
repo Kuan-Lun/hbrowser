@@ -1,9 +1,10 @@
-from functools import partial
+from functools import partial, wraps
 import time
 from collections import defaultdict
 from random import random
 
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import UnexpectedAlertPresentException
 
 from .hv import HVDriver
 from .hv_battle_ponychart import PonyChart
@@ -12,7 +13,6 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_skill_manager import SkillManager
 from .hv_battle_buff_manager import BuffManager
 
-# from .hv_battle_dashboard import BattleDashBoard
 from .pause_controller import PauseController
 from .hv_battle_observer_pattern import BattleDashboard
 
@@ -27,6 +27,33 @@ MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
     "Vital Theft": "Drain",
     "Silenced": "Silence",
 }
+
+
+def retry_on_server_fail(func):
+    """在出現 Server communication failed alert 時，自動刷新頁面並重試一次"""
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except UnexpectedAlertPresentException:
+            try:
+                alert = self.hvdriver.driver.switch_to.alert
+                text = alert.text
+                alert.accept()
+                if "Server communication failed" in text:
+                    print(
+                        "[WARN] Server communication failed detected, retrying after refresh..."
+                    )
+                    time.sleep(5)
+                    self.hvdriver.driver.refresh()
+                    return func(self, *args, **kwargs)
+            except Exception as e:
+                print(f"[ERROR] Failed to handle alert or refresh: {e}")
+            # 如果不是這種錯誤或重試也失敗，拋出原例外
+            raise
+
+    return wrapper
 
 
 class StatThreshold:
@@ -422,6 +449,7 @@ class BattleDriver(HVDriver):
 
         return False
 
+    @retry_on_server_fail
     def battle_in_turn(self) -> bool:
         self.turn += 1
         self.clear_cache()
