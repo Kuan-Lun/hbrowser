@@ -7,3 +7,7 @@ build
 dist
 cProfile_result.txt
 .DS_Store
+
+!/.gitignore
+!/.vscode/
+!.vscode/**
