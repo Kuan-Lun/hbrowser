@@ -10,7 +10,8 @@ from selenium.webdriver.common.by import By
 from hbrowser.gallery import EHDriver
 
 
-genxpath = lambda imagepath: '//img[@src="{imagepath}"]'.format(imagepath=imagepath)
+def genxpath(imagepath):
+    return '//img[@src="{imagepath}"]'.format(imagepath=imagepath)
 
 
 def searchxpath_fun(srclist: list | tuple | set) -> str:
