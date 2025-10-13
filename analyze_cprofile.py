@@ -8,7 +8,7 @@ cProfile結果分析工具
 
 import re
 import argparse
-from typing import List, Dict, Tuple
+from typing import List
 
 
 class ProfileLine:
@@ -249,7 +249,7 @@ class CProfileAnalyzer:
             return
 
         # 分析真正的瓶頸：自身時間少但累計時間多的函數（說明大部分時間花在調用其他函數上）
-        print(f"\n=== hbrowser 真正效能瓶頸 (累計時間高但自身時間低的函數) ===")
+        print("\n=== hbrowser 真正效能瓶頸 (累計時間高但自身時間低的函數) ===")
         print(
             f"{'累計時間':<10} {'自身時間':<10} {'時間比率':<10} {'調用次數':<10} {'函數位置':<50}"
         )
@@ -280,7 +280,7 @@ class CProfileAnalyzer:
             )
 
         # 按模組分組統計
-        print(f"\n=== hbrowser 套件按模組分組統計 ===")
+        print("\n=== hbrowser 套件按模組分組統計 ===")
         module_stats = {}
         for line in hbrowser_lines:
             module = line.get_hbrowser_module()
@@ -301,7 +301,7 @@ class CProfileAnalyzer:
             )
 
         # 找出最可能的效能瓶頸
-        print(f"\n=== hbrowser 效能瓶頸分析 ===")
+        print("\n=== hbrowser 效能瓶頸分析 ===")
         print(
             "這些函數累計時間長，但自身時間短，說明大部分時間花在調用其他函數（如 selenium）:"
         )
@@ -316,13 +316,13 @@ class CProfileAnalyzer:
                 print(f"   時間比率: {ratio:.1f}x (累計/自身)")
                 print(f"   調用次數: {line.ncalls}")
                 print(f"   位置: {line.filename_function}")
-                print(f"   → 這個函數可能調用了耗時的 selenium 或網路操作")
+                print("   → 這個函數可能調用了耗時的 selenium 或網路操作")
         else:
             print("未檢測到明顯的 hbrowser 效能瓶頸")
 
     def analyze_external_calls_impact(self):
         """分析外部函數調用對 hbrowser 的影響"""
-        print(f"\n=== 外部函數對 hbrowser 的效能影響分析 ===")
+        print("\n=== 外部函數對 hbrowser 的效能影響分析 ===")
 
         # 找出最耗時的外部函數
         external_lines = [line for line in self.lines if not line.is_hbrowser_package()]
@@ -345,7 +345,7 @@ class CProfileAnalyzer:
                 f"{line.cumtime:<10.3f} {line.tottime:<10.3f} {line.ncalls:<10} {line.filename_function[:49]:<50}"
             )
 
-        print(f"\n對應的 hbrowser 函數 (可能調用了上述外部函數):")
+        print("\n對應的 hbrowser 函數 (可能調用了上述外部函數):")
         print(
             f"{'累計時間':<10} {'自身時間':<10} {'時間比率':<10} {'調用次數':<10} {'函數':<40}"
         )
@@ -364,7 +364,7 @@ class CProfileAnalyzer:
                         f"{line.cumtime:<10.3f} {line.tottime:<10.3f} {ratio_str:<10} {line.ncalls:<10} {line.function_name[:39]:<40}"
                     )
 
-        print(f"\n💡 分析建議:")
+        print("\n💡 分析建議:")
         print(
             "- 累計時間高但自身時間低的 hbrowser 函數，表示大部分時間花在調用外部函數"
         )
@@ -373,7 +373,7 @@ class CProfileAnalyzer:
 
     def analyze_time_distribution(self):
         """分析時間分布和調用關係"""
-        print(f"\n=== 時間分布分析 ===")
+        print("\n=== 時間分布分析 ===")
 
         # 計算真正消耗時間的函數（自身時間較高的）
         high_tottime = [line for line in self.lines if line.tottime > 0.1]
@@ -401,7 +401,7 @@ class CProfileAnalyzer:
 
         high_amplification.sort(key=lambda x: x[1], reverse=True)
 
-        print(f"\n🔄 調用放大效應最嚴重的函數 (可能是效能瓶頸的入口點):")
+        print("\n🔄 調用放大效應最嚴重的函數 (可能是效能瓶頸的入口點):")
         print(
             f"{'放大倍數':<10} {'累計時間':<10} {'自身時間':<10} {'調用次數':<10} {'函數':<40}"
         )
@@ -413,14 +413,14 @@ class CProfileAnalyzer:
             )
 
         if high_amplification:
-            print(f"\n💡 分析建議:")
+            print("\n💡 分析建議:")
             print("• 放大倍數高的函數是調用鏈的上游，優化它們可能帶來最大收益")
             print("• 這些函數本身執行很快，但調用了很多耗時的子函數")
             print("• 考慮減少這些函數的調用次數，或優化其調用的子函數")
 
     def analyze_by_category(self):
         """按類別分析"""
-        print(f"\n=== 按類別分析總耗時 ===")
+        print("\n=== 按類別分析總耗時 ===")
 
         categories = {
             "hbrowser套件": lambda x: x.is_hbrowser_package(),
@@ -491,14 +491,14 @@ class CProfileAnalyzer:
 
     def performance_summary(self):
         """效能總結"""
-        print(f"\n=== 效能分析總結 ===")
+        print("\n=== 效能分析總結 ===")
         print(f"總執行時間: {self.total_time:.3f} 秒")
         print(f"總函數調用數: {sum(line.ncalls for line in self.lines):,}")
         print(f"分析的函數數量: {len(self.lines)}")
 
         # 找出最耗時的前5個函數（按累計時間）
         top_5_cumtime = sorted(self.lines, key=lambda x: x.cumtime, reverse=True)[:5]
-        print(f"\n最耗時的5個函數 (按累計時間 - 包含子函數調用):")
+        print("\n最耗時的5個函數 (按累計時間 - 包含子函數調用):")
         print("💡 注意：累計時間可能超過總執行時間，因為包含重疊的子函數調用時間")
         for i, line in enumerate(top_5_cumtime, 1):
             percentage = (
@@ -510,7 +510,7 @@ class CProfileAnalyzer:
 
         # 找出最耗時的前5個函數（按自身時間）
         top_5_tottime = sorted(self.lines, key=lambda x: x.tottime, reverse=True)[:5]
-        print(f"\n最耗時的5個函數 (按自身時間 - 不包含子函數調用):")
+        print("\n最耗時的5個函數 (按自身時間 - 不包含子函數調用):")
         total_tottime = sum(line.tottime for line in self.lines)
         for i, line in enumerate(top_5_tottime, 1):
             percentage = (
@@ -520,17 +520,17 @@ class CProfileAnalyzer:
                 f"  {i}. {line.function_name} - {line.tottime:.3f}秒 ({percentage:.1f}%)"
             )
 
-        print(f"\n📊 時間分析說明:")
-        print(f"• 累計時間 (cumtime): 包含該函數及其所有子函數的執行時間")
-        print(f"• 自身時間 (tottime): 僅該函數本身的執行時間（不含子函數）")
+        print("\n📊 時間分析說明:")
+        print("• 累計時間 (cumtime): 包含該函數及其所有子函數的執行時間")
+        print("• 自身時間 (tottime): 僅該函數本身的執行時間（不含子函數）")
         print(f"• 累計時間總和: {sum(line.cumtime for line in self.lines):.3f}秒")
         print(f"• 自身時間總和: {total_tottime:.3f}秒")
         print(f"• 實際執行時間: {self.total_time:.3f}秒")
-        print(f"• 累計時間超過實際時間是正常的，因為子函數調用時間被重複計算")
+        print("• 累計時間超過實際時間是正常的，因為子函數調用時間被重複計算")
 
     def analyze_battle_in_turn_details(self, hbrowser_lines):
         """詳細分析 battle_in_turn 內部的函數調用"""
-        print(f"\n=== battle_in_turn 內部函數調用分析 ===")
+        print("\n=== battle_in_turn 內部函數調用分析 ===")
 
         # 找到 battle_in_turn 函數
         battle_in_turn_line = None
@@ -543,7 +543,7 @@ class CProfileAnalyzer:
             print("未找到 battle_in_turn 函數")
             return
 
-        print(f"battle_in_turn 總計:")
+        print("battle_in_turn 總計:")
         print(f"  累計時間: {battle_in_turn_line.cumtime:.3f}秒")
         print(f"  自身時間: {battle_in_turn_line.tottime:.3f}秒")
         print(f"  調用次數: {battle_in_turn_line.ncalls}")
@@ -572,7 +572,7 @@ class CProfileAnalyzer:
             "find_element",
         ]
 
-        print(f"\n可能由 battle_in_turn 調用的函數 (按累計時間排序):")
+        print("\n可能由 battle_in_turn 調用的函數 (按累計時間排序):")
         print(
             f"{'累計時間':<10} {'自身時間':<10} {'調用次數':<10} {'平均耗時':<10} {'函數':<30}"
         )
@@ -596,7 +596,7 @@ class CProfileAnalyzer:
             )
 
         # 分析平均每次調用最慢的函數
-        print(f"\n平均每次調用最慢的函數:")
+        print("\n平均每次調用最慢的函數:")
         print(f"{'平均耗時':<10} {'累計時間':<10} {'調用次數':<10} {'函數':<40}")
         print("-" * 75)
 
