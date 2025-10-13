@@ -108,7 +108,7 @@ class BuffManager:
         """
         Check if the buff is active.
         """
-        if not key in self.battle_dashboard.snap.player.buffs:
+        if key not in self.battle_dashboard.snap.player.buffs:
             return False
 
         remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
