@@ -227,8 +227,8 @@ class PonyChart:
         except Exception as e:  # pragma: no cover
             print(f"[PonyChart] 自動勾選失敗: {e}")
 
-        # 原始等待邏輯 (約 10 秒) 保留
-        waitlimit = 10
+        # 原始等待邏輯 (約 15 秒) 保留
+        waitlimit = 15
         while waitlimit > 0 and self._check():
             time.sleep(1)
             waitlimit -= 1
