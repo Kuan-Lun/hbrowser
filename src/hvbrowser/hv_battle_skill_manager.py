@@ -111,6 +111,9 @@ class SkillManager:
         根據技能名稱（如 'Haste' 或 'Weaken'）從 HTML 片段中找出對應的數值。
         """
 
+        if skill_name not in self.get_skills_and_spells():
+            return -1  # Default cost if skill not found
+
         self.skills_cost[skill_name] = max(
             self.get_skills_and_spells()[skill_name].cost,
             self.skills_cost[skill_name],
