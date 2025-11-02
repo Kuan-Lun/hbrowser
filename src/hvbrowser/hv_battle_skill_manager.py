@@ -1,5 +1,6 @@
 from collections import defaultdict
 
+from hv_bie.types import Ability
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import StaleElementReferenceException
@@ -99,7 +100,7 @@ class SkillManager:
         else:
             return False
 
-    def get_skills_and_spells(self):
+    def get_skills_and_spells(self) -> dict[str, Ability]:
         return (
             self.battle_dashboard.snap.abilities.skills
             | self.battle_dashboard.snap.abilities.spells
