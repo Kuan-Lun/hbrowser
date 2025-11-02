@@ -442,6 +442,9 @@ class BattleDriver(HVDriver):
                 skill2remaining[skill_name] = (
                     (refresh_turns - remaining_turns) * refresh_turns / skill_cost
                 )
+            if max(skill2remaining.values()) < 0:
+                return False
+
             to_use_skill_name = max(skill2remaining, key=lambda k: skill2remaining[k])
 
             self.apply_buff(to_use_skill_name, force=True)
