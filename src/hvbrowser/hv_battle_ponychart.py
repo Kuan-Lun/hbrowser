@@ -10,6 +10,13 @@ import cv2 as cv
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 
+if sys.platform == "darwin":
+    import tensorflow as tf
+
+    Interpreter = tf.lite.Interpreter
+else:
+    from tflite_runtime.interpreter import Interpreter
+
 from hbrowser.beep import beep_os_independent
 from .hv import HVDriver
 
@@ -58,6 +65,34 @@ class _InlineModel:
         self.sd = None
         self.classes: List[str] = []
         self.thresholds: Dict[str, float] = {}
+
+        # TFLite 相關：全都掛在實例上，避免全域變數
+        self._tflite_interpreter = None
+        self._tflite_input_details = None
+        self._tflite_output_details = None
+
+    def _load_tflite(self) -> None:
+        """如果 hog_multilabel.tflite 存在，就載入 TFLite interpreter。
+        若不存在，就保持 None，之後 predict 會 fallback 用 numpy 的 W@x+b。
+        """
+        if self._tflite_interpreter is not None:
+            return  # 已經載入過了
+
+        model_path = os.path.join(self._dir(), "hog_multilabel.tflite")
+        if not os.path.exists(model_path):
+            return  # 還沒建立 TFLite 模型，就當沒這回事
+
+        interpreter = Interpreter(
+            model_path=os.path.join(
+                os.path.dirname(__file__),
+                "hv_battle_ponychart_ml",
+                "hog_multilabel.tflite",
+            )
+        )
+        interpreter.allocate_tensors()
+        self._tflite_interpreter = interpreter
+        self._tflite_input_details = interpreter.get_input_details()
+        self._tflite_output_details = interpreter.get_output_details()
 
     def _dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "hv_battle_ponychart_ml")
@@ -112,19 +147,53 @@ class _InlineModel:
         return gray
 
     def predict(
-        self, img_path: str, min_k=1, max_k=3
+        self, img_path: str, min_k: int = 1, max_k: int = 3
     ) -> Tuple[List[str], Dict[str, float]]:
+        # 1. 照舊載入權重
         self.load()
+        # 2. 若有 TFLite backend + .tflite 檔，就載入 interpreter
+        self._load_tflite()
+
         img = cv.imread(img_path, cv.IMREAD_COLOR)
         if img is None:
             raise RuntimeError(f"無法讀取圖片: {img_path}")
         gray = self._pre(img)
+
+        # HOG + 標準化：完全沿用原本邏輯
         x = self._hog().compute(gray).reshape(-1).astype(np.float32)
         x = (x - self.mu) / (self.sd + 1e-8) if self.sd is not None else x - self.mu
-        logits = self.W @ x + self.b
-        probs = 1.0 / (1.0 + np.exp(-logits))
-        scores = {self.classes[i]: float(probs[i]) for i in range(len(self.classes))}
-        picked = [c for c, p in scores.items() if p >= self.thresholds.get(c, 0.5)]
+
+        # ---- 這裡開始：決定用 TFLite 還是 numpy ----
+        if (
+            self._tflite_interpreter is not None
+            and self._tflite_input_details is not None
+            and self._tflite_output_details is not None
+        ):
+            # 使用 TFLite 推論（假設 .tflite 模型輸出已經是 sigmoid 後的機率）
+            interpreter = self._tflite_interpreter
+            input_details = self._tflite_input_details
+            output_details = self._tflite_output_details
+
+            # TFLite 要求輸入 shape 為 [1, D]
+            inp = x[np.newaxis, :].astype(input_details[0]["dtype"])
+            interpreter.set_tensor(input_details[0]["index"], inp)
+            interpreter.invoke()
+            out = interpreter.get_tensor(output_details[0]["index"])
+            probs = out[0].astype(np.float32)  # shape: [C]
+        else:
+            # 回退使用原本 numpy 線性模型
+            logits = self.W @ x + self.b
+            probs = 1.0 / (1.0 + np.exp(-logits))
+
+        # ---- 以下完全原樣保留：scores + picked ----
+        scores: Dict[str, float] = {
+            self.classes[i]: float(probs[i]) for i in range(len(self.classes))
+        }
+
+        picked: List[str] = [
+            c for c, p in scores.items() if p >= self.thresholds.get(c, 0.5)
+        ]
+
         if len(picked) < min_k:
             picked = [
                 c
@@ -136,9 +205,12 @@ class _InlineModel:
             picked = [
                 c
                 for c, _ in sorted(
-                    ((c, scores[c]) for c in picked), key=lambda kv: kv[1], reverse=True
+                    ((c, scores[c]) for c in picked),
+                    key=lambda kv: kv[1],
+                    reverse=True,
                 )[:max_k]
             ]
+
         return picked, scores
 
 
