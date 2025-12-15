@@ -1,6 +1,5 @@
 __all__ = [
     "beep_os_independent",
-    "DriverPass",
     "EHDriver",
     "ExHDriver",
     "Tag",
@@ -8,7 +7,6 @@ __all__ = [
 
 from .beep import beep_os_independent
 from .gallery import (
-    DriverPass,
     EHDriver,
     ExHDriver,
     Tag,
