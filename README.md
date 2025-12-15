@@ -37,12 +37,10 @@ HBrowser uses [2Captcha](https://2captcha.com/) service to automatically solve C
 Here's a quick example of how to use HBrowser:
 
 ```python
-from hbrowser import DriverPass, EHDriver
+from hbrowser import EHDriver
 
 
 if __name__ == "__main__":
-    driverpass = DriverPass(username="username", password="password")
-
     with EHDriver(**driverpass.getdict()) as driver:
         driver.punchin()
 ```
@@ -50,13 +48,10 @@ if __name__ == "__main__":
 Here's a quick example of how to use HVBrowser:
 
 ```python
-from hbrowser import DriverPass
 from hvbrowser import HVDriver
 
 
 if __name__ == "__main__":
-    driverpass = DriverPass(username="username", password="password")
-
-    with HVDriver(**driverpass.getdict()) as driver:
+    with HVDriver() as driver:
         driver.monstercheck()
 ```
