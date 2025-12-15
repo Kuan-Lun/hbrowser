@@ -34,12 +34,19 @@ Homepage = "https://github.com/Kuan-Lun/hbrowser"
 Tracker = "https://github.com/Kuan-Lun/hbrowser/issues"
 
 [tool.setuptools]
-packages = ["hbrowser", "hvbrowser"]
-package-dir = { hbrowser = "src/hbrowser", hvbrowser = "src/hvbrowser" }
+# Use automatic package discovery (PEP 621 recommended approach)
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hbrowser*", "hvbrowser*"]
 
 [tool.setuptools.package-data]
-hbrowser = ["py.typed"]
-hvbrowser = [
+"hbrowser" = ["py.typed"]
+"hbrowser.gallery" = ["py.typed"]
+"hbrowser.gallery.browser" = ["py.typed"]
+"hbrowser.gallery.captcha" = ["py.typed"]
+"hvbrowser" = [
     "py.typed",
     "hv_battle_ponychart_ml/weights.npz",
     "hv_battle_ponychart_ml/thresholds.json",
