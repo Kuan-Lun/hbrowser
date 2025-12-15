@@ -22,19 +22,3 @@ class Tag:
 
     def __str__(self) -> str:
         return ", ".join(self.__repr__().split("\n"))
-
-
-class DriverPass:
-    def __init__(
-        self,
-        logcontrol=None,
-        headless=True,
-    ) -> None:
-        self.logcontrol = logcontrol
-        self.headless = headless
-
-    def getdict(self) -> dict:
-        vdict = dict()
-        for attr_name, attr_value in self.__dict__.items():
-            vdict[attr_name] = attr_value
-        return vdict

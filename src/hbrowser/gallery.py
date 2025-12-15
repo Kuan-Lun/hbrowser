@@ -6,10 +6,10 @@ Gallery 模組
 """
 
 # 數據模型
-from .gallery.models import Tag, DriverPass
+from .gallery.models import Tag
 
 # Driver 類
 from .gallery.eh_driver import EHDriver
 from .gallery.exh_driver import ExHDriver
 
-__all__ = ["EHDriver", "ExHDriver", "Tag", "DriverPass"]
+__all__ = ["EHDriver", "ExHDriver", "Tag"]
