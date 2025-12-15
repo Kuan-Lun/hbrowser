@@ -8,21 +8,66 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from functools import partial
 from random import random
+from typing import Optional, Literal
+from dataclasses import dataclass
 
 
 from fake_useragent import UserAgent  # type: ignore
+from twocaptcha import TwoCaptcha  # type: ignore
 from h2h_galleryinfo_parser import GalleryURLParser
-from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.chrome.options import ChromiumOptions
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.remote.webelement import WebElement
+import undetected_chromedriver as uc  # type: ignore
 
-from .exceptions import ClientOfflineException, InsufficientFundsException
+from .exceptions import (
+    ClientOfflineException,
+    InsufficientFundsException,
+    CaptchaAPIKeyNotSetException,
+    CaptchaSolveException,
+)
+
+
+Kind = Literal["none", "turnstile_widget", "cf_managed_challenge"]
+
+TURNSTILE_IFRAME_CSS = (
+    "iframe[src*='challenges.cloudflare.com'][src*='/turnstile/'], "
+    "iframe[src*='challenges.cloudflare.com'][src*='turnstile']"
+)
+SITEKEY_RE = re.compile(r"/(0x[a-zA-Z0-9]+)/")
+RAY_RE = re.compile(r"Ray ID:\s*<code>\s*([0-9a-f]+)\s*</code>", re.IGNORECASE)
+
+
+def get_log_dir() -> str:
+    """
+    獲取主腳本所在目錄下的 log 資料夾路徑，如果不存在則建立
+
+    Returns:
+        log 資料夾的絕對路徑
+    """
+    import sys
+
+    # 獲取主腳本的路徑
+    if hasattr(sys, 'argv') and len(sys.argv) > 0:
+        main_script = sys.argv[0]
+        if main_script:
+            # 獲取主腳本所在的目錄
+            script_dir = os.path.dirname(os.path.abspath(main_script))
+        else:
+            # 如果無法獲取主腳本路徑，使用當前工作目錄
+            script_dir = os.getcwd()
+    else:
+        script_dir = os.getcwd()
+
+    # 建立 log 資料夾路徑
+    log_dir = os.path.join(script_dir, "log")
+
+    # 如果 log 資料夾不存在，則建立
+    os.makedirs(log_dir, exist_ok=True)
+
+    return log_dir
 
 
 class Tag:
@@ -44,6 +89,15 @@ class Tag:
 
     def __str__(self) -> str:
         return ", ".join(self.__repr__().split("\n"))
+
+
+@dataclass(frozen=True)
+class ChallengeDetection:
+    url: str
+    kind: Kind
+    sitekey: Optional[str] = None
+    iframe_src: Optional[str] = None
+    ray_id: Optional[str] = None
 
 
 def matchurl(*args) -> bool:
@@ -185,6 +239,40 @@ def parse_ban_time(page_source: str) -> int:
 
 
 class Driver(ABC):
+    def detect_challenge(self, timeout: float = 2.0) -> ChallengeDetection:
+        url = self.driver.current_url
+        title = (self.driver.title or "").strip()
+
+        # (A) 先判斷是否為 Cloudflare managed challenge 整頁（你貼的就是這種）
+        # 特徵：title + _cf_chl_opt + /cdn-cgi/challenge-platform
+        html = self.driver.page_source or ""
+        if (
+            ("請稍候" in title)
+            or ("Just a moment" in title)
+            or ("_cf_chl_opt" in html)
+            or ("/cdn-cgi/challenge-platform/" in html)
+        ):
+            ray = None
+            m = RAY_RE.search(html)
+            if m:
+                ray = m.group(1)
+            return ChallengeDetection(url=url, kind="cf_managed_challenge", ray_id=ray)
+
+        # (B) 再找 Turnstile widget iframe（可抽 sitekey 的那種）
+        try:
+            iframe = WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, TURNSTILE_IFRAME_CSS))
+            )
+        except TimeoutException:
+            return ChallengeDetection(url=url, kind="none")
+
+        iframe_src = iframe.get_attribute("src") or ""
+        m = SITEKEY_RE.search(iframe_src)
+        sitekey = m.group(1) if m else None
+        return ChallengeDetection(
+            url=url, kind="turnstile_widget", sitekey=sitekey, iframe_src=iframe_src
+        )
+
     @abstractmethod
     def _setname(self) -> str:
         pass
@@ -214,42 +302,26 @@ class Driver(ABC):
         headless=True,
     ) -> None:
         def gendriver(logcontrol):
-            # 設定 ChromeDriver 的路徑
-            driver_service = Service(ChromeDriverManager().install())
-
             # 設定瀏覽器參數
-            options = ChromiumOptions()
+            options = uc.ChromeOptions()
             options.add_argument("--disable-extensions")
             if headless:
-                options.add_argument("--headless")  # 無頭模式
-                # options.add_argument("--disable-gpu")  # 禁用GPU加速
+                options.add_argument("--headless=new")  # 使用新的無頭模式
             options.add_argument(
                 "--no-sandbox"
             )  # 解決DevToolsActivePort文件不存在的問題
             options.add_argument("--window-size=1600,900")
-            options.add_argument("start-maximized")  # 最大化窗口
-            options.add_argument("disable-infobars")
-            options.add_argument("--disable-extensions")
             options.add_argument("--disable-dev-shm-usage")
-            # options.add_argument("--incognito")  # 隐身模式
-            # options.add_argument("--disable-dev-shm-usage")  # 覆蓋限制導致的問題
-            # options.add_argument("--accept-lang=zh-TW")
-            # options.add_argument("--lang=zh-TW")
             options.add_argument(
                 "user-agent={ua}".format(ua=UserAgent()["google chrome"])
             )
-            # options.add_argument(
-            #     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            # )
             options.page_load_strategy = (
                 "normal"  # 等待加载图片normal eager none </span></div>
             )
 
-            # 初始化 WebDriver
-            driver = webdriver.Chrome(service=driver_service, options=options)
-            driver.execute_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            # 使用 undetected-chromedriver 初始化 WebDriver
+            driver = uc.Chrome(options=options, use_subprocess=True)
+
             # driver.request_interceptor = interceptor
             driver.myget = handle_ban_decorator(driver, logcontrol)  # , cookiesname)
 
@@ -282,7 +354,7 @@ class Driver(ABC):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type:
             with open(
-                os.path.join(os.path.dirname(__file__), "error.txt"),
+                os.path.join(get_log_dir(), "error.txt"),
                 "w",
                 errors="ignore",
             ) as f:
@@ -314,6 +386,210 @@ class Driver(ABC):
             time.sleep(3 * random())
         else:
             time.sleep(sleeptime)
+
+    def solve_cloudflare_challenge(self, det: ChallengeDetection, max_wait: int = 60) -> None:
+        """
+        解決 Cloudflare 驗證挑戰
+
+        Args:
+            det: 檢測到的驗證信息
+            max_wait: 最長等待時間（秒）
+
+        Raises:
+            ValueError: 當 APIKEY_2CAPTCHA 環境變數未設置
+            RuntimeError: 當驗證解決失敗或超時
+        """
+        # 檢查 API key
+        api_key = os.getenv("APIKEY_2CAPTCHA")
+        if not api_key:
+            raise CaptchaAPIKeyNotSetException(
+                "APIKEY_2CAPTCHA environment variable is not set. "
+                "Please set it using: export APIKEY_2CAPTCHA=your_api_key"
+            )
+
+        print(f"Detected {det.kind} challenge, attempting to solve...")
+
+        try:
+            solver = TwoCaptcha(api_key)
+
+            if det.kind == "cf_managed_challenge":
+                # Cloudflare managed challenge (整頁驗證)
+                # 保存當前頁面以供調試
+                with open(
+                    os.path.join(get_log_dir(), "challenge_page.html"),
+                    "w",
+                    errors="ignore",
+                ) as f:
+                    f.write(self.driver.page_source)
+
+                print(f"Cloudflare managed challenge detected (Ray ID: {det.ray_id})")
+
+                # 嘗試提取 sitekey（managed challenge 也可能包含 Turnstile）
+                html = self.driver.page_source
+                sitekey_match = re.search(r'sitekey["\s:]+([0-9a-zA-Z_-]+)', html)
+
+                if sitekey_match:
+                    sitekey = sitekey_match.group(1)
+                    print(f"Found sitekey in managed challenge: {sitekey}")
+
+                    # 嘗試使用 2Captcha 解決 Turnstile
+                    try:
+                        print("Attempting to solve with 2Captcha Turnstile API...")
+                        result = solver.turnstile(
+                            sitekey=sitekey,
+                            url=det.url,
+                        )
+
+                        token = result.get("code")
+                        if token:
+                            print(f"Got token from 2Captcha: {token[:50]}...")
+
+                            # 嘗試注入 token
+                            self.driver.execute_script(
+                                """
+                                // 方法1: 尋找並設置 turnstile response input
+                                var inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-turnstile"]');
+                                for (var i = 0; i < inputs.length; i++) {
+                                    inputs[i].value = arguments[0];
+                                }
+
+                                // 方法2: 如果有 callback
+                                if (window.turnstile && typeof window.turnstile.reset === 'function') {
+                                    try {
+                                        // 嘗試觸發驗證完成
+                                        if (window.cfCallback) window.cfCallback(arguments[0]);
+                                        if (window.tsCallback) window.tsCallback(arguments[0]);
+                                    } catch(e) {
+                                        console.log('Callback error:', e);
+                                    }
+                                }
+
+                                // 方法3: 提交表單（如果存在）
+                                var form = document.querySelector('form');
+                                if (form) {
+                                    try {
+                                        form.submit();
+                                    } catch(e) {
+                                        console.log('Form submit error:', e);
+                                    }
+                                }
+                                """,
+                                token
+                            )
+
+                            print("Token injected, waiting for page to respond...")
+                            time.sleep(5)
+                    except Exception as e:
+                        print(f"2Captcha solve attempt failed: {str(e)}")
+                        print("Falling back to passive waiting...")
+
+                # 輪詢檢查頁面是否已經通過驗證
+                print("Monitoring page for challenge resolution...")
+                start_time = time.time()
+                check_interval = 5
+                last_url = self.driver.current_url
+
+                while time.time() - start_time < max_wait:
+                    time.sleep(check_interval)
+
+                    current_url = self.driver.current_url
+
+                    # 檢查 URL 是否變化（表示可能已通過）
+                    if current_url != last_url:
+                        print(f"URL changed from {last_url} to {current_url}")
+                        last_url = current_url
+
+                    # 重新檢測是否還有驗證
+                    current_det = self.detect_challenge(timeout=1.0)
+                    if current_det.kind == "none":
+                        print("Challenge resolved successfully!")
+                        return
+
+                    elapsed = int(time.time() - start_time)
+                    print(f"Still waiting... ({elapsed}s/{max_wait}s)")
+
+                # 超時仍未解決
+                raise CaptchaSolveException(
+                    f"Cloudflare managed challenge not resolved after {max_wait} seconds. "
+                    f"Ray ID: {det.ray_id}. "
+                    f"\n\nPossible solutions:"
+                    f"\n1. Disable headless mode by setting headless=False"
+                    f"\n2. Try running the script with a real browser window"
+                    f"\n3. Use a different IP address or wait before retrying"
+                    f"\n4. Cloudflare may be blocking automated access to this site"
+                )
+
+            elif det.kind == "turnstile_widget":
+                # Turnstile widget (可以通過 API 解決)
+                if not det.sitekey:
+                    raise CaptchaSolveException("Turnstile widget detected but sitekey not found")
+
+                print(f"Solving Turnstile with sitekey: {det.sitekey}")
+
+                # 提交驗證任務到 2Captcha
+                result = solver.turnstile(
+                    sitekey=det.sitekey,
+                    url=det.url,
+                )
+
+                # 獲取解決的 token
+                token = result.get("code")
+                if not token:
+                    raise CaptchaSolveException("Failed to get token from 2Captcha response")
+
+                print(f"Got token from 2Captcha: {token[:50]}...")
+
+                # 將 token 注入到頁面
+                # 方法1: 通過 Turnstile callback
+                success = self.driver.execute_script(
+                    """
+                    if (window.turnstile && window.turnstile.reset) {
+                        // 如果有 callback，直接調用
+                        if (window.cfCallback || window.tsCallback) {
+                            const callback = window.cfCallback || window.tsCallback;
+                            callback(arguments[0]);
+                            return true;
+                        }
+                    }
+
+                    // 方法2: 設置到隱藏的表單欄位
+                    const input = document.querySelector('input[name="cf-turnstile-response"]');
+                    if (input) {
+                        input.value = arguments[0];
+                        return true;
+                    }
+
+                    return false;
+                    """,
+                    token
+                )
+
+                if success:
+                    print("Token injected successfully, waiting for page to respond...")
+                    time.sleep(3)
+
+                    # 檢查是否通過驗證
+                    current_det = self.detect_challenge(timeout=1.0)
+                    if current_det.kind == "none":
+                        print("Turnstile challenge resolved successfully!")
+                        return
+                else:
+                    print("Warning: Could not inject token using standard methods")
+
+        except (CaptchaAPIKeyNotSetException, CaptchaSolveException):
+            # 直接重新拋出這些已知的異常
+            raise
+        except Exception as e:
+            # 保存錯誤時的頁面狀態
+            with open(
+                os.path.join(get_log_dir(), "challenge_error.html"),
+                "w",
+                errors="ignore",
+            ) as f:
+                f.write(self.driver.page_source)
+
+            # 包裝其他未預期的異常
+            raise CaptchaSolveException(f"Failed to solve Cloudflare challenge: {str(e)}") from e
 
     def login(self) -> None:
         # 打開登入網頁
@@ -357,13 +633,33 @@ class Driver(ABC):
             # 顯式等待，直到 URL 改變
             wait = WebDriverWait(self.driver, 10)
             wait.until(lambda driver: driver.current_url != old_url)
-            # self.screenshot["login"].shot()
+            print("Login button clicked, checking for challenges...")
+
+            # 檢測是否遇到 Cloudflare 驗證
+            det = self.detect_challenge(timeout=3.0)
+
+            if det.kind != "none":
+                print(f"Challenge detected: {det.kind}")
+                # 保存登入後的頁面以供調試
+                with open(
+                    os.path.join(get_log_dir(), "login_page.html"),
+                    "w",
+                    errors="ignore",
+                ) as f:
+                    f.write(self.driver.page_source)
+
+                # 嘗試解決驗證
+                self.solve_cloudflare_challenge(det, max_wait=60)
+            else:
+                print("No challenge detected, proceeding...")
 
             # 假設跳轉後的頁面有一個具有 NAME=reset_imagelimit 的元素
             element_present = EC.presence_of_element_located(
                 (By.NAME, "reset_imagelimit")
             )
+            print("Waiting for homepage to load...")
             WebDriverWait(self.driver, 10).until(element_present)
+            print("Login completed successfully.")
         # Cookies.save(self.driver, self.cookiesname)
         self.gohomepage()
 
