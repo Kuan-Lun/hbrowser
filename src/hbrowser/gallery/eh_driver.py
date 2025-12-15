@@ -4,6 +4,7 @@ import os
 import time
 from random import random
 from functools import partial
+from typing import Any
 
 from h2h_galleryinfo_parser import GalleryURLParser
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -97,7 +98,7 @@ class EHDriver(Driver):
     def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
         """搜索 galleries"""
         def waitpage() -> None:
-            element_present = EC.presence_of_element_located((By.ID, "f_search"))
+            element_present: Any = EC.presence_of_element_located((By.ID, "f_search"))
             WebDriverWait(self.driver, 10).until(element_present)
 
         try:
@@ -144,26 +145,26 @@ class EHDriver(Driver):
 
     def download(self, gallery: GalleryURLParser) -> bool:
         """下載 gallery"""
-        def _check_ekey(driver, ekey: str):
+        def _check_ekey(driver: Any, ekey: str) -> Any:
             return EC.presence_of_element_located((By.XPATH, ekey))(
                 driver
             ) or EC.visibility_of_element_located((By.XPATH, ekey))(driver)
 
-        def check_download_success_by_element(driver):
+        def check_download_success_by_element(driver: Any) -> Any:
             ekey = "//p[contains(text(), 'Downloads should start processing within a couple of minutes.')]"
             return _check_ekey(driver, ekey)
 
-        def check_client_offline_by_element(driver):
+        def check_client_offline_by_element(driver: Any) -> Any:
             ekey = "//p[contains(text(), 'Your H@H client appears to be offline.')]"
             try:
-                _check_ekey(driver, ekey)
+                return _check_ekey(driver, ekey)
             except NoSuchElementException:
                 raise ClientOfflineException()
 
-        def check_insufficient_funds_by_element(driver):
+        def check_insufficient_funds_by_element(driver: Any) -> Any:
             ekey = "//p[contains(text(), 'Cannot start download: Insufficient funds')]"
             try:
-                _check_ekey(driver, ekey)
+                return _check_ekey(driver, ekey)
             except NoSuchElementException:
                 raise InsufficientFundsException()
 

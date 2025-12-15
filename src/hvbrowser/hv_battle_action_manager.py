@@ -1,9 +1,8 @@
 import time
-from typing import Callable, Union
+from typing import Any, Callable, Union
 
 from hv_bie import parse_snapshot
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import StaleElementReferenceException
@@ -18,7 +17,7 @@ class ElementActionManager:
         self.battle_dashboard = battle_dashboard
 
     @property
-    def driver(self) -> WebDriver:
+    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
     def _click(self, element: WebElement) -> None:

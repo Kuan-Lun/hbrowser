@@ -3,23 +3,22 @@ import time
 import sys
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 import numpy as np
 import cv2 as cv
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver
 
 from hbrowser.beep import beep_os_independent
 from .hv import HVDriver
 
-HOG_CFG = dict(
-    win_size=(192, 192),
-    cell_size=(8, 8),
-    block_size=(16, 16),
-    block_stride=(8, 8),
-    nbins=9,
-)
+HOG_CFG: dict[str, tuple[int, int] | int] = {
+    "win_size": (192, 192),
+    "cell_size": (8, 8),
+    "block_size": (16, 16),
+    "block_stride": (8, 8),
+    "nbins": 9,
+}
 IMG_SIZE = (192, 192)
 PREPROCESS = dict(
     equalize=False,
@@ -32,7 +31,7 @@ PREPROCESS = dict(
 )
 
 
-def _despeckle(gray, win: int, diff_thr: int):
+def _despeckle(gray: np.ndarray[Any, Any], win: int, diff_thr: int) -> np.ndarray[Any, Any]:
     if gray is None or getattr(gray, "ndim", 2) != 2:
         return gray
     if win < 3:
@@ -62,7 +61,7 @@ class _InlineModel:
     def _dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "hv_battle_ponychart_ml")
 
-    def load(self):
+    def load(self) -> None:
         if self.loaded:
             return
         d = self._dir()
@@ -78,16 +77,28 @@ class _InlineModel:
             self.thresholds = json.load(f)
         self.loaded = True
 
-    def _hog(self):
+    def _hog(self) -> cv.HOGDescriptor:
+        win_size = HOG_CFG["win_size"]
+        block_size = HOG_CFG["block_size"]
+        block_stride = HOG_CFG["block_stride"]
+        cell_size = HOG_CFG["cell_size"]
+        nbins = HOG_CFG["nbins"]
+
+        assert isinstance(win_size, tuple)
+        assert isinstance(block_size, tuple)
+        assert isinstance(block_stride, tuple)
+        assert isinstance(cell_size, tuple)
+        assert isinstance(nbins, int)
+
         return cv.HOGDescriptor(
-            HOG_CFG["win_size"],
-            HOG_CFG["block_size"],
-            HOG_CFG["block_stride"],
-            HOG_CFG["cell_size"],
-            HOG_CFG["nbins"],
+            win_size,
+            block_size,
+            block_stride,
+            cell_size,
+            nbins,
         )
 
-    def _pre(self, bgr):
+    def _pre(self, bgr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
         gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
         gray = cv.resize(gray, IMG_SIZE, interpolation=cv.INTER_AREA)
         q = PREPROCESS["quant_step"]
@@ -112,14 +123,17 @@ class _InlineModel:
         return gray
 
     def predict(
-        self, img_path: str, min_k=1, max_k=3
+        self, img_path: str, min_k: int = 1, max_k: int = 3
     ) -> Tuple[List[str], Dict[str, float]]:
         self.load()
         img = cv.imread(img_path, cv.IMREAD_COLOR)
         if img is None:
             raise RuntimeError(f"無法讀取圖片: {img_path}")
         gray = self._pre(img)
-        x = self._hog().compute(gray).reshape(-1).astype(np.float32)
+        hog_result = self._hog().compute(gray)
+        x = np.array(hog_result).reshape(-1).astype(np.float32) if hog_result is not None else np.array([])
+        if self.mu is None:
+            raise RuntimeError("Model not loaded properly: mu is None")
         x = (x - self.mu) / (self.sd + 1e-8) if self.sd is not None else x - self.mu
         logits = self.W @ x + self.b
         probs = 1.0 / (1.0 + np.exp(-logits))
@@ -148,7 +162,7 @@ class PonyChart:
         self._model = _InlineModel()
 
     @property
-    def driver(self) -> WebDriver:
+    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
     def _save_pony_chart_image(self) -> str:
@@ -210,7 +224,7 @@ class PonyChart:
         return labels
 
     def _check(self) -> bool:
-        return self.driver.find_elements(By.ID, "riddlesubmit") != []
+        return bool(self.driver.find_elements(By.ID, "riddlesubmit") != [])
 
     def check(self) -> bool:
         isponychart: bool = self._check()

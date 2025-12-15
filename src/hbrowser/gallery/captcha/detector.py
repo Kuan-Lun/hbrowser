@@ -1,5 +1,6 @@
 """驗證碼檢測器 - 純粹的檢測邏輯，不依賴解決方案"""
 
+from typing import Any
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -12,7 +13,7 @@ from .constants import TURNSTILE_IFRAME_CSS, SITEKEY_RE, RAY_RE
 class CaptchaDetector:
     """驗證碼檢測器 - 與解決方案無關"""
 
-    def detect(self, driver, timeout: float = 2.0) -> ChallengeDetection:
+    def detect(self, driver: Any, timeout: float = 2.0) -> ChallengeDetection:
         """
         檢測當前頁面是否存在驗證碼挑戰
 
@@ -69,7 +70,7 @@ class CaptchaDetector:
         m = RAY_RE.search(html)
         return m.group(1) if m else None
 
-    def _find_turnstile_iframe(self, driver, timeout: float) -> dict | None:
+    def _find_turnstile_iframe(self, driver: Any, timeout: float) -> dict[str, Any] | None:
         """查找 Turnstile iframe 並提取 sitekey"""
         try:
             iframe = WebDriverWait(driver, timeout).until(
@@ -82,7 +83,7 @@ class CaptchaDetector:
         except TimeoutException:
             return None
 
-    def _find_recaptcha_div(self, driver, timeout: float) -> dict | None:
+    def _find_recaptcha_div(self, driver: Any, timeout: float) -> dict[str, Any] | None:
         """查找 reCAPTCHA div 並提取 sitekey"""
         try:
             recaptcha_div = WebDriverWait(driver, timeout).until(

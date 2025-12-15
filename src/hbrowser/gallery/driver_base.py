@@ -5,6 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from functools import partial
 from random import random
+from typing import Any, Callable
 
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
@@ -34,11 +35,11 @@ class Driver(ABC):
 
     def __init__(
         self,
-        logcontrol=None,
-        headless=True,
+        logcontrol: Any = None,
+        headless: bool = True,
     ) -> None:
-        def seturl() -> dict:
-            url = dict()
+        def seturl() -> dict[str, str]:
+            url: dict[str, str] = dict()
             url["My Home"] = "https://e-hentai.org/home.php"
             url["E-Hentai"] = "https://e-hentai.org/"
             url["ExHentai"] = "https://exhentai.org/"
@@ -59,12 +60,12 @@ class Driver(ABC):
 
         self.get(self.url["My Home"])
 
-    def __enter__(self):
+    def __enter__(self) -> "Driver":
         self.login()
         self.gohomepage()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if exc_type:
             with open(
                 os.path.join(get_log_dir(), "error.txt"),
@@ -82,10 +83,10 @@ class Driver(ABC):
 
     def find_element_chain(self, *selectors: tuple[str, str]) -> WebElement:
         """通過選擇器鏈逐步查找元素，每次在前一個元素的基礎上查找下一個"""
-        element = self.driver
+        element: Any = self.driver
         for by, value in selectors:
             element = element.find_element(by, value)
-        return element
+        return element  # type: ignore[no-any-return]
 
     def get(self, url: str) -> None:
         """導航到指定 URL"""
@@ -95,7 +96,7 @@ class Driver(ABC):
             ischangeurl=(not matchurl(url, old_url)),
         )
 
-    def wait(self, fun, ischangeurl: bool, sleeptime: int = -1) -> None:
+    def wait(self, fun: Callable[[], None], ischangeurl: bool, sleeptime: int = -1) -> None:
         """
         執行函數並等待頁面變化
 
@@ -122,7 +123,7 @@ class Driver(ABC):
         else:
             time.sleep(sleeptime)
 
-    def login(self, isfirst=True) -> None:
+    def login(self, isfirst: bool = True) -> None:
         """登入流程"""
         # 打開登入網頁
         self.driver.myget(self.url["My Home"])

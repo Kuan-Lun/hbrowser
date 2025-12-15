@@ -1,11 +1,13 @@
 """瀏覽器 WebDriver 工廠"""
-import undetected_chromedriver as uc  # type: ignore
-from fake_useragent import UserAgent  # type: ignore
+from typing import Any
+
+import undetected_chromedriver as uc
+from fake_useragent import UserAgent
 
 from .ban_handler import handle_ban_decorator
 
 
-def create_driver(headless: bool = True, logcontrol=None):
+def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     """
     創建 WebDriver 實例
 

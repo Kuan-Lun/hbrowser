@@ -1,7 +1,7 @@
 """URL 相關工具函數"""
 
 
-def matchurl(*args) -> bool:
+def matchurl(*args: str) -> bool:
     """
     比較多個 URL 是否相同（忽略結尾的斜線）
 

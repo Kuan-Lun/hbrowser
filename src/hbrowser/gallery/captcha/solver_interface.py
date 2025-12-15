@@ -1,5 +1,6 @@
 """驗證碼解決器抽象接口"""
 from abc import ABC, abstractmethod
+from typing import Any
 from .models import ChallengeDetection, SolveResult
 
 
@@ -11,7 +12,7 @@ class CaptchaSolver(ABC):
     """
 
     @abstractmethod
-    def solve(self, challenge: ChallengeDetection, driver) -> SolveResult:
+    def solve(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
         """
         解決驗證碼
 

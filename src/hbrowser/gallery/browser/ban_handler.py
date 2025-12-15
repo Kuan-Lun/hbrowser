@@ -2,6 +2,7 @@
 import re
 import time
 from datetime import datetime, timedelta
+from typing import Any, Callable
 
 
 def parse_ban_time(page_source: str) -> int:
@@ -39,7 +40,7 @@ def parse_ban_time(page_source: str) -> int:
     )
 
 
-def handle_ban_decorator(driver, logcontrol):
+def handle_ban_decorator(driver: Any, logcontrol: Any) -> Callable[..., None]:
     """
     處理 IP ban 的裝飾器
 
@@ -69,7 +70,7 @@ def handle_ban_decorator(driver, logcontrol):
             return baningmsg in source
 
         def whilechecknothing() -> bool:
-            return nothing == source
+            return bool(nothing == source)
 
         source = driver.page_source
         nothing = "<html><head></head><body></body></html>"
@@ -106,7 +107,7 @@ def handle_ban_decorator(driver, logcontrol):
         else:
             return
 
-    def myget(*args, **kwargs) -> None:
+    def myget(*args: Any, **kwargs: Any) -> None:
         driver.get(*args, **kwargs)
         banningcheck()
 
