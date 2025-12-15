@@ -1,0 +1,113 @@
+"""IP ban 處理邏輯"""
+import re
+import time
+from datetime import datetime, timedelta
+
+
+def parse_ban_time(page_source: str) -> int:
+    """
+    解析被禁時間
+
+    Args:
+        page_source: 頁面源碼
+
+    Returns:
+        被禁的秒數
+    """
+    def calculate(duration_str: str) -> dict[str, int]:
+        # Regular expression patterns to capture days, hours, and minutes
+        patterns = {
+            "days": r"(\d+) day?",
+            "hours": r"(\d+) hour?",
+            "minutes": r"(\d+) minute?",
+        }
+
+        # Dictionary to store the found durations
+        durations = {"days": 0, "hours": 0, "minutes": 0}
+
+        # Search for each duration in the string and update the durations dictionary
+        for key, pattern in patterns.items():
+            match = re.search(pattern, duration_str)
+            if match:
+                durations[key] = int(match.group(1))
+
+        return durations
+
+    durations = calculate(page_source)
+    return 60 * (
+        60 * (24 * durations["days"] + durations["hours"]) + durations["minutes"]
+    )
+
+
+def handle_ban_decorator(driver, logcontrol):
+    """
+    處理 IP ban 的裝飾器
+
+    Args:
+        driver: WebDriver 實例
+        logcontrol: 日誌控制函數
+
+    Returns:
+        包裝後的 get 函數
+    """
+    def sendmsg(msg: str) -> None:
+        if logcontrol is not None:
+            logcontrol(msg)
+        else:
+            print(msg)
+
+    def banningcheck() -> None:
+        def banningmsg() -> str:
+            a = timedelta(seconds=wait_seconds)
+            msg = f"IP banned, waiting for {a} (until {wait_until.strftime('%Y-%m-%d %H:%M:%S')}) to retry..."
+            return msg
+
+        def whilecheck() -> bool:
+            return whilecheckban() or whilechecknothing()
+
+        def whilecheckban() -> bool:
+            return baningmsg in source
+
+        def whilechecknothing() -> bool:
+            return nothing == source
+
+        source = driver.page_source
+        nothing = "<html><head></head><body></body></html>"
+        baningmsg = "Your IP address has been temporarily banned"
+        onehour = 60 * 60
+
+        if whilecheck():
+            isfirst = True
+            isnothing = nothing == source
+            while whilecheck():
+                sendmsg(source)
+                if not isfirst:
+                    sendmsg("Ban again")
+                if isnothing:
+                    wait_seconds = 4 * onehour
+                else:
+                    wait_seconds = parse_ban_time(source)
+                wait_until = datetime.now() + timedelta(seconds=wait_seconds)
+                sendmsg(banningmsg())
+
+                while wait_seconds > onehour:
+                    time.sleep(onehour)
+                    wait_seconds -= onehour
+                    sendmsg(banningmsg())
+                time.sleep(wait_seconds + 15 * 60)
+                wait_seconds = 0
+                sendmsg("Retry")
+                driver.refresh()
+                source = driver.page_source
+                isfirst = False
+                if isnothing:
+                    raise RuntimeError()
+            sendmsg("Now is fine")
+        else:
+            return
+
+    def myget(*args, **kwargs) -> None:
+        driver.get(*args, **kwargs)
+        banningcheck()
+
+    return myget
