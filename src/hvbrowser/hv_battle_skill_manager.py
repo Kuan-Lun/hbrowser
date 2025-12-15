@@ -1,8 +1,7 @@
 from collections import defaultdict
+from typing import Any
 
-from hv_bie.types import Ability
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import StaleElementReferenceException
 
 from .hv import HVDriver
@@ -24,13 +23,13 @@ class SkillManager:
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
 
     @property
-    def driver(self) -> WebDriver:
+    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
     def _get_skill_xpath(self, key: str) -> str:
         return f"//div[not(@style)]/div/div[contains(text(), '{key}')]"
 
-    def _click_skill_menu(self):
+    def _click_skill_menu(self) -> None:
         # Use resilient locator-based click
         try:
             self.element_action_manager.click_resilient(
@@ -42,7 +41,7 @@ class SkillManager:
                 lambda: self.driver.find_element(By.ID, "ckey_skill")
             )
 
-    def open_skills_menu(self):
+    def open_skills_menu(self) -> None:
         attempts = 0
         while True:
             style = self.driver.find_element(By.ID, "pane_skill").get_attribute("style")
@@ -56,7 +55,7 @@ class SkillManager:
                 pass
             attempts += 1
 
-    def open_spells_menu(self):
+    def open_spells_menu(self) -> None:
         attempts = 0
         while True:
             style = self.driver.find_element(By.ID, "pane_magic").get_attribute("style")
@@ -70,7 +69,7 @@ class SkillManager:
                 pass
             attempts += 1
 
-    def _click_skill(self, skill_xpath: str, iswait: bool):
+    def _click_skill(self, skill_xpath: str, iswait: bool) -> None:
         if iswait:
             # Use locator-based wait+click so stale elements are re-found
             self.element_action_manager.click_and_wait_log_locator(
@@ -81,7 +80,7 @@ class SkillManager:
                 lambda: self.driver.find_element(By.XPATH, skill_xpath)
             )
 
-    def cast(self, key: str, iswait=True) -> bool:
+    def cast(self, key: str, iswait: bool = True) -> bool:
         if key not in self.get_skills_and_spells():
             return False
 
@@ -100,7 +99,7 @@ class SkillManager:
         else:
             return False
 
-    def get_skills_and_spells(self) -> dict[str, Ability]:
+    def get_skills_and_spells(self) -> dict[str, Any]:
         return (
             self.battle_dashboard.snap.abilities.skills
             | self.battle_dashboard.snap.abilities.spells

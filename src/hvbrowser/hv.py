@@ -2,6 +2,7 @@ import time
 import re
 from abc import ABC
 from random import random
+from typing import Any
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -10,11 +11,11 @@ from selenium.webdriver.common.by import By
 from hbrowser.gallery import EHDriver
 
 
-def genxpath(imagepath):
+def genxpath(imagepath: str) -> str:
     return '//img[@src="{imagepath}"]'.format(imagepath=imagepath)
 
 
-def searchxpath_fun(srclist: list | tuple | set) -> str:
+def searchxpath_fun(srclist: list[Any] | tuple[Any, ...] | set[Any]) -> str:
     return " | ".join(
         [genxpath(s + imagepath) for imagepath in srclist for s in ["", "/isekai"]]
     )
@@ -60,7 +61,7 @@ class HVDriver(EHDriver):
         self.gohomepage()
 
         for lettory in ["Weapon Lottery", "Armor Lottery"]:
-            element = dict()
+            element: dict[str, Any] = dict()
             element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
             element[lettory] = self.driver.find_element(
                 By.XPATH, "//div[contains(text(), '{lettory}')]".format(lettory=lettory)
@@ -97,7 +98,7 @@ class HVDriver(EHDriver):
         self.gohomepage()
 
         # 進入 Monster Lab
-        element = dict()
+        element: dict[str, Any] = dict()
         element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
         element["Monster Lab"] = self.driver.find_element(
             By.XPATH, "//div[contains(text(), 'Monster Lab')]"
@@ -111,7 +112,7 @@ class HVDriver(EHDriver):
             ischangeurl=False,
         )
 
-        keypair = dict()
+        keypair: dict[str, str] = dict()
         keypair["feed"] = "food"
         keypair["drug"] = "drugs"
         for key in keypair:
@@ -150,9 +151,9 @@ class HVDriver(EHDriver):
                 iszero = quantity_text == ""
             except NoSuchElementException:
                 iszero = True
-            return iszero
+            return bool(iszero)
 
-        def resell():
+        def resell() -> None:
             # 定位到元素
             element = self.driver.find_element(
                 By.XPATH, "//td[contains(@onclick, 'autofill_from_sell_order')]"
@@ -167,6 +168,7 @@ class HVDriver(EHDriver):
                 number = match.group(1)
             else:
                 print("未能從 onclick 屬性中提取數字")
+                return
             # 假設 driver 是你的 WebDriver 實例
             self.driver.execute_script(
                 "autofill_from_sell_order({number},0,0);".format(number=number)
@@ -194,7 +196,7 @@ class HVDriver(EHDriver):
             ischangeurl=False,
         )
 
-        marketurl = dict()
+        marketurl: dict[str, str] = dict()
         # Consumables
         marketurl["Consumables"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=co"
@@ -211,11 +213,12 @@ class HVDriver(EHDriver):
         filterpage("Browse Items", ischangeurl=True)
         for marketkey in marketurl:
             filterpage(marketkey, ischangeurl=False)
-            sellidx = list()
+            sellidx: list[int] = list()
             # 使用find_elements方法获取页面上所有<tr>元素
             tr_elements = self.driver.find_elements(By.XPATH, "//tr")
             for idx, tr_element in enumerate(tr_elements[1:]):
                 itemname = tr_element.find_element(By.XPATH, ".//td[1]").text
+                thecheckitemlist: list[str]
                 match marketkey:
                     case "Consumables":
                         thecheckitemlist = sellitems.consumables

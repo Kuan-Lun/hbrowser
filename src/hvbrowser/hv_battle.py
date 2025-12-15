@@ -2,6 +2,7 @@ from functools import partial, wraps
 import time
 from collections import defaultdict
 from random import random
+from typing import Any, Callable, TypeVar
 
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import UnexpectedAlertPresentException
@@ -16,6 +17,8 @@ from .hv_battle_buff_manager import BuffManager
 from .pause_controller import PauseController
 from .hv_battle_observer_pattern import BattleDashboard
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
 MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
     "Imperiled": "Imperil",
     "Weakened": "Weaken",
@@ -29,11 +32,11 @@ MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
 }
 
 
-def retry_on_server_fail(func):
+def retry_on_server_fail(func: _F) -> _F:
     """在出現 Server communication failed alert 時，自動刷新頁面並重試一次"""
 
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             return func(self, *args, **kwargs)
         except UnexpectedAlertPresentException:
@@ -53,7 +56,7 @@ def retry_on_server_fail(func):
             # 如果不是這種錯誤或重試也失敗，拋出原例外
             raise
 
-    return wrapper
+    return wrapper  # type: ignore[return-value]
 
 
 class StatThreshold:
@@ -88,7 +91,7 @@ class StatThreshold:
 
 
 class BattleDriver(HVDriver):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
         self.battle_dashboard = BattleDashboard(self)
@@ -112,12 +115,12 @@ class BattleDriver(HVDriver):
         self.pround = self.round
 
     def set_battle_parameters(
-        self, statthreshold: StatThreshold, forbidden_skills: list[list]
+        self, statthreshold: StatThreshold, forbidden_skills: list[str]
     ) -> None:
         self.statthreshold = statthreshold
         self.forbidden_skills = forbidden_skills
 
-    def click_skill(self, key: str, iswait=True) -> bool:
+    def click_skill(self, key: str, iswait: bool = True) -> bool:
         if key in self.forbidden_skills:
             return False
         result = self._skillmanager.cast(key, iswait=iswait)
@@ -135,7 +138,7 @@ class BattleDriver(HVDriver):
                 value = self.battle_dashboard.snap.player.overcharge_value
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
-        return value
+        return float(value)
 
     @property
     def new_logs(self) -> list[str]:
@@ -298,7 +301,7 @@ class BattleDriver(HVDriver):
         return self.attack_monster(n)
 
     def attack(self) -> bool:
-        base_monster_ids = [1, 3, 5, 7, 9, 2, 4, 6, 8, 0]
+        base_monster_ids: list[int] = [1, 3, 5, 7, 9, 2, 4, 6, 8, 0]
 
         def monster_ids_starting_with(ids: list[int], n: int) -> list[int]:
             """Returns a list of monster IDs starting with the given number."""
@@ -306,7 +309,7 @@ class BattleDriver(HVDriver):
 
         def resort_monster_alive_ids(bmlist: list[int]) -> list[int]:
             """Returns a list of monster IDs starting with the given number."""
-            monster_alive_ids = [
+            monster_alive_ids: list[int] = [
                 id
                 for id in bmlist
                 if id in self.battle_dashboard.overview_monsters.alive_monster
@@ -351,7 +354,7 @@ class BattleDriver(HVDriver):
             return True
 
         # Get the list of alive monster IDs
-        monster_alive_ids = resort_monster_alive_ids(base_monster_ids)
+        monster_alive_ids: list[int] = resort_monster_alive_ids(base_monster_ids)
 
         # Get the list of monster IDs that are not debuffed with the specified debuffs
         if (
@@ -372,6 +375,7 @@ class BattleDriver(HVDriver):
                     return True
 
         # Get the list of monster IDs that are not debuffed with Imperil
+        monster_with_imperil: list[int]
         if (
             "Imperil" not in self.forbidden_skills
             and self.get_stat_percent("mp") > self.statthreshold.mp[1]

@@ -9,6 +9,7 @@ TwoCaptcha 適配器
 import os
 import re
 import time
+from typing import Any
 
 from ..solver_interface import CaptchaSolver
 from ..models import ChallengeDetection, SolveResult
@@ -22,7 +23,7 @@ from twocaptcha import TwoCaptcha  # type: ignore
 class TwoCaptchaAdapter(CaptchaSolver):
     """適配 TwoCaptcha 服務到統一接口"""
 
-    def __init__(self, api_key: str | None = None, max_wait: int = 120):
+    def __init__(self, api_key: str | None = None, max_wait: int = 120) -> None:
         """
         初始化 TwoCaptcha 適配器
 
@@ -41,7 +42,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 被適配的對象
         self._twocaptcha = TwoCaptcha(self.api_key)
 
-    def solve(self, challenge: ChallengeDetection, driver) -> SolveResult:
+    def solve(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
         """
         使用 TwoCaptcha 服務解決驗證碼
 
@@ -88,7 +89,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             ) from e
 
     def _solve_managed_challenge(
-        self, challenge: ChallengeDetection, driver, max_wait: int
+        self, challenge: ChallengeDetection, driver: Any, max_wait: int
     ) -> SolveResult:
         """解決 Cloudflare managed challenge"""
         # 保存當前頁面以供調試
@@ -216,7 +217,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         )
 
     def _solve_turnstile_widget(
-        self, challenge: ChallengeDetection, driver
+        self, challenge: ChallengeDetection, driver: Any
     ) -> SolveResult:
         """解決 Turnstile widget"""
         if not challenge.sitekey:
@@ -283,7 +284,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             solver_name="TwoCaptcha",
         )
 
-    def _solve_recaptcha_v2(self, challenge: ChallengeDetection, driver) -> SolveResult:
+    def _solve_recaptcha_v2(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
         """解決 reCAPTCHA v2"""
         if not challenge.sitekey:
             raise CaptchaSolveException("reCAPTCHA v2 detected but sitekey not found")

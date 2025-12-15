@@ -1,7 +1,6 @@
 from collections import defaultdict
-from typing import Union
+from typing import Any, Union
 
-from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.common.by import By
 
 from .hv import HVDriver
@@ -81,7 +80,7 @@ class BuffManager:
         self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
 
     @property
-    def driver(self) -> WebElement:
+    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
     def get_buff_remaining_turns(self, key: str) -> Union[int, float]:
@@ -114,9 +113,9 @@ class BuffManager:
         remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
 
         if key in AutoCast_BUFFS:
-            return float("inf") > remaining_turns >= 0
+            return bool(float("inf") > remaining_turns >= 0)
         else:
-            return remaining_turns >= 0
+            return bool(remaining_turns >= 0)
 
     def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
         """

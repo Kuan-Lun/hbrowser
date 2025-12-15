@@ -4,7 +4,7 @@ import sys
 import os
 
 
-def beep_os_independent():
+def beep_os_independent() -> None:
     """跨平台提示音。
 
     - Windows: 使用 winsound.MessageBeep。

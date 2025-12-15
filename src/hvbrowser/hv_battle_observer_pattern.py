@@ -2,21 +2,31 @@ import re
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any, TypeVar, overload
 
 from hv_bie import parse_snapshot
 from hv_bie.types import BattleSnapshot
 
 from .hv import HVDriver
 
+_T = TypeVar("_T")
 
-class DefaultMinusOneDict(dict):
+
+class DefaultMinusOneDict(dict[Any, int]):
     """A dict that returns -1 for missing keys without inserting them."""
 
-    def __missing__(self, key):  # type: ignore[override]
+    def __missing__(self, key: Any) -> int:
         return -1
 
-    def get(self, key, default=None):  # type: ignore[override]
+    @overload
+    def get(self, key: Any, /) -> int: ...
+
+    @overload
+    def get(self, key: Any, /, default: _T) -> int | _T: ...
+
+    def get(self, key: Any, /, default: Any = None) -> Any:
         # By default, behave like __getitem__ and return -1 for missing keys
+        # This intentionally changes dict's behavior to return -1 instead of None
         if default is None:
             return self[key]
         return super().get(key, default)
@@ -35,13 +45,13 @@ class BattleSubject:
         self._hvdriver = driver
         self.snap = parse_snapshot(driver.driver.page_source)
 
-    def attach(self, observer: Observer):
+    def attach(self, observer: Observer) -> None:
         self._observers.append(observer)
 
-    def detach(self, observer: Observer):
+    def detach(self, observer: Observer) -> None:
         self._observers.remove(observer)
 
-    def notify(self):
+    def notify(self) -> None:
         self.snap = parse_snapshot(self._hvdriver.driver.page_source)
         for observer in self._observers:
             observer.update(self.snap)
@@ -56,7 +66,7 @@ class OverviewMonsters:
 
 
 class ExtendedBattleSnapshot(BattleSnapshot):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
 
@@ -80,10 +90,9 @@ class LogEntry(Observer):
                     self.total_round = int(match.group(2))
 
     def get_new_lines(self, snap: BattleSnapshot) -> list[str]:
-        textlog = snap.log.lines
-        return textlog
+        return snap.log.lines
 
-    def update(self, snap: BattleSnapshot):
+    def update(self, snap: BattleSnapshot) -> None:
         lines = self.get_new_lines(snap)
         if lines:
             self.current_lines = [line for line in lines if line not in self.prev_lines]
@@ -101,12 +110,12 @@ class BattleDashboard:
         self.battle_subject.attach(self.log_entries)
         self.update()
 
-    def update(self):
+    def update(self) -> None:
         self.battle_subject.notify()
         self.snap = self.battle_subject.snap
         self.update_overview_monsters()
 
-    def update_overview_monsters(self):
+    def update_overview_monsters(self) -> None:
         self.overview_monsters.alive_monster = [
             monster.slot_index
             for monster in self.snap.monsters.values()

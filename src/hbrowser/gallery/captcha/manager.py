@@ -1,4 +1,5 @@
 """驗證碼管理器 - 協調檢測和解決"""
+from typing import Any
 from .detector import CaptchaDetector
 from .solver_interface import CaptchaSolver
 from .models import ChallengeDetection
@@ -7,7 +8,7 @@ from .models import ChallengeDetection
 class CaptchaManager:
     """驗證碼管理器 - 核心協調邏輯"""
 
-    def __init__(self, solver: CaptchaSolver):
+    def __init__(self, solver: CaptchaSolver) -> None:
         """
         初始化驗證碼管理器
 
@@ -17,7 +18,7 @@ class CaptchaManager:
         self.solver = solver
         self.detector = CaptchaDetector()
 
-    def detect(self, driver, timeout: float = 2.0) -> ChallengeDetection:
+    def detect(self, driver: Any, timeout: float = 2.0) -> ChallengeDetection:
         """
         檢測驗證碼
 
@@ -30,7 +31,7 @@ class CaptchaManager:
         """
         return self.detector.detect(driver, timeout)
 
-    def solve(self, challenge: ChallengeDetection, driver) -> bool:
+    def solve(self, challenge: ChallengeDetection, driver: Any) -> bool:
         """
         解決驗證碼
 
@@ -47,7 +48,7 @@ class CaptchaManager:
         result = self.solver.solve(challenge, driver)
         return result.success
 
-    def detect_and_solve(self, driver, timeout: float = 2.0) -> bool:
+    def detect_and_solve(self, driver: Any, timeout: float = 2.0) -> bool:
         """
         檢測並解決驗證碼
 

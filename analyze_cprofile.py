@@ -8,7 +8,12 @@ cProfile結果分析工具
 
 import re
 import argparse
-from typing import List
+from typing import Callable, Dict, List, TypedDict
+
+
+class BottleneckCandidate(TypedDict):
+    line: "ProfileLine"
+    ratio: float
 
 
 class ProfileLine:
@@ -142,7 +147,7 @@ class CProfileAnalyzer:
         self.lines: List[ProfileLine] = []
         self.total_time = 0.0
 
-    def parse_file(self):
+    def parse_file(self) -> None:
         """解析cProfile文件"""
         with open(self.filename, "r", encoding="utf-8") as f:
             content = f.read()
@@ -178,7 +183,7 @@ class CProfileAnalyzer:
                 )
                 self.lines.append(profile_line)
 
-    def analyze_by_cumtime(self, top_n: int = 20):
+    def analyze_by_cumtime(self, top_n: int = 20) -> None:
         """按累計時間排序分析"""
         print(f"\n=== 前 {top_n} 名最耗時函數 (按累計時間排序) ===")
         print(
@@ -193,7 +198,7 @@ class CProfileAnalyzer:
                 f"{line.module_name[:19]:<20} {line.function_name[:29]:<30}"
             )
 
-    def analyze_by_tottime(self, top_n: int = 20):
+    def analyze_by_tottime(self, top_n: int = 20) -> None:
         """按自身時間排序分析"""
         print(f"\n=== 前 {top_n} 名最耗時函數 (按自身時間排序) ===")
         print(
@@ -208,7 +213,7 @@ class CProfileAnalyzer:
                 f"{line.module_name[:19]:<20} {line.function_name[:29]:<30}"
             )
 
-    def analyze_user_code(self, top_n: int = 10):
+    def analyze_user_code(self, top_n: int = 10) -> None:
         """分析用戶自己的代碼"""
         print(f"\n=== 用戶代碼效能分析 (前 {top_n} 名) ===")
         print(f"{'累計時間':<10} {'自身時間':<10} {'調用次數':<10} {'函數位置':<50}")
@@ -223,7 +228,7 @@ class CProfileAnalyzer:
                 f"{line.filename_function[:49]:<50}"
             )
 
-    def analyze_hbrowser_package(self, top_n: int = 20):
+    def analyze_hbrowser_package(self, top_n: int = 20) -> None:
         """詳細分析 hbrowser 套件效能"""
         print(f"\n=== hbrowser 套件效能分析 (前 {top_n} 名) ===")
         print(
@@ -255,7 +260,7 @@ class CProfileAnalyzer:
         )
         print("-" * 100)
 
-        bottleneck_candidates = []
+        bottleneck_candidates: list[BottleneckCandidate] = []
         for line in hbrowser_lines:
             if line.cumtime > 0.1:  # 累計時間超過0.1秒
                 # 計算時間比率：累計時間 / 自身時間，比率越高說明越多時間花在調用其他函數
@@ -271,12 +276,12 @@ class CProfileAnalyzer:
         bottleneck_candidates.sort(key=lambda x: x["line"].cumtime, reverse=True)
 
         for candidate in bottleneck_candidates[:15]:
-            line = candidate["line"]
-            ratio = candidate["ratio"]
-            ratio_str = f"{ratio:.1f}x" if ratio != float("inf") else "∞"
+            candidate_line = candidate["line"]
+            candidate_ratio = candidate["ratio"]
+            ratio_str = f"{candidate_ratio:.1f}x" if candidate_ratio != float("inf") else "∞"
             print(
-                f"{line.cumtime:<10.3f} {line.tottime:<10.3f} {ratio_str:<10} {line.ncalls:<10} "
-                f"{line.filename_function[:49]:<50}"
+                f"{candidate_line.cumtime:<10.3f} {candidate_line.tottime:<10.3f} {ratio_str:<10} {candidate_line.ncalls:<10} "
+                f"{candidate_line.filename_function[:49]:<50}"
             )
 
         # 按模組分組統計
@@ -308,19 +313,19 @@ class CProfileAnalyzer:
 
         if bottleneck_candidates:
             for i, candidate in enumerate(bottleneck_candidates[:10], 1):
-                line = candidate["line"]
-                ratio = candidate["ratio"]
-                print(f"\n{i}. {line.get_hbrowser_module()}.{line.function_name}")
-                print(f"   累計時間: {line.cumtime:.3f}秒 (包含調用其他函數的時間)")
-                print(f"   自身時間: {line.tottime:.3f}秒 (函數本身的執行時間)")
-                print(f"   時間比率: {ratio:.1f}x (累計/自身)")
-                print(f"   調用次數: {line.ncalls}")
-                print(f"   位置: {line.filename_function}")
+                bottleneck_line = candidate["line"]
+                bottleneck_ratio = candidate["ratio"]
+                print(f"\n{i}. {bottleneck_line.get_hbrowser_module()}.{bottleneck_line.function_name}")
+                print(f"   累計時間: {bottleneck_line.cumtime:.3f}秒 (包含調用其他函數的時間)")
+                print(f"   自身時間: {bottleneck_line.tottime:.3f}秒 (函數本身的執行時間)")
+                print(f"   時間比率: {bottleneck_ratio:.1f}x (累計/自身)")
+                print(f"   調用次數: {bottleneck_line.ncalls}")
+                print(f"   位置: {bottleneck_line.filename_function}")
                 print("   → 這個函數可能調用了耗時的 selenium 或網路操作")
         else:
             print("未檢測到明顯的 hbrowser 效能瓶頸")
 
-    def analyze_external_calls_impact(self):
+    def analyze_external_calls_impact(self) -> None:
         """分析外部函數調用對 hbrowser 的影響"""
         print("\n=== 外部函數對 hbrowser 的效能影響分析 ===")
 
@@ -371,7 +376,7 @@ class CProfileAnalyzer:
         print("- 重點優化這些 hbrowser 函數中對 selenium/網路操作的調用方式")
         print("- 考慮減少不必要的 find_element 調用或增加等待策略優化")
 
-    def analyze_time_distribution(self):
+    def analyze_time_distribution(self) -> None:
         """分析時間分布和調用關係"""
         print("\n=== 時間分布分析 ===")
 
@@ -418,11 +423,11 @@ class CProfileAnalyzer:
             print("• 這些函數本身執行很快，但調用了很多耗時的子函數")
             print("• 考慮減少這些函數的調用次數，或優化其調用的子函數")
 
-    def analyze_by_category(self):
+    def analyze_by_category(self) -> None:
         """按類別分析"""
         print("\n=== 按類別分析總耗時 ===")
 
-        categories = {
+        categories: Dict[str, Callable[[ProfileLine], bool]] = {
             "hbrowser套件": lambda x: x.is_hbrowser_package(),
             "用戶代碼": lambda x: x.is_your_code() and not x.is_hbrowser_package(),
             "Selenium": lambda x: x.is_selenium(),
@@ -452,7 +457,7 @@ class CProfileAnalyzer:
                 f"{category_name:<15} {total_cumtime:<12.3f} {percentage:<12.1f} {count:<10}"
             )
 
-    def find_frequent_calls(self, min_calls: int = 1000):
+    def find_frequent_calls(self, min_calls: int = 1000) -> None:
         """尋找高頻調用的函數"""
         print(f"\n=== 高頻調用函數 (調用次數 >= {min_calls}) ===")
         print(
@@ -470,7 +475,7 @@ class CProfileAnalyzer:
                 f"{line.module_name[:19]:<20} {line.function_name[:29]:<30}"
             )
 
-    def search_functions(self, keyword: str):
+    def search_functions(self, keyword: str) -> None:
         """搜尋包含特定關鍵字的函數"""
         print(f"\n=== 搜尋結果: '{keyword}' ===")
         print(f"{'累計時間':<10} {'自身時間':<10} {'調用次數':<10} {'函數位置':<50}")
@@ -489,7 +494,7 @@ class CProfileAnalyzer:
                 f"{line.filename_function[:49]:<50}"
             )
 
-    def performance_summary(self):
+    def performance_summary(self) -> None:
         """效能總結"""
         print("\n=== 效能分析總結 ===")
         print(f"總執行時間: {self.total_time:.3f} 秒")
@@ -528,7 +533,7 @@ class CProfileAnalyzer:
         print(f"• 實際執行時間: {self.total_time:.3f}秒")
         print("• 累計時間超過實際時間是正常的，因為子函數調用時間被重複計算")
 
-    def analyze_battle_in_turn_details(self, hbrowser_lines):
+    def analyze_battle_in_turn_details(self, hbrowser_lines: List[ProfileLine]) -> None:
         """詳細分析 battle_in_turn 內部的函數調用"""
         print("\n=== battle_in_turn 內部函數調用分析 ===")
 
@@ -609,7 +614,7 @@ class CProfileAnalyzer:
             )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="分析cProfile結果")
     parser.add_argument("filename", help="cProfile結果文件路徑")
     parser.add_argument(

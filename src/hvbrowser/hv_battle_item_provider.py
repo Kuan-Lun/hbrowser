@@ -1,5 +1,6 @@
+from typing import Any
+
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver, WebElement
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
@@ -17,11 +18,11 @@ class ItemProvider:
         )
 
     @property
-    def driver(self) -> WebDriver:
+    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
     @property
-    def items_menu_web_element(self) -> WebElement:
+    def items_menu_web_element(self) -> Any:  # WebElement from untyped driver
         return self.hvdriver.driver.find_element(By.ID, "ckey_items")
 
     def click_items_menu(self) -> None:
@@ -37,16 +38,17 @@ class ItemProvider:
         items_menum = self.items_menu_web_element.get_attribute("src") or ""
         return "items_s.png" in items_menum
 
-    def get_pane_items(self) -> WebElement:
+    def get_pane_items(self) -> Any:  # WebElement from untyped driver
         return self.hvdriver.driver.find_element(By.ID, "pane_item")
 
-    def get_item_elements(self, item: str) -> list[WebElement]:
-        return self.get_pane_items().find_elements(
+    def get_item_elements(self, item: str) -> list[Any]:
+        elements: list[Any] = self.get_pane_items().find_elements(
             By.XPATH,
             "//div[@id and @onclick and div[@class='fc2 fal fcb']/div[text()='{item_name}']]".format(
                 item_name=item
             ),
         )
+        return elements
 
     def use(self, item: str) -> bool:
         if item not in self.battle_dashboard.snap.items.items:
