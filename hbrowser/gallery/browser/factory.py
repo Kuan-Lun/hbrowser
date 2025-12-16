@@ -1,4 +1,5 @@
 """瀏覽器 WebDriver 工廠"""
+
 import os
 import platform
 from typing import Any
@@ -25,9 +26,9 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
 
     # 檢測是否為 Linux + Xvfb 環境
     is_xvfb_env = (
-        platform.system() == "Linux" and
-        os.environ.get("DISPLAY") and
-        ":" in os.environ.get("DISPLAY", "")
+        platform.system() == "Linux"
+        and os.environ.get("DISPLAY")
+        and ":" in os.environ.get("DISPLAY", "")
     )
 
     # 基本設定
@@ -42,9 +43,8 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
 
         # 檢測是否為 Linux server 環境（通常沒有 GPU）
         # 在 Linux 且檢測到 DISPLAY 環境變數為空或 Xvfb 時，認為是 server 環境
-        is_linux_server = (
-            platform.system() == "Linux" and
-            (not os.environ.get("DISPLAY") or "Xvfb" in os.environ.get("DISPLAY", ""))
+        is_linux_server = platform.system() == "Linux" and (
+            not os.environ.get("DISPLAY") or "Xvfb" in os.environ.get("DISPLAY", "")
         )
 
         # 只在 Linux server 環境下添加 GPU 相關參數
@@ -53,12 +53,13 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
             options.add_argument("--disable-gpu")  # 無 GPU 環境必須
             options.add_argument("--disable-software-rasterizer")
 
-    # 如果在 Xvfb 環境下（即使 headless=False），也需要添加一些參數
-    # 因為 Xvfb 沒有真實的 GPU
+    # Xvfb 環境下不添加 --disable-gpu 參數
+    # 原因：讓 Chrome 使用 SwiftShader 軟體渲染可能有更自然的指紋
+    # 明確禁用 GPU 反而容易被 Cloudflare 偵測
     if is_xvfb_env and not headless:
-        print("Detected Xvfb environment, adding GPU-related parameters...")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-software-rasterizer")
+        print(
+            "Detected Xvfb environment, using default GPU settings for better fingerprint..."
+        )
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
     options.add_argument("--disable-blink-features=AutomationControlled")
