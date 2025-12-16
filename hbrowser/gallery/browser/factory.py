@@ -1,4 +1,6 @@
 """瀏覽器 WebDriver 工廠"""
+import os
+import platform
 from typing import Any
 
 import undetected_chromedriver as uc
@@ -30,9 +32,19 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     # Headless 模式設定
     if headless:
         options.add_argument("--headless=new")  # 使用新的無頭模式
-        # 在 headless 模式下添加更多反偵測參數
-        options.add_argument("--disable-gpu")  # 無 GPU 環境必須
-        options.add_argument("--disable-software-rasterizer")
+
+        # 檢測是否為 Linux server 環境（通常沒有 GPU）
+        # 在 Linux 且檢測到 DISPLAY 環境變數為空或 Xvfb 時，認為是 server 環境
+        is_linux_server = (
+            platform.system() == "Linux" and
+            (not os.environ.get("DISPLAY") or "Xvfb" in os.environ.get("DISPLAY", ""))
+        )
+
+        # 只在 Linux server 環境下添加 GPU 相關參數
+        # 在 macOS/Windows 或有實體顯示的 Linux 桌面環境，不添加這些參數以保持更真實的瀏覽器指紋
+        if is_linux_server:
+            options.add_argument("--disable-gpu")  # 無 GPU 環境必須
+            options.add_argument("--disable-software-rasterizer")
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
     options.add_argument("--disable-blink-features=AutomationControlled")
