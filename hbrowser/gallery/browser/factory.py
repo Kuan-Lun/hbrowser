@@ -23,6 +23,13 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     # 設定瀏覽器參數
     options = uc.ChromeOptions()
 
+    # 檢測是否為 Linux + Xvfb 環境
+    is_xvfb_env = (
+        platform.system() == "Linux" and
+        os.environ.get("DISPLAY") and
+        ":" in os.environ.get("DISPLAY", "")
+    )
+
     # 基本設定
     options.add_argument("--disable-extensions")
     options.add_argument("--no-sandbox")  # 解決DevToolsActivePort文件不存在的問題
@@ -45,6 +52,13 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
         if is_linux_server:
             options.add_argument("--disable-gpu")  # 無 GPU 環境必須
             options.add_argument("--disable-software-rasterizer")
+
+    # 如果在 Xvfb 環境下（即使 headless=False），也需要添加一些參數
+    # 因為 Xvfb 沒有真實的 GPU
+    if is_xvfb_env and not headless:
+        print("Detected Xvfb environment, adding GPU-related parameters...")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
     options.add_argument("--disable-blink-features=AutomationControlled")
