@@ -2,12 +2,100 @@
 
 import os
 import platform
+import zipfile
+import tempfile
 from typing import Any
 
 import undetected_chromedriver as uc
 from fake_useragent import UserAgent
 
 from .ban_handler import handle_ban_decorator
+
+
+def _create_proxy_extension(
+    proxy_host: str, proxy_port: int, proxy_user: str, proxy_pass: str
+) -> str:
+    """
+    創建一個 Chrome 擴充功能來處理代理認證
+
+    Returns:
+        擴充功能 zip 檔案的路徑
+    """
+    manifest_json = """
+{
+    "version": "1.0.0",
+    "manifest_version": 2,
+    "name": "Chrome Proxy",
+    "permissions": [
+        "proxy",
+        "tabs",
+        "unlimitedStorage",
+        "storage",
+        "<all_urls>",
+        "webRequest",
+        "webRequestBlocking"
+    ],
+    "background": {
+        "scripts": ["background.js"]
+    },
+    "minimum_chrome_version":"22.0.0"
+}
+"""
+
+    background_js = """
+var config = {
+        mode: "fixed_servers",
+        rules: {
+          singleProxy: {
+            scheme: "http",
+            host: "%s",
+            port: parseInt(%s)
+          },
+          bypassList: ["localhost"]
+        }
+      };
+
+chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+function callbackFn(details) {
+    return {
+        authCredentials: {
+            username: "%s",
+            password: "%s"
+        }
+    };
+}
+
+chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {urls: ["<all_urls>"]},
+            ['blocking']
+);
+""" % (
+        proxy_host,
+        proxy_port,
+        proxy_user,
+        proxy_pass,
+    )
+
+    # 創建臨時目錄
+    plugin_dir = tempfile.mkdtemp()
+
+    # 寫入 manifest.json
+    with open(os.path.join(plugin_dir, "manifest.json"), "w") as f:
+        f.write(manifest_json)
+
+    # 寫入 background.js
+    with open(os.path.join(plugin_dir, "background.js"), "w") as f:
+        f.write(background_js)
+
+    # 創建 zip 檔案
+    plugin_file = os.path.join(tempfile.gettempdir(), "proxy_auth_plugin.zip")
+    with zipfile.ZipFile(plugin_file, "w") as zp:
+        zp.write(os.path.join(plugin_dir, "manifest.json"), "manifest.json")
+        zp.write(os.path.join(plugin_dir, "background.js"), "background.js")
+
+    return plugin_file
 
 
 def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
@@ -24,6 +112,35 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     # 設定瀏覽器參數
     options = uc.ChromeOptions()
 
+    # 住宅代理設定（從環境變數讀取）
+    rp_username = os.getenv("RP_USERNAME")
+    rp_password = os.getenv("RP_PASSWORD")
+    rp_dns = os.getenv("RP_DNS")
+
+    proxy_extension = None
+    if rp_username and rp_password and rp_dns:
+        # 解析代理地址和端口
+        if ":" in rp_dns:
+            proxy_host, proxy_port = rp_dns.split(":", 1)
+        else:
+            proxy_host = rp_dns
+            proxy_port = "8080"
+
+        print(f"Using residential proxy: {rp_username}@{proxy_host}:{proxy_port}")
+
+        # 創建代理認證擴充功能
+        proxy_extension = _create_proxy_extension(
+            proxy_host=proxy_host,
+            proxy_port=int(proxy_port),
+            proxy_user=rp_username,
+            proxy_pass=rp_password,
+        )
+        print(f"Proxy extension created at: {proxy_extension}")
+    else:
+        print(
+            "No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
+        )
+
     # 檢測是否為 Linux + Xvfb 環境
     is_xvfb_env = (
         platform.system() == "Linux"
@@ -32,7 +149,9 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     )
 
     # 基本設定
-    options.add_argument("--disable-extensions")
+    # 注意：如果使用代理擴充功能，不能禁用擴充功能
+    if not proxy_extension:
+        options.add_argument("--disable-extensions")
     options.add_argument("--no-sandbox")  # 解決DevToolsActivePort文件不存在的問題
     options.add_argument("--window-size=1600,900")
     options.add_argument("--disable-dev-shm-usage")
@@ -72,6 +191,10 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
 
     # 頁面加載策略
     options.page_load_strategy = "normal"  # 等待加载图片normal eager none
+
+    # 如果有代理擴充功能，添加到選項中
+    if proxy_extension:
+        options.add_extension(proxy_extension)
 
     # 使用 undetected-chromedriver 初始化 WebDriver
     # 注意: undetected-chromedriver 已經內建處理了 excludeSwitches 和 useAutomationExtension
