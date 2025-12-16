@@ -102,6 +102,24 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         print(f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})")
 
+        # 等待 Turnstile iframe 載入（最多等待 10 秒）
+        print("Waiting for Cloudflare Turnstile to load...")
+        iframe_wait_start = time.time()
+        iframe_loaded = False
+        while time.time() - iframe_wait_start < 10:
+            try:
+                iframes = driver.find_elements("tag name", "iframe")
+                if iframes:
+                    print(f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s")
+                    iframe_loaded = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not iframe_loaded:
+            print("Warning: No iframes loaded after 10 seconds")
+
         # 嘗試多種方式提取 sitekey
         html = driver.page_source
         sitekey = None
