@@ -102,13 +102,66 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         print(f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})")
 
-        # 嘗試提取 sitekey
+        # 嘗試多種方式提取 sitekey
         html = driver.page_source
-        sitekey_match = re.search(r'sitekey["\s:]+([0-9a-zA-Z_-]+)', html)
+        sitekey = None
 
-        if sitekey_match:
-            sitekey = sitekey_match.group(1)
-            print(f"Found sitekey in managed challenge: {sitekey}")
+        # 方法 1: 從 sitekey 屬性提取
+        patterns = [
+            r'sitekey["\s:]+([0-9a-zA-Z_-]+)',
+            r'data-sitekey["\s]*=["\s]*([0-9a-zA-Z_-]+)',
+            r'"siteKey"["\s]*:["\s]*"([0-9a-zA-Z_-]+)"',
+            r'turnstile\.render\([^,]+,[^{]*\{[^}]*sitekey["\s]*:["\s]*["\']([0-9a-zA-Z_-]+)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                sitekey = match.group(1)
+                print(f"Found sitekey using pattern '{pattern}': {sitekey}")
+                break
+
+        # 方法 2: 從 JavaScript 變數提取
+        if not sitekey:
+            try:
+                sitekey = driver.execute_script("""
+                    // 嘗試從各種可能的全域變數獲取 sitekey
+                    if (window.turnstile && window.turnstile.sitekey) {
+                        return window.turnstile.sitekey;
+                    }
+                    if (window._cf_chl_opt && window._cf_chl_opt.cKey) {
+                        return window._cf_chl_opt.cKey;
+                    }
+                    // 搜尋所有 iframe 的 src
+                    const iframes = document.querySelectorAll('iframe');
+                    for (let iframe of iframes) {
+                        const src = iframe.src || '';
+                        const match = src.match(/sitekey=([0-9a-zA-Z_-]+)/);
+                        if (match) return match[1];
+                    }
+                    return null;
+                """)
+                if sitekey:
+                    print(f"Found sitekey from JavaScript: {sitekey}")
+            except Exception as e:
+                print(f"Failed to extract sitekey from JavaScript: {e}")
+
+        # 方法 3: 檢查是否有 Turnstile iframe
+        if not sitekey:
+            try:
+                iframes = driver.find_elements("css selector", "iframe[src*='challenges.cloudflare.com']")
+                if iframes:
+                    iframe_src = iframes[0].get_attribute("src")
+                    print(f"Found Cloudflare challenge iframe: {iframe_src}")
+                    match = re.search(r'sitekey=([0-9a-zA-Z_-]+)', iframe_src)
+                    if match:
+                        sitekey = match.group(1)
+                        print(f"Extracted sitekey from iframe src: {sitekey}")
+            except Exception as e:
+                print(f"Failed to check iframes: {e}")
+
+        if sitekey:
+            print(f"Final sitekey to use: {sitekey}")
 
             # 嘗試使用 2Captcha 解決 Turnstile
             try:
@@ -163,13 +216,45 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         # 輪詢檢查頁面是否已經通過驗證
         print("Monitoring page for challenge resolution...")
-        if not sitekey_match:
+        if not sitekey:
             print(
                 "NOTE: No sitekey found. If running in non-headless mode, please solve the captcha manually."
             )
             print(
                 "      The script will automatically continue once the challenge is resolved."
             )
+            print("")
+            print("DEBUG: Saving additional debug information...")
+
+            # 保存頁面截圖（如果可能）
+            try:
+                screenshot_path = os.path.join(get_log_dir(), "challenge_screenshot.png")
+                driver.save_screenshot(screenshot_path)
+                print(f"DEBUG: Screenshot saved to {screenshot_path}")
+            except Exception as e:
+                print(f"DEBUG: Failed to save screenshot: {e}")
+
+            # 打印當前 URL 和標題
+            print(f"DEBUG: Current URL: {driver.current_url}")
+            print(f"DEBUG: Page title: {driver.title}")
+
+            # 檢查頁面中的關鍵元素
+            try:
+                cf_elements = driver.find_elements("css selector", "[class*='cf'], [id*='cf']")
+                print(f"DEBUG: Found {len(cf_elements)} Cloudflare-related elements")
+
+                challenge_forms = driver.find_elements("css selector", "form")
+                print(f"DEBUG: Found {len(challenge_forms)} forms on page")
+
+                all_iframes = driver.find_elements("tag name", "iframe")
+                print(f"DEBUG: Found {len(all_iframes)} iframes on page")
+                for idx, iframe in enumerate(all_iframes):
+                    src = iframe.get_attribute("src") or "(no src)"
+                    print(f"DEBUG:   iframe {idx}: {src[:100]}")
+            except Exception as e:
+                print(f"DEBUG: Failed to inspect page elements: {e}")
+
+            print("")
 
         detector = CaptchaDetector()
 
