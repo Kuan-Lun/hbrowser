@@ -13,6 +13,9 @@ def matchurl(*args: str) -> bool:
     """
     fixargs = list()
     for url in args:
+        # 處理 None 或空字串的情況
+        if not url:
+            return False
         while url[-1] == "/":
             url = url[0:-1]
         fixargs.append(url)
