@@ -7,7 +7,11 @@ from functools import partial
 from random import random
 from typing import Any, Callable
 
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -96,7 +100,9 @@ class Driver(ABC):
             ischangeurl=(not matchurl(url, old_url)),
         )
 
-    def wait(self, fun: Callable[[], None], ischangeurl: bool, sleeptime: int = -1) -> None:
+    def wait(
+        self, fun: Callable[[], None], ischangeurl: bool, sleeptime: int = -1
+    ) -> None:
         """
         執行函數並等待頁面變化
 
@@ -106,7 +112,19 @@ class Driver(ABC):
             sleeptime: 等待時間（秒），-1 表示隨機等待
         """
         old_url = self.driver.current_url
-        fun()
+
+        # 重試機制處理 StaleElementReferenceException
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                fun()
+                break
+            except StaleElementReferenceException:
+                if attempt == max_retries - 1:
+                    raise
+                # 短暫等待後重試
+                time.sleep(0.5)
+
         try:
             match ischangeurl:
                 case False:
