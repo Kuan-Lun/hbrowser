@@ -19,7 +19,7 @@ from selenium.webdriver.remote.webelement import WebElement
 
 from .browser import create_driver
 from .captcha import CaptchaManager, TwoCaptchaAdapter
-from .utils import matchurl, get_log_dir
+from .utils import matchurl, get_log_dir, setup_logger
 
 
 class Driver(ABC):
@@ -39,7 +39,6 @@ class Driver(ABC):
 
     def __init__(
         self,
-        logcontrol: Any = None,
         headless: bool = True,
     ) -> None:
         def seturl() -> dict[str, str]:
@@ -51,11 +50,12 @@ class Driver(ABC):
             url["HentaiVerse isekai"] = "https://hentaiverse.org/isekai/"
             return url
 
+        self.logger = setup_logger(__name__)
         self.username = os.getenv("EH_USERNAME")
         self.password = os.getenv("EH_PASSWORD")
         self.url = seturl()
         self.name = self._setname()
-        self.driver = create_driver(headless=headless, logcontrol=logcontrol)
+        self.driver = create_driver(headless=headless)
 
         # 初始化驗證碼管理器
         # 使用 180 秒（3 分鐘）的等待時間，以便在非 headless 模式下有足夠時間手動解決驗證碼
@@ -71,19 +71,22 @@ class Driver(ABC):
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if exc_type:
-            with open(
-                os.path.join(get_log_dir(), "error.txt"),
-                "w",
-                errors="ignore",
-            ) as f:
+            self.logger.error(f"Exception occurred: {exc_type.__name__}: {exc_val}")
+            error_file = os.path.join(get_log_dir(), "error.txt")
+            with open(error_file, "w", errors="ignore") as f:
                 f.write(self.driver.page_source)
+            self.logger.debug(f"Error page saved to: {error_file}")
+        self.logger.info("Closing browser driver")
         self.driver.quit()
 
     def gohomepage(self) -> None:
         """前往主頁"""
         url = self.url[self.name]
         if not matchurl(self.driver.current_url, url):
+            self.logger.info(f"Navigate to homepage: {url}")
             self.get(url)
+        else:
+            self.logger.debug("Already on homepage, no navigation needed")
 
     def find_element_chain(self, *selectors: tuple[str, str]) -> WebElement:
         """通過選擇器鏈逐步查找元素，每次在前一個元素的基礎上查找下一個"""
@@ -95,6 +98,7 @@ class Driver(ABC):
     def get(self, url: str) -> None:
         """導航到指定 URL"""
         old_url = self.driver.current_url
+        self.logger.debug(f"Navigate to URL: {url}")
         self.wait(
             fun=partial(self.driver.myget, url),
             ischangeurl=(not matchurl(url, old_url)),
@@ -143,6 +147,7 @@ class Driver(ABC):
 
     def login(self, isfirst: bool = True) -> None:
         """登入流程"""
+        self.logger.info("Starting login process")
         # 打開登入網頁
         self.driver.myget(self.url["My Home"])
         try:
@@ -151,6 +156,7 @@ class Driver(ABC):
         except NoSuchElementException:
             iscontinue = True
         if not iscontinue:
+            self.logger.info("Already logged in, skipping login")
             return
         WebDriverWait(self.driver, 10).until(
             EC.presence_of_element_located((By.NAME, "UserName"))
@@ -178,34 +184,35 @@ class Driver(ABC):
             # 顯式等待，直到 URL 改變
             wait = WebDriverWait(self.driver, 10)
             wait.until(lambda driver: driver.current_url != old_url)
-            print("Login button clicked, checking for challenges...")
+            self.logger.info("Login button clicked, checking for challenges...")
 
             # 檢測是否遇到 Cloudflare 驗證
             det = self.captcha_manager.detect(self.driver, timeout=3.0)
 
             if det.kind != "none":
-                print(f"Challenge detected: {det.kind}")
+                self.logger.warning(f"Challenge detected: {det.kind}")
                 # 保存登入後的頁面以供調試
-                with open(
-                    os.path.join(get_log_dir(), "login_page.html"),
-                    "w",
-                    errors="ignore",
-                ) as f:
+                login_page_path = os.path.join(get_log_dir(), "login_page.html")
+                with open(login_page_path, "w", errors="ignore") as f:
                     f.write(self.driver.page_source)
+                self.logger.debug(f"Login page saved to: {login_page_path}")
 
                 # 嘗試解決驗證
+                self.logger.info(f"Attempting to solve {det.kind} challenge...")
                 success = self.captcha_manager.solve(det, self.driver)
                 if not success:
+                    self.logger.error("Failed to solve captcha challenge")
                     raise Exception("Failed to solve captcha challenge")
+                self.logger.info("Challenge solved successfully")
             else:
-                print("No challenge detected, proceeding...")
+                self.logger.info("No challenge detected, proceeding with login...")
 
             # 假設跳轉後的頁面有一個具有 NAME=reset_imagelimit 的元素
             element_present = EC.presence_of_element_located(
                 (By.NAME, "reset_imagelimit")
             )
-            print("Waiting for homepage to load...")
+            self.logger.debug("Waiting for homepage to load...")
             WebDriverWait(self.driver, 10).until(element_present)
-            print("Login completed successfully.")
+            self.logger.info("Login completed successfully")
 
         self.gohomepage()

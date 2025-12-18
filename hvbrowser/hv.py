@@ -9,6 +9,9 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery import EHDriver
+from hbrowser.gallery.utils import setup_logger
+
+logger = setup_logger(__name__)
 
 
 def genxpath(imagepath: str) -> str:
@@ -55,12 +58,15 @@ class HVDriver(EHDriver):
         return "My Home"
 
     def goisekai(self) -> None:
+        logger.info("Navigating to HentaiVerse isekai page")
         self.get(self.url["HentaiVerse isekai"])
 
     def loetterycheck(self, num: int) -> None:
+        logger.info(f"Checking lottery tickets (target: {num})")
         self.gohomepage()
 
         for lettory in ["Weapon Lottery", "Armor Lottery"]:
+            logger.debug(f"Processing {lettory}")
             element: dict[str, Any] = dict()
             element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
             element[lettory] = self.driver.find_element(
@@ -88,16 +94,24 @@ class HVDriver(EHDriver):
             numbers = re.findall(r"[\d,]+", html_element.text)
             buy_number = numbers[0].replace(",", "")
 
+            logger.info(f"{lettory}: Currently have {currently_number} credits, hold {buy_number} tickets")
+
             if int(buy_number) < num and int(currently_number) > (num * 1000):
+                purchase_amount = num - int(buy_number)
+                logger.info(f"Purchasing {purchase_amount} tickets for {lettory}")
                 html_element = self.driver.find_element(By.ID, "ticket_temp")
                 html_element.clear()
-                html_element.send_keys(num - int(buy_number))
+                html_element.send_keys(purchase_amount)
                 self.driver.execute_script("submit_buy()")
+            else:
+                logger.debug(f"No purchase needed for {lettory} (tickets: {buy_number}, credits: {currently_number})")
 
     def monstercheck(self) -> None:
+        logger.info("Starting monster check")
         self.gohomepage()
 
         # 進入 Monster Lab
+        logger.debug("Navigating to Monster Lab")
         element: dict[str, Any] = dict()
         element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
         element["Monster Lab"] = self.driver.find_element(
@@ -124,17 +138,24 @@ class HVDriver(EHDriver):
 
             # 如果存在，則執行 JavaScript
             if images:
+                logger.info(f"Feeding all monsters with {keypair[key]}")
                 self.driver.execute_script(
                     "do_feed_all('{key}')".format(key=keypair[key])
                 )
                 self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
+            else:
+                logger.debug(f"No feed all option available for {keypair[key]}")
 
     def marketcheck(self, sellitems: SellItems) -> None:
+        logger.info("Starting market check for selling items")
+
         def marketpage() -> None:
             # 進入 Market
+            logger.debug("Navigating to market page")
             self.get("https://hentaiverse.org/?s=Bazaar&ss=mk")
 
         def filterpage(key: str, ischangeurl: bool) -> None:
+            logger.debug(f"Filtering page by: {key}")
             self.wait(
                 self.driver.find_element(
                     By.XPATH, "//div[contains(text(), '{key}')]/..".format(key=key)
@@ -166,8 +187,9 @@ class HVDriver(EHDriver):
             match = re.search(r"autofill_from_sell_order\((\d+),0,0\)", onclick_attr)
             if match:
                 number = match.group(1)
+                logger.debug(f"Re-listing sell order #{number}")
             else:
-                print("未能從 onclick 屬性中提取數字")
+                logger.warning("Unable to extract number from onclick attribute")
                 return
             # 假設 driver 是你的 WebDriver 實例
             self.driver.execute_script(
@@ -188,6 +210,7 @@ class HVDriver(EHDriver):
         marketpage()
 
         # 存錢
+        logger.info("Depositing credits to account")
         self.driver.find_element(
             By.XPATH, "//div[contains(text(), 'Account Balance')]"
         ).click()
@@ -239,6 +262,7 @@ class HVDriver(EHDriver):
                 if itempage():
                     continue
                 sellidx.append(idx + 1)
+            logger.info(f"Found {len(sellidx)} items to sell in {marketkey}")
             for idx in sellidx:
                 tr_element = self.driver.find_element(
                     By.XPATH, "//tr[{n}]".format(n=idx + 1)
@@ -247,11 +271,13 @@ class HVDriver(EHDriver):
                 resell()
 
         filterpage("My Sell Orders", ischangeurl=True)
+        logger.info("Checking existing sell orders for re-listing")
         for marketkey in marketurl:
             filterpage(marketkey, ischangeurl=False)
             try:
                 tr_elements = self.driver.find_elements(By.XPATH, "//tr")
                 sellitemnum = len(tr_elements) - 1
+                logger.debug(f"Found {sellitemnum} existing sell orders in {marketkey}")
                 for n in range(sellitemnum):
                     tr_element = self.driver.find_element(
                         By.XPATH, "//tr[{n}]".format(n=n + 2)
@@ -259,4 +285,6 @@ class HVDriver(EHDriver):
                     self.wait(tr_element.click, ischangeurl=False)
                     resell()
             except NoSuchElementException:
+                logger.debug(f"No existing sell orders found in {marketkey}")
                 pass
+        logger.info("Market check completed")

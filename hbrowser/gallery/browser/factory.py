@@ -10,6 +10,9 @@ import undetected_chromedriver as uc
 from fake_useragent import UserAgent
 
 from .ban_handler import handle_ban_decorator
+from ..utils import setup_logger
+
+logger = setup_logger(__name__)
 
 
 def _create_proxy_extension(
@@ -98,17 +101,17 @@ chrome.webRequest.onAuthRequired.addListener(
     return plugin_file
 
 
-def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
+def create_driver(headless: bool = True) -> Any:
     """
     創建 WebDriver 實例
 
     Args:
         headless: 是否使用無頭模式
-        logcontrol: 日誌控制函數
 
     Returns:
         配置好的 WebDriver 實例
     """
+    logger.info(f"Creating WebDriver (headless: {headless})")
     # 設定瀏覽器參數
     options = uc.ChromeOptions()
 
@@ -126,7 +129,7 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
             proxy_host = rp_dns
             proxy_port = "8080"
 
-        print(f"Using residential proxy: {rp_username}@{proxy_host}:{proxy_port}")
+        logger.info(f"Using residential proxy: {rp_username}@{proxy_host}:{proxy_port}")
 
         # 創建代理認證擴充功能
         proxy_extension = _create_proxy_extension(
@@ -135,11 +138,9 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
             proxy_user=rp_username,
             proxy_pass=rp_password,
         )
-        print(f"Proxy extension created at: {proxy_extension}")
+        logger.debug(f"Proxy extension created at: {proxy_extension}")
     else:
-        print(
-            "No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
-        )
+        logger.info("No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)")
 
     # 檢測是否為 Linux + Xvfb 環境
     is_xvfb_env = (
@@ -176,9 +177,7 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     # 原因：讓 Chrome 使用 SwiftShader 軟體渲染可能有更自然的指紋
     # 明確禁用 GPU 反而容易被 Cloudflare 偵測
     if is_xvfb_env and not headless:
-        print(
-            "Detected Xvfb environment, using default GPU settings for better fingerprint..."
-        )
+        logger.info("Detected Xvfb environment, using default GPU settings for better fingerprint")
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
     options.add_argument("--disable-blink-features=AutomationControlled")
@@ -199,9 +198,11 @@ def create_driver(headless: bool = True, logcontrol: Any = None) -> Any:
     # 使用 undetected-chromedriver 初始化 WebDriver
     # 注意: undetected-chromedriver 已經內建處理了 excludeSwitches 和 useAutomationExtension
     # 所以我們不需要手動設定這些選項
+    logger.debug("Initializing Chrome driver...")
     driver = uc.Chrome(options=options, use_subprocess=True)
+    logger.info("Chrome driver initialized successfully")
 
     # 添加 ban 檢查裝飾器
-    driver.myget = handle_ban_decorator(driver, logcontrol)
+    driver.myget = handle_ban_decorator(driver)
 
     return driver

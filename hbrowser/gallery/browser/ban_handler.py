@@ -4,6 +4,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from ..utils import setup_logger
+
+logger = setup_logger(__name__)
+
 
 def parse_ban_time(page_source: str) -> int:
     """
@@ -40,27 +44,21 @@ def parse_ban_time(page_source: str) -> int:
     )
 
 
-def handle_ban_decorator(driver: Any, logcontrol: Any) -> Callable[..., None]:
+def handle_ban_decorator(driver: Any) -> Callable[..., None]:
     """
     處理 IP ban 的裝飾器
 
     Args:
         driver: WebDriver 實例
-        logcontrol: 日誌控制函數
 
     Returns:
         包裝後的 get 函數
     """
-    def sendmsg(msg: str) -> None:
-        if logcontrol is not None:
-            logcontrol(msg)
-        else:
-            print(msg)
 
     def banningcheck() -> None:
         def banningmsg() -> str:
             a = timedelta(seconds=wait_seconds)
-            msg = f"IP banned, waiting for {a} (until {wait_until.strftime('%Y-%m-%d %H:%M:%S')}) to retry..."
+            msg = f"IP banned, waiting {a} (until {wait_until.strftime('%Y-%m-%d %H:%M:%S')}) to retry..."
             return msg
 
         def whilecheck() -> bool:
@@ -81,29 +79,30 @@ def handle_ban_decorator(driver: Any, logcontrol: Any) -> Callable[..., None]:
             isfirst = True
             isnothing = nothing == source
             while whilecheck():
-                sendmsg(source)
+                logger.debug(f"Page source: {source[:200]}...")
                 if not isfirst:
-                    sendmsg("Ban again")
+                    logger.warning("Banned again")
                 if isnothing:
                     wait_seconds = 4 * onehour
                 else:
                     wait_seconds = parse_ban_time(source)
                 wait_until = datetime.now() + timedelta(seconds=wait_seconds)
-                sendmsg(banningmsg())
+                logger.warning(banningmsg())
 
                 while wait_seconds > onehour:
                     time.sleep(onehour)
                     wait_seconds -= onehour
-                    sendmsg(banningmsg())
+                    logger.info(banningmsg())
                 time.sleep(wait_seconds + 15 * 60)
                 wait_seconds = 0
-                sendmsg("Retry")
+                logger.info("Retrying connection")
                 driver.refresh()
                 source = driver.page_source
                 isfirst = False
                 if isnothing:
+                    logger.error("Empty page, stopping retry")
                     raise RuntimeError()
-            sendmsg("Now is fine")
+            logger.info("IP ban lifted")
         else:
             return
 
