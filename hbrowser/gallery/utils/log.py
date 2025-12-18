@@ -1,6 +1,60 @@
 """日誌相關工具函數"""
 import os
 import sys
+import logging
+
+
+def setup_logger(name: str) -> logging.Logger:
+    """
+    創建或獲取 logger
+
+    日誌級別可通過環境變量 HBROWSER_LOG_LEVEL 控制：
+    - DEBUG: 詳細的調試信息
+    - INFO: 一般信息（默認）
+    - WARNING: 警告信息
+    - ERROR: 錯誤信息
+
+    Args:
+        name: logger 名稱（通常使用 __name__）
+
+    Returns:
+        配置好的 Logger 實例
+
+    Example:
+        >>> import os
+        >>> os.environ["HBROWSER_LOG_LEVEL"] = "DEBUG"
+        >>> logger = setup_logger(__name__)
+        >>> logger.debug("這是調試信息")
+    """
+    logger = logging.getLogger(name)
+
+    # 避免重複配置
+    if logger.handlers:
+        return logger
+
+    # 從環境變量獲取日誌級別
+    level_str = os.getenv("HBROWSER_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_str, logging.INFO)
+    logger.setLevel(level)
+
+    # 創建控制台處理器
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+
+    # 設置格式化器
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+
+    # 添加處理器到 logger
+    logger.addHandler(handler)
+
+    # 防止日誌向上傳播到 root logger（避免重複輸出）
+    logger.propagate = False
+
+    return logger
 
 
 def get_log_dir() -> str:

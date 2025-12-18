@@ -29,6 +29,7 @@ class EHDriver(Driver):
 
     def checkh2h(self) -> bool:
         """檢查 H@H 客戶端是否在線"""
+        self.logger.info("Checking H@H client status")
         self.get("https://e-hentai.org/hentaiathome.php")
         WebDriverWait(self.driver, 10).until(
             EC.presence_of_element_located((By.ID, "hct"))
@@ -45,16 +46,20 @@ class EHDriver(Driver):
             # 使用 'Status' 列的索引來檢查狀態
             status = cells[status_index].text
             if status.lower() == "online":
+                self.logger.info("H@H client is online")
                 return True
+        self.logger.warning("H@H client is offline")
         return False
 
     def punchin(self) -> None:
         """簽到"""
+        self.logger.info("Starting daily check-in")
         # 嘗試簽到
         self.get("https://e-hentai.org/news.php")
 
         # 刷新以免沒簽到成功
         self.wait(self.driver.refresh, ischangeurl=False)
+        self.logger.info("Check-in completed")
 
     def search2gallery(self, url: str) -> list[GalleryURLParser]:
         """從搜索結果頁面提取所有 gallery URLs"""
@@ -138,13 +143,16 @@ class EHDriver(Driver):
 
         input_element = self.driver.find_element(By.ID, "f_search")
         input_value = input_element.get_attribute("value")
-        print("Search", input_value)
+        self.logger.info(f"Search keyword: {input_value}")
 
         result = self.search2gallery(self.driver.current_url)
+        self.logger.info(f"Found {len(result)} galleries")
         return result
 
     def download(self, gallery: GalleryURLParser) -> bool:
         """下載 gallery"""
+        self.logger.info(f"Starting download for gallery: {gallery.url}")
+
         def _check_ekey(driver: Any, ekey: str) -> Any:
             return EC.presence_of_element_located((By.XPATH, ekey))(
                 driver
@@ -176,6 +184,7 @@ class EHDriver(Driver):
             ]
             xpath_query = " | ".join(xpath_query_list)
             self.driver.find_element(By.XPATH, xpath_query)
+            self.logger.warning(f"Gallery unavailable or deleted: {gallery.url}")
             return False
         except NoSuchElementException:
             gallerywindow = self.driver.current_window_handle
@@ -184,10 +193,9 @@ class EHDriver(Driver):
             try:
                 self.driver.find_element(By.XPATH, key).click()
             except NoSuchElementException:
-                print("NoSuchElementException")
+                self.logger.warning("Archive Download element not found, retrying download")
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
-                print("Retry again.")
                 return self.download(gallery)
             WebDriverWait(self.driver, 10).until(
                 partial(find_new_window, existing_windows)
@@ -220,13 +228,13 @@ class EHDriver(Driver):
                     else:
                         raise TimeoutException()
             except TimeoutException:
-                with open(os.path.join(".", "error.txt"), "w", errors="ignore") as f:
+                error_file = os.path.join(".", "error.txt")
+                with open(error_file, "w", errors="ignore") as f:
                     f.write(self.driver.page_source)
                 retrytime = 1 * 60  # 1 minute
-                print("TimeoutException")
+                self.logger.warning(f"Download timeout, error page saved to {error_file}, retrying in {retrytime}s")
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
-                print("Retry again.")
                 time.sleep(retrytime)
                 return self.download(gallery)
             if len(self.driver.current_window_handle) > 1:
@@ -235,11 +243,10 @@ class EHDriver(Driver):
                 self.driver.switch_to.window(gallerywindow)
                 time.sleep(random())
             else:
-                print(
-                    "Error. driver.current_window_handle: {a}".format(
-                        a=self.driver.current_window_handle
-                    )
+                self.logger.error(
+                    f"Window handle anomaly: {self.driver.current_window_handle}"
                 )
+            self.logger.info(f"Gallery downloaded successfully: {gallery.url}")
             return True
 
     def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:

@@ -7,6 +7,8 @@ from typing import Any, Callable, TypeVar
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import UnexpectedAlertPresentException
 
+from hbrowser.gallery.utils import setup_logger
+
 from .hv import HVDriver
 from .hv_battle_ponychart import PonyChart
 from .hv_battle_item_provider import ItemProvider
@@ -16,6 +18,8 @@ from .hv_battle_buff_manager import BuffManager
 
 from .pause_controller import PauseController
 from .hv_battle_observer_pattern import BattleDashboard
+
+logger = setup_logger(__name__)
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -45,14 +49,12 @@ def retry_on_server_fail(func: _F) -> _F:
                 text = alert.text
                 alert.accept()
                 if "Server communication failed" in text:
-                    print(
-                        "[WARN] Server communication failed detected, retrying after refresh..."
-                    )
+                    logger.warning("Server communication failed detected, retrying after refresh...")
                     time.sleep(5)
                     self.hvdriver.driver.refresh()
                     return func(self, *args, **kwargs)
             except Exception as e:
-                print(f"[ERROR] Failed to handle alert or refresh: {e}")
+                logger.error(f"Failed to handle alert or refresh: {e}")
             # 如果不是這種錯誤或重試也失敗，拋出原例外
             raise
 
@@ -460,9 +462,10 @@ class BattleDriver(HVDriver):
     def battle_in_turn(self) -> bool:
         self.turn += 1
         self.clear_cache()
-        # Print the current round logs
+        # Log the current round logs
         if self.new_logs:
-            print("\n".join(self.new_logs))
+            for log_line in self.new_logs:
+                logger.info(log_line)
 
         for fun in [
             self.go_next_floor,

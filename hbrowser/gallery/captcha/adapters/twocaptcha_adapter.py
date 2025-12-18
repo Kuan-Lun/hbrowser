@@ -14,10 +14,12 @@ from typing import Any
 from ..solver_interface import CaptchaSolver
 from ..models import ChallengeDetection, SolveResult
 from ....exceptions import CaptchaAPIKeyNotSetException, CaptchaSolveException
-from ...utils.log import get_log_dir
+from ...utils.log import get_log_dir, setup_logger
 from ..detector import CaptchaDetector
 
 from twocaptcha import TwoCaptcha  # type: ignore
+
+logger = setup_logger(__name__)
 
 
 class TwoCaptchaAdapter(CaptchaSolver):
@@ -53,7 +55,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         Returns:
             SolveResult: 解決結果
         """
-        print(f"Detected {challenge.kind} challenge, attempting to solve...")
+        logger.info(f"Detected {challenge.kind} challenge, attempting to solve...")
 
         try:
             match challenge.kind:
@@ -77,12 +79,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
             raise
         except Exception as e:
             # 保存錯誤時的頁面狀態
-            with open(
-                os.path.join(get_log_dir(), "challenge_error.html"),
-                "w",
-                errors="ignore",
-            ) as f:
+            error_file = os.path.join(get_log_dir(), "challenge_error.html")
+            with open(error_file, "w", errors="ignore") as f:
                 f.write(driver.page_source)
+            logger.error(f"Failed to solve challenge, page saved to {error_file}")
 
             raise CaptchaSolveException(
                 f"Failed to solve Cloudflare challenge: {str(e)}"
@@ -100,17 +100,17 @@ class TwoCaptchaAdapter(CaptchaSolver):
         ) as f:
             f.write(driver.page_source)
 
-        print(f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})")
+        logger.info(f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})")
 
         # 等待 Turnstile iframe 載入（最多等待 10 秒）
-        print("Waiting for Cloudflare Turnstile to load...")
+        logger.debug("Waiting for Cloudflare Turnstile to load...")
         iframe_wait_start = time.time()
         iframe_loaded = False
         while time.time() - iframe_wait_start < 10:
             try:
                 iframes = driver.find_elements("tag name", "iframe")
                 if iframes:
-                    print(f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s")
+                    logger.debug(f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s")
                     iframe_loaded = True
                     break
             except Exception:
@@ -118,7 +118,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             time.sleep(0.5)
 
         if not iframe_loaded:
-            print("Warning: No iframes loaded after 10 seconds")
+            logger.warning("No iframes loaded after 10 seconds")
 
         # 嘗試多種方式提取 sitekey
         html = driver.page_source
@@ -136,7 +136,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             match = re.search(pattern, html, re.IGNORECASE)
             if match:
                 sitekey = match.group(1)
-                print(f"Found sitekey using pattern '{pattern}': {sitekey}")
+                logger.debug(f"Found sitekey using pattern '{pattern}': {sitekey}")
                 break
 
         # 方法 2: 從 JavaScript 變數提取
@@ -160,9 +160,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
                     return null;
                 """)
                 if sitekey:
-                    print(f"Found sitekey from JavaScript: {sitekey}")
+                    logger.debug(f"Found sitekey from JavaScript: {sitekey}")
             except Exception as e:
-                print(f"Failed to extract sitekey from JavaScript: {e}")
+                logger.warning(f"Failed to extract sitekey from JavaScript: {e}")
 
         # 方法 3: 檢查是否有 Turnstile iframe
         if not sitekey:
@@ -170,20 +170,20 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 iframes = driver.find_elements("css selector", "iframe[src*='challenges.cloudflare.com']")
                 if iframes:
                     iframe_src = iframes[0].get_attribute("src")
-                    print(f"Found Cloudflare challenge iframe: {iframe_src}")
+                    logger.debug(f"Found Cloudflare challenge iframe: {iframe_src}")
                     match = re.search(r'sitekey=([0-9a-zA-Z_-]+)', iframe_src)
                     if match:
                         sitekey = match.group(1)
-                        print(f"Extracted sitekey from iframe src: {sitekey}")
+                        logger.debug(f"Extracted sitekey from iframe src: {sitekey}")
             except Exception as e:
-                print(f"Failed to check iframes: {e}")
+                logger.warning(f"Failed to check iframes: {e}")
 
         if sitekey:
-            print(f"Final sitekey to use: {sitekey}")
+            logger.info(f"Final sitekey to use: {sitekey}")
 
             # 嘗試使用 2Captcha 解決 Turnstile
             try:
-                print("Attempting to solve with 2Captcha Turnstile API...")
+                logger.info("Attempting to solve with 2Captcha Turnstile API...")
                 result = self._twocaptcha.turnstile(
                     sitekey=sitekey,
                     url=challenge.url,
@@ -191,7 +191,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
                 token = result.get("code")
                 if token:
-                    print(f"Got token from 2Captcha: {token[:50]}...")
+                    logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
                     # 嘗試注入 token
                     driver.execute_script(
@@ -226,53 +226,46 @@ class TwoCaptchaAdapter(CaptchaSolver):
                         token,
                     )
 
-                    print("Token injected, waiting for page to respond...")
+                    logger.info("Token injected, waiting for page to respond...")
                     time.sleep(5)
             except Exception as e:
-                print(f"2Captcha solve attempt failed: {str(e)}")
-                print("Falling back to passive waiting...")
+                logger.warning(f"2Captcha solve attempt failed: {str(e)}")
+                logger.info("Falling back to passive waiting...")
 
         # 輪詢檢查頁面是否已經通過驗證
-        print("Monitoring page for challenge resolution...")
+        logger.info("Monitoring page for challenge resolution...")
         if not sitekey:
-            print(
-                "NOTE: No sitekey found. If running in non-headless mode, please solve the captcha manually."
-            )
-            print(
-                "      The script will automatically continue once the challenge is resolved."
-            )
-            print("")
-            print("DEBUG: Saving additional debug information...")
+            logger.warning("No sitekey found. If running in non-headless mode, please solve the captcha manually")
+            logger.info("The script will automatically continue once the challenge is resolved")
+            logger.debug("Saving additional debug information...")
 
             # 保存頁面截圖（如果可能）
             try:
                 screenshot_path = os.path.join(get_log_dir(), "challenge_screenshot.png")
                 driver.save_screenshot(screenshot_path)
-                print(f"DEBUG: Screenshot saved to {screenshot_path}")
+                logger.debug(f"Screenshot saved to {screenshot_path}")
             except Exception as e:
-                print(f"DEBUG: Failed to save screenshot: {e}")
+                logger.debug(f"Failed to save screenshot: {e}")
 
             # 打印當前 URL 和標題
-            print(f"DEBUG: Current URL: {driver.current_url}")
-            print(f"DEBUG: Page title: {driver.title}")
+            logger.debug(f"Current URL: {driver.current_url}")
+            logger.debug(f"Page title: {driver.title}")
 
             # 檢查頁面中的關鍵元素
             try:
                 cf_elements = driver.find_elements("css selector", "[class*='cf'], [id*='cf']")
-                print(f"DEBUG: Found {len(cf_elements)} Cloudflare-related elements")
+                logger.debug(f"Found {len(cf_elements)} Cloudflare-related elements")
 
                 challenge_forms = driver.find_elements("css selector", "form")
-                print(f"DEBUG: Found {len(challenge_forms)} forms on page")
+                logger.debug(f"Found {len(challenge_forms)} forms on page")
 
                 all_iframes = driver.find_elements("tag name", "iframe")
-                print(f"DEBUG: Found {len(all_iframes)} iframes on page")
+                logger.debug(f"Found {len(all_iframes)} iframes on page")
                 for idx, iframe in enumerate(all_iframes):
                     src = iframe.get_attribute("src") or "(no src)"
-                    print(f"DEBUG:   iframe {idx}: {src[:100]}")
+                    logger.debug(f"  iframe {idx}: {src[:100]}")
             except Exception as e:
-                print(f"DEBUG: Failed to inspect page elements: {e}")
-
-            print("")
+                logger.debug(f"Failed to inspect page elements: {e}")
 
         detector = CaptchaDetector()
 
@@ -289,22 +282,22 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
             # 檢查 URL 是否變化
             if current_url != last_url:
-                print(f"URL changed from {last_url} to {current_url}")
+                logger.info(f"URL changed from {last_url} to {current_url}")
                 last_url = current_url
 
             # 檢查標題是否變化（可能表示頁面狀態變更）
             if current_title != last_title:
-                print(f"Page title changed: {last_title} -> {current_title}")
+                logger.info(f"Page title changed: {last_title} -> {current_title}")
                 last_title = current_title
 
             # 重新檢測是否還有驗證
             current_det = detector.detect(driver, timeout=1.0)
             if current_det.kind == "none":
-                print("Challenge resolved successfully!")
+                logger.info("Challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
 
             elapsed = int(time.time() - start_time)
-            print(
+            logger.debug(
                 f"Still waiting... ({elapsed}s/{max_wait}s) - Current URL: {current_url[:50]}..."
             )
 
@@ -328,7 +321,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 "Turnstile widget detected but sitekey not found"
             )
 
-        print(f"Solving Turnstile with sitekey: {challenge.sitekey}")
+        logger.info(f"Solving Turnstile with sitekey: {challenge.sitekey}")
 
         # 提交驗證任務到 2Captcha
         result = self._twocaptcha.turnstile(
@@ -341,7 +334,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         if not token:
             raise CaptchaSolveException("Failed to get token from 2Captcha response")
 
-        print(f"Got token from 2Captcha: {token[:50]}...")
+        logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
         # 將 token 注入到頁面
         success = driver.execute_script(
@@ -368,7 +361,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         )
 
         if success:
-            print("Token injected successfully, waiting for page to respond...")
+            logger.info("Token injected successfully, waiting for page to respond...")
             time.sleep(3)
 
             # 檢查是否通過驗證
@@ -376,10 +369,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
             detector = CaptchaDetector()
             current_det = detector.detect(driver, timeout=1.0)
             if current_det.kind == "none":
-                print("Turnstile challenge resolved successfully!")
+                logger.info("Turnstile challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
         else:
-            print("Warning: Could not inject token using standard methods")
+            logger.warning("Could not inject token using standard methods")
 
         return SolveResult(
             success=False,
@@ -392,7 +385,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         if not challenge.sitekey:
             raise CaptchaSolveException("reCAPTCHA v2 detected but sitekey not found")
 
-        print(f"Solving reCAPTCHA v2 with sitekey: {challenge.sitekey}")
+        logger.info(f"Solving reCAPTCHA v2 with sitekey: {challenge.sitekey}")
 
         # 提交驗證任務到 2Captcha
         result = self._twocaptcha.recaptcha(
@@ -405,7 +398,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         if not token:
             raise CaptchaSolveException("Failed to get token from 2Captcha response")
 
-        print(f"Got token from 2Captcha: {token[:50]}...")
+        logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
         # 將 token 注入到頁面
         success = driver.execute_script(
@@ -422,17 +415,17 @@ class TwoCaptchaAdapter(CaptchaSolver):
             token,
         )
         if success:
-            print("Token injected successfully, waiting for page to respond...")
+            logger.info("Token injected successfully, waiting for page to respond...")
             time.sleep(3)
 
             # 檢查是否通過驗證
             detector = CaptchaDetector()
             current_det = detector.detect(driver, timeout=1.0)
             if current_det.kind == "none":
-                print("reCAPTCHA v2 challenge resolved successfully!")
+                logger.info("reCAPTCHA v2 challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
         else:
-            print("Warning: Could not inject token using standard methods")
+            logger.warning("Could not inject token using standard methods")
 
         return SolveResult(
             success=False,

@@ -10,7 +10,10 @@ import cv2 as cv
 from selenium.webdriver.common.by import By
 
 from hbrowser.beep import beep_os_independent
+from hbrowser.gallery.utils import setup_logger
 from .hv import HVDriver
+
+logger = setup_logger(__name__)
 
 HOG_CFG: dict[str, tuple[int, int] | int] = {
     "win_size": (192, 192),
@@ -220,7 +223,7 @@ class PonyChart:
                 clicked.append(name)
             except Exception:
                 pass
-        print(f"[PonyChart][ML] 預測: {labels} -> 點擊文字: {clicked}")
+        logger.info(f"[PonyChart][ML] Prediction: {labels} -> Clicked text: {clicked}")
         return labels
 
     def _check(self) -> bool:
@@ -239,7 +242,7 @@ class PonyChart:
         try:
             self._auto_answer(img_path)
         except Exception as e:  # pragma: no cover
-            print(f"[PonyChart] 自動勾選失敗: {e}")
+            logger.error(f"[PonyChart] Auto-check failed: {e}")
 
         # 原始等待邏輯 (約 15 秒) 保留
         waitlimit = 15
@@ -248,7 +251,7 @@ class PonyChart:
             waitlimit -= 1
 
         if waitlimit <= 1 and self._check():
-            print("PonyChart check timeout, please check your network connection.")
+            logger.warning("PonyChart check timeout, please check your network connection")
             # 改為依送出按鈕顯示文字 (value="Submit Answer") 來尋找並點擊，失敗時回退用 id
             try:
                 self.hvdriver.driver.find_element(
