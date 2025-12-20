@@ -56,4 +56,4 @@ include = ["hbrowser*", "hvbrowser*"]
 line-length = 88
 
 [tool.ruff.lint]
-select = ["I"]
+select = ["E", "F", "I", "UP"]
