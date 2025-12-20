@@ -145,9 +145,7 @@ class HVDriver(EHDriver):
             # 如果存在，則執行 JavaScript
             if images:
                 logger.info(f"Feeding all monsters with {keypair[key]}")
-                self.driver.execute_script(
-                    f"do_feed_all('{keypair[key]}')"
-                )
+                self.driver.execute_script(f"do_feed_all('{keypair[key]}')")
                 self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
             else:
                 logger.debug(f"No feed all option available for {keypair[key]}")
@@ -198,9 +196,7 @@ class HVDriver(EHDriver):
                 logger.warning("Unable to extract number from onclick attribute")
                 return
             # 假設 driver 是你的 WebDriver 實例
-            self.driver.execute_script(
-                f"autofill_from_sell_order({number},0,0);"
-            )
+            self.driver.execute_script(f"autofill_from_sell_order({number},0,0);")
 
             for id in ["sell_order_stock_field", "sellorder_update"]:
                 Sell_button = self.driver.find_element(
@@ -270,9 +266,7 @@ class HVDriver(EHDriver):
                 sellidx.append(idx + 1)
             logger.info(f"Found {len(sellidx)} items to sell in {marketkey}")
             for idx in sellidx:
-                tr_element = self.driver.find_element(
-                    By.XPATH, f"//tr[{idx + 1}]"
-                )
+                tr_element = self.driver.find_element(By.XPATH, f"//tr[{idx + 1}]")
                 self.wait(tr_element.click, ischangeurl=False)
                 resell()
 
@@ -285,9 +279,7 @@ class HVDriver(EHDriver):
                 sellitemnum = len(tr_elements) - 1
                 logger.debug(f"Found {sellitemnum} existing sell orders in {marketkey}")
                 for n in range(sellitemnum):
-                    tr_element = self.driver.find_element(
-                        By.XPATH, f"//tr[{n + 2}]"
-                    )
+                    tr_element = self.driver.find_element(By.XPATH, f"//tr[{n + 2}]")
                     self.wait(tr_element.click, ischangeurl=False)
                     resell()
             except NoSuchElementException:

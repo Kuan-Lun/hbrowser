@@ -61,7 +61,7 @@ def handle_ban_decorator(driver: Any) -> Callable[..., None]:
     def banningcheck() -> None:
         def banningmsg() -> str:
             a = timedelta(seconds=wait_seconds)
-            wait_until_str = wait_until.strftime('%Y-%m-%d %H:%M:%S')
+            wait_until_str = wait_until.strftime("%Y-%m-%d %H:%M:%S")
             msg = f"IP banned, waiting {a} (until {wait_until_str}) to retry..."
             return msg
 

@@ -46,9 +46,7 @@ class ItemProvider:
             f"//div[@id and @onclick and "
             f"div[@class='fc2 fal fcb']/div[text()='{item}']]"
         )
-        elements: list[Any] = self.get_pane_items().find_elements(
-            By.XPATH, xpath
-        )
+        elements: list[Any] = self.get_pane_items().find_elements(By.XPATH, xpath)
         return elements
 
     def use(self, item: str) -> bool:
