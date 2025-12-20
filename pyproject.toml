@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.11.1"
+version = "0.11.2"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -51,3 +51,9 @@ include = ["hbrowser*", "hvbrowser*"]
     "hv_battle_ponychart_ml/weights.npz",
     "hv_battle_ponychart_ml/thresholds.json",
 ]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["I"]
