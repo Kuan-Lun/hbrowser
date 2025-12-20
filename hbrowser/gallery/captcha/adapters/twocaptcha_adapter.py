@@ -113,9 +113,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 iframes = driver.find_elements("tag name", "iframe")
                 if iframes:
                     wait_time = int(time.time() - iframe_wait_start)
-                    logger.debug(
-                        f"Found {len(iframes)} iframe(s) after {wait_time}s"
-                    )
+                    logger.debug(f"Found {len(iframes)} iframe(s) after {wait_time}s")
                     iframe_loaded = True
                     break
             except Exception:
