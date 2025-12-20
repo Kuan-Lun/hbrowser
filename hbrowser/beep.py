@@ -1,7 +1,7 @@
 __all__ = ["beep_os_independent"]
 
-import sys
 import os
+import sys
 
 
 def beep_os_independent() -> None:

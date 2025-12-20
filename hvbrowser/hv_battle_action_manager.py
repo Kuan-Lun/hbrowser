@@ -2,10 +2,10 @@ import time
 from typing import Any, Callable, Union
 
 from hv_bie import parse_snapshot
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.common.by import By
 from selenium.common.exceptions import StaleElementReferenceException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.webelement import WebElement
 
 from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard

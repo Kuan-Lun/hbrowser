@@ -1,8 +1,8 @@
 """日誌相關工具函數"""
 
+import logging
 import os
 import sys
-import logging
 
 
 def setup_logger(name: str) -> logging.Logger:

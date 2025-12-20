@@ -1,5 +1,5 @@
-import time
 import re
+import time
 from abc import ABC
 from random import random
 from typing import Any
