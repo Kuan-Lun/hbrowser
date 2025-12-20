@@ -1,9 +1,9 @@
 """瀏覽器視窗相關工具函數"""
 
-from typing import Any, Optional
+from typing import Any
 
 
-def find_new_window(existing_windows: set[str], driver: Any) -> Optional[str]:
+def find_new_window(existing_windows: set[str], driver: Any) -> str | None:
     """
     找到新開啟的視窗
 

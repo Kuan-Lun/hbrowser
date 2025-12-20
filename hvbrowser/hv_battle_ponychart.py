@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import cv2 as cv
 import numpy as np
@@ -61,8 +61,8 @@ class _InlineModel:
         self.b = None
         self.mu = None
         self.sd = None
-        self.classes: List[str] = []
-        self.thresholds: Dict[str, float] = {}
+        self.classes: list[str] = []
+        self.thresholds: dict[str, float] = {}
 
     def _dir(self) -> str:
         return os.path.join(os.path.dirname(__file__), "hv_battle_ponychart_ml")
@@ -79,7 +79,7 @@ class _InlineModel:
         self.mu = data["scaler_mean"].astype(np.float32)
         self.sd = data["scaler_scale"].astype(np.float32)
         self.classes = [c for c in data["classes"]]
-        with open(th, "r", encoding="utf-8") as f:
+        with open(th, encoding="utf-8") as f:
             self.thresholds = json.load(f)
         self.loaded = True
 
@@ -130,7 +130,7 @@ class _InlineModel:
 
     def predict(
         self, img_path: str, min_k: int = 1, max_k: int = 3
-    ) -> Tuple[List[str], Dict[str, float]]:
+    ) -> tuple[list[str], dict[str, float]]:
         self.load()
         img = cv.imread(img_path, cv.IMREAD_COLOR)
         if img is None:
@@ -209,7 +209,7 @@ class PonyChart:
         return filepath
 
     # ---------------- ML & 自動作答邏輯 ----------------
-    def _auto_answer(self, img_path: str) -> Optional[List[str]]:
+    def _auto_answer(self, img_path: str) -> list[str] | None:
         """最簡化：模型推論 -> 依角色名稱精確比對 label 文字 -> 點擊。"""
         labels, _ = self._model.predict(img_path)
         drv = self.driver
@@ -261,7 +261,8 @@ class PonyChart:
             logger.warning(
                 "PonyChart check timeout, please check your network connection"
             )
-            # 改為依送出按鈕顯示文字 (value="Submit Answer") 來尋找並點擊，失敗時回退用 id
+            # 改為依送出按鈕顯示文字 (value="Submit Answer") 來尋找並點擊，
+            # 失敗時回退用 id
             try:
                 self.hvdriver.driver.find_element(
                     By.XPATH, "//input[@type='submit' and @value='Submit Answer']"

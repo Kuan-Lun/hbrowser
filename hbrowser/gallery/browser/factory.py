@@ -45,41 +45,36 @@ def _create_proxy_extension(
 }
 """
 
-    background_js = """
-var config = {
+    background_js = f"""
+var config = {{
         mode: "fixed_servers",
-        rules: {
-          singleProxy: {
+        rules: {{
+          singleProxy: {{
             scheme: "http",
-            host: "%s",
-            port: parseInt(%s)
-          },
+            host: "{proxy_host}",
+            port: parseInt({proxy_port})
+          }},
           bypassList: ["localhost"]
-        }
-      };
+        }}
+      }};
 
-chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
 
-function callbackFn(details) {
-    return {
-        authCredentials: {
-            username: "%s",
-            password: "%s"
-        }
-    };
-}
+function callbackFn(details) {{
+    return {{
+        authCredentials: {{
+            username: "{proxy_user}",
+            password: "{proxy_pass}"
+        }}
+    }};
+}}
 
 chrome.webRequest.onAuthRequired.addListener(
             callbackFn,
-            {urls: ["<all_urls>"]},
+            {{urls: ["<all_urls>"]}},
             ['blocking']
 );
-""" % (
-        proxy_host,
-        proxy_port,
-        proxy_user,
-        proxy_pass,
-    )
+"""
 
     # 創建臨時目錄
     plugin_dir = tempfile.mkdtemp()
@@ -141,7 +136,8 @@ def create_driver(headless: bool = True) -> Any:
         logger.debug(f"Proxy extension created at: {proxy_extension}")
     else:
         logger.info(
-            "No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
+            "No residential proxy configured "
+            "(set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
         )
 
     # 檢測是否為 Linux + Xvfb 環境
@@ -170,7 +166,8 @@ def create_driver(headless: bool = True) -> Any:
         )
 
         # 只在 Linux server 環境下添加 GPU 相關參數
-        # 在 macOS/Windows 或有實體顯示的 Linux 桌面環境，不添加這些參數以保持更真實的瀏覽器指紋
+        # 在 macOS/Windows 或有實體顯示的 Linux 桌面環境，
+        # 不添加這些參數以保持更真實的瀏覽器指紋
         if is_linux_server:
             options.add_argument("--disable-gpu")  # 無 GPU 環境必須
             options.add_argument("--disable-software-rasterizer")
@@ -180,7 +177,8 @@ def create_driver(headless: bool = True) -> Any:
     # 明確禁用 GPU 反而容易被 Cloudflare 偵測
     if is_xvfb_env and not headless:
         logger.info(
-            "Detected Xvfb environment, using default GPU settings for better fingerprint"
+            "Detected Xvfb environment, "
+            "using default GPU settings for better fingerprint"
         )
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
@@ -200,7 +198,8 @@ def create_driver(headless: bool = True) -> Any:
         options.add_extension(proxy_extension)
 
     # 使用 undetected-chromedriver 初始化 WebDriver
-    # 注意: undetected-chromedriver 已經內建處理了 excludeSwitches 和 useAutomationExtension
+    # 注意: undetected-chromedriver 已經內建處理了
+    # excludeSwitches 和 useAutomationExtension
     # 所以我們不需要手動設定這些選項
     logger.debug("Initializing Chrome driver...")
     driver = uc.Chrome(options=options, use_subprocess=True)
