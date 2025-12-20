@@ -112,8 +112,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
             try:
                 iframes = driver.find_elements("tag name", "iframe")
                 if iframes:
+                    wait_time = int(time.time() - iframe_wait_start)
                     logger.debug(
-                        f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s"
+                        f"Found {len(iframes)} iframe(s) after {wait_time}s"
                     )
                     iframe_loaded = True
                     break
@@ -205,13 +206,18 @@ class TwoCaptchaAdapter(CaptchaSolver):
                     driver.execute_script(
                         """
                         // 方法1: 尋找並設置 turnstile response input
-                        var inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-turnstile"]');
+                        var inputs = document.querySelectorAll(
+                            'input[name*="turnstile"], input[name*="cf-turnstile"]'
+                        );
                         for (var i = 0; i < inputs.length; i++) {
                             inputs[i].value = arguments[0];
                         }
 
                         // 方法2: 如果有 callback
-                        if (window.turnstile && typeof window.turnstile.reset === 'function') {
+                        if (
+                            window.turnstile &&
+                            typeof window.turnstile.reset === 'function'
+                        ) {
                             try {
                                 // 嘗試觸發驗證完成
                                 if (window.cfCallback) window.cfCallback(arguments[0]);
@@ -244,7 +250,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
         logger.info("Monitoring page for challenge resolution...")
         if not sitekey:
             logger.warning(
-                "No sitekey found. If running in non-headless mode, please solve the captcha manually"
+                "No sitekey found. If running in non-headless mode, "
+                "please solve the captcha manually"
             )
             logger.info(
                 "The script will automatically continue once the challenge is resolved"
@@ -313,8 +320,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 return SolveResult(success=True, solver_name="TwoCaptcha")
 
             elapsed = int(time.time() - start_time)
+            url_preview = current_url[:50]
             logger.debug(
-                f"Still waiting... ({elapsed}s/{max_wait}s) - Current URL: {current_url[:50]}..."
+                f"Still waiting... ({elapsed}s/{max_wait}s) - "
+                f"Current URL: {url_preview}..."
             )
 
         # 超時仍未解決

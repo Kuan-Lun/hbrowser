@@ -1,6 +1,7 @@
 import threading
+from collections.abc import Callable
 from time import sleep
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
 

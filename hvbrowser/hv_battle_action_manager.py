@@ -1,5 +1,6 @@
 import time
-from typing import Any, Callable, Union
+from collections.abc import Callable
+from typing import Any
 
 from hv_bie import parse_snapshot
 from selenium.common.exceptions import StaleElementReferenceException
@@ -47,7 +48,7 @@ class ElementActionManager:
 
     def click_and_wait_log_locator(
         self,
-        by: Union[str, By],
+        by: str | By,
         value: str,
         is_retry: bool = True,
         stale_retries: int = 3,
@@ -55,8 +56,8 @@ class ElementActionManager:
         check_interval: float = 0.05,
     ) -> None:
         """
-        Like click_and_wait_log but takes a locator so we can re-find element if it turns stale
-        or after a refresh.
+        Like click_and_wait_log but takes a locator so we can re-find
+        element if it turns stale or after a refresh.
         """
         # Pre-click snapshot
         html = self.battle_dashboard.log_entries.get_new_lines(
@@ -88,7 +89,8 @@ class ElementActionManager:
             waited += check_interval
             if waited >= timeout:
                 if is_retry:
-                    # Soft recovery: browser refresh, then attempt once more (no infinite recursion)
+                    # Soft recovery: browser refresh, then attempt once more
+                    # (no infinite recursion)
                     self.hvdriver.driver.refresh()
                     return self.click_and_wait_log_locator(
                         by,

@@ -15,7 +15,7 @@ logger = setup_logger(__name__)
 
 
 def genxpath(imagepath: str) -> str:
-    return '//img[@src="{imagepath}"]'.format(imagepath=imagepath)
+    return f'//img[@src="{imagepath}"]'
 
 
 def searchxpath_fun(srclist: list[Any] | tuple[Any, ...] | set[Any]) -> str:
@@ -70,7 +70,7 @@ class HVDriver(EHDriver):
             element: dict[str, Any] = dict()
             element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
             element[lettory] = self.driver.find_element(
-                By.XPATH, "//div[contains(text(), '{lettory}')]".format(lettory=lettory)
+                By.XPATH, f"//div[contains(text(), '{lettory}')]"
             )
             actions = ActionChains(self.driver)
             self.wait(
@@ -95,7 +95,8 @@ class HVDriver(EHDriver):
             buy_number = numbers[0].replace(",", "")
 
             logger.info(
-                f"{lettory}: Currently have {currently_number} credits, hold {buy_number} tickets"
+                f"{lettory}: Currently have {currently_number} credits, "
+                f"hold {buy_number} tickets"
             )
 
             if int(buy_number) < num and int(currently_number) > (num * 1000):
@@ -107,7 +108,8 @@ class HVDriver(EHDriver):
                 self.driver.execute_script("submit_buy()")
             else:
                 logger.debug(
-                    f"No purchase needed for {lettory} (tickets: {buy_number}, credits: {currently_number})"
+                    f"No purchase needed for {lettory} "
+                    f"(tickets: {buy_number}, credits: {currently_number})"
                 )
 
     def monstercheck(self) -> None:
@@ -137,14 +139,14 @@ class HVDriver(EHDriver):
             # 嘗試找到圖片元素
             images = self.driver.find_elements(
                 By.XPATH,
-                searchxpath_fun(["/y/monster/{key}allmonsters.png".format(key=key)]),
+                searchxpath_fun([f"/y/monster/{key}allmonsters.png"]),
             )
 
             # 如果存在，則執行 JavaScript
             if images:
                 logger.info(f"Feeding all monsters with {keypair[key]}")
                 self.driver.execute_script(
-                    "do_feed_all('{key}')".format(key=keypair[key])
+                    f"do_feed_all('{keypair[key]}')"
                 )
                 self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
             else:
@@ -162,7 +164,7 @@ class HVDriver(EHDriver):
             logger.debug(f"Filtering page by: {key}")
             self.wait(
                 self.driver.find_element(
-                    By.XPATH, "//div[contains(text(), '{key}')]/..".format(key=key)
+                    By.XPATH, f"//div[contains(text(), '{key}')]/.."
                 ).click,
                 ischangeurl=ischangeurl,
             )
@@ -197,7 +199,7 @@ class HVDriver(EHDriver):
                 return
             # 假設 driver 是你的 WebDriver 實例
             self.driver.execute_script(
-                "autofill_from_sell_order({number},0,0);".format(number=number)
+                f"autofill_from_sell_order({number},0,0);"
             )
 
             for id in ["sell_order_stock_field", "sellorder_update"]:
@@ -269,7 +271,7 @@ class HVDriver(EHDriver):
             logger.info(f"Found {len(sellidx)} items to sell in {marketkey}")
             for idx in sellidx:
                 tr_element = self.driver.find_element(
-                    By.XPATH, "//tr[{n}]".format(n=idx + 1)
+                    By.XPATH, f"//tr[{idx + 1}]"
                 )
                 self.wait(tr_element.click, ischangeurl=False)
                 resell()
@@ -284,7 +286,7 @@ class HVDriver(EHDriver):
                 logger.debug(f"Found {sellitemnum} existing sell orders in {marketkey}")
                 for n in range(sellitemnum):
                     tr_element = self.driver.find_element(
-                        By.XPATH, "//tr[{n}]".format(n=n + 2)
+                        By.XPATH, f"//tr[{n + 2}]"
                     )
                     self.wait(tr_element.click, ischangeurl=False)
                     resell()

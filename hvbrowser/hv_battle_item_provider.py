@@ -42,11 +42,12 @@ class ItemProvider:
         return self.hvdriver.driver.find_element(By.ID, "pane_item")
 
     def get_item_elements(self, item: str) -> list[Any]:
+        xpath = (
+            f"//div[@id and @onclick and "
+            f"div[@class='fc2 fal fcb']/div[text()='{item}']]"
+        )
         elements: list[Any] = self.get_pane_items().find_elements(
-            By.XPATH,
-            "//div[@id and @onclick and div[@class='fc2 fal fcb']/div[text()='{item_name}']]".format(
-                item_name=item
-            ),
+            By.XPATH, xpath
         )
         return elements
 
@@ -64,7 +65,8 @@ class ItemProvider:
         if not self.is_open_items_menu():
             self.click_items_menu()
             item_button_list = self.get_item_elements(item)
-        # Use locator-based click (derive unique locator via first element's id attribute if present)
+        # Use locator-based click (derive unique locator via first
+        # element's id attribute if present)
         target = item_button_list[0]
         item_id = target.get_attribute("id")
         if item_id:

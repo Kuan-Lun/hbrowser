@@ -9,7 +9,11 @@ def matchurl(*args: str) -> bool:
         matchurl("https://e-hentai.org", "https://e-hentai.org/") -> True
         matchurl("https://e-hentai.org", "https://e-hentai.org") -> True
         matchurl("https://e-hentai.org", "https://exhentai.org") -> False
-        matchurl("https://e-hentai.org", "https://e-hentai.org", "https://e-hentai.org") -> True
+        matchurl(
+            "https://e-hentai.org",
+            "https://e-hentai.org",
+            "https://e-hentai.org"
+        ) -> True
     """
     fixargs = list()
     for url in args:

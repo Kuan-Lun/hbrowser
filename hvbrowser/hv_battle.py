@@ -1,8 +1,9 @@
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from functools import partial, wraps
 from random import random
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from selenium.common.exceptions import UnexpectedAlertPresentException
 from selenium.webdriver.common.by import By
@@ -49,7 +50,8 @@ def retry_on_server_fail(func: _F) -> _F:
                 alert.accept()
                 if "Server communication failed" in text:
                     logger.warning(
-                        "Server communication failed detected, retrying after refresh..."
+                        "Server communication failed detected, "
+                        "retrying after refresh..."
                     )
                     time.sleep(5)
                     self.hvdriver.driver.refresh()
@@ -148,7 +150,9 @@ class BattleDriver(HVDriver):
         new_logs = self.battle_dashboard.log_entries.current_lines
         # 固定寬度，假設最大 3 位數
         turn_str = f"Turn {self.turn:>5}"
-        round_str = f"Round {self.battle_dashboard.log_entries.current_round:>3} / {self.battle_dashboard.log_entries.total_round:<3}"
+        current = self.battle_dashboard.log_entries.current_round
+        total = self.battle_dashboard.log_entries.total_round
+        round_str = f"Round {current:>3} / {total:<3}"
         return [f"{turn_str} {round_str} {line}" for line in new_logs]
 
     def use_item(self, key: str) -> bool:
@@ -245,7 +249,8 @@ class BattleDriver(HVDriver):
 
     def check_overcharge(self) -> bool:
         if self._buffmanager.has_buff("Spirit Stance"):
-            # If Spirit Stance is active, check if Overcharge and SP are below thresholds
+            # If Spirit Stance is active, check if Overcharge and SP
+            # are below thresholds
             if any(
                 [
                     self.get_stat_percent("overcharge")
@@ -497,7 +502,8 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         self._create_last_debuff_monster_id()
-        # Open skill menu twice using resilient locator-based click (no element caching & no log wait)
+        # Open skill menu twice using resilient locator-based click
+        # (no element caching & no log wait)
         from selenium.webdriver.common.by import (
             By as _By,
         )  # local import to avoid top-level clutter

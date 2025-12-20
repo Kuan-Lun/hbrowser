@@ -71,7 +71,8 @@ class EHDriver(Driver):
         input_value = input_element.get_attribute("value")
         if input_value == "":
             raise ValueError(
-                "The value in the search box is empty. I think there are TOO MANY GALLERIES."
+                "The value in the search box is empty. "
+                "I think there are TOO MANY GALLERIES."
             )
 
         glist = list()
@@ -91,10 +92,11 @@ class EHDriver(Driver):
                 break
         if len(glist) == 0:
             try:
-                self.driver.find_element(
-                    By.XPATH,
-                    "//*[contains(text(), 'No hits found')] | //td[contains(text(), 'No unfiltered results found.')]",
+                xpath = (
+                    "//*[contains(text(), 'No hits found')] | "
+                    "//td[contains(text(), 'No unfiltered results found.')]"
                 )
+                self.driver.find_element(By.XPATH, xpath)
             except NoSuchElementException:
                 raise ValueError("找出 0 個 Gallery，但頁面沒有顯示 'No hits found'。")
         glist = list(set(glist))
@@ -161,7 +163,11 @@ class EHDriver(Driver):
             ) or EC.visibility_of_element_located((By.XPATH, ekey))(driver)
 
         def check_download_success_by_element(driver: Any) -> Any:
-            ekey = "//p[contains(text(), 'Downloads should start processing within a couple of minutes.')]"
+            ekey = (
+                "//p[contains(text(), "
+                "'Downloads should start processing within a couple of minutes.'"
+                ")]"
+            )
             return _check_ekey(driver, ekey)
 
         def check_client_offline_by_element(driver: Any) -> Any:
@@ -181,7 +187,9 @@ class EHDriver(Driver):
         self.get(gallery.url)
         try:
             xpath_query_list = [
-                "//p[contains(text(), 'This gallery is unavailable due to a copyright claim by Irodori Comics.')]",
+                "//p[contains(text(), "
+                "'This gallery is unavailable due to a copyright claim "
+                "by Irodori Comics.')]",
                 "//input[@id='f_search']",
             ]
             xpath_query = " | ".join(xpath_query_list)
@@ -237,7 +245,8 @@ class EHDriver(Driver):
                     f.write(self.driver.page_source)
                 retrytime = 1 * 60  # 1 minute
                 self.logger.warning(
-                    f"Download timeout, error page saved to {error_file}, retrying in {retrytime}s"
+                    f"Download timeout, error page saved to {error_file}, "
+                    f"retrying in {retrytime}s"
                 )
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
@@ -260,7 +269,7 @@ class EHDriver(Driver):
         self.get(gallery.url)
         try:
             elements = self.driver.find_elements(
-                By.XPATH, "//a[contains(@id, 'ta_{filter}')]".format(filter=filter)
+                By.XPATH, f"//a[contains(@id, 'ta_{filter}')]"
             )
         except NoSuchElementException:
             return list()

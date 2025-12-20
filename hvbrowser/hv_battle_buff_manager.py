@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Any, Union
+from typing import Any
 
 from selenium.webdriver.common.by import By
 
@@ -83,7 +83,7 @@ class BuffManager:
     def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
-    def get_buff_remaining_turns(self, key: str) -> Union[int, float]:
+    def get_buff_remaining_turns(self, key: str) -> int | float:
         """
         Get the remaining turns of the buff.
         Returns 0 if the buff is not active.

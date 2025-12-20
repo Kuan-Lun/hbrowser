@@ -2,8 +2,9 @@
 
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 from ..utils import setup_logger
 
@@ -60,7 +61,8 @@ def handle_ban_decorator(driver: Any) -> Callable[..., None]:
     def banningcheck() -> None:
         def banningmsg() -> str:
             a = timedelta(seconds=wait_seconds)
-            msg = f"IP banned, waiting {a} (until {wait_until.strftime('%Y-%m-%d %H:%M:%S')}) to retry..."
+            wait_until_str = wait_until.strftime('%Y-%m-%d %H:%M:%S')
+            msg = f"IP banned, waiting {a} (until {wait_until_str}) to retry..."
             return msg
 
         def whilecheck() -> bool:

@@ -3,9 +3,10 @@
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from functools import partial
 from random import random
-from typing import Any, Callable
+from typing import Any
 
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -58,7 +59,8 @@ class Driver(ABC):
         self.driver = create_driver(headless=headless)
 
         # 初始化驗證碼管理器
-        # 使用 180 秒（3 分鐘）的等待時間，以便在非 headless 模式下有足夠時間手動解決驗證碼
+        # 使用 180 秒（3 分鐘）的等待時間，
+        # 以便在非 headless 模式下有足夠時間手動解決驗證碼
         solver = TwoCaptchaAdapter(max_wait=180)
         self.captcha_manager = CaptchaManager(solver)
 
