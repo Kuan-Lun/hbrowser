@@ -66,7 +66,7 @@ from hbrowser import EHDriver
 
 
 if __name__ == "__main__":
-    with EHDriver(**driverpass.getdict()) as driver:
+    with EHDriver() as driver:
         driver.punchin()
 ```
 
