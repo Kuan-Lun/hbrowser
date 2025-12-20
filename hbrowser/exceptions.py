@@ -8,7 +8,9 @@ class ClientOfflineException(Exception):
 
 
 class InsufficientFundsException(Exception):
-    def __init__(self, message: str = "Insufficient funds to start the download.") -> None:
+    def __init__(
+        self, message: str = "Insufficient funds to start the download."
+    ) -> None:
         self.message = message
         super().__init__(self.message)
 
@@ -17,7 +19,9 @@ class InsufficientFundsException(Exception):
 
 
 class CaptchaAPIKeyNotSetException(Exception):
-    def __init__(self, message: str = "APIKEY_2CAPTCHA environment variable is not set.") -> None:
+    def __init__(
+        self, message: str = "APIKEY_2CAPTCHA environment variable is not set."
+    ) -> None:
         self.message = message
         super().__init__(self.message)
 

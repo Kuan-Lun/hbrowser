@@ -94,7 +94,9 @@ class HVDriver(EHDriver):
             numbers = re.findall(r"[\d,]+", html_element.text)
             buy_number = numbers[0].replace(",", "")
 
-            logger.info(f"{lettory}: Currently have {currently_number} credits, hold {buy_number} tickets")
+            logger.info(
+                f"{lettory}: Currently have {currently_number} credits, hold {buy_number} tickets"
+            )
 
             if int(buy_number) < num and int(currently_number) > (num * 1000):
                 purchase_amount = num - int(buy_number)
@@ -104,7 +106,9 @@ class HVDriver(EHDriver):
                 html_element.send_keys(purchase_amount)
                 self.driver.execute_script("submit_buy()")
             else:
-                logger.debug(f"No purchase needed for {lettory} (tickets: {buy_number}, credits: {currently_number})")
+                logger.debug(
+                    f"No purchase needed for {lettory} (tickets: {buy_number}, credits: {currently_number})"
+                )
 
     def monstercheck(self) -> None:
         logger.info("Starting monster check")

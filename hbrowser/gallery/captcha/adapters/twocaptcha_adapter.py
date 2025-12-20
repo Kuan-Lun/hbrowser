@@ -100,7 +100,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
         ) as f:
             f.write(driver.page_source)
 
-        logger.info(f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})")
+        logger.info(
+            f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})"
+        )
 
         # 等待 Turnstile iframe 載入（最多等待 10 秒）
         logger.debug("Waiting for Cloudflare Turnstile to load...")
@@ -110,7 +112,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
             try:
                 iframes = driver.find_elements("tag name", "iframe")
                 if iframes:
-                    logger.debug(f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s")
+                    logger.debug(
+                        f"Found {len(iframes)} iframe(s) after {int(time.time() - iframe_wait_start)}s"
+                    )
                     iframe_loaded = True
                     break
             except Exception:
@@ -142,7 +146,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 方法 2: 從 JavaScript 變數提取
         if not sitekey:
             try:
-                sitekey = driver.execute_script("""
+                sitekey = driver.execute_script(
+                    """
                     // 嘗試從各種可能的全域變數獲取 sitekey
                     if (window.turnstile && window.turnstile.sitekey) {
                         return window.turnstile.sitekey;
@@ -158,7 +163,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
                         if (match) return match[1];
                     }
                     return null;
-                """)
+                """
+                )
                 if sitekey:
                     logger.debug(f"Found sitekey from JavaScript: {sitekey}")
             except Exception as e:
@@ -167,11 +173,13 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 方法 3: 檢查是否有 Turnstile iframe
         if not sitekey:
             try:
-                iframes = driver.find_elements("css selector", "iframe[src*='challenges.cloudflare.com']")
+                iframes = driver.find_elements(
+                    "css selector", "iframe[src*='challenges.cloudflare.com']"
+                )
                 if iframes:
                     iframe_src = iframes[0].get_attribute("src")
                     logger.debug(f"Found Cloudflare challenge iframe: {iframe_src}")
-                    match = re.search(r'sitekey=([0-9a-zA-Z_-]+)', iframe_src)
+                    match = re.search(r"sitekey=([0-9a-zA-Z_-]+)", iframe_src)
                     if match:
                         sitekey = match.group(1)
                         logger.debug(f"Extracted sitekey from iframe src: {sitekey}")
@@ -235,13 +243,19 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 輪詢檢查頁面是否已經通過驗證
         logger.info("Monitoring page for challenge resolution...")
         if not sitekey:
-            logger.warning("No sitekey found. If running in non-headless mode, please solve the captcha manually")
-            logger.info("The script will automatically continue once the challenge is resolved")
+            logger.warning(
+                "No sitekey found. If running in non-headless mode, please solve the captcha manually"
+            )
+            logger.info(
+                "The script will automatically continue once the challenge is resolved"
+            )
             logger.debug("Saving additional debug information...")
 
             # 保存頁面截圖（如果可能）
             try:
-                screenshot_path = os.path.join(get_log_dir(), "challenge_screenshot.png")
+                screenshot_path = os.path.join(
+                    get_log_dir(), "challenge_screenshot.png"
+                )
                 driver.save_screenshot(screenshot_path)
                 logger.debug(f"Screenshot saved to {screenshot_path}")
             except Exception as e:
@@ -253,7 +267,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
             # 檢查頁面中的關鍵元素
             try:
-                cf_elements = driver.find_elements("css selector", "[class*='cf'], [id*='cf']")
+                cf_elements = driver.find_elements(
+                    "css selector", "[class*='cf'], [id*='cf']"
+                )
                 logger.debug(f"Found {len(cf_elements)} Cloudflare-related elements")
 
                 challenge_forms = driver.find_elements("css selector", "form")
@@ -380,7 +396,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
             solver_name="TwoCaptcha",
         )
 
-    def _solve_recaptcha_v2(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
+    def _solve_recaptcha_v2(
+        self, challenge: ChallengeDetection, driver: Any
+    ) -> SolveResult:
         """解決 reCAPTCHA v2"""
         if not challenge.sitekey:
             raise CaptchaSolveException("reCAPTCHA v2 detected but sitekey not found")

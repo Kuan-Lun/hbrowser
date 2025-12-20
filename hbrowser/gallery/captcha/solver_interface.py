@@ -1,4 +1,5 @@
 """驗證碼解決器抽象接口"""
+
 from abc import ABC, abstractmethod
 from typing import Any
 from .models import ChallengeDetection, SolveResult

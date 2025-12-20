@@ -3,6 +3,7 @@
 
 提供驗證碼檢測、解決和管理功能
 """
+
 from .models import ChallengeDetection, SolveResult, Kind
 from .solver_interface import CaptchaSolver
 from .detector import CaptchaDetector

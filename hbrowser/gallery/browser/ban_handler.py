@@ -1,4 +1,5 @@
 """IP ban 處理邏輯"""
+
 import re
 import time
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ def parse_ban_time(page_source: str) -> int:
     Returns:
         被禁的秒數
     """
+
     def calculate(duration_str: str) -> dict[str, int]:
         # Regular expression patterns to capture days, hours, and minutes
         patterns = {

@@ -49,7 +49,9 @@ def retry_on_server_fail(func: _F) -> _F:
                 text = alert.text
                 alert.accept()
                 if "Server communication failed" in text:
-                    logger.warning("Server communication failed detected, retrying after refresh...")
+                    logger.warning(
+                        "Server communication failed detected, retrying after refresh..."
+                    )
                     time.sleep(5)
                     self.hvdriver.driver.refresh()
                     return func(self, *args, **kwargs)
