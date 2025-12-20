@@ -1,8 +1,7 @@
 """驗證碼相關數據模型"""
 
 from dataclasses import dataclass
-from typing import Optional, Literal
-
+from typing import Literal, Optional
 
 Kind = Literal["none", "turnstile_widget", "cf_managed_challenge", "recaptcha_v2"]
 

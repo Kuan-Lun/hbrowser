@@ -1,8 +1,8 @@
 from collections import defaultdict
 from typing import Any
 
-from selenium.webdriver.common.by import By
 from selenium.common.exceptions import StaleElementReferenceException
+from selenium.webdriver.common.by import By
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager

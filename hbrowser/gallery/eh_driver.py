@@ -1,10 +1,10 @@
 """E-Hentai Driver 實現"""
 
-import re
 import os
+import re
 import time
-from random import random
 from functools import partial
+from random import random
 from typing import Any
 
 from h2h_galleryinfo_parser import GalleryURLParser
@@ -13,10 +13,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from ..exceptions import ClientOfflineException, InsufficientFundsException
 from .driver_base import Driver
 from .models import Tag
-from .utils import matchurl, find_new_window
-from ..exceptions import ClientOfflineException, InsufficientFundsException
+from .utils import find_new_window, matchurl
 
 
 class EHDriver(Driver):

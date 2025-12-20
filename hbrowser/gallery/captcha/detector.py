@@ -1,13 +1,14 @@
 """驗證碼檢測器 - 純粹的檢測邏輯，不依賴解決方案"""
 
 from typing import Any
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_IFRAME_CSS
 from .models import ChallengeDetection
-from .constants import TURNSTILE_IFRAME_CSS, SITEKEY_RE, RAY_RE
 
 
 class CaptchaDetector:

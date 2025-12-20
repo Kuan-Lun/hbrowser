@@ -1,9 +1,10 @@
 """驗證碼管理器 - 協調檢測和解決"""
 
 from typing import Any
+
 from .detector import CaptchaDetector
-from .solver_interface import CaptchaSolver
 from .models import ChallengeDetection
+from .solver_interface import CaptchaSolver
 
 
 class CaptchaManager:

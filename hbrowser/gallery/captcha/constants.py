@@ -2,7 +2,6 @@
 
 import re
 
-
 TURNSTILE_IFRAME_CSS = (
     "iframe[src*='challenges.cloudflare.com'][src*='/turnstile/'], "
     "iframe[src*='challenges.cloudflare.com'][src*='turnstile']"

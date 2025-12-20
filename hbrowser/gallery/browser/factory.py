@@ -2,15 +2,15 @@
 
 import os
 import platform
-import zipfile
 import tempfile
+import zipfile
 from typing import Any
 
 import undetected_chromedriver as uc
 from fake_useragent import UserAgent
 
-from .ban_handler import handle_ban_decorator
 from ..utils import setup_logger
+from .ban_handler import handle_ban_decorator
 
 logger = setup_logger(__name__)
 

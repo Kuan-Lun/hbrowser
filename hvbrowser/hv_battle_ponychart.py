@@ -1,16 +1,17 @@
-import os
-import time
-import sys
 import json
+import os
+import sys
+import time
 from datetime import datetime
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import cv2 as cv
+import numpy as np
 from selenium.webdriver.common.by import By
 
 from hbrowser.beep import beep_os_independent
 from hbrowser.gallery.utils import setup_logger
+
 from .hv import HVDriver
 
 logger = setup_logger(__name__)

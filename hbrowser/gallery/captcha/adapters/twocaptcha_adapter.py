@@ -11,13 +11,13 @@ import re
 import time
 from typing import Any
 
-from ..solver_interface import CaptchaSolver
-from ..models import ChallengeDetection, SolveResult
+from twocaptcha import TwoCaptcha  # type: ignore
+
 from ....exceptions import CaptchaAPIKeyNotSetException, CaptchaSolveException
 from ...utils.log import get_log_dir, setup_logger
 from ..detector import CaptchaDetector
-
-from twocaptcha import TwoCaptcha  # type: ignore
+from ..models import ChallengeDetection, SolveResult
+from ..solver_interface import CaptchaSolver
 
 logger = setup_logger(__name__)
 
