@@ -1,4 +1,5 @@
 """E-Hentai Driver 實現"""
+
 import re
 import os
 import time
@@ -102,6 +103,7 @@ class EHDriver(Driver):
 
     def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
         """搜索 galleries"""
+
         def waitpage() -> None:
             element_present: Any = EC.presence_of_element_located((By.ID, "f_search"))
             WebDriverWait(self.driver, 10).until(element_present)
@@ -193,7 +195,9 @@ class EHDriver(Driver):
             try:
                 self.driver.find_element(By.XPATH, key).click()
             except NoSuchElementException:
-                self.logger.warning("Archive Download element not found, retrying download")
+                self.logger.warning(
+                    "Archive Download element not found, retrying download"
+                )
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
                 return self.download(gallery)
@@ -232,7 +236,9 @@ class EHDriver(Driver):
                 with open(error_file, "w", errors="ignore") as f:
                     f.write(self.driver.page_source)
                 retrytime = 1 * 60  # 1 minute
-                self.logger.warning(f"Download timeout, error page saved to {error_file}, retrying in {retrytime}s")
+                self.logger.warning(
+                    f"Download timeout, error page saved to {error_file}, retrying in {retrytime}s"
+                )
                 self.driver.close()
                 self.driver.switch_to.window(gallerywindow)
                 time.sleep(retrytime)

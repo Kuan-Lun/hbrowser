@@ -2,7 +2,7 @@ import threading
 from time import sleep
 from typing import Any, Callable, TypeVar
 
-F = TypeVar('F', bound=Callable[..., Any])
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 class PauseController:

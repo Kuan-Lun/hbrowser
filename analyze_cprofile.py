@@ -278,7 +278,9 @@ class CProfileAnalyzer:
         for candidate in bottleneck_candidates[:15]:
             candidate_line = candidate["line"]
             candidate_ratio = candidate["ratio"]
-            ratio_str = f"{candidate_ratio:.1f}x" if candidate_ratio != float("inf") else "∞"
+            ratio_str = (
+                f"{candidate_ratio:.1f}x" if candidate_ratio != float("inf") else "∞"
+            )
             print(
                 f"{candidate_line.cumtime:<10.3f} {candidate_line.tottime:<10.3f} {ratio_str:<10} {candidate_line.ncalls:<10} "
                 f"{candidate_line.filename_function[:49]:<50}"
@@ -315,9 +317,15 @@ class CProfileAnalyzer:
             for i, candidate in enumerate(bottleneck_candidates[:10], 1):
                 bottleneck_line = candidate["line"]
                 bottleneck_ratio = candidate["ratio"]
-                print(f"\n{i}. {bottleneck_line.get_hbrowser_module()}.{bottleneck_line.function_name}")
-                print(f"   累計時間: {bottleneck_line.cumtime:.3f}秒 (包含調用其他函數的時間)")
-                print(f"   自身時間: {bottleneck_line.tottime:.3f}秒 (函數本身的執行時間)")
+                print(
+                    f"\n{i}. {bottleneck_line.get_hbrowser_module()}.{bottleneck_line.function_name}"
+                )
+                print(
+                    f"   累計時間: {bottleneck_line.cumtime:.3f}秒 (包含調用其他函數的時間)"
+                )
+                print(
+                    f"   自身時間: {bottleneck_line.tottime:.3f}秒 (函數本身的執行時間)"
+                )
                 print(f"   時間比率: {bottleneck_ratio:.1f}x (累計/自身)")
                 print(f"   調用次數: {bottleneck_line.ncalls}")
                 print(f"   位置: {bottleneck_line.filename_function}")

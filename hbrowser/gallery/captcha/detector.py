@@ -70,7 +70,9 @@ class CaptchaDetector:
         m = RAY_RE.search(html)
         return m.group(1) if m else None
 
-    def _find_turnstile_iframe(self, driver: Any, timeout: float) -> dict[str, Any] | None:
+    def _find_turnstile_iframe(
+        self, driver: Any, timeout: float
+    ) -> dict[str, Any] | None:
         """查找 Turnstile iframe 並提取 sitekey"""
         try:
             iframe = WebDriverWait(driver, timeout).until(

@@ -34,7 +34,9 @@ PREPROCESS = dict(
 )
 
 
-def _despeckle(gray: np.ndarray[Any, Any], win: int, diff_thr: int) -> np.ndarray[Any, Any]:
+def _despeckle(
+    gray: np.ndarray[Any, Any], win: int, diff_thr: int
+) -> np.ndarray[Any, Any]:
     if gray is None or getattr(gray, "ndim", 2) != 2:
         return gray
     if win < 3:
@@ -134,7 +136,11 @@ class _InlineModel:
             raise RuntimeError(f"無法讀取圖片: {img_path}")
         gray = self._pre(img)
         hog_result = self._hog().compute(gray)
-        x = np.array(hog_result).reshape(-1).astype(np.float32) if hog_result is not None else np.array([])
+        x = (
+            np.array(hog_result).reshape(-1).astype(np.float32)
+            if hog_result is not None
+            else np.array([])
+        )
         if self.mu is None:
             raise RuntimeError("Model not loaded properly: mu is None")
         x = (x - self.mu) / (self.sd + 1e-8) if self.sd is not None else x - self.mu
@@ -251,7 +257,9 @@ class PonyChart:
             waitlimit -= 1
 
         if waitlimit <= 1 and self._check():
-            logger.warning("PonyChart check timeout, please check your network connection")
+            logger.warning(
+                "PonyChart check timeout, please check your network connection"
+            )
             # 改為依送出按鈕顯示文字 (value="Submit Answer") 來尋找並點擊，失敗時回退用 id
             try:
                 self.hvdriver.driver.find_element(

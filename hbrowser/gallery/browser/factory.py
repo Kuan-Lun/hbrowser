@@ -140,7 +140,9 @@ def create_driver(headless: bool = True) -> Any:
         )
         logger.debug(f"Proxy extension created at: {proxy_extension}")
     else:
-        logger.info("No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)")
+        logger.info(
+            "No residential proxy configured (set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
+        )
 
     # 檢測是否為 Linux + Xvfb 環境
     is_xvfb_env = (
@@ -177,7 +179,9 @@ def create_driver(headless: bool = True) -> Any:
     # 原因：讓 Chrome 使用 SwiftShader 軟體渲染可能有更自然的指紋
     # 明確禁用 GPU 反而容易被 Cloudflare 偵測
     if is_xvfb_env and not headless:
-        logger.info("Detected Xvfb environment, using default GPU settings for better fingerprint")
+        logger.info(
+            "Detected Xvfb environment, using default GPU settings for better fingerprint"
+        )
 
     # 反偵測參數 - 降低被 Cloudflare 識別的機率
     options.add_argument("--disable-blink-features=AutomationControlled")

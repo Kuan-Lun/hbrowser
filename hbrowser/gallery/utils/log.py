@@ -1,4 +1,5 @@
 """日誌相關工具函數"""
+
 import os
 import sys
 import logging
@@ -43,8 +44,8 @@ def setup_logger(name: str) -> logging.Logger:
 
     # 設置格式化器
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
 
@@ -65,7 +66,7 @@ def get_log_dir() -> str:
         log 資料夾的絕對路徑
     """
     # 獲取主腳本的路徑
-    if hasattr(sys, 'argv') and len(sys.argv) > 0:
+    if hasattr(sys, "argv") and len(sys.argv) > 0:
         main_script = sys.argv[0]
         if main_script:
             # 獲取主腳本所在的目錄
