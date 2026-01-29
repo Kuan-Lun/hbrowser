@@ -11,3 +11,5 @@ cProfile_result.txt
 !/.gitignore
 !/.vscode/
 !.vscode/**
+
+uv.lock
