@@ -11,6 +11,7 @@ from fake_useragent import UserAgent
 
 from ..utils import setup_logger
 from .ban_handler import handle_ban_decorator
+from .chrome_manager import ensure_chrome_installed
 
 logger = setup_logger(__name__)
 
@@ -197,12 +198,20 @@ def create_driver(headless: bool = True) -> Any:
     if proxy_extension:
         options.add_extension(proxy_extension)
 
+    # 確保 Chrome 和 ChromeDriver 已安裝
+    chrome_paths = ensure_chrome_installed()
+    options.binary_location = chrome_paths.chrome
+
     # 使用 undetected-chromedriver 初始化 WebDriver
     # 注意: undetected-chromedriver 已經內建處理了
     # excludeSwitches 和 useAutomationExtension
     # 所以我們不需要手動設定這些選項
     logger.debug("Initializing Chrome driver...")
-    driver = uc.Chrome(options=options, use_subprocess=True)
+    driver = uc.Chrome(
+        options=options,
+        use_subprocess=True,
+        driver_executable_path=chrome_paths.chromedriver,
+    )
     logger.info("Chrome driver initialized successfully")
 
     # 添加 ban 檢查裝飾器
