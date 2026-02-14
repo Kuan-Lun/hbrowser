@@ -2,12 +2,14 @@
 
 import os
 import platform
+import subprocess
 import tempfile
 import zipfile
 from typing import Any
 
 import undetected_chromedriver as uc
 from fake_useragent import UserAgent
+from undetected_chromedriver.patcher import Patcher
 
 from ..utils import setup_logger
 from .ban_handler import handle_ban_decorator
@@ -198,9 +200,27 @@ def create_driver(headless: bool = True) -> Any:
     if proxy_extension:
         options.add_extension(proxy_extension)
 
+    # macOS: 避免 Chrome for Testing 存取系統鑰匙圈時彈出授權提示
+    if platform.system() == "Darwin":
+        options.add_argument("--use-mock-keychain")
+
     # 確保 Chrome 和 ChromeDriver 已安裝
     chrome_paths = ensure_chrome_installed()
     options.binary_location = chrome_paths.chrome
+
+    # macOS: 先用 Patcher 手動 patch chromedriver，再 codesign
+    # 這樣 uc.Chrome() 偵測到已 patch 就不會再修改二進位，簽名保持有效
+    if platform.system() == "Darwin":
+        patcher = Patcher(executable_path=chrome_paths.chromedriver)
+        if not patcher.is_binary_patched():
+            patcher.patch_exe()
+            logger.debug("ChromeDriver patched for undetected-chromedriver")
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", chrome_paths.chromedriver],
+            check=False,
+            capture_output=True,
+        )
+        logger.debug("ChromeDriver codesigned")
 
     # 使用 undetected-chromedriver 初始化 WebDriver
     # 注意: undetected-chromedriver 已經內建處理了

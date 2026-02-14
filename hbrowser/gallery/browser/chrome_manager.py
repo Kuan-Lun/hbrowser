@@ -6,7 +6,7 @@ import os
 import platform
 import shutil
 import stat
-import sys
+import subprocess
 import zipfile
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -60,16 +60,16 @@ def _get_platform() -> str:
 
 def _get_cache_dir() -> Path:
     """
-    取得快取目錄路徑（在主腳本所在目錄下的 .cache）
+    取得快取目錄路徑（~/.cache/chrome-for-testing）
+
+    使用使用者家目錄下的 .cache，避免放在可能受雲端同步
+    （iCloud、SynologyDrive 等）管理的路徑下，
+    因為 macOS file provider 會導致 Chrome 執行檔無法正常啟動。
 
     Returns:
         快取目錄的 Path 物件
     """
-    # 取得最外層執行腳本的目錄
-    main_script = os.path.abspath(sys.argv[0])
-    main_dir = os.path.dirname(main_script)
-
-    cache_dir = Path(main_dir) / ".cache" / "chrome-for-testing"
+    cache_dir = Path.home() / ".cache" / "chrome-for-testing"
     return cache_dir
 
 
@@ -110,6 +110,9 @@ def _download_and_extract(url: str, dest_dir: Path, desc: str) -> None:
     """
     下載 zip 檔案並解壓縮
 
+    macOS 使用 ditto 解壓以正確保留 symlinks 和 .app bundle 結構，
+    其他平台使用 Python zipfile。
+
     Args:
         url: 下載連結
         dest_dir: 目標目錄
@@ -124,8 +127,14 @@ def _download_and_extract(url: str, dest_dir: Path, desc: str) -> None:
     urlretrieve(url, zip_path)
 
     logger.info(f"Extracting {desc}...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(dest_dir)
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["ditto", "-xk", str(zip_path), str(dest_dir)],
+            check=True,
+        )
+    else:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(dest_dir)
 
     # 刪除 zip 檔案
     zip_path.unlink()
@@ -137,6 +146,22 @@ def _make_executable(path: Path) -> None:
     if platform.system() != "Windows":
         current_mode = path.stat().st_mode
         path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _remove_quarantine(path: Path) -> None:
+    """移除 macOS 的 quarantine 屬性（僅 macOS）
+
+    使用 -dr 只刪除 com.apple.quarantine，
+    而非 -cr 清除所有屬性（會破壞 code signing）。
+    """
+    if platform.system() != "Darwin":
+        return
+    subprocess.run(
+        ["xattr", "-dr", "com.apple.quarantine", str(path)],
+        check=False,
+        capture_output=True,
+    )
+    logger.debug(f"Removed quarantine attribute: {path}")
 
 
 def _find_download_url(downloads: list[dict[str, str]], plat: str) -> str | None:
@@ -281,6 +306,7 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
                 raise RuntimeError(f"No Chrome download found for platform: {plat}")
             _download_and_extract(chrome_url, version_dir, "Chrome")
             _make_executable(chrome_path)
+            _remove_quarantine(version_dir / chrome_folder)
 
         # 下載 ChromeDriver
         if need_chromedriver:
@@ -291,6 +317,7 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
                 )
             _download_and_extract(chromedriver_url, version_dir, "ChromeDriver")
             _make_executable(chromedriver_path)
+            _remove_quarantine(chromedriver_path)
 
         logger.info("Chrome and ChromeDriver are ready")
     else:
