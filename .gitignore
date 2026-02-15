@@ -13,3 +13,5 @@ cProfile_result.txt
 !.vscode/**
 
 uv.lock
+
+hvbrowser/hv_battle_ponychart_ml/rawimage/*
