@@ -97,10 +97,29 @@ class _InlineModel:
         return picked, scores
 
 
+_model = _InlineModel()
+
+
+def preload_model() -> None:
+    """預先載入 ONNX 模型，在 BattleDriver 初始化時呼叫以提早發現依賴問題。"""
+    try:
+        _model.load()
+    except ImportError as e:
+        msg = "onnxruntime 載入失敗。"
+        if sys.platform == "win32" and "DLL load failed" in str(e):
+            msg += (
+                "\n可能原因：缺少 Microsoft Visual C++ Redistributable。"
+                "\n請至 https://aka.ms/vs/17/release/vc_redist.x64.exe 下載安裝後重試。"
+            )
+        else:
+            msg += "\n請執行: pip install onnxruntime"
+        raise RuntimeError(msg) from e
+
+
 class PonyChart:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver = driver
-        self._model = _InlineModel()
+        self._model = _model
 
     @property
     def driver(self) -> Any:  # WebDriver from EHDriver is untyped
