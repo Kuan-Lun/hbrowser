@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.11.9"
+version = "0.12.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -18,10 +18,12 @@ dependencies = [
     "hv-bie>=0.3.5",
     "numpy>=2.2.6",
     "opencv-python>=4.12.0.88",
+    "onnxruntime>=1.15.0",
     "2captcha-python>=2.0.2",
     "undetected-chromedriver>=3.5.5",
     "setuptools>=80.9.0",
 ]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -29,6 +31,9 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3.13",
 ]
+
+[project.optional-dependencies]
+train = ["torch>=2.0", "torchvision>=0.15", "scikit-learn>=1.3"]
 
 [project.urls]
 Homepage = "https://github.com/Kuan-Lun/hbrowser"
@@ -49,7 +54,7 @@ include = ["hbrowser*", "hvbrowser*"]
 "hbrowser.gallery.captcha" = ["py.typed"]
 "hvbrowser" = [
     "py.typed",
-    "hv_battle_ponychart_ml/weights.npz",
+    "hv_battle_ponychart_ml/model.onnx",
     "hv_battle_ponychart_ml/thresholds.json",
 ]
 
