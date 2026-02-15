@@ -15,7 +15,7 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_observer_pattern import BattleDashboard
-from .hv_battle_ponychart import PonyChart
+from .hv_battle_ponychart import PonyChart, preload_model
 from .hv_battle_skill_manager import SkillManager
 from .pause_controller import PauseController
 
@@ -110,6 +110,8 @@ class BattleDriver(HVDriver):
         self.turn = -1
         self.round = -1
         self.pround = -1
+
+        preload_model()
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態

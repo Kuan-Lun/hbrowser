@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.12.0"
+version = "0.12.1"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -13,15 +13,15 @@ dependencies = [
     "webdriver-manager>=4.0.2",
     "fake-useragent>=2.2.0",
     "h2h-galleryinfo-parser>=0.2.2",
-    "selenium>=4.35.0",
-    "beautifulsoup4>=4.13.4",
-    "hv-bie>=0.3.5",
+    "selenium>=4.40.0",
+    "beautifulsoup4>=4.14.3",
+    "hv-bie>=0.3.7",
     "numpy>=2.2.6",
     "opencv-python>=4.12.0.88",
     "onnxruntime>=1.15.0",
     "2captcha-python>=2.0.2",
     "undetected-chromedriver>=3.5.5",
-    "setuptools>=80.9.0",
+    "setuptools>=82.0.0",
 ]
 
 classifiers = [
