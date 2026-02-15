@@ -16,52 +16,23 @@ from .hv import HVDriver
 
 logger = setup_logger(__name__)
 
-HOG_CFG: dict[str, tuple[int, int] | int] = {
-    "win_size": (192, 192),
-    "cell_size": (8, 8),
-    "block_size": (16, 16),
-    "block_stride": (8, 8),
-    "nbins": 9,
-}
-IMG_SIZE = (192, 192)
-PREPROCESS = dict(
-    equalize=False,
-    quant_step=1,
-    denoise=False,
-    denoise_ksize=1,
-    remove_specks=True,
-    despeckle_win=1,
-    despeckle_diff=1,
-)
-
-
-def _despeckle(
-    gray: np.ndarray[Any, Any], win: int, diff_thr: int
-) -> np.ndarray[Any, Any]:
-    if gray is None or getattr(gray, "ndim", 2) != 2:
-        return gray
-    if win < 3:
-        return gray
-    if win % 2 == 0:
-        win += 1
-    med = cv.medianBlur(gray, win)
-    diff = cv.absdiff(gray, med)
-    mask = diff > diff_thr
-    if not np.any(mask):
-        return gray
-    out = gray.copy()
-    out[mask] = med[mask]
-    return out
+# ImageNet 預訓練模型的固定正規化參數，不隨訓練資料改變
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 class _InlineModel:
     def __init__(self) -> None:
         self.loaded = False
-        self.W = None
-        self.b = None
-        self.mu = None
-        self.sd = None
-        self.classes: list[str] = []
+        self.session: Any = None
+        self.classes: list[str] = [
+            "Twilight Sparkle",
+            "Rarity",
+            "Fluttershy",
+            "Rainbow Dash",
+            "Pinkie Pie",
+            "Applejack",
+        ]
         self.thresholds: dict[str, float] = {}
 
     def _dir(self) -> str:
@@ -70,63 +41,27 @@ class _InlineModel:
     def load(self) -> None:
         if self.loaded:
             return
+        import onnxruntime as ort
+
         d = self._dir()
-        weights = os.path.join(d, "weights.npz")
-        th = os.path.join(d, "thresholds.json")
-        data = np.load(weights, allow_pickle=True)
-        self.W = data["W"].astype(np.float32)
-        self.b = data["b"].astype(np.float32)
-        self.mu = data["scaler_mean"].astype(np.float32)
-        self.sd = data["scaler_scale"].astype(np.float32)
-        self.classes = [c for c in data["classes"]]
-        with open(th, encoding="utf-8") as f:
+        model_path = os.path.join(d, "model.onnx")
+        th_path = os.path.join(d, "thresholds.json")
+        self.session = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
+        with open(th_path, encoding="utf-8") as f:
             self.thresholds = json.load(f)
         self.loaded = True
 
-    def _hog(self) -> cv.HOGDescriptor:
-        win_size = HOG_CFG["win_size"]
-        block_size = HOG_CFG["block_size"]
-        block_stride = HOG_CFG["block_stride"]
-        cell_size = HOG_CFG["cell_size"]
-        nbins = HOG_CFG["nbins"]
-
-        assert isinstance(win_size, tuple)
-        assert isinstance(block_size, tuple)
-        assert isinstance(block_stride, tuple)
-        assert isinstance(cell_size, tuple)
-        assert isinstance(nbins, int)
-
-        return cv.HOGDescriptor(
-            win_size,
-            block_size,
-            block_stride,
-            cell_size,
-            nbins,
-        )
-
-    def _pre(self, bgr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
-        gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-        gray = cv.resize(gray, IMG_SIZE, interpolation=cv.INTER_AREA)
-        q = PREPROCESS["quant_step"]
-        try:
-            qv = int(q)
-        except Exception:
-            qv = 1
-        if qv > 1:
-            gray = (gray // qv) * qv
-        if PREPROCESS["denoise"]:
-            k = PREPROCESS["denoise_ksize"]
-            if isinstance(k, int) and k >= 3 and k % 2 == 1:
-                gray = cv.medianBlur(gray, k)
-        if PREPROCESS["equalize"]:
-            gray = cv.equalizeHist(gray)
-        if PREPROCESS["remove_specks"]:
-            gray = _despeckle(
-                gray,
-                PREPROCESS["despeckle_win"],
-                PREPROCESS["despeckle_diff"],
-            )
-        return gray
+    def _preprocess(self, bgr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+        """BGR 圖片 -> NCHW float32 tensor (matching training transforms)."""
+        resized = cv.resize(bgr, (256, 256), interpolation=cv.INTER_AREA)
+        # Center crop: (256-224)//2 = 16
+        cropped = resized[16:240, 16:240]
+        rgb = cv.cvtColor(cropped, cv.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        normalized = (rgb - _IMAGENET_MEAN) / _IMAGENET_STD
+        # HWC -> CHW -> NCHW
+        return normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
 
     def predict(
         self, img_path: str, min_k: int = 1, max_k: int = 3
@@ -135,32 +70,28 @@ class _InlineModel:
         img = cv.imread(img_path, cv.IMREAD_COLOR)
         if img is None:
             raise RuntimeError(f"無法讀取圖片: {img_path}")
-        gray = self._pre(img)
-        hog_result = self._hog().compute(gray)
-        x = (
-            np.array(hog_result).reshape(-1).astype(np.float32)
-            if hog_result is not None
-            else np.array([])
-        )
-        if self.mu is None:
-            raise RuntimeError("Model not loaded properly: mu is None")
-        x = (x - self.mu) / (self.sd + 1e-8) if self.sd is not None else x - self.mu
-        logits = self.W @ x + self.b
-        probs = 1.0 / (1.0 + np.exp(-logits))
+
+        input_tensor = self._preprocess(img)
+        input_name: str = self.session.get_inputs()[0].name
+        logits = self.session.run(None, {input_name: input_tensor})[0]
+        probs = 1.0 / (1.0 + np.exp(-logits[0]))
+
         scores = {self.classes[i]: float(probs[i]) for i in range(len(self.classes))}
         picked = [c for c, p in scores.items() if p >= self.thresholds.get(c, 0.5)]
         if len(picked) < min_k:
             picked = [
                 c
-                for c, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[
-                    :max_k
-                ]
+                for c, _ in sorted(
+                    scores.items(), key=lambda kv: kv[1], reverse=True
+                )[:max_k]
             ]
         elif len(picked) > max_k:
             picked = [
                 c
                 for c, _ in sorted(
-                    ((c, scores[c]) for c in picked), key=lambda kv: kv[1], reverse=True
+                    ((c, scores[c]) for c in picked),
+                    key=lambda kv: kv[1],
+                    reverse=True,
                 )[:max_k]
             ]
         return picked, scores
