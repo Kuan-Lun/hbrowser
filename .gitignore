@@ -15,3 +15,4 @@ cProfile_result.txt
 uv.lock
 
 hvbrowser/hv_battle_ponychart_ml/rawimage/*
+hvbrowser/hv_battle_ponychart_ml/labels.json
