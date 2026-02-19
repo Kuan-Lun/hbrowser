@@ -24,15 +24,16 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score  # type: ignore[import-untyped]
+from sklearn.model_selection import train_test_split  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
+from torchvision import models, transforms  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ class PonyChartDataset(Dataset):  # type: ignore[type-arg]
         if self.transform:
             image = self.transform(image)
         target = labels_to_binary(label_list)
-        return image, target
+        return image, target  # type: ignore[return-value]
 
 
 def get_transforms(is_train: bool) -> transforms.Compose:
@@ -197,7 +198,7 @@ def build_model(pretrained: bool = True) -> nn.Module:
     model = models.mobilenet_v3_small(weights=weights)
     in_features: int = model.classifier[3].in_features  # 1024
     model.classifier[3] = nn.Linear(in_features, NUM_CLASSES)
-    return model
+    return model  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +221,7 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * images.size(0)
-    return total_loss / len(loader.dataset)  # type: ignore[arg-type]
+    return total_loss / len(loader.dataset)  # type: ignore[arg-type, no-any-return, operator]
 
 
 @torch.no_grad()
@@ -232,8 +233,8 @@ def validate(
 ) -> tuple[float, float, list[float]]:
     model.eval()
     total_loss = 0.0
-    all_probs: list[np.ndarray] = []
-    all_targets: list[np.ndarray] = []
+    all_probs: list[np.ndarray[Any, Any]] = []
+    all_targets: list[np.ndarray[Any, Any]] = []
     for images, targets in loader:
         images, targets = images.to(device), targets.to(device)
         logits = model(images)
@@ -253,7 +254,7 @@ def validate(
         per_class_f1.append(float(f1))
 
     macro_f1 = float(np.mean(per_class_f1))
-    avg_loss = total_loss / len(loader.dataset)  # type: ignore[arg-type]
+    avg_loss = total_loss / len(loader.dataset)  # type: ignore[arg-type, operator]
     return avg_loss, macro_f1, per_class_f1
 
 
@@ -267,8 +268,8 @@ def optimize_thresholds(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    all_probs: list[np.ndarray] = []
-    all_targets: list[np.ndarray] = []
+    all_probs: list[np.ndarray[Any, np.dtype[Any]]] = []
+    all_targets: list[np.ndarray[Any, np.dtype[Any]]] = []
     for images, targets in loader:
         logits = model(images.to(device))
         probs = torch.sigmoid(logits).cpu().numpy()
@@ -303,7 +304,7 @@ def export_onnx(model: nn.Module, output_path: Path) -> None:
     dummy = torch.randn(1, 3, 224, 224)
     torch.onnx.export(
         model_cpu,
-        dummy,
+        (dummy,),
         str(output_path),
         input_names=["input"],
         output_names=["logits"],
@@ -400,10 +401,10 @@ def main() -> None:
     # ---- Phase 1: Head only ----
     phase1_epochs = 10
     logger.info("=== Phase 1: Head-only training (%d epochs) ===", phase1_epochs)
-    for param in model.features.parameters():
+    for param in model.features.parameters():  # type: ignore[union-attr]
         param.requires_grad = False
     optimizer = torch.optim.AdamW(
-        model.classifier.parameters(), lr=1e-3, weight_decay=1e-4
+        model.classifier.parameters(), lr=1e-3, weight_decay=1e-4  # type: ignore[union-attr]
     )
 
     for epoch in range(1, phase1_epochs + 1):
@@ -420,12 +421,12 @@ def main() -> None:
 
     # ---- Phase 2: Full fine-tuning ----
     logger.info("=== Phase 2: Full fine-tuning (%d epochs) ===", args.epochs)
-    for param in model.features.parameters():
+    for param in model.features.parameters():  # type: ignore[union-attr]
         param.requires_grad = True
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.features.parameters(), "lr": 3e-5},
-            {"params": model.classifier.parameters(), "lr": 3e-4},
+            {"params": model.features.parameters(), "lr": 3e-5},  # type: ignore[union-attr]
+            {"params": model.classifier.parameters(), "lr": 3e-4},  # type: ignore[union-attr]
         ],
         weight_decay=1e-4,
     )
