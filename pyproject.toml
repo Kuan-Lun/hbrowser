@@ -36,6 +36,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+publish = [
+    "build",
+    "twine",
+]
 train = [
     "torch>=2.0",
     "torchvision>=0.15",
