@@ -110,7 +110,7 @@ class LabelApp:
     def path_to_key(self, p: Path) -> str:
         return IMAGE_SUBDIR + "/" + p.name
 
-    def on_filter_toggle(self):
+    def on_filter_toggle(self) -> None:
         """切換是否只顯示未標註圖片"""
         if self.filter_unlabeled_var.get():
             unlabeled = [
@@ -138,7 +138,7 @@ class LabelApp:
                     self.idx = 0
         self.refresh()
 
-    def refresh(self):
+    def refresh(self) -> None:
         if not self.image_paths:
             # 若是過濾未標註造成的空 -> 已在 on_filter_toggle 處理；這裡保險再處理一次
             if self.filter_unlabeled_var.get():
@@ -173,18 +173,20 @@ class LabelApp:
             text=f"labels: {label_names}  ({self.idx+1}/{len(self.image_paths)})\n{key}"
         )
 
-    def toggle_label(self, v: int):
+    def toggle_label(self, v: int) -> None:
         if v in self.current_labels:
             self.current_labels.remove(v)
         else:
             self.current_labels.append(v)
             self.current_labels.sort()
         label_names = [LABEL_MAP.get(i, str(i)) for i in self.current_labels]
+        key = self.image_key()
+        count = f"{self.idx + 1}/{len(self.image_paths)}"
         self.preview.configure(
-            text=f"labels: {label_names}  ({self.idx+1}/{len(self.image_paths)})\n{self.image_key()}"
+            text=f"labels: {label_names}  ({count})\n{key}"
         )
 
-    def save(self):
+    def save(self) -> None:
         key = self.image_key()
         if self.current_labels:
             self.labels[key] = self.current_labels
@@ -194,8 +196,10 @@ class LabelApp:
             json.dumps(self.labels, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         label_names = [LABEL_MAP.get(i, str(i)) for i in self.current_labels]
+        key = self.image_key()
+        count = f"{self.idx + 1}/{len(self.image_paths)}"
         self.preview.configure(
-            text=f"labels: {label_names}  ({self.idx+1}/{len(self.image_paths)})\n{self.image_key()}  (saved)"
+            text=f"labels: {label_names}  ({count})\n{key}  (saved)"
         )
         # 若當前開啟 "只顯示未標註"，且此圖片已標好 -> 重新過濾並跳下一張
         if self.filter_unlabeled_var.get():
@@ -220,7 +224,6 @@ class LabelApp:
                 start_index = -1
             if self.filter_unlabeled_var.get():  # 仍在過濾模式
                 # 從 start_index+1 開始找下一個未標註 key
-                next_idx = None
                 all_len = len(self.all_paths)
                 for offset in range(1, all_len + 1):
                     candidate = self.all_paths[(start_index + offset) % all_len]
@@ -248,7 +251,7 @@ class LabelApp:
                         self.idx = min(self.idx, len(self.image_paths) - 1)
             self.refresh()
 
-    def on_key(self, e: tk.Event):
+    def on_key(self, e: "tk.Event[tk.Misc]") -> None:
         k = e.keysym.lower()
         if k in ["1", "2", "3", "4", "5", "6"]:
             self.toggle_label(int(k))
@@ -262,7 +265,7 @@ class LabelApp:
             self.save()
 
 
-def main():
+def main() -> None:
     # 掃描 rawimage/ 下的影像
     if not IMAGE_DIR.exists():
         messagebox.showerror("Error", f"找不到資料夾: {IMAGE_DIR}")
@@ -275,7 +278,7 @@ def main():
     ]
     paths.sort()
     root = tk.Tk()
-    app = LabelApp(root, paths)
+    LabelApp(root, paths)
     root.mainloop()
 
 
