@@ -7,6 +7,7 @@ from typing import Any
 
 import cv2 as cv
 import numpy as np
+import onnxruntime as ort
 from selenium.webdriver.common.by import By
 
 from hbrowser.beep import beep_os_independent
@@ -41,7 +42,6 @@ class _InlineModel:
     def load(self) -> None:
         if self.loaded:
             return
-        import onnxruntime as ort
 
         d = self._dir()
         model_path = os.path.join(d, "model.onnx")
@@ -81,9 +81,9 @@ class _InlineModel:
         if len(picked) < min_k:
             picked = [
                 c
-                for c, _ in sorted(
-                    scores.items(), key=lambda kv: kv[1], reverse=True
-                )[:max_k]
+                for c, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[
+                    :max_k
+                ]
             ]
         elif len(picked) > max_k:
             picked = [
