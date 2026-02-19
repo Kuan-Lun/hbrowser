@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import os
 import sys
 from collections import defaultdict
@@ -30,6 +31,8 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,7 +69,7 @@ def load_samples() -> list[tuple[str, list[int]]]:
         filepath = str(RAWIMAGE_DIR / filename)
         if os.path.isfile(filepath):
             samples.append((filepath, label_list))
-    print(f"Loaded {len(samples)} samples (of {len(raw)} labels.json entries)")
+    logger.info("Loaded %d samples (of %d labels.json entries)", len(samples), len(raw))
     return samples
 
 
@@ -266,7 +269,7 @@ def optimize_thresholds(
                 best_f1 = f1
                 best_thr = float(thr)
         thresholds[name] = round(best_thr, 4)
-        print(f"  {name}: threshold={best_thr:.4f}  F1={best_f1:.4f}")
+        logger.info("  %s: threshold=%.4f  F1=%.4f", name, best_thr, best_f1)
     return thresholds
 
 
@@ -298,13 +301,18 @@ def export_onnx(model: nn.Module, output_path: Path) -> None:
         )
         external_data.unlink()
     size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"ONNX model exported: {output_path} ({size_mb:.1f} MB)")
+    logger.info("ONNX model exported: %s (%.1f MB)", output_path, size_mb)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
     parser = argparse.ArgumentParser(description="Train PonyChart classifier")
     parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -327,7 +335,7 @@ def main() -> None:
             device = torch.device("cpu")
     else:
         device = torch.device(args.device)
-    print(f"Device: {device}")
+    logger.info("Device: %s", device)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -335,13 +343,13 @@ def main() -> None:
     # Data
     samples = load_samples()
     if not samples:
-        print("ERROR: No samples found. Check rawimage/ and labels.json.")
+        logger.error("No samples found. Check rawimage/ and labels.json.")
         sys.exit(1)
 
     train_idx, val_idx = group_stratified_split(samples, test_size=0.15, seed=args.seed)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
-    print(f"Train: {len(train_samples)}  Val: {len(val_samples)}")
+    logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
 
     train_ds = PonyChartDataset(train_samples, get_transforms(is_train=True))
     val_ds = PonyChartDataset(val_samples, get_transforms(is_train=False))
@@ -358,7 +366,7 @@ def main() -> None:
 
     # ---- Phase 1: Head only ----
     phase1_epochs = 10
-    print(f"\n=== Phase 1: Head-only training ({phase1_epochs} epochs) ===")
+    logger.info("=== Phase 1: Head-only training (%d epochs) ===", phase1_epochs)
     for param in model.features.parameters():
         param.requires_grad = False
     optimizer = torch.optim.AdamW(
@@ -368,13 +376,13 @@ def main() -> None:
     for epoch in range(1, phase1_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_f1, _ = validate(model, val_loader, criterion, device)
-        print(
-            f"  Epoch {epoch}/{phase1_epochs}  train_loss={train_loss:.4f}  "
-            f"val_loss={val_loss:.4f}  val_F1={val_f1:.4f}"
+        logger.info(
+            "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
+            epoch, phase1_epochs, train_loss, val_loss, val_f1,
         )
 
     # ---- Phase 2: Full fine-tuning ----
-    print(f"\n=== Phase 2: Full fine-tuning ({args.epochs} epochs) ===")
+    logger.info("=== Phase 2: Full fine-tuning (%d epochs) ===", args.epochs)
     for param in model.features.parameters():
         param.requires_grad = True
     optimizer = torch.optim.AdamW(
@@ -410,34 +418,33 @@ def main() -> None:
         per_class_str = "  ".join(
             f"{name}={f1:.4f}" for name, f1 in zip(CLASS_NAMES, per_class)
         )
-        print(
-            f"  Epoch {epoch}/{args.epochs}  train_loss={train_loss:.4f}  "
-            f"val_loss={val_loss:.4f}  val_F1={val_f1:.4f}{marker}\n"
-            f"    {per_class_str}"
+        logger.info(
+            "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f%s\n    %s",
+            epoch, args.epochs, train_loss, val_loss, val_f1, marker, per_class_str,
         )
         if patience_counter >= patience:
-            print(f"  Early stopping (no improvement for {patience} epochs)")
+            logger.info("  Early stopping (no improvement for %d epochs)", patience)
             break
 
     # Restore best model
     model.load_state_dict(best_state)
     _, final_f1, final_per_class = validate(model, val_loader, criterion, device)
-    print(f"\nBest val F1: {final_f1:.4f}")
+    logger.info("Best val F1: %.4f", final_f1)
     for i, name in enumerate(CLASS_NAMES):
-        print(f"  {name}: F1={final_per_class[i]:.4f}")
+        logger.info("  %s: F1=%.4f", name, final_per_class[i])
 
     # Optimize thresholds
-    print("\nOptimizing per-class thresholds...")
+    logger.info("Optimizing per-class thresholds...")
     thresholds = optimize_thresholds(model, val_loader, device)
     with open(OUTPUT_THRESHOLDS, "w", encoding="utf-8") as f:
         json.dump(thresholds, f, ensure_ascii=False, indent=2)
-    print(f"Thresholds saved: {OUTPUT_THRESHOLDS}")
+    logger.info("Thresholds saved: %s", OUTPUT_THRESHOLDS)
 
     # Export ONNX
-    print("\nExporting ONNX...")
+    logger.info("Exporting ONNX...")
     export_onnx(model, OUTPUT_ONNX)
 
-    print("\nDone!")
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
