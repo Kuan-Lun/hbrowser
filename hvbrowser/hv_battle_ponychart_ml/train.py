@@ -142,14 +142,14 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         return transforms.Compose(
             [
                 transforms.Resize((256, 256)),
-                transforms.RandomCrop((224, 224)),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
-                transforms.ColorJitter(
-                    brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
-                ),
                 transforms.RandomAffine(
                     degrees=180, translate=(0.05, 0.05), scale=(0.9, 1.1)
+                ),
+                transforms.RandomCrop((224, 224)),
+                transforms.ColorJitter(
+                    brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
                 ),
                 transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
                 transforms.ToTensor(),
