@@ -354,7 +354,8 @@ def main() -> None:
             device = torch.device("cpu")
     else:
         device = torch.device(args.device)
-    logger.info("Device: %s", device)
+    num_workers = _get_performance_cpu_count()
+    logger.info("Device: %s  DataLoader workers: %d", device, num_workers)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -372,7 +373,6 @@ def main() -> None:
 
     train_ds = PonyChartDataset(train_samples, get_transforms(is_train=True))
     val_ds = PonyChartDataset(val_samples, get_transforms(is_train=False))
-    num_workers = _get_performance_cpu_count()
     use_persistent = num_workers > 0
     train_loader = DataLoader(
         train_ds,
