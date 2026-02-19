@@ -100,7 +100,7 @@ class SkillManager:
             return False
 
     def get_skills_and_spells(self) -> dict[str, Any]:
-        return (
+        return (  # type: ignore[no-any-return]
             self.battle_dashboard.snap.abilities.skills
             | self.battle_dashboard.snap.abilities.spells
         )
