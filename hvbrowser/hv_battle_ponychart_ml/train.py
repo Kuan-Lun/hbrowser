@@ -407,9 +407,13 @@ def main() -> None:
         else:
             patience_counter += 1
 
+        per_class_str = "  ".join(
+            f"{name}={f1:.4f}" for name, f1 in zip(CLASS_NAMES, per_class)
+        )
         print(
             f"  Epoch {epoch}/{args.epochs}  train_loss={train_loss:.4f}  "
-            f"val_loss={val_loss:.4f}  val_F1={val_f1:.4f}{marker}"
+            f"val_loss={val_loss:.4f}  val_F1={val_f1:.4f}{marker}\n"
+            f"    {per_class_str}"
         )
         if patience_counter >= patience:
             print(f"  Early stopping (no improvement for {patience} epochs)")
