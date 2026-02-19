@@ -95,7 +95,7 @@ class Driver(ABC):
         element: Any = self.driver
         for by, value in selectors:
             element = element.find_element(by, value)
-        return element  # type: ignore[no-any-return]
+        return element
 
     def get(self, url: str) -> None:
         """導航到指定 URL"""

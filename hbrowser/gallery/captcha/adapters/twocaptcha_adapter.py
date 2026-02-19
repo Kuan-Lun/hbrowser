@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any
 
-from twocaptcha import TwoCaptcha  # type: ignore
+from twocaptcha import TwoCaptcha
 
 from ....exceptions import CaptchaAPIKeyNotSetException, CaptchaSolveException
 from ...utils.log import get_log_dir, setup_logger

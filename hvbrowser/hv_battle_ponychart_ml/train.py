@@ -30,10 +30,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import f1_score  # type: ignore[import-untyped]
-from sklearn.model_selection import train_test_split  # type: ignore[import-untyped]
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms  # type: ignore[import-untyped]
+from torchvision import models, transforms
 from torchvision.transforms import InterpolationMode
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ def group_stratified_split(
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-class PonyChartDataset(Dataset):  # type: ignore[type-arg]
+class PonyChartDataset(Dataset):  # type: ignore[misc]
     def __init__(
         self,
         samples: list[tuple[str, list[int]]],
@@ -158,7 +158,7 @@ class PonyChartDataset(Dataset):  # type: ignore[type-arg]
         if self.transform:
             image = self.transform(image)
         target = labels_to_binary(label_list)
-        return image, target  # type: ignore[return-value]
+        return image, target
 
 
 def get_transforms(is_train: bool) -> transforms.Compose:
@@ -199,7 +199,7 @@ def build_model(pretrained: bool = True) -> nn.Module:
     model = models.mobilenet_v3_small(weights=weights)
     in_features: int = model.classifier[3].in_features  # 1024
     model.classifier[3] = nn.Linear(in_features, NUM_CLASSES)
-    return model  # type: ignore[no-any-return]
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ def build_model(pretrained: bool = True) -> nn.Module:
 # ---------------------------------------------------------------------------
 def train_one_epoch(
     model: nn.Module,
-    loader: DataLoader,  # type: ignore[type-arg]
+    loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -222,13 +222,13 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * images.size(0)
-    return total_loss / len(loader.dataset)  # type: ignore[arg-type, no-any-return, operator]
+    return total_loss / len(loader.dataset)
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[untyped-decorator]
 def validate(
     model: nn.Module,
-    loader: DataLoader,  # type: ignore[type-arg]
+    loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
 ) -> tuple[float, float, list[float]]:
@@ -255,17 +255,17 @@ def validate(
         per_class_f1.append(float(f1))
 
     macro_f1 = float(np.mean(per_class_f1))
-    avg_loss = total_loss / len(loader.dataset)  # type: ignore[arg-type, operator]
+    avg_loss = total_loss / len(loader.dataset)
     return avg_loss, macro_f1, per_class_f1
 
 
 # ---------------------------------------------------------------------------
 # Threshold optimization
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[untyped-decorator]
 def optimize_thresholds(
     model: nn.Module,
-    loader: DataLoader,  # type: ignore[type-arg]
+    loader: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
@@ -406,10 +406,10 @@ def main() -> None:
     # ---- Phase 1: Head only ----
     phase1_epochs = 10
     logger.info("=== Phase 1: Head-only training (%d epochs) ===", phase1_epochs)
-    for param in model.features.parameters():  # type: ignore[union-attr]
+    for param in model.features.parameters():
         param.requires_grad = False
     optimizer = torch.optim.AdamW(
-        model.classifier.parameters(), lr=1e-3, weight_decay=1e-4  # type: ignore[union-attr]
+        model.classifier.parameters(), lr=1e-3, weight_decay=1e-4
     )
 
     for epoch in range(1, phase1_epochs + 1):
@@ -426,12 +426,12 @@ def main() -> None:
 
     # ---- Phase 2: Full fine-tuning ----
     logger.info("=== Phase 2: Full fine-tuning (%d epochs) ===", args.epochs)
-    for param in model.features.parameters():  # type: ignore[union-attr]
+    for param in model.features.parameters():
         param.requires_grad = True
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.features.parameters(), "lr": 3e-5},  # type: ignore[union-attr]
-            {"params": model.classifier.parameters(), "lr": 3e-4},  # type: ignore[union-attr]
+            {"params": model.features.parameters(), "lr": 3e-5},
+            {"params": model.classifier.parameters(), "lr": 3e-4},
         ],
         weight_decay=1e-4,
     )

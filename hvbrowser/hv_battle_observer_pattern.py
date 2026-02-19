@@ -65,7 +65,7 @@ class OverviewMonsters:
     alive_monster_name: dict[str, int] = field(default_factory=DefaultMinusOneDict)
 
 
-class ExtendedBattleSnapshot(BattleSnapshot):
+class ExtendedBattleSnapshot(BattleSnapshot):  # type: ignore[misc]
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
@@ -90,7 +90,7 @@ class LogEntry(Observer):
                     self.total_round = int(match.group(2))
 
     def get_new_lines(self, snap: BattleSnapshot) -> list[str]:
-        return snap.log.lines
+        return snap.log.lines  # type: ignore[no-any-return]
 
     def update(self, snap: BattleSnapshot) -> None:
         lines = self.get_new_lines(snap)
