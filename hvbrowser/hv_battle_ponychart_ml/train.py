@@ -34,6 +34,7 @@ from sklearn.metrics import f1_score  # type: ignore[import-untyped]
 from sklearn.model_selection import train_test_split  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms  # type: ignore[import-untyped]
+from torchvision.transforms import InterpolationMode
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
     if is_train:
         return transforms.Compose(
             [
-                transforms.Resize((256, 256)),
+                transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomAffine(
@@ -182,7 +183,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         )
     return transforms.Compose(
         [
-            transforms.Resize((256, 256)),
+            transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
             transforms.CenterCrop((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
