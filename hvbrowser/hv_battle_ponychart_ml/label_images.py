@@ -3,12 +3,14 @@
 - 掃描 rawimage/ 下的圖片
 - 支援 1..6 六個標籤（對應你的主題/角色等），可多選
 - 標註結果存為 labels.json ：{"pony_chart/filename.png": [1,3]}
+- 支援裁切功能：按 C 進入裁切模式，拖曳選取區域，Enter 確認存檔
 使用：
   python label_images.py
 """
 
 import glob
 import json
+import re
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
@@ -67,9 +69,27 @@ class LabelApp:
             except Exception:
                 self.labels = {}
 
-        root.title("Pony Chart Labeler (1..6 標記 | A 上一張 | D 下一張 | S 儲存)")
-        self.canvas = tk.Label(root)
+        root.title(
+            "Pony Chart Labeler (1..6 標記 | A/D 切換 | S 儲存 | C 裁切)"
+        )
+
+        # 用 Canvas 取代 Label 以支援滑鼠繪製裁切框
+        self.canvas = tk.Canvas(root, highlightthickness=0)
         self.canvas.pack()
+        self._canvas_image_id: int | None = None
+
+        # 裁切模式狀態
+        self.crop_mode: bool = False
+        self.crop_start: tuple[int, int] | None = None
+        self.crop_end: tuple[int, int] | None = None
+        self.crop_rect_id: int | None = None
+        self.scale: float = 1.0
+        self.current_pil_image: Image.Image | None = None
+
+        # Canvas 滑鼠事件
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
 
         # 顯示數字與角色對應
         mapping_text = "  |  ".join(f"{k}: {v}" for k, v in LABEL_MAP.items())
@@ -80,7 +100,7 @@ class LabelApp:
 
         self.help = tk.Label(
             root,
-            text="1..6 加/取消標籤  |  A 上一張  |  D 下一張  |  S 儲存",
+            text="1..6 加/取消標籤  |  A 上一張  |  D 下一張  |  S 儲存  |  C 裁切",
             fg="#666",
         )
         self.help.pack(pady=(0, 6))
@@ -153,18 +173,34 @@ class LabelApp:
                 messagebox.showinfo("Info", "No images found under ./pony_chart")
                 self.root.destroy()
                 return
+
+        # 離開裁切模式
+        self._exit_crop_mode()
+
         p = self.image_paths[self.idx]
         try:
             im = Image.open(p).convert("RGB")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open {p}: {e}")
             return
+
+        self.current_pil_image = im
         w, h = im.size
-        scale = min(MAX_SIZE / max(1, w), MAX_SIZE / max(1, h), 1.0)
-        if scale < 1.0:
-            im = im.resize((int(w * scale), int(h * scale)))
-        self.tk_im = ImageTk.PhotoImage(im)
-        self.canvas.configure(image=self.tk_im)
+        self.scale = min(MAX_SIZE / max(1, w), MAX_SIZE / max(1, h), 1.0)
+        display_im = im
+        if self.scale < 1.0:
+            display_im = im.resize(
+                (int(w * self.scale), int(h * self.scale))
+            )
+
+        self.tk_im = ImageTk.PhotoImage(display_im)
+        dw, dh = display_im.size
+        self.canvas.configure(width=dw, height=dh)
+        if self._canvas_image_id is not None:
+            self.canvas.delete(self._canvas_image_id)
+        self._canvas_image_id = self.canvas.create_image(
+            0, 0, anchor="nw", image=self.tk_im
+        )
 
         key = self.image_key()
         self.current_labels = sorted(list(set(self.labels.get(key, []))))
@@ -251,8 +287,161 @@ class LabelApp:
                         self.idx = min(self.idx, len(self.image_paths) - 1)
             self.refresh()
 
+    # ── 裁切模式 ──────────────────────────────────────────────
+
+    def _enter_crop_mode(self) -> None:
+        self.crop_mode = True
+        self.crop_start = None
+        self.crop_end = None
+        if self.crop_rect_id is not None:
+            self.canvas.delete(self.crop_rect_id)
+            self.crop_rect_id = None
+        self.preview.configure(
+            text="裁切模式：拖曳選取區域，Enter 確認，Escape 取消"
+        )
+
+    def _exit_crop_mode(self) -> None:
+        self.crop_mode = False
+        self.crop_start = None
+        self.crop_end = None
+        if self.crop_rect_id is not None:
+            self.canvas.delete(self.crop_rect_id)
+            self.crop_rect_id = None
+
+    def on_mouse_press(self, e: "tk.Event[tk.Canvas]") -> None:
+        if not self.crop_mode:
+            return
+        self.crop_start = (e.x, e.y)
+        self.crop_end = None
+        if self.crop_rect_id is not None:
+            self.canvas.delete(self.crop_rect_id)
+            self.crop_rect_id = None
+
+    def on_mouse_drag(self, e: "tk.Event[tk.Canvas]") -> None:
+        if not self.crop_mode or self.crop_start is None:
+            return
+        if self.crop_rect_id is not None:
+            self.canvas.delete(self.crop_rect_id)
+        self.crop_rect_id = self.canvas.create_rectangle(
+            self.crop_start[0],
+            self.crop_start[1],
+            e.x,
+            e.y,
+            outline="red",
+            width=2,
+            dash=(4, 4),
+        )
+
+    def on_mouse_release(self, e: "tk.Event[tk.Canvas]") -> None:
+        if not self.crop_mode or self.crop_start is None:
+            return
+        self.crop_end = (e.x, e.y)
+        self.preview.configure(
+            text="裁切模式：Enter 確認儲存，Escape 取消"
+        )
+
+    def _next_crop_name(self, base_path: Path) -> Path:
+        """產生下一個可用的 _cropN 檔名。"""
+        stem = base_path.stem
+        suffix = base_path.suffix
+        parent = base_path.parent
+        n = 1
+        while True:
+            candidate = parent / f"{stem}_crop{n}{suffix}"
+            if not candidate.exists():
+                return candidate
+            n += 1
+
+    def _save_crop(self) -> None:
+        """將選取區域裁切並存檔。"""
+        if (
+            self.crop_start is None
+            or self.crop_end is None
+            or self.current_pil_image is None
+        ):
+            return
+
+        sx, sy = self.crop_start
+        ex, ey = self.crop_end
+        # 確保左上 / 右下
+        x1, x2 = sorted((sx, ex))
+        y1, y2 = sorted((sy, ey))
+
+        # 忽略太小的選取
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            messagebox.showwarning("裁切", "選取區域太小，請重新拖曳。")
+            return
+
+        # 顯示座標 → 原圖座標
+        orig_x1 = int(x1 / self.scale)
+        orig_y1 = int(y1 / self.scale)
+        orig_x2 = int(x2 / self.scale)
+        orig_y2 = int(y2 / self.scale)
+
+        # 限制在原圖範圍內
+        w, h = self.current_pil_image.size
+        orig_x1 = max(0, min(orig_x1, w))
+        orig_y1 = max(0, min(orig_y1, h))
+        orig_x2 = max(0, min(orig_x2, w))
+        orig_y2 = max(0, min(orig_y2, h))
+
+        cropped = self.current_pil_image.crop(
+            (orig_x1, orig_y1, orig_x2, orig_y2)
+        )
+
+        # 決定存檔路徑
+        current_path = self.image_paths[self.idx]
+        # 取基底名稱（去掉已有的 _cropN 後綴，避免巢狀命名）
+        base_stem = re.sub(r"_crop\d+$", "", current_path.stem)
+        base_path = current_path.parent / f"{base_stem}{current_path.suffix}"
+        save_path = self._next_crop_name(base_path)
+
+        cropped.save(save_path)
+
+        # 將新圖加入列表（排序後插入正確位置）
+        self.all_paths.append(save_path)
+        self.all_paths.sort()
+        # 重建過濾列表
+        if self.filter_unlabeled_var.get():
+            self.image_paths = [
+                p
+                for p in self.all_paths
+                if self.path_to_key(p) not in self.labels
+            ]
+        else:
+            self.image_paths = list(self.all_paths)
+
+        # 跳到新裁切的圖片
+        try:
+            self.idx = next(
+                i
+                for i, p in enumerate(self.image_paths)
+                if p == save_path
+            )
+        except StopIteration:
+            pass
+
+        self._exit_crop_mode()
+        self.refresh()
+        self.preview.configure(
+            text=f"已儲存裁切圖：{save_path.name}\n"
+            f"({self.idx+1}/{len(self.image_paths)})"
+        )
+
+    # ── 鍵盤事件 ─────────────────────────────────────────────
+
     def on_key(self, e: "tk.Event[tk.Misc]") -> None:
         k = e.keysym.lower()
+
+        # 裁切模式下的按鍵
+        if self.crop_mode:
+            if k == "return":
+                self._save_crop()
+            elif k == "escape":
+                self._exit_crop_mode()
+                self.refresh()
+            return
+
         if k in ["1", "2", "3", "4", "5", "6"]:
             self.toggle_label(int(k))
         elif k == "a":
@@ -263,6 +452,8 @@ class LabelApp:
             self.refresh()
         elif k == "s":
             self.save()
+        elif k == "c":
+            self._enter_crop_mode()
 
 
 def main() -> None:
