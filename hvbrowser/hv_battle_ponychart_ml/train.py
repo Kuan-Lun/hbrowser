@@ -19,6 +19,8 @@ import copy
 import json
 import logging
 import os
+import platform
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -59,6 +61,23 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+def _get_performance_cpu_count() -> int:
+    """回傳效能核心數（macOS Apple Silicon），其餘平台回傳總核心數。"""
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return max((os.cpu_count() or 1) - 2, 1)
+
+
 def load_samples() -> list[tuple[str, list[int]]]:
     """讀取 labels.json，回傳 [(image_path, [1-indexed labels]), ...]。"""
     with open(LABELS_FILE, encoding="utf-8") as f:
@@ -353,11 +372,25 @@ def main() -> None:
 
     train_ds = PonyChartDataset(train_samples, get_transforms(is_train=True))
     val_ds = PonyChartDataset(val_samples, get_transforms(is_train=False))
+    num_workers = _get_performance_cpu_count()
+    use_persistent = num_workers > 0
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if use_persistent else None,
+        pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if use_persistent else None,
+        pin_memory=(device.type == "cuda"),
     )
 
     # Model
@@ -378,7 +411,11 @@ def main() -> None:
         val_loss, val_f1, _ = validate(model, val_loader, criterion, device)
         logger.info(
             "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
-            epoch, phase1_epochs, train_loss, val_loss, val_f1,
+            epoch,
+            phase1_epochs,
+            train_loss,
+            val_loss,
+            val_f1,
         )
 
     # ---- Phase 2: Full fine-tuning ----
@@ -420,7 +457,13 @@ def main() -> None:
         )
         logger.info(
             "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f%s\n    %s",
-            epoch, args.epochs, train_loss, val_loss, val_f1, marker, per_class_str,
+            epoch,
+            args.epochs,
+            train_loss,
+            val_loss,
+            val_f1,
+            marker,
+            per_class_str,
         )
         if patience_counter >= patience:
             logger.info("  Early stopping (no improvement for %d epochs)", patience)
