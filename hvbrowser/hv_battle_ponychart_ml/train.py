@@ -169,7 +169,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomAffine(
-                    degrees=180, translate=(0.05, 0.05), scale=(0.9, 1.1)
+                    degrees=90, translate=(0.05, 0.05), scale=(0.9, 1.1)
                 ),
                 transforms.RandomCrop((224, 224)),
                 transforms.ColorJitter(
@@ -298,19 +298,23 @@ def optimize_thresholds(
 # ONNX export
 # ---------------------------------------------------------------------------
 def export_onnx(model: nn.Module, output_path: Path) -> None:
+    import warnings
+
     import onnx
 
     model.eval()
     model_cpu = model.cpu()
     dummy = torch.randn(1, 3, 224, 224)
-    torch.onnx.export(
-        model_cpu,
-        (dummy,),
-        str(output_path),
-        input_names=["input"],
-        output_names=["logits"],
-        opset_version=18,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Missing annotation for parameter")
+        torch.onnx.export(
+            model_cpu,
+            (dummy,),
+            str(output_path),
+            input_names=["input"],
+            output_names=["logits"],
+            opset_version=18,
+        )
     # 新版 PyTorch 可能把權重存成 external data，需合併成單一檔案
     external_data = Path(str(output_path) + ".data")
     if external_data.exists():
