@@ -92,6 +92,11 @@ class LabelStore:
         return self._subdir + "/" + p.name
 
 
+def is_raw_image(p: Path) -> bool:
+    """判斷是否為原始圖片（pony_chart_YYYYMMDD_HHMMSS，無額外後綴）。"""
+    return bool(re.fullmatch(r"pony_chart_\d{8}_\d{6}", p.stem))
+
+
 class ImageNavigator:
     """圖片列表管理、過濾與導航。"""
 
@@ -100,7 +105,7 @@ class ImageNavigator:
         self._store = store
         self._paths = list(all_paths)
         self._idx = 0
-        self._filtered = False
+        self._filter_fn: Callable[[Path], bool] | None = None
 
     @property
     def total(self) -> int:
@@ -116,7 +121,7 @@ class ImageNavigator:
 
     @property
     def is_filtered(self) -> bool:
-        return self._filtered
+        return self._filter_fn is not None
 
     @property
     def current_path(self) -> Path:
@@ -125,6 +130,10 @@ class ImageNavigator:
     @property
     def current_key(self) -> str:
         return self._store.path_to_key(self._paths[self._idx])
+
+    @property
+    def all_paths(self) -> list[Path]:
+        return self._all_paths
 
     def go_next(self) -> None:
         self._idx = (self._idx + 1) % len(self._paths)
@@ -143,40 +152,36 @@ class ImageNavigator:
         """跳到指定 key 的圖片。"""
         self._idx = self._find_index_by_key(key)
 
-    def set_filter(self, enabled: bool) -> bool:
-        """設定過濾模式。回傳 False 表示沒有未標註圖片。"""
-        self._filtered = enabled
-        if enabled:
-            unlabeled = [
-                p
-                for p in self._all_paths
-                if not self._store.has(self._store.path_to_key(p))
-            ]
-            if not unlabeled:
-                self._filtered = False
+    def apply_filter(self, fn: Callable[[Path], bool] | None) -> bool:
+        """套用篩選函式。回傳 False 表示篩選結果為空。"""
+        current_key = self.current_key if not self.is_empty else None
+        self._filter_fn = fn
+        if fn is not None:
+            self._paths = [p for p in self._all_paths if fn(p)]
+            if not self._paths:
+                self._filter_fn = None
                 return False
-            self._paths = unlabeled
-            self._idx = 0
         else:
-            current_key = self.current_key if not self.is_empty else None
             self._paths = list(self._all_paths)
-            if current_key:
-                self._idx = self._find_index_by_key(current_key)
+        if current_key:
+            self._idx = self._find_index_by_key(current_key)
+        else:
+            self._idx = 0
         return True
 
     def refresh_filter(self) -> None:
         """重新套用目前的過濾設定（例如 save 後）。"""
-        if self._filtered:
-            self._paths = [
-                p
-                for p in self._all_paths
-                if not self._store.has(self._store.path_to_key(p))
-            ]
+        if self._filter_fn is not None:
+            self._paths = [p for p in self._all_paths if self._filter_fn(p)]
         else:
             self._paths = list(self._all_paths)
+        if self._paths:
+            self._idx = min(self._idx, len(self._paths) - 1)
+        else:
+            self._idx = 0
 
     def advance_after_label(self, labeled_key: str) -> None:
-        """在過濾模式下，從 labeled_key 往後找下一個未標註圖片。"""
+        """在過濾模式下，從 labeled_key 往後找下一個符合篩選的圖片。"""
         try:
             start = next(
                 i
@@ -190,7 +195,7 @@ class ImageNavigator:
         all_len = len(self._all_paths)
         for offset in range(1, all_len + 1):
             candidate = self._all_paths[(start + offset) % all_len]
-            if not self._store.has(self._store.path_to_key(candidate)):
+            if self._filter_fn is None or self._filter_fn(candidate):
                 try:
                     self._idx = next(
                         i for i, p in enumerate(self._paths) if p == candidate
@@ -209,6 +214,10 @@ class ImageNavigator:
             self._idx = next(i for i, p in enumerate(self._paths) if p == path)
         except StopIteration:
             pass
+
+    def contains_key(self, key: str) -> bool:
+        """目前篩選後的列表中是否包含指定 key。"""
+        return any(self._store.path_to_key(p) == key for p in self._paths)
 
     def _find_index_by_key(self, key: str) -> int:
         try:
@@ -337,14 +346,35 @@ class LabelApp:
             fg="#666",
         ).pack(pady=(0, 6))
 
-        # 只顯示未標註的 checkbox
+        # 篩選選項
+        filter_frame = tk.Frame(root)
+        filter_frame.pack(pady=(0, 4))
+
+        self.raw_only_var = tk.BooleanVar(value=False)
+        self.raw_only_cb = tk.Checkbutton(
+            filter_frame,
+            text="只顯示原圖",
+            variable=self.raw_only_var,
+            command=self._on_raw_toggle,
+        )
+        self.raw_only_cb.pack(side="left", padx=(0, 8))
+
+        self.uncropped_only_var = tk.BooleanVar(value=False)
+        self.uncropped_only_cb = tk.Checkbutton(
+            filter_frame,
+            text="只顯示未裁切原圖",
+            variable=self.uncropped_only_var,
+            command=self._on_uncropped_toggle,
+        )
+        self.uncropped_only_cb.pack(side="left", padx=(0, 8))
+
         self.filter_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
-            root,
+            filter_frame,
             text="只顯示未標註",
             variable=self.filter_var,
             command=self._on_filter_toggle,
-        ).pack(pady=(0, 4))
+        ).pack(side="left")
 
         # 計數器（可點擊跳轉）
         self.counter_label = tk.Label(
@@ -373,10 +403,9 @@ class LabelApp:
 
     def _refresh(self) -> None:
         if self.nav.is_empty:
-            if self.filter_var.get():
-                messagebox.showinfo("Info", "所有圖片都已標註。")
-                self.filter_var.set(False)
-                self.nav.set_filter(False)
+            if self.nav.is_filtered:
+                messagebox.showinfo("Info", "篩選結果為空。")
+                self._reset_all_filters()
                 if self.nav.is_empty:
                     self._show_no_images()
                     return
@@ -437,19 +466,79 @@ class LabelApp:
 
         self.nav.refresh_filter()
         if self.nav.is_empty:
-            messagebox.showinfo("Info", "所有圖片都已標註。")
-            self.filter_var.set(False)
-            self.nav.set_filter(False)
+            messagebox.showinfo("Info", "篩選結果為空。")
+            self._reset_all_filters()
             self.nav.go_to_key(key)
-        else:
+        elif not self.nav.contains_key(key):
             self.nav.advance_after_label(key)
         self._refresh()
 
     def _on_filter_toggle(self) -> None:
-        if not self.nav.set_filter(self.filter_var.get()):
-            messagebox.showinfo("Info", "所有圖片都已標註。")
-            self.filter_var.set(False)
+        self._apply_filters()
+
+    def _on_raw_toggle(self) -> None:
+        if not self.raw_only_var.get():
+            self.uncropped_only_var.set(False)
+            self.uncropped_only_cb.configure(state="normal")
+        self._apply_filters()
+
+    def _on_uncropped_toggle(self) -> None:
+        if self.uncropped_only_var.get():
+            self.raw_only_var.set(True)
+            self.raw_only_cb.configure(state="disabled")
+        else:
+            self.raw_only_cb.configure(state="normal")
+        self._apply_filters()
+
+    def _build_filter_fn(self) -> Callable[[Path], bool] | None:
+        """根據所有篩選 checkbox 的狀態組合出篩選函式。"""
+        raw_only = self.raw_only_var.get()
+        uncropped_only = self.uncropped_only_var.get()
+        unlabeled_only = self.filter_var.get()
+
+        if not raw_only and not uncropped_only and not unlabeled_only:
+            return None
+
+        # 預計算已有裁切圖的 raw stem 集合（避免 O(n²)）
+        raw_stems_with_crops: set[str] | None = None
+        if uncropped_only:
+            raw_stems_with_crops = set()
+            for p in self.nav.all_paths:
+                if not is_raw_image(p):
+                    m = re.match(r"(pony_chart_\d{8}_\d{6})", p.stem)
+                    if m:
+                        raw_stems_with_crops.add(m.group(1))
+
+        store = self.store
+
+        def predicate(p: Path) -> bool:
+            if raw_only or uncropped_only:
+                if not is_raw_image(p):
+                    return False
+            if raw_stems_with_crops is not None and p.stem in raw_stems_with_crops:
+                return False
+            if unlabeled_only and store.has(store.path_to_key(p)):
+                return False
+            return True
+
+        return predicate
+
+    def _apply_filters(self) -> None:
+        """套用所有篩選 checkbox 的組合結果。"""
+        fn = self._build_filter_fn()
+        if not self.nav.apply_filter(fn):
+            messagebox.showinfo("Info", "篩選結果為空。")
+            self._reset_all_filters()
         self._refresh()
+
+    def _reset_all_filters(self) -> None:
+        """重置所有篩選 checkbox 並清除篩選。"""
+        self.raw_only_var.set(False)
+        self.uncropped_only_var.set(False)
+        self.filter_var.set(False)
+        self.raw_only_cb.configure(state="normal")
+        self.uncropped_only_cb.configure(state="normal")
+        self.nav.apply_filter(None)
 
     def _jump_to_image(self) -> None:
         n = simpledialog.askinteger(
