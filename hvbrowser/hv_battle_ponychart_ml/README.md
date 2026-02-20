@@ -53,7 +53,7 @@ python hvbrowser/hv_battle_ponychart_ml/label_images.py
 uv pip install torch torchvision scikit-learn onnxscript
 
 # 執行訓練
-python -m hvbrowser.hv_battle_ponychart_ml.train --epochs 50
+uv run python -m hvbrowser.hv_battle_ponychart_ml.train --epochs 50
 ```
 
 訓練完成後會直接覆寫 `model.onnx` 和 `thresholds.json`，下次推論自動使用新模型。
