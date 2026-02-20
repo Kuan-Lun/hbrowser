@@ -25,11 +25,9 @@
     "--ignore=E203,E501,W503,E704"
   ],
   // --- mypy 擴充套件 ---
-  // 確保 VS Code mypy 擴充套件使用專案的 mypy.ini（含嚴格模式設定）。
-  // 關閉 unused-ignore 警告：VS Code mypy 的解析環境與 CLI 不一致，
-  // 會誤判某些 type: ignore 為多餘（CLI mypy 仍會正確檢查）。
+  // 使用專案虛擬環境中的 mypy，確保 IDE 與 CLI (uv run mypy) 結果一致。
+  "mypy-type-checker.importStrategy": "fromEnvironment",
   "mypy-type-checker.args": [
-    "--config-file=mypy.ini",
-    "--no-warn-unused-ignores"
+    "--config-file=mypy.ini"
   ]
 }
