@@ -35,7 +35,6 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
-from torchvision.transforms import InterpolationMode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,16 +231,21 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
     ) -> None:
         self.samples = samples
         self.transform = transform
+        # Pre-load and resize all images into memory to avoid repeated disk I/O
+        self._cache: list[Image.Image] = []
+        for path, _ in samples:
+            img = Image.open(path).convert("RGB")
+            img = img.resize((256, 256), Image.Resampling.BOX)
+            self._cache.append(img)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        path, label_list = self.samples[idx]
-        image = Image.open(path).convert("RGB")
+        image = self._cache[idx]
         if self.transform:
             image = self.transform(image)
-        target = labels_to_binary(label_list)
+        target = labels_to_binary(self.samples[idx][1])
         return image, target
 
 
@@ -249,7 +253,6 @@ def get_transforms(is_train: bool) -> transforms.Compose:
     if is_train:
         return transforms.Compose(
             [
-                transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomAffine(
@@ -267,7 +270,6 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         )
     return transforms.Compose(
         [
-            transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
             transforms.CenterCrop((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -309,7 +311,7 @@ def train_one_epoch(
     return total_loss / len(loader.dataset)
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[untyped-decorator]
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
@@ -362,7 +364,7 @@ def evaluate(
     }
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[untyped-decorator]
 def optimize_thresholds(
     model: nn.Module,
     loader: DataLoader,

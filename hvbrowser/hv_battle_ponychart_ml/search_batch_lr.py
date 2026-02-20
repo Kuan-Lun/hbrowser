@@ -17,7 +17,6 @@ Batch size × Learning rate 超參數搜尋。
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
@@ -36,7 +35,6 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
-from torchvision.transforms import InterpolationMode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,16 +160,21 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
     ) -> None:
         self.samples = samples
         self.transform = transform
+        # Pre-load and resize all images into memory to avoid repeated disk I/O
+        self._cache: list[Image.Image] = []
+        for path, _ in samples:
+            img = Image.open(path).convert("RGB")
+            img = img.resize((256, 256), Image.Resampling.BOX)
+            self._cache.append(img)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        path, label_list = self.samples[idx]
-        image = Image.open(path).convert("RGB")
+        image = self._cache[idx]
         if self.transform:
             image = self.transform(image)
-        target = labels_to_binary(label_list)
+        target = labels_to_binary(self.samples[idx][1])
         return image, target
 
 
@@ -179,7 +182,6 @@ def get_transforms(is_train: bool) -> transforms.Compose:
     if is_train:
         return transforms.Compose(
             [
-                transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
                 transforms.RandomAffine(
@@ -197,7 +199,6 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         )
     return transforms.Compose(
         [
-            transforms.Resize((256, 256), interpolation=InterpolationMode.BOX),
             transforms.CenterCrop((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -239,7 +240,7 @@ def train_one_epoch(
     return total_loss / len(loader.dataset)
 
 
-@torch.no_grad()
+@torch.no_grad()  # type: ignore[untyped-decorator]
 def validate(
     model: nn.Module,
     loader: DataLoader,
@@ -393,8 +394,12 @@ def main() -> None:
     logger.info("HYPERPARAMETER SEARCH: %d combinations", total_combos)
     logger.info("  Batch sizes: %s", BATCH_SIZES)
     logger.info("  LR scales:   %s (× linear scaling rule)", LR_SCALES)
-    logger.info("  Phase 1: %d epochs, Phase 2: %d epochs (patience=%d)",
-                PHASE1_EPOCHS, PHASE2_EPOCHS, PATIENCE)
+    logger.info(
+        "  Phase 1: %d epochs, Phase 2: %d epochs (patience=%d)",
+        PHASE1_EPOCHS,
+        PHASE2_EPOCHS,
+        PATIENCE,
+    )
     logger.info("=" * 70)
     logger.info("")
 
@@ -433,14 +438,16 @@ def main() -> None:
             )
             elapsed = time.monotonic() - t0
 
-            result.update({
-                "batch_size": batch_size,
-                "lr_scale": lr_scale,
-                "lr_head": lr_head,
-                "lr_features": lr_features,
-                "lr_classifier": lr_classifier,
-                "time_s": elapsed,
-            })
+            result.update(
+                {
+                    "batch_size": batch_size,
+                    "lr_scale": lr_scale,
+                    "lr_head": lr_head,
+                    "lr_features": lr_features,
+                    "lr_classifier": lr_classifier,
+                    "time_s": elapsed,
+                }
+            )
             results.append(result)
 
             logger.info(
@@ -459,8 +466,15 @@ def main() -> None:
     logger.info("=" * 90)
     logger.info(
         "  %-4s  %-6s  %-8s  %-10s  %-10s  %-10s  %-8s  %-6s  %-7s",
-        "Rank", "Batch", "LR scale", "LR head", "LR feat", "LR cls",
-        "Macro F1", "Epoch", "Time",
+        "Rank",
+        "Batch",
+        "LR scale",
+        "LR head",
+        "LR feat",
+        "LR cls",
+        "Macro F1",
+        "Epoch",
+        "Time",
     )
     logger.info("  " + "-" * 85)
     for rank, r in enumerate(results, 1):
@@ -483,7 +497,10 @@ def main() -> None:
     for rank, r in enumerate(results[:3], 1):
         logger.info(
             "  #%d (batch=%d, scale=%.1fx, F1=%.4f):",
-            rank, r["batch_size"], r["lr_scale"], r["best_f1"],
+            rank,
+            r["batch_size"],
+            r["lr_scale"],
+            r["best_f1"],
         )
         for i, name in enumerate(CLASS_NAMES):
             logger.info("    %-20s  %.4f", name, r["per_class_f1"][i])
@@ -496,9 +513,7 @@ def main() -> None:
     logger.info("=" * 90)
     logger.info("  Best config:")
     logger.info("    --batch-size %d", best["batch_size"])
-    logger.info(
-        "    Phase 1 lr: %.1e  (train.py default: 1e-3)", best["lr_head"]
-    )
+    logger.info("    Phase 1 lr: %.1e  (train.py default: 1e-3)", best["lr_head"])
     logger.info(
         "    Phase 2 lr_features: %.1e  (train.py default: 3e-5)",
         best["lr_features"],
@@ -519,7 +534,8 @@ def main() -> None:
         speedup = baseline["time_s"] / best["time_s"] if best["time_s"] > 0 else 0
         logger.info(
             "  vs baseline (batch=32, 1.0x): F1 %+.4f, %.1fx speed",
-            diff, speedup,
+            diff,
+            speedup,
         )
     elif baseline:
         logger.info("  Baseline (batch=32, 1.0x) is already the best config.")
