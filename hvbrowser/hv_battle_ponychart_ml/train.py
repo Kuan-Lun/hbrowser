@@ -7,9 +7,9 @@ PonyChart 多標籤分類訓練腳本。
   uv pip install torch torchvision scikit-learn
 
 使用方式：
-  python -m hvbrowser.hv_battle_ponychart_ml.train
+  uv run python -m hvbrowser.hv_battle_ponychart_ml.train
   # 或
-  python hvbrowser/hv_battle_ponychart_ml/train.py
+  uv run python hvbrowser/hv_battle_ponychart_ml/train.py
 """
 
 from __future__ import annotations
