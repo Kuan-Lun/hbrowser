@@ -207,22 +207,6 @@ def main() -> None:
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
     train_val_balanced = train_val_orig + balanced_crops
 
-    # ── Distribution analysis ──
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("DISTRIBUTION ANALYSIS")
-    logger.info("=" * 60)
-    log_distribution("Original images (train+val)", train_val_orig)
-    crop_rates = log_distribution("Crop images (raw)", train_val_crop)
-    log_distribution("Crop images (balanced)", balanced_crops)
-    logger.info("")
-    logger.info("  Per-class bias (crop_rate - orig_rate):")
-    bias_per_class = []
-    for i, name in enumerate(CLASS_NAMES):
-        bias = crop_rates[i] - orig_rates[i]
-        bias_per_class.append(bias)
-        logger.info("    %-20s  %+.1f%%", name, bias * 100)
-
     # ── Split train/val for each experiment ──
     # Experiment A: originals + all crops (biased)
     train_gk_a, val_gk_a = split_by_groups(
@@ -265,23 +249,6 @@ def main() -> None:
         train_val_balanced[i] for gk in val_gk_c for i in groups_c[gk]
     ]
 
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("DATA SPLIT SUMMARY")
-    logger.info("=" * 60)
-    logger.info(
-        "Test set (shared, originals only): %d images", len(test_samples)
-    )
-    logger.info("")
-    logger.info("Experiment A (orig + biased crops):")
-    logger.info("  Train: %d  Val: %d", len(train_a), len(val_a))
-    logger.info("Experiment B (originals only):")
-    logger.info("  Train: %d  Val: %d", len(train_b), len(val_b))
-    logger.info("Experiment C (orig + balanced crops):")
-    logger.info("  Train: %d  Val: %d", len(train_c), len(val_c))
-    logger.info("=" * 60)
-    logger.info("")
-
     criterion = nn.BCEWithLogitsLoss()
 
     # ---- Train experiments ----
@@ -323,6 +290,38 @@ def main() -> None:
     result_c = evaluate(
         model_c, test_loader, criterion, device, thresholds_c
     )
+
+    # ── Data split summary ──
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("DATA SPLIT SUMMARY")
+    logger.info("=" * 80)
+    logger.info(
+        "Test set (shared, originals only): %d images", len(test_samples)
+    )
+    logger.info("")
+    logger.info("Experiment A (orig + biased crops):")
+    logger.info("  Train: %d  Val: %d", len(train_a), len(val_a))
+    logger.info("Experiment B (originals only):")
+    logger.info("  Train: %d  Val: %d", len(train_b), len(val_b))
+    logger.info("Experiment C (orig + balanced crops):")
+    logger.info("  Train: %d  Val: %d", len(train_c), len(val_c))
+
+    # ── Distribution analysis ──
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("DISTRIBUTION ANALYSIS")
+    logger.info("=" * 80)
+    log_distribution("Original images (train+val)", train_val_orig)
+    crop_rates = log_distribution("Crop images (raw)", train_val_crop)
+    log_distribution("Crop images (balanced)", balanced_crops)
+    logger.info("")
+    logger.info("  Per-class bias (crop_rate - orig_rate):")
+    bias_per_class = []
+    for i, name in enumerate(CLASS_NAMES):
+        bias = crop_rates[i] - orig_rates[i]
+        bias_per_class.append(bias)
+        logger.info("    %-20s  %+.1f%%", name, bias * 100)
 
     # ── Print comparison ──
     logger.info("")
