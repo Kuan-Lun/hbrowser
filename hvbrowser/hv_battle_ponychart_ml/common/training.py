@@ -17,10 +17,18 @@ from .constants import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    LR_CLASSIFIER,
+    LR_FEATURES,
+    LR_HEAD,
+    MIN_DELTA,
     NUM_CLASSES,
     PATIENCE,
     PHASE1_EPOCHS,
     PHASE2_EPOCHS,
+    SCHEDULER_FACTOR,
+    SCHEDULER_MIN_LR,
+    SCHEDULER_PATIENCE,
+    WEIGHT_DECAY,
 )
 from .data import PonyChartDataset, get_transforms, make_dataloader
 from .model import build_model
@@ -90,12 +98,8 @@ def evaluate(
     per_class_recall = []
     for i in range(NUM_CLASSES):
         f1 = f1_score(all_targets_arr[:, i], preds[:, i], zero_division=0.0)
-        prec = precision_score(
-            all_targets_arr[:, i], preds[:, i], zero_division=0.0
-        )
-        rec = recall_score(
-            all_targets_arr[:, i], preds[:, i], zero_division=0.0
-        )
+        prec = precision_score(all_targets_arr[:, i], preds[:, i], zero_division=0.0)
+        rec = recall_score(all_targets_arr[:, i], preds[:, i], zero_division=0.0)
         per_class_f1.append(float(f1))
         per_class_precision.append(float(prec))
         per_class_recall.append(float(rec))
@@ -180,12 +184,18 @@ def train_model(
     train_ds = PonyChartDataset(train_samples, train_transform)
     val_ds = PonyChartDataset(val_samples, val_transform)
     train_loader = make_dataloader(
-        train_ds, batch_size, shuffle=True,
-        num_workers=num_workers, device=device,
+        train_ds,
+        batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        device=device,
     )
     val_loader = make_dataloader(
-        val_ds, batch_size, shuffle=False,
-        num_workers=num_workers, device=device,
+        val_ds,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
 
     model = build_model(backbone=backbone, pretrained=True).to(device)
@@ -196,12 +206,10 @@ def train_model(
     for param in model.features.parameters():
         param.requires_grad = False
     optimizer = torch.optim.AdamW(
-        model.classifier.parameters(), lr=1e-3, weight_decay=1e-4
+        model.classifier.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY
     )
     for epoch in range(1, phase1_epochs + 1):
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
-        )
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_result = evaluate(model, val_loader, criterion, device)
         logger.info(
             "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
@@ -218,13 +226,17 @@ def train_model(
         param.requires_grad = True
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.features.parameters(), "lr": 3e-5},
-            {"params": model.classifier.parameters(), "lr": 3e-4},
+            {"params": model.features.parameters(), "lr": LR_FEATURES},
+            {"params": model.classifier.parameters(), "lr": LR_CLASSIFIER},
         ],
-        weight_decay=1e-4,
+        weight_decay=WEIGHT_DECAY,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-7
+        optimizer,
+        mode="max",
+        factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE,
+        min_lr=SCHEDULER_MIN_LR,
     )
 
     best_f1 = 0.0
@@ -232,15 +244,13 @@ def train_model(
     patience_counter = 0
 
     for epoch in range(1, phase2_epochs + 1):
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
-        )
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_result = evaluate(model, val_loader, criterion, device)
         val_f1 = val_result["macro_f1"]
         scheduler.step(val_f1)
 
         marker = ""
-        if val_f1 > best_f1 + 0.0005:
+        if val_f1 > best_f1 + MIN_DELTA:
             best_f1 = val_f1
             best_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
@@ -275,9 +285,7 @@ def train_model(
                 marker,
             )
         if patience_counter >= patience:
-            logger.info(
-                "  Early stopping (no improvement for %d epochs)", patience
-            )
+            logger.info("  Early stopping (no improvement for %d epochs)", patience)
             break
 
     model.load_state_dict(best_state)
@@ -290,8 +298,6 @@ def train_model(
 
     # Optimize thresholds on validation set
     thresholds = optimize_thresholds(model, val_loader, device)
-    logger.info(
-        "Optimized thresholds: %s", dict(zip(CLASS_NAMES, thresholds))
-    )
+    logger.info("Optimized thresholds: %s", dict(zip(CLASS_NAMES, thresholds)))
 
     return model, thresholds

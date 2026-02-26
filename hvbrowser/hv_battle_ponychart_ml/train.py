@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 
 import numpy as np
@@ -27,10 +28,13 @@ from .common import (
     OUTPUT_ONNX,
     OUTPUT_THRESHOLDS,
     SEED,
+    balance_crop_samples,
+    compute_class_rates,
     export_onnx,
     get_device,
     get_performance_cpu_count,
     group_stratified_split,
+    is_original,
     load_samples,
     train_model,
 )
@@ -56,6 +60,25 @@ def main() -> None:
     if not samples:
         logger.error("No samples found. Check rawimage/ and labels.json.")
         sys.exit(1)
+
+    # Separate originals and crops, then balance crops to match original distribution
+    orig_samples = [
+        s for s in samples if is_original(os.path.basename(s[0]))
+    ]
+    crop_samples = [
+        s for s in samples if not is_original(os.path.basename(s[0]))
+    ]
+    orig_rates = compute_class_rates(orig_samples)
+    rng = np.random.RandomState(SEED)
+    balanced_crops = balance_crop_samples(crop_samples, orig_rates, rng)
+    samples = orig_samples + balanced_crops
+    logger.info(
+        "Orig: %d  Crop: %d -> Balanced: %d  Total: %d",
+        len(orig_samples),
+        len(crop_samples),
+        len(balanced_crops),
+        len(samples),
+    )
 
     train_idx, val_idx = group_stratified_split(
         samples, test_size=0.15, seed=SEED

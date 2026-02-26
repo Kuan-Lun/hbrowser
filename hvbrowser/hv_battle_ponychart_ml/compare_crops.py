@@ -34,6 +34,8 @@ from .common import (
     CLASS_NAMES,
     NUM_CLASSES,
     SEED,
+    balance_crop_samples,
+    compute_class_rates,
     evaluate,
     get_base_timestamp,
     get_device,
@@ -52,57 +54,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Unique helpers for crop analysis
-# ---------------------------------------------------------------------------
-def compute_class_rates(
-    samples: list[tuple[str, list[int]]],
-) -> list[float]:
-    """計算每個 class 的出現比例 (positive rate)。"""
-    counts = [0] * NUM_CLASSES
-    for _, labels in samples:
-        for lbl in labels:
-            counts[lbl - 1] += 1
-    n = max(len(samples), 1)
-    return [c / n for c in counts]
-
-
-def balance_crop_samples(
-    crop_samples: list[tuple[str, list[int]]],
-    target_rates: list[float],
-    rng: np.random.RandomState,
-) -> list[tuple[str, list[int]]]:
-    """Oversample crop 圖片使 per-class 出現比例接近 target_rates。"""
-    if not crop_samples:
-        return []
-
-    current_rates = compute_class_rates(crop_samples)
-    n = len(crop_samples)
-
-    target_counts = [max(int(round(tr * n)), 0) for tr in target_rates]
-    current_counts = [int(round(cr * n)) for cr in current_rates]
-
-    class_to_indices: dict[int, list[int]] = defaultdict(list)
-    for idx, (_, labels) in enumerate(crop_samples):
-        for lbl in labels:
-            class_to_indices[lbl - 1].append(idx)
-
-    extra_indices: set[int] = set()
-    extra_samples: list[tuple[str, list[int]]] = []
-
-    for cls in range(NUM_CLASSES):
-        deficit = target_counts[cls] - current_counts[cls]
-        if deficit <= 0 or not class_to_indices[cls]:
-            continue
-        sampled = rng.choice(class_to_indices[cls], size=deficit, replace=True)
-        for idx in sampled:
-            if idx not in extra_indices:
-                extra_indices.add(idx)
-                extra_samples.append(crop_samples[idx])
-
-    return list(crop_samples) + extra_samples
 
 
 def log_distribution(
