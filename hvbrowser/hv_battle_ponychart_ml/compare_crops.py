@@ -54,7 +54,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-
 # ---------------------------------------------------------------------------
 # Unique helpers for crop analysis
 # ---------------------------------------------------------------------------
@@ -115,9 +114,7 @@ def log_distribution(
     logger.info("  %s (%d samples):", label, len(samples))
     for i, name in enumerate(CLASS_NAMES):
         count = sum(1 for _, lbls in samples if (i + 1) in lbls)
-        logger.info(
-            "    %-20s  %4d  (%.1f%%)", name, count, rates[i] * 100
-        )
+        logger.info("    %-20s  %4d  (%.1f%%)", name, count, rates[i] * 100)
     return rates
 
 
@@ -181,11 +178,7 @@ def main() -> None:
             else:
                 train_val_indices_crop.append(idx)
 
-    train_val_all = [
-        all_samples[i]
-        for gk in train_val_groups
-        for i in groups[gk]
-    ]
+    train_val_all = [all_samples[i] for gk in train_val_groups for i in groups[gk]]
     train_val_orig = [all_samples[i] for i in train_val_indices_orig]
     train_val_crop = [all_samples[i] for i in train_val_indices_crop]
 
@@ -196,29 +189,21 @@ def main() -> None:
 
     # ── Split train/val for each experiment ──
     # Experiment A: originals + all crops (biased)
-    train_gk_a, val_gk_a = split_by_groups(
-        train_val_all, test_size=0.15, seed=SEED
-    )
+    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=0.15, seed=SEED)
     groups_a: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_all):
         base = get_base_timestamp(os.path.basename(path))
         groups_a[base].append(idx)
-    train_a = [
-        train_val_all[i] for gk in train_gk_a for i in groups_a[gk]
-    ]
+    train_a = [train_val_all[i] for gk in train_gk_a for i in groups_a[gk]]
     val_a = [train_val_all[i] for gk in val_gk_a for i in groups_a[gk]]
 
     # Experiment B: originals only
-    train_gk_b, val_gk_b = split_by_groups(
-        train_val_orig, test_size=0.15, seed=SEED
-    )
+    train_gk_b, val_gk_b = split_by_groups(train_val_orig, test_size=0.15, seed=SEED)
     groups_b: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_orig):
         base = get_base_timestamp(os.path.basename(path))
         groups_b[base].append(idx)
-    train_b = [
-        train_val_orig[i] for gk in train_gk_b for i in groups_b[gk]
-    ]
+    train_b = [train_val_orig[i] for gk in train_gk_b for i in groups_b[gk]]
     val_b = [train_val_orig[i] for gk in val_gk_b for i in groups_b[gk]]
 
     # Experiment C: originals + balanced crops
@@ -229,18 +214,17 @@ def main() -> None:
     for idx, (path, _) in enumerate(train_val_balanced):
         base = get_base_timestamp(os.path.basename(path))
         groups_c[base].append(idx)
-    train_c = [
-        train_val_balanced[i] for gk in train_gk_c for i in groups_c[gk]
-    ]
-    val_c = [
-        train_val_balanced[i] for gk in val_gk_c for i in groups_c[gk]
-    ]
+    train_c = [train_val_balanced[i] for gk in train_gk_c for i in groups_c[gk]]
+    val_c = [train_val_balanced[i] for gk in val_gk_c for i in groups_c[gk]]
 
     criterion = nn.BCEWithLogitsLoss()
 
     # ---- Train experiments ----
     model_a, thresholds_a = train_model(
-        train_a, val_a, device, num_workers,
+        train_a,
+        val_a,
+        device,
+        num_workers,
         "A: Originals + biased crops",
         backbone=BACKBONE,
     )
@@ -248,7 +232,10 @@ def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     model_b, thresholds_b = train_model(
-        train_b, val_b, device, num_workers,
+        train_b,
+        val_b,
+        device,
+        num_workers,
         "B: Originals only (baseline)",
         backbone=BACKBONE,
     )
@@ -256,7 +243,10 @@ def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     model_c, thresholds_c = train_model(
-        train_c, val_c, device, num_workers,
+        train_c,
+        val_c,
+        device,
+        num_workers,
         "C: Originals + balanced crops",
         backbone=BACKBONE,
     )
@@ -264,28 +254,23 @@ def main() -> None:
     # ---- Evaluate all on test set ----
     test_ds = PonyChartDataset(test_samples, get_transforms(is_train=False))
     test_loader = make_dataloader(
-        test_ds, BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, device=device,
+        test_ds,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
 
-    result_a = evaluate(
-        model_a, test_loader, criterion, device, thresholds_a
-    )
-    result_b = evaluate(
-        model_b, test_loader, criterion, device, thresholds_b
-    )
-    result_c = evaluate(
-        model_c, test_loader, criterion, device, thresholds_c
-    )
+    result_a = evaluate(model_a, test_loader, criterion, device, thresholds_a)
+    result_b = evaluate(model_b, test_loader, criterion, device, thresholds_b)
+    result_c = evaluate(model_c, test_loader, criterion, device, thresholds_c)
 
     # ── Data split summary ──
     logger.info("")
     logger.info("=" * 80)
     logger.info("DATA SPLIT SUMMARY")
     logger.info("=" * 80)
-    logger.info(
-        "Test set (shared, originals only): %d images", len(test_samples)
-    )
+    logger.info("Test set (shared, originals only): %d images", len(test_samples))
     logger.info("")
     logger.info("Experiment A (orig + biased crops):")
     logger.info("  Train: %d  Val: %d", len(train_a), len(val_a))
@@ -313,19 +298,11 @@ def main() -> None:
     # ── Print comparison ──
     logger.info("")
     logger.info("=" * 80)
-    logger.info(
-        "TEST SET EVALUATION (on %d original images)", len(test_samples)
-    )
+    logger.info("TEST SET EVALUATION (on %d original images)", len(test_samples))
     logger.info("=" * 80)
-    logger.info(
-        "  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a))
-    )
-    logger.info(
-        "  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b))
-    )
-    logger.info(
-        "  C thresholds: %s", dict(zip(CLASS_NAMES, thresholds_c))
-    )
+    logger.info("  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a)))
+    logger.info("  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b)))
+    logger.info("  C thresholds: %s", dict(zip(CLASS_NAMES, thresholds_c)))
     logger.info("")
     logger.info(
         "%-20s  %-14s  %-14s  %-14s",
@@ -397,9 +374,7 @@ def main() -> None:
         "  C vs B (pure augmentation effect):           %+.4f",
         augment_effect,
     )
-    logger.info(
-        "  A vs C (pure bias effect):                   %+.4f", bias_effect
-    )
+    logger.info("  A vs C (pure bias effect):                   %+.4f", bias_effect)
 
     logger.info("")
     logger.info("Per-class effect decomposition:")
@@ -447,12 +422,8 @@ def main() -> None:
         if abs(r_ac) > 0.3
         else "(弱相關 = 偏差對 F1 影響有限)"
     )
-    logger.info(
-        "  Pearson r (bias vs A-B F1 diff): %.4f  %s", r_ab, ab_hint
-    )
-    logger.info(
-        "  Pearson r (bias vs A-C F1 diff): %.4f  %s", r_ac, ac_hint
-    )
+    logger.info("  Pearson r (bias vs A-B F1 diff): %.4f  %s", r_ab, ab_hint)
+    logger.info("  Pearson r (bias vs A-C F1 diff): %.4f  %s", r_ac, ac_hint)
 
     # ── Summary ──
     logger.info("")
@@ -471,22 +442,17 @@ def main() -> None:
     logger.info("  Bias-F1 correlation:  r=%.4f", r_ac)
     logger.info("")
     if abs(bias_effect) < 0.005:
-        logger.info(
-            "  結論: 裁切偏差對整體 F1 影響有限 (%.4f)", bias_effect
-        )
+        logger.info("  結論: 裁切偏差對整體 F1 影響有限 (%.4f)", bias_effect)
     elif bias_effect < -0.005:
         logger.info(
             "  結論: 裁切偏差降低效果 (%.4f F1)，建議使用平衡後的 crop",
             bias_effect,
         )
     else:
-        logger.info(
-            "  結論: 裁切偏差反而有正面效果 (+%.4f F1)", bias_effect
-        )
+        logger.info("  結論: 裁切偏差反而有正面效果 (+%.4f F1)", bias_effect)
     if abs(r_ac) > 0.5:
         logger.info(
-            "  注意: 偏差與 per-class F1 有強相關"
-            " (r=%.2f)，特定角色受影響顯著",
+            "  注意: 偏差與 per-class F1 有強相關" " (r=%.2f)，特定角色受影響顯著",
             r_ac,
         )
     logger.info("=" * 80)
@@ -543,8 +509,7 @@ def main() -> None:
     logger.info("CROP RECOMMENDATION")
     logger.info("=" * 80)
     logger.info(
-        "  估算方式: 讓各 class 的 crop 數量比例"
-        "對齊原圖出現比例 (total crops=%d)",
+        "  估算方式: 讓各 class 的 crop 數量比例" "對齊原圖出現比例 (total crops=%d)",
         total_crops,
     )
     logger.info("")
@@ -571,8 +536,7 @@ def main() -> None:
         else:
             advice = "  (效果有限)"
         logger.info(
-            "  #%-3d %-18s  %-6d %-6d %-6d  %-8.4f"
-            "  %+-9.4f %+-9.4f %s",
+            "  #%-3d %-18s  %-6d %-6d %-6d  %-8.4f" "  %+-9.4f %+-9.4f %s",
             rank,
             r["name"],
             r["crop_n"],
@@ -586,9 +550,7 @@ def main() -> None:
 
     # 摘要
     logger.info("")
-    to_crop = [
-        r for r in recommendations if r["beneficial"] and r["suggested"] > 0
-    ]
+    to_crop = [r for r in recommendations if r["beneficial"] and r["suggested"] > 0]
     if to_crop:
         logger.info("  具體行動:")
         total_suggested = 0
@@ -605,22 +567,12 @@ def main() -> None:
     else:
         logger.info("  各 class crop 數量已足夠或 crop 無正面效果。")
 
-    saturated = [
-        r
-        for r in recommendations
-        if r["beneficial"] and r["suggested"] == 0
-    ]
+    saturated = [r for r in recommendations if r["beneficial"] and r["suggested"] == 0]
     if saturated:
         names = ", ".join(r["name"] for r in saturated)
-        logger.info(
-            "  已達標 (crop 有效但數量足夠): %s", names
-        )
+        logger.info("  已達標 (crop 有效但數量足夠): %s", names)
 
-    harmful = [
-        r
-        for r in recommendations
-        if r["cb"] < -0.03 and r["ab"] < -0.03
-    ]
+    harmful = [r for r in recommendations if r["cb"] < -0.03 and r["ab"] < -0.03]
     if harmful:
         names = ", ".join(r["name"] for r in harmful)
         logger.info("  暫不裁切 (crop 反而有害): %s", names)
