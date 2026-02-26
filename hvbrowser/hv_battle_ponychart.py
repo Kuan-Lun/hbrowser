@@ -14,26 +14,23 @@ from hbrowser.beep import beep_os_independent
 from hbrowser.gallery.utils import setup_logger
 
 from .hv import HVDriver
+from .hv_battle_ponychart_ml.common.constants import (
+    CLASS_NAMES,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
 
 logger = setup_logger(__name__)
 
-# ImageNet 預訓練模型的固定正規化參數，不隨訓練資料改變
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_IMAGENET_MEAN = np.array(IMAGENET_MEAN, dtype=np.float32)
+_IMAGENET_STD = np.array(IMAGENET_STD, dtype=np.float32)
 
 
 class _InlineModel:
     def __init__(self) -> None:
         self.loaded = False
         self.session: Any = None
-        self.classes: list[str] = [
-            "Twilight Sparkle",
-            "Rarity",
-            "Fluttershy",
-            "Rainbow Dash",
-            "Pinkie Pie",
-            "Applejack",
-        ]
+        self.classes: list[str] = list(CLASS_NAMES)
         self.thresholds: dict[str, float] = {}
 
     def _dir(self) -> str:

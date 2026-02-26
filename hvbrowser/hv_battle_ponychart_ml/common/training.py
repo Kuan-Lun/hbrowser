@@ -13,7 +13,15 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from .constants import CLASS_NAMES, NUM_CLASSES
+from .constants import (
+    BACKBONE,
+    BATCH_SIZE,
+    CLASS_NAMES,
+    NUM_CLASSES,
+    PATIENCE,
+    PHASE1_EPOCHS,
+    PHASE2_EPOCHS,
+)
 from .data import PonyChartDataset, get_transforms, make_dataloader
 from .model import build_model
 
@@ -143,12 +151,13 @@ def train_model(
     num_workers: int,
     experiment_name: str,
     *,
-    backbone: str = "mobilenet_v3_large",
+    backbone: str = BACKBONE,
     train_transform: transforms.Compose | None = None,
-    batch_size: int = 32,
-    phase1_epochs: int = 10,
-    phase2_epochs: int = 35,
-    patience: int = 12,
+    batch_size: int = BATCH_SIZE,
+    phase1_epochs: int = PHASE1_EPOCHS,
+    phase2_epochs: int = PHASE2_EPOCHS,
+    patience: int = PATIENCE,
+    verbose: bool = False,
 ) -> tuple[nn.Module, list[float]]:
     """Train a model end-to-end.
 
@@ -239,15 +248,32 @@ def train_model(
         else:
             patience_counter += 1
 
-        logger.info(
-            "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f%s",
-            epoch,
-            phase2_epochs,
-            train_loss,
-            val_result["loss"],
-            val_f1,
-            marker,
-        )
+        if verbose:
+            per_class_str = "  ".join(
+                f"{name}={f1:.4f}"
+                for name, f1 in zip(CLASS_NAMES, val_result["per_class_f1"])
+            )
+            logger.info(
+                "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f"
+                "  val_F1=%.4f%s\n    %s",
+                epoch,
+                phase2_epochs,
+                train_loss,
+                val_result["loss"],
+                val_f1,
+                marker,
+                per_class_str,
+            )
+        else:
+            logger.info(
+                "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f%s",
+                epoch,
+                phase2_epochs,
+                train_loss,
+                val_result["loss"],
+                val_f1,
+                marker,
+            )
         if patience_counter >= patience:
             logger.info(
                 "  Early stopping (no improvement for %d epochs)", patience
@@ -255,6 +281,12 @@ def train_model(
             break
 
     model.load_state_dict(best_state)
+
+    # Log best model performance
+    final_result = evaluate(model, val_loader, criterion, device)
+    logger.info("Best val F1: %.4f", final_result["macro_f1"])
+    for i, name in enumerate(CLASS_NAMES):
+        logger.info("  %s: F1=%.4f", name, final_result["per_class_f1"][i])
 
     # Optimize thresholds on validation set
     thresholds = optimize_thresholds(model, val_loader, device)

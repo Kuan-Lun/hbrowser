@@ -7,13 +7,10 @@ Learning Curve 分析腳本：估算增加 raw 資料對模型 F1 的邊際效�
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.learning_curve
-  uv run python -m hvbrowser.hv_battle_ponychart_ml.learning_curve \
-    --backbone efficientnet_b0
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from collections import defaultdict
@@ -25,7 +22,10 @@ import torch.nn as nn
 from sklearn.model_selection import train_test_split
 
 from .common import (
+    BACKBONE,
+    BATCH_SIZE,
     CLASS_NAMES,
+    SEED,
     evaluate,
     get_base_timestamp,
     get_device,
@@ -44,9 +44,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-SEED = 42
-BATCH_SIZE = 32
 
 DATA_FRACTIONS = [0.20, 0.35, 0.50, 0.65, 0.80, 1.00]
 
@@ -146,17 +143,6 @@ def extrapolate_f1(
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Learning curve analysis"
-    )
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="mobilenet_v3_large",
-        help="mobilenet_v3_small / mobilenet_v3_large / efficientnet_b0",
-    )
-    args = parser.parse_args()
-
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -246,7 +232,7 @@ def main() -> None:
             device,
             num_workers,
             name,
-            backbone=args.backbone,
+            backbone=BACKBONE,
         )
 
         # Evaluate on shared test set

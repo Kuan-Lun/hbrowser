@@ -15,13 +15,10 @@
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.analyze_augmentations
-  uv run python -m hvbrowser.hv_battle_ponychart_ml.analyze_augmentations \
-    --backbone efficientnet_b0
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 from typing import Any
 
@@ -31,9 +28,12 @@ import torch.nn as nn
 from torchvision import transforms
 
 from .common import (
+    BACKBONE,
+    BATCH_SIZE,
     CLASS_NAMES,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    SEED,
     evaluate,
     get_device,
     get_performance_cpu_count,
@@ -50,9 +50,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-SEED = 42
-BATCH_SIZE = 32
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +129,6 @@ def build_train_transform(cfg: AugConfig) -> transforms.Compose:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Augmentation ablation study"
-    )
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="mobilenet_v3_large",
-        help="mobilenet_v3_small / mobilenet_v3_large / efficientnet_b0",
-    )
-    args = parser.parse_args()
-
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -196,7 +182,7 @@ def main() -> None:
             device,
             num_workers,
             cfg.name,
-            backbone=args.backbone,
+            backbone=BACKBONE,
             train_transform=train_tf,
         )
         result = evaluate(

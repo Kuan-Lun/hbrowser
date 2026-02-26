@@ -21,3 +21,11 @@ CLASS_NAMES = [
 ]
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Training hyperparameters (single source of truth)
+BACKBONE = "efficientnet_b0"
+BATCH_SIZE = 32
+SEED = 42
+PHASE1_EPOCHS = 10
+PHASE2_EPOCHS = 60
+PATIENCE = 12
