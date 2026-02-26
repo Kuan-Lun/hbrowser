@@ -13,13 +13,10 @@ Batch size x Learning rate 超參數搜尋。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.search_batch_lr
-  uv run python -m hvbrowser.hv_battle_ponychart_ml.search_batch_lr \
-    --backbone efficientnet_b0
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import time
 from typing import Any
@@ -29,7 +26,9 @@ import torch
 import torch.nn as nn
 
 from .common import (
+    BACKBONE,
     CLASS_NAMES,
+    SEED,
     build_model,
     evaluate,
     get_device,
@@ -47,8 +46,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-SEED = 42
 
 # Reduced epochs for faster search
 PHASE1_EPOCHS = 5
@@ -144,17 +141,6 @@ def run_experiment(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Batch/LR hyperparameter search"
-    )
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="mobilenet_v3_large",
-        help="mobilenet_v3_small / mobilenet_v3_large / efficientnet_b0",
-    )
-    args = parser.parse_args()
-
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -178,7 +164,7 @@ def main() -> None:
     logger.info("")
     logger.info("=" * 70)
     logger.info("HYPERPARAMETER SEARCH: %d combinations", total_combos)
-    logger.info("  Backbone:    %s", args.backbone)
+    logger.info("  Backbone:    %s", BACKBONE)
     logger.info("  Batch sizes: %s", BATCH_SIZES)
     logger.info("  LR scales:   %s (x linear scaling rule)", LR_SCALES)
     logger.info(
@@ -223,7 +209,7 @@ def main() -> None:
                 lr_head,
                 lr_features,
                 lr_classifier,
-                args.backbone,
+                BACKBONE,
             )
             elapsed = time.monotonic() - t0
 

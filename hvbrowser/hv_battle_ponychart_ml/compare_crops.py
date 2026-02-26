@@ -15,13 +15,10 @@
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.compare_crops
-  uv run python -m hvbrowser.hv_battle_ponychart_ml.compare_crops \
-    --backbone efficientnet_b0
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from collections import defaultdict
@@ -32,8 +29,11 @@ import torch
 import torch.nn as nn
 
 from .common import (
+    BACKBONE,
+    BATCH_SIZE,
     CLASS_NAMES,
     NUM_CLASSES,
+    SEED,
     evaluate,
     get_base_timestamp,
     get_device,
@@ -53,8 +53,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SEED = 42
-BATCH_SIZE = 32
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +137,6 @@ def _pearson_r(x: list[float], y: list[float]) -> float:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Compare crop effects on training"
-    )
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="mobilenet_v3_large",
-        help="mobilenet_v3_small / mobilenet_v3_large / efficientnet_b0",
-    )
-    args = parser.parse_args()
-
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     rng = np.random.RandomState(SEED)
@@ -255,7 +242,7 @@ def main() -> None:
     model_a, thresholds_a = train_model(
         train_a, val_a, device, num_workers,
         "A: Originals + biased crops",
-        backbone=args.backbone,
+        backbone=BACKBONE,
     )
 
     torch.manual_seed(SEED)
@@ -263,7 +250,7 @@ def main() -> None:
     model_b, thresholds_b = train_model(
         train_b, val_b, device, num_workers,
         "B: Originals only (baseline)",
-        backbone=args.backbone,
+        backbone=BACKBONE,
     )
 
     torch.manual_seed(SEED)
@@ -271,7 +258,7 @@ def main() -> None:
     model_c, thresholds_c = train_model(
         train_c, val_c, device, num_workers,
         "C: Originals + balanced crops",
-        backbone=args.backbone,
+        backbone=BACKBONE,
     )
 
     # ---- Evaluate all on test set ----
