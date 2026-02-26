@@ -1,7 +1,7 @@
 """
 Batch size x Learning rate 超參數搜尋。
 
-以縮短的訓練流程（Phase1=5, Phase2=15, patience=6）測試不同組合，
+以縮短的訓練流程測試不同組合，
 找出最佳配置後再套用至 train.py 做完整訓練。
 
 搜尋策略：
@@ -28,7 +28,18 @@ import torch.nn as nn
 from .common import (
     BACKBONE,
     CLASS_NAMES,
+    LR_CLASSIFIER,
+    LR_FEATURES,
+    LR_HEAD,
+    MIN_DELTA,
+    SCHEDULER_FACTOR,
+    SCHEDULER_MIN_LR,
+    SCHEDULER_PATIENCE,
+    SEARCH_PATIENCE,
+    SEARCH_PHASE1_EPOCHS,
+    SEARCH_PHASE2_EPOCHS,
     SEED,
+    WEIGHT_DECAY,
     build_model,
     evaluate,
     get_device,
@@ -47,19 +58,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Reduced epochs for faster search
-PHASE1_EPOCHS = 5
-PHASE2_EPOCHS = 15
-PATIENCE = 6
-
 # Search grid
 BATCH_SIZES = [32, 64, 128, 256]
 LR_SCALES = [0.5, 1.0, 2.0]
 
-# Base LRs (tuned for batch_size=32, from train.py)
-BASE_LR_HEAD = 1e-3
-BASE_LR_FEATURES = 3e-5
-BASE_LR_CLASSIFIER = 3e-4
+# Base LRs from constants (single source of truth with train.py)
+BASE_LR_HEAD = LR_HEAD
+BASE_LR_FEATURES = LR_FEATURES
+BASE_LR_CLASSIFIER = LR_CLASSIFIER
 
 
 def run_experiment(
@@ -92,9 +98,9 @@ def run_experiment(
     for param in model.features.parameters():
         param.requires_grad = False
     optimizer = torch.optim.AdamW(
-        model.classifier.parameters(), lr=lr_head, weight_decay=1e-4
+        model.classifier.parameters(), lr=lr_head, weight_decay=WEIGHT_DECAY
     )
-    for _epoch in range(1, PHASE1_EPOCHS + 1):
+    for _epoch in range(1, SEARCH_PHASE1_EPOCHS + 1):
         train_one_epoch(model, train_loader, criterion, optimizer, device)
 
     # Phase 2: Full fine-tuning
@@ -105,31 +111,32 @@ def run_experiment(
             {"params": model.features.parameters(), "lr": lr_features},
             {"params": model.classifier.parameters(), "lr": lr_classifier},
         ],
-        weight_decay=1e-4,
+        weight_decay=WEIGHT_DECAY,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7
+        optimizer, mode="max", factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR,
     )
 
     best_f1 = 0.0
     best_per_class: list[float] = []
     patience_counter = 0
-    stopped_epoch = PHASE2_EPOCHS
+    stopped_epoch = SEARCH_PHASE2_EPOCHS
 
-    for epoch in range(1, PHASE2_EPOCHS + 1):
+    for epoch in range(1, SEARCH_PHASE2_EPOCHS + 1):
         train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_result = evaluate(model, val_loader, criterion, device)
         val_f1 = val_result["macro_f1"]
         scheduler.step(val_f1)
 
-        if val_f1 > best_f1 + 0.0005:
+        if val_f1 > best_f1 + MIN_DELTA:
             best_f1 = val_f1
             best_per_class = list(val_result["per_class_f1"])
             patience_counter = 0
         else:
             patience_counter += 1
 
-        if patience_counter >= PATIENCE:
+        if patience_counter >= SEARCH_PATIENCE:
             stopped_epoch = epoch
             break
 
@@ -169,9 +176,9 @@ def main() -> None:
     logger.info("  LR scales:   %s (x linear scaling rule)", LR_SCALES)
     logger.info(
         "  Phase 1: %d epochs, Phase 2: %d epochs (patience=%d)",
-        PHASE1_EPOCHS,
-        PHASE2_EPOCHS,
-        PATIENCE,
+        SEARCH_PHASE1_EPOCHS,
+        SEARCH_PHASE2_EPOCHS,
+        SEARCH_PATIENCE,
     )
     logger.info("=" * 70)
     logger.info("")
