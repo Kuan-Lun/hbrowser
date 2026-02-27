@@ -8,6 +8,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 RAWIMAGE_DIR = SCRIPT_DIR / "rawimage"
 LABELS_FILE = SCRIPT_DIR / "labels.json"
 OUTPUT_ONNX = SCRIPT_DIR / "model.onnx"
+OUTPUT_CHECKPOINT = SCRIPT_DIR / "checkpoint.pt"
 OUTPUT_THRESHOLDS = SCRIPT_DIR / "thresholds.json"
 
 NUM_CLASSES = 6
