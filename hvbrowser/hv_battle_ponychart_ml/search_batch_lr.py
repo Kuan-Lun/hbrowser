@@ -18,9 +18,7 @@ Batch size x Learning rate 超參數搜尋。
 from __future__ import annotations
 
 import logging
-import multiprocessing
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
@@ -44,6 +42,7 @@ from .common import (
     WEIGHT_DECAY,
     build_model,
     evaluate,
+    get_device,
     get_performance_cpu_count,
     get_transforms,
     group_stratified_split,
@@ -148,54 +147,13 @@ def run_experiment(
     }
 
 
-def _run_experiment_worker(job: dict[str, Any]) -> dict[str, Any]:
-    """Run a single experiment in a worker process (CPU-parallel mode)."""
-    torch.set_num_threads(job["threads_per_worker"])
-    torch.manual_seed(job["seed"])
-    np.random.seed(job["seed"])
-
-    device = torch.device("cpu")
-    t0 = time.monotonic()
-    result = run_experiment(
-        job["train_samples"],
-        job["val_samples"],
-        device,
-        0,  # no DataLoader subprocesses inside worker
-        job["batch_size"],
-        job["lr_head"],
-        job["lr_features"],
-        job["lr_classifier"],
-        job["backbone"],
-    )
-    elapsed = time.monotonic() - t0
-
-    result.update(
-        {
-            "batch_size": job["batch_size"],
-            "lr_scale": job["lr_scale"],
-            "lr_head": job["lr_head"],
-            "lr_features": job["lr_features"],
-            "lr_classifier": job["lr_classifier"],
-            "time_s": elapsed,
-            "run_idx": job["run_idx"],
-        }
-    )
-    return result
-
-
 def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    perf_cores = get_performance_cpu_count()
-    max_workers = max(perf_cores // 2, 2)
-    threads_per_worker = max(perf_cores // max_workers, 1)
-
-    logger.info(
-        "Parallel search: %d workers x %d threads/worker (CPU)",
-        max_workers,
-        threads_per_worker,
-    )
+    device = get_device()
+    num_workers = get_performance_cpu_count()
+    logger.info("Device: %s  DataLoader workers: %d", device, num_workers)
 
     # Load data (same split for all experiments)
     samples = load_samples()
@@ -213,9 +171,8 @@ def main() -> None:
     logger.info("")
     logger.info("=" * 70)
     logger.info(
-        "HYPERPARAMETER SEARCH: %d combinations (%d parallel)",
+        "HYPERPARAMETER SEARCH: %d combinations",
         total_combos,
-        max_workers,
     )
     logger.info("  Backbone:    %s", BACKBONE)
     logger.info("  Batch sizes: %s", BATCH_SIZES)
@@ -229,8 +186,8 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("")
 
-    # Build job list
-    jobs: list[dict[str, Any]] = []
+    # Run experiments sequentially on device
+    results: list[dict[str, Any]] = []
     run_idx = 0
     for batch_size in BATCH_SIZES:
         for lr_scale in LR_SCALES:
@@ -239,22 +196,6 @@ def main() -> None:
             lr_head = BASE_LR_HEAD * linear_factor * lr_scale
             lr_features = BASE_LR_FEATURES * linear_factor * lr_scale
             lr_classifier = BASE_LR_CLASSIFIER * linear_factor * lr_scale
-
-            jobs.append(
-                {
-                    "run_idx": run_idx,
-                    "batch_size": batch_size,
-                    "lr_scale": lr_scale,
-                    "lr_head": lr_head,
-                    "lr_features": lr_features,
-                    "lr_classifier": lr_classifier,
-                    "train_samples": train_samples,
-                    "val_samples": val_samples,
-                    "backbone": BACKBONE,
-                    "threads_per_worker": threads_per_worker,
-                    "seed": SEED,
-                }
-            )
 
             logger.info(
                 "  [%d/%d] batch=%d  lr_scale=%s  "
@@ -267,36 +208,42 @@ def main() -> None:
                 lr_features,
                 lr_classifier,
             )
-    logger.info("")
 
-    # Run experiments in parallel (CPU) to maximise core utilisation
-    results: list[dict[str, Any]] = []
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=max_workers, mp_context=ctx
-    ) as executor:
-        future_to_idx = {
-            executor.submit(_run_experiment_worker, job): job["run_idx"]
-            for job in jobs
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                result = future.result()
-                results.append(result)
-                logger.info(
-                    "    [%d/%d done] batch=%d  lr_scale=%.1f  "
-                    "F1=%.4f  stopped_epoch=%d  time=%.1fs",
-                    len(results),
-                    total_combos,
-                    result["batch_size"],
-                    result["lr_scale"],
-                    result["best_f1"],
-                    result["stopped_epoch"],
-                    result["time_s"],
-                )
-            except Exception:
-                logger.exception("    [%d/%d] FAILED", idx, total_combos)
+            torch.manual_seed(SEED)
+            np.random.seed(SEED)
+
+            t0 = time.monotonic()
+            result = run_experiment(
+                train_samples,
+                val_samples,
+                device,
+                num_workers,
+                batch_size,
+                lr_head,
+                lr_features,
+                lr_classifier,
+                BACKBONE,
+            )
+            elapsed = time.monotonic() - t0
+
+            result.update(
+                {
+                    "batch_size": batch_size,
+                    "lr_scale": lr_scale,
+                    "lr_head": lr_head,
+                    "lr_features": lr_features,
+                    "lr_classifier": lr_classifier,
+                    "time_s": elapsed,
+                    "run_idx": run_idx,
+                }
+            )
+            results.append(result)
+            logger.info(
+                "    -> F1=%.4f  stopped_epoch=%d  time=%.1fs",
+                result["best_f1"],
+                result["stopped_epoch"],
+                result["time_s"],
+            )
 
     logger.info("")
 
