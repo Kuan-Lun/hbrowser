@@ -38,7 +38,7 @@ SCHEDULER_FACTOR = 0.5
 SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR = 1e-7
 
-# Reduced settings for hyperparameter search
-SEARCH_PHASE1_EPOCHS = 5
-SEARCH_PHASE2_EPOCHS = 15
-SEARCH_PATIENCE = 6
+# Reduced settings for hyperparameter search (derived from main settings)
+SEARCH_PHASE1_EPOCHS = PHASE1_EPOCHS
+SEARCH_PHASE2_EPOCHS = PHASE2_EPOCHS
+SEARCH_PATIENCE = PATIENCE
