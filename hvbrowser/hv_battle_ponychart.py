@@ -18,6 +18,8 @@ from .hv_battle_ponychart_ml.common.constants import (
     CLASS_NAMES,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    INPUT_SIZE,
+    PRE_RESIZE,
 )
 
 logger = setup_logger(__name__)
@@ -52,9 +54,9 @@ class _InlineModel:
 
     def _preprocess(self, bgr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
         """BGR 圖片 -> NCHW float32 tensor (matching training transforms)."""
-        resized = cv.resize(bgr, (256, 256), interpolation=cv.INTER_AREA)
-        # Center crop: (256-224)//2 = 16
-        cropped = resized[16:240, 16:240]
+        resized = cv.resize(bgr, (PRE_RESIZE, PRE_RESIZE), interpolation=cv.INTER_AREA)
+        offset = (PRE_RESIZE - INPUT_SIZE) // 2
+        cropped = resized[offset:offset + INPUT_SIZE, offset:offset + INPUT_SIZE]
         rgb = cv.cvtColor(cropped, cv.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - _IMAGENET_MEAN) / _IMAGENET_STD
         # HWC -> CHW -> NCHW

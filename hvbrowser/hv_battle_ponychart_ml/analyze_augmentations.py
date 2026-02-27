@@ -33,6 +33,7 @@ from .common import (
     CLASS_NAMES,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    INPUT_SIZE,
     SEED,
     evaluate,
     get_device,
@@ -113,7 +114,7 @@ def build_train_transform(cfg: AugConfig) -> transforms.Compose:
     return transforms.Compose(
         [
             *spatial,
-            transforms.RandomCrop((224, 224)),
+            transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
             transforms.ColorJitter(
                 brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
             ),

@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from .constants import INPUT_SIZE
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,7 +21,7 @@ def export_onnx(model: nn.Module, output_path: Path) -> None:
 
     model.eval()
     model_cpu = model.cpu()
-    dummy = torch.randn(1, 3, 224, 224)
+    dummy = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Missing annotation for parameter")
         torch.onnx.export(

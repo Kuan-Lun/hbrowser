@@ -42,6 +42,13 @@ def _build_efficientnet_b0(pretrained: bool) -> nn.Module:
     return models.efficientnet_b0(weights=weights)
 
 
+def _build_efficientnet_b2(pretrained: bool) -> nn.Module:
+    weights = (
+        models.EfficientNet_B2_Weights.IMAGENET1K_V1 if pretrained else None
+    )
+    return models.efficientnet_b2(weights=weights)
+
+
 BACKBONE_REGISTRY: dict[str, BackboneConfig] = {
     "mobilenet_v3_small": BackboneConfig(
         name="mobilenet_v3_small",
@@ -60,6 +67,12 @@ BACKBONE_REGISTRY: dict[str, BackboneConfig] = {
         build_fn=_build_efficientnet_b0,
         classifier_layer_index=1,
         description="EfficientNet-B0 (5.3M params, ~11MB ONNX)",
+    ),
+    "efficientnet_b2": BackboneConfig(
+        name="efficientnet_b2",
+        build_fn=_build_efficientnet_b2,
+        classifier_layer_index=1,
+        description="EfficientNet-B2 (9.1M params, ~18MB ONNX)",
     ),
 }
 
