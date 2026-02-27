@@ -15,6 +15,7 @@ PonyChart 多標籤分類訓練腳本。
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import torch
 
 from .common import (
     CLASS_NAMES,
+    OUTPUT_CHECKPOINT,
     OUTPUT_ONNX,
     OUTPUT_THRESHOLDS,
     SEED,
@@ -43,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="PonyChart multi-label training")
+    parser.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Ignore existing checkpoint and train from ImageNet weights",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -62,12 +72,8 @@ def main() -> None:
         sys.exit(1)
 
     # Separate originals and crops, then balance crops to match original distribution
-    orig_samples = [
-        s for s in samples if is_original(os.path.basename(s[0]))
-    ]
-    crop_samples = [
-        s for s in samples if not is_original(os.path.basename(s[0]))
-    ]
+    orig_samples = [s for s in samples if is_original(os.path.basename(s[0]))]
+    crop_samples = [s for s in samples if not is_original(os.path.basename(s[0]))]
     orig_rates = compute_class_rates(orig_samples)
     rng = np.random.RandomState(SEED)
     balanced_crops = balance_crop_samples(crop_samples, orig_rates, rng)
@@ -80,12 +86,16 @@ def main() -> None:
         len(samples),
     )
 
-    train_idx, val_idx = group_stratified_split(
-        samples, test_size=0.15, seed=SEED
-    )
+    train_idx, val_idx = group_stratified_split(samples, test_size=0.15, seed=SEED)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
     logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
+
+    # Auto-detect checkpoint for resume training
+    resume_from = None
+    if not args.from_scratch and OUTPUT_CHECKPOINT.exists():
+        resume_from = OUTPUT_CHECKPOINT
+        logger.info("Found checkpoint: %s (use --from-scratch to ignore)", resume_from)
 
     # Train
     model, thresholds = train_model(
@@ -95,6 +105,7 @@ def main() -> None:
         num_workers,
         "PonyChart Training",
         verbose=True,
+        resume_from=resume_from,
     )
 
     # Save thresholds
@@ -104,6 +115,10 @@ def main() -> None:
     with open(OUTPUT_THRESHOLDS, "w", encoding="utf-8") as f:
         json.dump(thresholds_dict, f, ensure_ascii=False, indent=2)
     logger.info("Thresholds saved: %s", OUTPUT_THRESHOLDS)
+
+    # Save checkpoint for future resume training
+    torch.save(model.state_dict(), OUTPUT_CHECKPOINT)
+    logger.info("Checkpoint saved: %s", OUTPUT_CHECKPOINT)
 
     # Export ONNX
     logger.info("Exporting ONNX...")

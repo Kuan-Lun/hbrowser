@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -162,8 +163,13 @@ def train_model(
     phase2_epochs: int = PHASE2_EPOCHS,
     patience: int = PATIENCE,
     verbose: bool = False,
+    resume_from: Path | None = None,
 ) -> tuple[nn.Module, list[float]]:
     """Train a model end-to-end.
+
+    When *resume_from* points to an existing checkpoint (``.pt`` file),
+    the model weights are loaded from that file and Phase 1 (head-only
+    training) is skipped, going directly into Phase 2 fine-tuning.
 
     Returns (best_model, optimized_thresholds).
     """
@@ -175,6 +181,8 @@ def train_model(
         len(val_samples),
     )
     logger.info("  Backbone: %s", backbone)
+    if resume_from is not None:
+        logger.info("  Resuming from checkpoint: %s", resume_from)
     logger.info("=" * 60)
 
     if train_transform is None:
@@ -198,27 +206,38 @@ def train_model(
         device=device,
     )
 
-    model = build_model(backbone=backbone, pretrained=True).to(device)
+    if resume_from is not None:
+        model = build_model(backbone=backbone, pretrained=False).to(device)
+        state_dict = torch.load(resume_from, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        logger.info("Loaded checkpoint weights from %s", resume_from)
+    else:
+        model = build_model(backbone=backbone, pretrained=True).to(device)
     criterion = nn.BCEWithLogitsLoss()
 
-    # Phase 1: Head only
-    logger.info("--- Phase 1: Head-only (%d epochs) ---", phase1_epochs)
-    for param in model.features.parameters():
-        param.requires_grad = False
-    optimizer = torch.optim.AdamW(
-        model.classifier.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY
-    )
-    for epoch in range(1, phase1_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_result = evaluate(model, val_loader, criterion, device)
-        logger.info(
-            "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
-            epoch,
-            phase1_epochs,
-            train_loss,
-            val_result["loss"],
-            val_result["macro_f1"],
+    # Phase 1: Head only (skipped when resuming from checkpoint)
+    if resume_from is None:
+        logger.info("--- Phase 1: Head-only (%d epochs) ---", phase1_epochs)
+        for param in model.features.parameters():
+            param.requires_grad = False
+        optimizer = torch.optim.AdamW(
+            model.classifier.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY
         )
+        for epoch in range(1, phase1_epochs + 1):
+            train_loss = train_one_epoch(
+                model, train_loader, criterion, optimizer, device
+            )
+            val_result = evaluate(model, val_loader, criterion, device)
+            logger.info(
+                "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
+                epoch,
+                phase1_epochs,
+                train_loss,
+                val_result["loss"],
+                val_result["macro_f1"],
+            )
+    else:
+        logger.info("--- Skipping Phase 1 (resuming from checkpoint) ---")
 
     # Phase 2: Full fine-tuning
     logger.info("--- Phase 2: Full fine-tuning (%d epochs) ---", phase2_epochs)
