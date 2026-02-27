@@ -12,10 +12,12 @@
 import glob
 import json
 import re
+import threading
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import messagebox, simpledialog
+from typing import Literal
 
 from PIL import Image, ImageTk
 
@@ -33,6 +35,17 @@ LABEL_MAP = {
     5: "Pinkie Pie",
     6: "Applejack",
 }
+
+CHECKPOINT_FILE = _SCRIPT_DIR / "checkpoint.pt"
+THRESHOLDS_FILE = _SCRIPT_DIR / "thresholds.json"
+
+# Suspicious sample thresholds
+SUSPICIOUS_FN_PROB = 0.10  # label=1 but prob below this → possible mislabel
+SUSPICIOUS_FP_PROB = 0.80  # label=0 but prob above this → possible missing label
+SUSPICIOUS_MARGIN = 0.15  # |prob - threshold| below this → ambiguous
+
+CLASS_NAMES_LIST = [LABEL_MAP[i] for i in range(1, 7)]
+CLASS_SHORT = ["TS", "Ra", "FS", "RD", "PP", "AJ"]
 
 
 class LabelStore:
@@ -376,6 +389,68 @@ class LabelApp:
             command=self._on_filter_toggle,
         ).pack(side="left")
 
+        # Model analysis state
+        self._model_probs: dict[str, list[float]] | None = None
+        self._model_thresholds: list[float] | None = None
+        self._analysis_thread: threading.Thread | None = None
+        self._analysis_result: tuple[dict[str, list[float]], list[float]] | None = None
+        self._analysis_error: str | None = None
+
+        # Analyze button
+        analyze_frame = tk.Frame(root)
+        analyze_frame.pack(pady=(0, 4))
+        self._analyze_btn = tk.Button(
+            analyze_frame,
+            text="Analyze labels",
+            command=self._start_analysis,
+        )
+        self._analyze_btn.pack(side="left", padx=(0, 8))
+        self._analyze_status = tk.Label(analyze_frame, text="", fg="#999")
+        self._analyze_status.pack(side="left")
+
+        # Suspicious filter frame (initially disabled)
+        suspicious_frame = tk.Frame(root)
+        suspicious_frame.pack(pady=(0, 4))
+
+        tk.Label(suspicious_frame, text="Class:").pack(side="left")
+        self._suspicious_class_var = tk.StringVar(value="All")
+        self._suspicious_class_menu = tk.OptionMenu(
+            suspicious_frame,
+            self._suspicious_class_var,
+            *["All", *CLASS_NAMES_LIST],
+            command=lambda _: self._apply_filters(),
+        )
+        self._suspicious_class_menu.pack(side="left", padx=(2, 8))
+
+        self._mislabel_var = tk.BooleanVar(value=False)
+        self._mislabel_cb = tk.Checkbutton(
+            suspicious_frame,
+            text="Mislabel",
+            variable=self._mislabel_var,
+            command=self._apply_filters,
+        )
+        self._mislabel_cb.pack(side="left", padx=(0, 4))
+
+        self._missing_var = tk.BooleanVar(value=False)
+        self._missing_cb = tk.Checkbutton(
+            suspicious_frame,
+            text="Missing label",
+            variable=self._missing_var,
+            command=self._apply_filters,
+        )
+        self._missing_cb.pack(side="left", padx=(0, 4))
+
+        self._ambiguous_var = tk.BooleanVar(value=False)
+        self._ambiguous_cb = tk.Checkbutton(
+            suspicious_frame,
+            text="Ambiguous",
+            variable=self._ambiguous_var,
+            command=self._apply_filters,
+        )
+        self._ambiguous_cb.pack(side="left")
+
+        self._set_suspicious_controls_state("disabled")
+
         # 計數器（可點擊跳轉）
         self.counter_label = tk.Label(
             root, text="", font=("Consolas", 12), fg="#0066cc", cursor="hand2"
@@ -396,7 +471,17 @@ class LabelApp:
     def _update_display(self, extra: str = "") -> None:
         self.counter_label.configure(text=f"{self.nav.index + 1} / {self.nav.total}")
         label_names = [LABEL_MAP.get(i, str(i)) for i in self.current_labels]
-        info = f"labels: {label_names}\n{self.nav.current_key}"
+        info = f"labels: {label_names}\n"
+        if self._model_probs is not None:
+            key = self.nav.current_key
+            if key in self._model_probs:
+                probs = self._model_probs[key]
+                parts = []
+                for i, (short, prob) in enumerate(zip(CLASS_SHORT, probs)):
+                    marker = "*" if (i + 1) in self.current_labels else " "
+                    parts.append(f"{short}={prob:.2f}{marker}")
+                info += "Model: " + "  ".join(parts) + "\n"
+        info += self.nav.current_key
         if extra:
             info += f"  ({extra})"
         self.info_label.configure(text=info)
@@ -496,7 +581,19 @@ class LabelApp:
         uncropped_only = self.uncropped_only_var.get()
         unlabeled_only = self.filter_var.get()
 
-        if not raw_only and not uncropped_only and not unlabeled_only:
+        show_mislabel = self._mislabel_var.get()
+        show_missing = self._missing_var.get()
+        show_ambiguous = self._ambiguous_var.get()
+        suspicious_active = self._model_probs is not None and (
+            show_mislabel or show_missing or show_ambiguous
+        )
+
+        if (
+            not raw_only
+            and not uncropped_only
+            and not unlabeled_only
+            and not suspicious_active
+        ):
             return None
 
         # 預計算已有裁切圖的 raw stem 集合（避免 O(n²)）
@@ -510,6 +607,9 @@ class LabelApp:
                         raw_stems_with_crops.add(m.group(1))
 
         store = self.store
+        model_probs = self._model_probs
+        model_thresholds = self._model_thresholds
+        selected_class = self._suspicious_class_var.get()
 
         def predicate(p: Path) -> bool:
             if raw_only or uncropped_only:
@@ -519,6 +619,36 @@ class LabelApp:
                 return False
             if unlabeled_only and store.has(store.path_to_key(p)):
                 return False
+            if (
+                suspicious_active
+                and model_probs is not None
+                and model_thresholds is not None
+            ):
+                key = store.path_to_key(p)
+                if key not in model_probs:
+                    return False
+                probs = model_probs[key]
+                labels = store.get(key)
+                if selected_class == "All":
+                    classes_to_check: range | list[int] = range(len(CLASS_NAMES_LIST))
+                else:
+                    classes_to_check = [CLASS_NAMES_LIST.index(selected_class)]
+                match = False
+                for ci in classes_to_check:
+                    has_label = (ci + 1) in labels
+                    prob = probs[ci]
+                    thr = model_thresholds[ci]
+                    if show_mislabel and has_label and prob < SUSPICIOUS_FN_PROB:
+                        match = True
+                        break
+                    if show_missing and not has_label and prob > SUSPICIOUS_FP_PROB:
+                        match = True
+                        break
+                    if show_ambiguous and abs(prob - thr) < SUSPICIOUS_MARGIN:
+                        match = True
+                        break
+                if not match:
+                    return False
             return True
 
         return predicate
@@ -538,6 +668,10 @@ class LabelApp:
         self.filter_var.set(False)
         self.raw_only_cb.configure(state="normal")
         self.uncropped_only_cb.configure(state="normal")
+        self._mislabel_var.set(False)
+        self._missing_var.set(False)
+        self._ambiguous_var.set(False)
+        self._suspicious_class_var.set("All")
         self.nav.apply_filter(None)
 
     def _jump_to_image(self) -> None:
@@ -551,6 +685,136 @@ class LabelApp:
         if n is not None:
             self.nav.go_to(n)
             self._refresh()
+
+    # ── Model analysis ─────────────────────────────────────────
+
+    def _set_suspicious_controls_state(
+        self, state: Literal["normal", "disabled"],
+    ) -> None:
+        """Enable or disable suspicious filter controls."""
+        self._suspicious_class_menu.configure(state=state)
+        self._mislabel_cb.configure(state=state)
+        self._missing_cb.configure(state=state)
+        self._ambiguous_cb.configure(state=state)
+
+    def _start_analysis(self) -> None:
+        """Start model analysis in a background thread."""
+        if self._analysis_thread is not None and self._analysis_thread.is_alive():
+            return
+        if not CHECKPOINT_FILE.exists():
+            messagebox.showerror("Error", f"Checkpoint not found: {CHECKPOINT_FILE}")
+            return
+        if not THRESHOLDS_FILE.exists():
+            messagebox.showerror("Error", f"Thresholds not found: {THRESHOLDS_FILE}")
+            return
+
+        self._analyze_btn.configure(state="disabled")
+
+        # Build sample list (only labeled images)
+        samples: list[tuple[str, list[int]]] = []
+        keys: list[str] = []
+        for p in self.nav.all_paths:
+            key = self.store.path_to_key(p)
+            if self.store.has(key):
+                samples.append((str(p), self.store.get(key)))
+                keys.append(key)
+
+        self._analyze_status.configure(
+            text=f"Analyzing {len(samples)} images..."
+        )
+        self._analysis_result = None
+        self._analysis_error = None
+        self._analysis_thread = threading.Thread(
+            target=self._run_analysis_thread,
+            args=(samples, keys),
+            daemon=True,
+        )
+        self._analysis_thread.start()
+        self.root.after(200, self._poll_analysis)
+
+    def _run_analysis_thread(
+        self,
+        samples: list[tuple[str, list[int]]],
+        keys: list[str],
+    ) -> None:
+        """Background thread: run model inference on all labeled images."""
+        try:
+            import numpy as np
+            import torch
+
+            from .common import (
+                BACKBONE,
+                BATCH_SIZE,
+                build_model,
+                get_device,
+                get_transforms,
+                make_dataloader,
+            )
+            from .common.data import PonyChartDataset
+
+            device = get_device()
+            model = build_model(backbone=BACKBONE, pretrained=False).to(device)
+            state_dict = torch.load(
+                CHECKPOINT_FILE, map_location=device, weights_only=True
+            )
+            model.load_state_dict(state_dict)
+            model.eval()
+
+            with open(THRESHOLDS_FILE, encoding="utf-8") as f:
+                thr_data: dict[str, float] = json.load(f)
+            thresholds = [thr_data[name] for name in CLASS_NAMES_LIST]
+
+            transform = get_transforms(is_train=False)
+            dataset = PonyChartDataset(samples, transform)
+            loader = make_dataloader(
+                dataset,
+                BATCH_SIZE,
+                shuffle=False,
+                num_workers=0,
+                device=device,
+            )
+
+            all_probs_list: list[np.ndarray] = []
+            with torch.no_grad():
+                for images, _ in loader:
+                    logits = model(images.to(device))
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    all_probs_list.append(probs)
+
+            all_probs = np.concatenate(all_probs_list)
+            result: dict[str, list[float]] = {}
+            for i, key in enumerate(keys):
+                result[key] = all_probs[i].tolist()
+
+            self._analysis_result = (result, thresholds)
+        except Exception as e:
+            self._analysis_error = str(e)
+
+    def _poll_analysis(self) -> None:
+        """Poll background analysis thread for completion."""
+        if self._analysis_thread is not None and self._analysis_thread.is_alive():
+            self.root.after(200, self._poll_analysis)
+            return
+
+        self._analysis_thread = None
+
+        if self._analysis_error is not None:
+            self._analyze_btn.configure(state="normal")
+            self._analyze_status.configure(text="")
+            messagebox.showerror("Analysis Error", self._analysis_error)
+            self._analysis_error = None
+            return
+
+        if self._analysis_result is not None:
+            self._model_probs, self._model_thresholds = self._analysis_result
+            self._analysis_result = None
+            count = len(self._model_probs)
+            self._analyze_status.configure(text=f"Done ({count} images)")
+            self._set_suspicious_controls_state("normal")
+            self._refresh()
+        else:
+            self._analyze_btn.configure(state="normal")
+            self._analyze_status.configure(text="")
 
     # ── 裁切 ─────────────────────────────────────────────────
 

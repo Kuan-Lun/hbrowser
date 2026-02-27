@@ -37,6 +37,15 @@ def is_original(filename: str) -> bool:
     return bool(ORIG_PATTERN.match(filename))
 
 
+def separate_orig_crop(
+    samples: list[tuple[str, list[int]]],
+) -> tuple[list[tuple[str, list[int]]], list[tuple[str, list[int]]]]:
+    """Separate samples into originals and crops based on filename pattern."""
+    orig = [s for s in samples if is_original(os.path.basename(s[0]))]
+    crop = [s for s in samples if not is_original(os.path.basename(s[0]))]
+    return orig, crop
+
+
 def get_base_timestamp(filename: str) -> str:
     """Extract pony_chart_YYYYMMDD_HHMMSS from any variant."""
     parts = filename.replace(".png", "").replace(".jpg", "").split("_")

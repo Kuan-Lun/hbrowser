@@ -18,6 +18,7 @@ from .constants import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    LABEL_SMOOTHING,
     LR_CLASSIFIER,
     LR_FEATURES,
     LR_HEAD,
@@ -46,12 +47,15 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    label_smoothing: float = 0.0,
 ) -> float:
     """Train for one epoch, return average loss."""
     model.train()
     total_loss = 0.0
     for images, targets in loader:
         images, targets = images.to(device), targets.to(device)
+        if label_smoothing > 0:
+            targets = targets.clamp(min=label_smoothing, max=1.0 - label_smoothing)
         optimizer.zero_grad()
         logits = model(images)
         loss = criterion(logits, targets)
@@ -164,15 +168,24 @@ def train_model(
     patience: int = PATIENCE,
     verbose: bool = False,
     resume_from: Path | None = None,
+    resume_state_dict: dict[str, Any] | None = None,
+    label_smoothing: float = LABEL_SMOOTHING,
 ) -> tuple[nn.Module, list[float]]:
     """Train a model end-to-end.
 
     When *resume_from* points to an existing checkpoint (``.pt`` file),
-    the model weights are loaded from that file and Phase 1 (head-only
-    training) is skipped, going directly into Phase 2 fine-tuning.
+    or *resume_state_dict* provides weights directly from memory,
+    the model weights are loaded and Phase 1 (head-only training) is
+    skipped, going directly into Phase 2 fine-tuning.
+
+    *resume_from* and *resume_state_dict* are mutually exclusive.
 
     Returns (best_model, optimized_thresholds).
     """
+    if resume_from is not None and resume_state_dict is not None:
+        raise ValueError(
+            "resume_from and resume_state_dict are mutually exclusive"
+        )
     logger.info("=" * 60)
     logger.info("EXPERIMENT: %s", experiment_name)
     logger.info(
@@ -183,6 +196,8 @@ def train_model(
     logger.info("  Backbone: %s", backbone)
     if resume_from is not None:
         logger.info("  Resuming from checkpoint: %s", resume_from)
+    elif resume_state_dict is not None:
+        logger.info("  Resuming from in-memory state_dict")
     logger.info("=" * 60)
 
     if train_transform is None:
@@ -206,17 +221,22 @@ def train_model(
         device=device,
     )
 
+    resuming = resume_from is not None or resume_state_dict is not None
     if resume_from is not None:
         model = build_model(backbone=backbone, pretrained=False).to(device)
         state_dict = torch.load(resume_from, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         logger.info("Loaded checkpoint weights from %s", resume_from)
+    elif resume_state_dict is not None:
+        model = build_model(backbone=backbone, pretrained=False).to(device)
+        model.load_state_dict(resume_state_dict)
+        logger.info("Loaded checkpoint weights from in-memory state_dict")
     else:
         model = build_model(backbone=backbone, pretrained=True).to(device)
     criterion = nn.BCEWithLogitsLoss()
 
     # Phase 1: Head only (skipped when resuming from checkpoint)
-    if resume_from is None:
+    if not resuming:
         logger.info("--- Phase 1: Head-only (%d epochs) ---", phase1_epochs)
         for param in model.features.parameters():
             param.requires_grad = False
@@ -225,7 +245,7 @@ def train_model(
         )
         for epoch in range(1, phase1_epochs + 1):
             train_loss = train_one_epoch(
-                model, train_loader, criterion, optimizer, device
+                model, train_loader, criterion, optimizer, device, label_smoothing
             )
             val_result = evaluate(model, val_loader, criterion, device)
             logger.info(
@@ -263,7 +283,9 @@ def train_model(
     patience_counter = 0
 
     for epoch in range(1, phase2_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, label_smoothing
+        )
         val_result = evaluate(model, val_loader, criterion, device)
         val_f1 = val_result["macro_f1"]
         scheduler.step(val_f1)
