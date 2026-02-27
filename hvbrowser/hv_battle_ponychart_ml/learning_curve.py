@@ -1,9 +1,8 @@
 """
 Learning Curve 分析腳本：估算增加 raw 資料對模型 F1 的邊際效益。
 
-以不同比例（20%、35%、50%、65%、80%、100%）的訓練 groups 分別訓練模型，
-在共用 test set 上評估，畫出 F1 vs 資料量曲線，並以 power-law
-外推預測加 N 張新 raw 圖的預期 F1 提升。
+以不同比例的訓練 groups 進行巢狀、接續訓練（模擬 train.py 的增量流程），
+在共用 test set 上評估，以 power-law 外推預測加 N 張新 raw 圖的預期 F1 提升。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.learning_curve
@@ -11,6 +10,7 @@ Learning Curve 分析腳本：估算增加 raw 資料對模型 F1 的邊際效�
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from collections import defaultdict
@@ -19,13 +19,14 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
 
 from .common import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
     SEED,
+    balance_crop_samples,
+    compute_class_rates,
     evaluate,
     get_base_timestamp,
     get_device,
@@ -45,46 +46,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DATA_FRACTIONS = [0.20, 0.35, 0.50, 0.65, 0.80, 1.00]
+DATA_FRACTIONS = [0.40, 0.55, 0.70, 0.80, 0.85, 0.90, 0.95, 1.00]
 
 
 # ---------------------------------------------------------------------------
 # Unique helpers for learning curve
 # ---------------------------------------------------------------------------
-def subsample_groups(
+def nested_subsample_groups(
     group_keys: list[str],
-    samples: list[tuple[str, list[int]]],
     fraction: float,
-    seed: int,
+    shuffled_order: list[int],
 ) -> list[str]:
-    """從 group_keys 中按 fraction 比例抽取 groups（分層抽樣）。"""
-    if fraction >= 1.0:
-        return list(group_keys)
+    """從 group_keys 中取前 fraction 比例的 groups（巢狀抽樣）。
 
-    groups: dict[str, list[int]] = defaultdict(list)
-    for idx, (path, _) in enumerate(samples):
-        fname = os.path.basename(path)
-        base = get_base_timestamp(fname)
-        if base in set(group_keys):
-            groups[base].append(idx)
-
-    group_primary_label = []
-    for gk in group_keys:
-        label_counts: dict[int, int] = defaultdict(int)
-        for idx in groups[gk]:
-            for lbl in samples[idx][1]:
-                label_counts[lbl] += 1
-        primary = max(label_counts, key=lambda k: label_counts[k])
-        group_primary_label.append(str(primary))
-
-    selected: list[str]
-    selected, _ = train_test_split(
-        group_keys,
-        train_size=fraction,
-        random_state=seed,
-        stratify=group_primary_label,
-    )
-    return selected
+    使用預先洗牌的索引順序，保證較小 fraction 是較大 fraction 的子集。
+    """
+    n = max(1, int(np.ceil(fraction * len(group_keys))))
+    return [group_keys[i] for i in shuffled_order[:n]]
 
 
 def fit_power_law(
@@ -185,16 +163,21 @@ def main() -> None:
     )
     criterion = nn.BCEWithLogitsLoss()
 
-    # ── Run experiments at different data fractions ──
+    # ── Prepare nested sampling order (shuffle once) ──
+    rng = np.random.RandomState(SEED)
+    shuffled_order = list(rng.permutation(len(train_val_group_keys)))
+
+    # ── Run experiments at different data fractions (sequential resume) ──
     experiment_results: list[dict[str, Any]] = []
+    prev_state_dict: dict[str, Any] | None = None
 
     for frac in DATA_FRACTIONS:
         torch.manual_seed(SEED)
         np.random.seed(SEED)
 
-        # Subsample groups from train+val pool
-        selected_groups = subsample_groups(
-            train_val_group_keys, all_samples, frac, seed=SEED
+        # Nested subsample: smaller fractions are always subsets of larger ones
+        selected_groups = nested_subsample_groups(
+            train_val_group_keys, frac, shuffled_order
         )
 
         # Collect samples for selected groups
@@ -212,7 +195,7 @@ def main() -> None:
             base = get_base_timestamp(os.path.basename(path))
             sub_groups[base].append(idx)
 
-        train_samples = [
+        raw_train_samples = [
             selected_samples[i]
             for gk in sub_train_gk
             for i in sub_groups[gk]
@@ -222,6 +205,21 @@ def main() -> None:
             for gk in sub_val_gk
             for i in sub_groups[gk]
         ]
+
+        # Crop balancing (same as train.py)
+        orig_train = [
+            s for s in raw_train_samples
+            if is_original(os.path.basename(s[0]))
+        ]
+        crop_train = [
+            s for s in raw_train_samples
+            if not is_original(os.path.basename(s[0]))
+        ]
+        orig_rates = compute_class_rates(orig_train)
+        balanced_crops = balance_crop_samples(
+            crop_train, orig_rates, np.random.RandomState(SEED)
+        )
+        train_samples = orig_train + balanced_crops
 
         pct = int(frac * 100)
         name = f"{pct}% data ({len(selected_samples)} samples)"
@@ -233,7 +231,9 @@ def main() -> None:
             num_workers,
             name,
             backbone=BACKBONE,
+            resume_state_dict=prev_state_dict,
         )
+        prev_state_dict = copy.deepcopy(model.state_dict())
 
         # Evaluate on shared test set
         result = evaluate(
@@ -403,7 +403,7 @@ def main() -> None:
     logger.info(
         "  %-20s  %-8s  %-8s  %-10s  %-10s  %s",
         "Class",
-        "F1@20%",
+        f"F1@{int(DATA_FRACTIONS[0] * 100)}%",
         "F1@100%",
         "Gain",
         "Slope",

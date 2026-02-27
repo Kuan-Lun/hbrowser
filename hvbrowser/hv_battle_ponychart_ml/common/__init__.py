@@ -6,6 +6,7 @@ from .constants import (
     CLASS_NAMES,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    LABEL_SMOOTHING,
     LABELS_FILE,
     LR_CLASSIFIER,
     LR_FEATURES,
@@ -40,6 +41,7 @@ from .data import (
     labels_to_binary,
     load_samples,
     make_dataloader,
+    separate_orig_crop,
     split_by_groups,
 )
 from .device import get_device, get_performance_cpu_count
@@ -62,6 +64,7 @@ __all__ = [
     "compute_class_rates",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
+    "LABEL_SMOOTHING",
     "LABELS_FILE",
     "NUM_CLASSES",
     "OUTPUT_CHECKPOINT",
@@ -98,6 +101,7 @@ __all__ = [
     "load_samples",
     "make_dataloader",
     "optimize_thresholds",
+    "separate_orig_crop",
     "split_by_groups",
     "train_model",
     "train_one_epoch",

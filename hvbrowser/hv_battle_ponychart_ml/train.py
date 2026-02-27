@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 
 import numpy as np
@@ -36,8 +35,8 @@ from .common import (
     get_device,
     get_performance_cpu_count,
     group_stratified_split,
-    is_original,
     load_samples,
+    separate_orig_crop,
     train_model,
 )
 
@@ -72,8 +71,7 @@ def main() -> None:
         sys.exit(1)
 
     # Separate originals and crops, then balance crops to match original distribution
-    orig_samples = [s for s in samples if is_original(os.path.basename(s[0]))]
-    crop_samples = [s for s in samples if not is_original(os.path.basename(s[0]))]
+    orig_samples, crop_samples = separate_orig_crop(samples)
     orig_rates = compute_class_rates(orig_samples)
     rng = np.random.RandomState(SEED)
     balanced_crops = balance_crop_samples(crop_samples, orig_rates, rng)
