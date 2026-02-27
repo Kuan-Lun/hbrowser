@@ -1,7 +1,8 @@
 """
 比較不同 backbone 架構對 PonyChart 分類效果的影響。
 
-測試 MobileNetV3-Small、MobileNetV3-Large、EfficientNet-B0 三種 backbone，
+測試 MobileNetV3-Small、MobileNetV3-Large、EfficientNet-B0、
+EfficientNet-B2 四種 backbone，
 使用相同的 train/val/test split，比較 Macro F1、per-class F1、模型大小和訓練時間。
 
 使用方式：
@@ -43,7 +44,12 @@ logger = logging.getLogger(__name__)
 
 SEED = 42
 BATCH_SIZE = 32
-BACKBONES = ["mobilenet_v3_small", "mobilenet_v3_large", "efficientnet_b0"]
+BACKBONES = [
+    "mobilenet_v3_small",
+    "mobilenet_v3_large",
+    "efficientnet_b0",
+    "efficientnet_b2",
+]
 
 
 def get_onnx_size_mb(model: nn.Module) -> float:

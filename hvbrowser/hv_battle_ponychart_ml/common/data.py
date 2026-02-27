@@ -19,8 +19,10 @@ from torchvision import transforms
 from .constants import (
     IMAGENET_MEAN,
     IMAGENET_STD,
+    INPUT_SIZE,
     LABELS_FILE,
     NUM_CLASSES,
+    PRE_RESIZE,
     RAWIMAGE_DIR,
 )
 
@@ -111,10 +113,7 @@ def balance_crop_samples(
         deficit = target_counts[cls] - current_counts[cls]
         if deficit <= 0 or not class_to_indices[cls]:
             continue
-        available = [
-            idx for idx in class_to_indices[cls]
-            if idx not in extra_indices
-        ]
+        available = [idx for idx in class_to_indices[cls] if idx not in extra_indices]
         n_to_sample = min(deficit, len(available))
         if n_to_sample <= 0:
             continue
@@ -218,7 +217,7 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
         self._cache: list[Image.Image] = []
         for path, _ in samples:
             img = Image.open(path).convert("RGB")
-            img = img.resize((256, 256), Image.Resampling.BOX)
+            img = img.resize((PRE_RESIZE, PRE_RESIZE), Image.Resampling.BOX)
             self._cache.append(img)
 
     def __len__(self) -> int:
@@ -245,7 +244,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
                 transforms.RandomAffine(
                     degrees=90, translate=(0.05, 0.05), scale=(0.9, 1.1)
                 ),
-                transforms.RandomCrop((224, 224)),
+                transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
                 transforms.ColorJitter(
                     brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
                 ),
@@ -257,7 +256,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         )
     return transforms.Compose(
         [
-            transforms.CenterCrop((224, 224)),
+            transforms.CenterCrop((INPUT_SIZE, INPUT_SIZE)),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
