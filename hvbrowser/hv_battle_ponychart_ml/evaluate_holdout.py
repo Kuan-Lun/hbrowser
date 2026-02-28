@@ -6,8 +6,9 @@ Holdout 評估：在僅原圖的 test set 上測量真實 F1。
 
 Thresholds 在 val set 上 optimize，再套用到 test set 評估。
 
-支援 learning curve 模式（預設）：以不同數量的訓練原圖 group 訓練模型，
-觀察資料量對 F1 的影響。
+模擬 train.py 的 incremental 訓練流程：第一步從頭訓練，後續步驟接續
+前一步的 checkpoint 繼續訓練（跳過 Phase 1，僅 Phase 2 fine-tuning），
+觀察逐步增加原圖數量對 F1 的影響。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.evaluate_holdout
@@ -173,17 +174,23 @@ def main() -> None:
         device=device,
     )
 
-    # ── Run evaluation for each step ──
+    # ── Run evaluation for each step (incremental, like train.py) ──
     all_results: list[dict[str, Any]] = []
-    for n in step_sizes:
+    prev_state_dict: dict[str, Any] | None = None
+
+    for step_idx, n in enumerate(step_sizes):
+        is_first = step_idx == 0
         logger.info("")
         logger.info("=" * 60)
         logger.info(
-            "Training with %d / %d original groups …", n, total_train_groups
+            "Training with %d / %d original groups %s",
+            n,
+            total_train_groups,
+            "(from scratch)" if is_first else "(resume)",
         )
         logger.info("=" * 60)
 
-        # Per-step reproducibility
+        # Per-step reproducibility for data processing
         step_rng = np.random.RandomState(SEED + n)
         torch.manual_seed(SEED + n)
         np.random.seed(SEED + n)
@@ -214,7 +221,11 @@ def main() -> None:
             f"N={n}",
             backbone=BACKBONE,
             verbose=len(step_sizes) == 1,
+            resume_state_dict=prev_state_dict,
         )
+
+        # Carry model state forward to next step (like train.py checkpoint)
+        prev_state_dict = model.state_dict()
 
         result = evaluate(model, test_loader, criterion, device, thresholds)
         all_results.append(
@@ -241,7 +252,7 @@ def _print_summary(
     logger.info("")
     logger.info("=" * 90)
     logger.info(
-        "LEARNING CURVE SUMMARY  (test set: %d original images)",
+        "INCREMENTAL TRAINING CURVE  (test set: %d original images)",
         len(test_samples),
     )
     logger.info("=" * 90)
