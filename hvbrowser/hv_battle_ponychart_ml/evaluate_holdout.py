@@ -1,8 +1,8 @@
 """
 Holdout 評估：在僅原圖的 test set 上測量真實 F1。
 
-90% timestamp groups 用於訓練（原圖 + balanced crops），
-10% groups 的原圖作為 holdout test set，模擬實際推論場景。
+80% timestamp groups 用於訓練（原圖 + balanced crops），
+20% groups 的原圖作為 holdout test set，模擬實際推論場景。
 
 Thresholds 在 val set 上 optimize，再套用到 test set 評估。
 
@@ -70,9 +70,9 @@ def main() -> None:
         return
     logger.info("Total samples loaded: %d", len(all_samples))
 
-    # ── Split groups: 90% train+val, 10% test ──
+    # ── Split groups: 80% train+val, 20% test ──
     train_val_groups, test_groups = split_by_groups(
-        all_samples, test_size=0.10, seed=SEED
+        all_samples, test_size=0.20, seed=SEED
     )
 
     # Build group index
