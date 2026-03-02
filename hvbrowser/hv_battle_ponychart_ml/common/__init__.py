@@ -4,6 +4,7 @@ from .constants import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    HOLDOUT_TEST_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
     INPUT_SIZE,
@@ -30,6 +31,7 @@ from .constants import (
     SEARCH_PHASE1_EPOCHS,
     SEARCH_PHASE2_EPOCHS,
     SEED,
+    VAL_SIZE,
     WEIGHT_DECAY,
 )
 from .data import (
@@ -62,6 +64,7 @@ __all__ = [
     "BATCH_SIZE",
     "BackboneConfig",
     "CLASS_NAMES",
+    "HOLDOUT_TEST_SIZE",
     "balance_crop_samples",
     "compute_class_rates",
     "IMAGENET_MEAN",
@@ -91,6 +94,7 @@ __all__ = [
     "SEARCH_PHASE1_EPOCHS",
     "SEARCH_PHASE2_EPOCHS",
     "SEED",
+    "VAL_SIZE",
     "WEIGHT_DECAY",
     "build_model",
     "evaluate",

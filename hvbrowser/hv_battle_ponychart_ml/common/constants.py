@@ -42,6 +42,10 @@ SCHEDULER_FACTOR = 0.5
 SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR = 1e-7
 
+# Data split ratios
+HOLDOUT_TEST_SIZE = 0.20
+VAL_SIZE = 0.15
+
 # Reduced settings for hyperparameter search (derived from main settings)
 SEARCH_PHASE1_EPOCHS = PHASE1_EPOCHS
 SEARCH_PHASE2_EPOCHS = PHASE2_EPOCHS

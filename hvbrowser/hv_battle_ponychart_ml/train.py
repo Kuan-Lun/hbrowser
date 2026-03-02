@@ -29,6 +29,7 @@ from .common import (
     OUTPUT_ONNX,
     OUTPUT_THRESHOLDS,
     SEED,
+    VAL_SIZE,
     balance_crop_samples,
     compute_class_rates,
     export_onnx,
@@ -84,7 +85,7 @@ def main() -> None:
         len(samples),
     )
 
-    train_idx, val_idx = group_stratified_split(samples, test_size=0.15, seed=SEED)
+    train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
     logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))

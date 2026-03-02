@@ -25,7 +25,9 @@ from .common import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    HOLDOUT_TEST_SIZE,
     SEED,
+    VAL_SIZE,
     balance_crop_samples,
     compute_class_rates,
     evaluate,
@@ -72,7 +74,7 @@ def main() -> None:
 
     # ── Split groups: 80% train+val, 20% test ──
     train_val_groups, test_groups = split_by_groups(
-        all_samples, test_size=0.20, seed=SEED
+        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
     )
 
     # Build group index
@@ -113,7 +115,7 @@ def main() -> None:
         tv_groups_inner[base].append(idx)
 
     train_gk, val_gk = split_by_groups(
-        train_val_balanced, test_size=0.15, seed=SEED
+        train_val_balanced, test_size=VAL_SIZE, seed=SEED
     )
     train_samples = [
         train_val_balanced[idx] for gk in train_gk for idx in tv_groups_inner[gk]
