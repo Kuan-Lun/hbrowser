@@ -351,7 +351,7 @@ def main() -> None:
             "Delta",
         )
         logger.info("  " + "-" * 50)
-        for extra in [200, 400, 600, 1000, 2000]:
+        for extra in [1, 5, 10, 20, 50, 100, 200, 400]:
             pred = extrapolate_f1(params, current_n + extra)
             delta = pred - current_f1
             logger.info(
@@ -450,24 +450,29 @@ def main() -> None:
 
     # ── Per-class extrapolation ──
     logger.info("")
-    logger.info("Per-class extrapolation (+400 samples):")
+    logger.info("Per-class extrapolation:")
     current_n = ns[-1]
+    extras = [1, 5, 10, 20, 50, 100, 200, 400]
+
+    # Header
+    hdr = f"  {'Class':<20s}  {'now':>8s}"
+    for ex in extras:
+        hdr += f"  {'+' + str(ex):>8s}"
+    hdr += f"  {'asymptote':>10s}"
+    logger.info(hdr)
+    logger.info("  " + "-" * (20 + 2 + 8 + (2 + 8) * len(extras) + 12))
+
     for i, name in enumerate(CLASS_NAMES):
         class_f1s = [r["per_class_f1"][i] for r in experiment_results]
         class_params = fit_power_law(ns, class_f1s)
         if class_params is not None:
-            pred = extrapolate_f1(class_params, current_n + 400)
-            delta = pred - class_f1s[-1]
             asymptote = class_params[0]
-            logger.info(
-                "  %-20s  now=%.4f  +400->%.4f (%+.4f)"
-                "  asymptote=%.4f",
-                name,
-                class_f1s[-1],
-                min(pred, asymptote),
-                min(delta, asymptote - class_f1s[-1]),
-                asymptote,
-            )
+            row = f"  {name:<20s}  {class_f1s[-1]:>8.4f}"
+            for ex in extras:
+                pred = extrapolate_f1(class_params, current_n + ex)
+                row += f"  {min(pred, asymptote):>8.4f}"
+            row += f"  {asymptote:>10.4f}"
+            logger.info(row)
         else:
             logger.info("  %-20s  fitting failed", name)
 
