@@ -86,6 +86,23 @@ def compute_class_rates(
     return [c / n for c in counts]
 
 
+def compute_pos_weight(
+    samples: list[tuple[str, list[int]]],
+) -> torch.Tensor:
+    """從訓練樣本計算 BCEWithLogitsLoss 的 pos_weight。
+
+    公式: pos_weight[cls] = (N - pos_count) / pos_count
+    """
+    counts = [0] * NUM_CLASSES
+    for _, labels in samples:
+        for lbl in labels:
+            counts[lbl - 1] += 1
+    n = len(samples)
+    return torch.tensor(
+        [(n - c) / max(c, 1) for c in counts], dtype=torch.float32
+    )
+
+
 def balance_crop_samples(
     crop_samples: list[tuple[str, list[int]]],
     target_rates: list[float],

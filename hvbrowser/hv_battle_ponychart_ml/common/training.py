@@ -170,6 +170,9 @@ def train_model(
     resume_from: Path | None = None,
     resume_state_dict: dict[str, Any] | None = None,
     label_smoothing: float = LABEL_SMOOTHING,
+    lr_features: float = LR_FEATURES,
+    lr_classifier: float = LR_CLASSIFIER,
+    pos_weight: torch.Tensor | None = None,
 ) -> tuple[nn.Module, list[float]]:
     """Train a model end-to-end.
 
@@ -194,6 +197,7 @@ def train_model(
         len(val_samples),
     )
     logger.info("  Backbone: %s", backbone)
+    logger.info("  LR features: %.1e, LR classifier: %.1e", lr_features, lr_classifier)
     if resume_from is not None:
         logger.info("  Resuming from checkpoint: %s", resume_from)
     elif resume_state_dict is not None:
@@ -233,7 +237,11 @@ def train_model(
         logger.info("Loaded checkpoint weights from in-memory state_dict")
     else:
         model = build_model(backbone=backbone, pretrained=True).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    if pos_weight is not None:
+        logger.info("  pos_weight: %s", pos_weight.tolist())
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=pos_weight.to(device) if pos_weight is not None else None,
+    )
 
     # Phase 1: Head only (skipped when resuming from checkpoint)
     if not resuming:
@@ -265,8 +273,8 @@ def train_model(
         param.requires_grad = True
     optimizer = torch.optim.AdamW(
         [
-            {"params": model.features.parameters(), "lr": LR_FEATURES},
-            {"params": model.classifier.parameters(), "lr": LR_CLASSIFIER},
+            {"params": model.features.parameters(), "lr": lr_features},
+            {"params": model.classifier.parameters(), "lr": lr_classifier},
         ],
         weight_decay=WEIGHT_DECAY,
     )
