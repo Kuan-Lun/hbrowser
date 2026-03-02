@@ -3,7 +3,9 @@
 
 測試 MobileNetV3-Small、MobileNetV3-Large、EfficientNet-B0、
 EfficientNet-B2 四種 backbone，
-使用相同的 train/val/test split，比較 Macro F1、per-class F1、模型大小和訓練時間。
+使用 holdout 評估：80% timestamp groups 用於訓練（原圖 + balanced crops），
+20% groups 的原圖作為 holdout test set，模擬實際推論場景。
+比較 Macro F1、per-class F1、模型大小和訓練時間。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.compare_backbones
@@ -12,8 +14,10 @@ EfficientNet-B2 四種 backbone，
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -23,15 +27,24 @@ import torch.nn as nn
 
 from .common import (
     BACKBONE_REGISTRY,
+    BATCH_SIZE,
     CLASS_NAMES,
+    HOLDOUT_TEST_SIZE,
+    SEED,
+    VAL_SIZE,
+    balance_crop_samples,
+    compute_class_rates,
     evaluate,
     export_onnx,
+    get_base_timestamp,
     get_device,
     get_performance_cpu_count,
     get_transforms,
-    group_stratified_split,
+    is_original,
     load_samples,
     make_dataloader,
+    separate_orig_crop,
+    split_by_groups,
     train_model,
 )
 from .common.data import PonyChartDataset
@@ -42,8 +55,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SEED = 42
-BATCH_SIZE = 32
 BACKBONES = [
     "mobilenet_v3_small",
     "mobilenet_v3_large",
@@ -75,31 +86,74 @@ def count_parameters(model: nn.Module) -> int:
 def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+    rng = np.random.RandomState(SEED)
 
     device = get_device()
     num_workers = get_performance_cpu_count()
     logger.info("Device: %s  Workers: %d", device, num_workers)
 
-    # Load data
+    # ── Load all samples ──
     all_samples = load_samples()
     if not all_samples:
         logger.error("No samples found. Check rawimage/ and labels.json.")
         return
+    logger.info("Total samples loaded: %d", len(all_samples))
 
-    # Split: train+val (85%) / test (15%)
-    train_val_idx, test_idx = group_stratified_split(
-        all_samples, test_size=0.15, seed=SEED
+    # ── Split groups: 80% train+val, 20% test ──
+    train_val_groups, test_groups = split_by_groups(
+        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
     )
-    train_val_samples = [all_samples[i] for i in train_val_idx]
-    test_samples = [all_samples[i] for i in test_idx]
 
-    # From train_val, split train (85%) / val (15%)
-    train_idx, val_idx = group_stratified_split(
-        train_val_samples, test_size=0.15, seed=SEED
+    # Build group index
+    groups: dict[str, list[int]] = defaultdict(list)
+    for idx, (path, _) in enumerate(all_samples):
+        base = get_base_timestamp(os.path.basename(path))
+        groups[base].append(idx)
+
+    # ── Test set: only originals from test groups ──
+    test_samples = [
+        all_samples[idx]
+        for gk in test_groups
+        for idx in groups[gk]
+        if is_original(os.path.basename(all_samples[idx][0]))
+    ]
+    logger.info("Test set (originals only): %d images", len(test_samples))
+
+    # ── Train+val pool: originals + balanced crops from train groups ──
+    train_val_all = [
+        all_samples[idx] for gk in train_val_groups for idx in groups[gk]
+    ]
+    train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
+    orig_rates = compute_class_rates(train_val_orig)
+    balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
+    train_val_balanced = train_val_orig + balanced_crops
+    logger.info(
+        "Train+val pool: %d orig + %d crops (raw %d) = %d total",
+        len(train_val_orig),
+        len(balanced_crops),
+        len(train_val_crop),
+        len(train_val_balanced),
     )
-    train_samples = [train_val_samples[i] for i in train_idx]
-    val_samples = [train_val_samples[i] for i in val_idx]
 
+    # ── Split train/val within pool ──
+    tv_groups_inner: dict[str, list[int]] = defaultdict(list)
+    for idx, (path, _) in enumerate(train_val_balanced):
+        base = get_base_timestamp(os.path.basename(path))
+        tv_groups_inner[base].append(idx)
+
+    train_gk, val_gk = split_by_groups(
+        train_val_balanced, test_size=VAL_SIZE, seed=SEED
+    )
+    train_samples = [
+        train_val_balanced[idx]
+        for gk in train_gk
+        for idx in tv_groups_inner[gk]
+    ]
+    val_samples = [
+        train_val_balanced[idx]
+        for gk in val_gk
+        for idx in tv_groups_inner[gk]
+    ]
     logger.info(
         "Train: %d  Val: %d  Test: %d",
         len(train_samples),

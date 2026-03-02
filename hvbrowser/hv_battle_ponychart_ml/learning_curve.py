@@ -24,7 +24,9 @@ from .common import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    HOLDOUT_TEST_SIZE,
     SEED,
+    VAL_SIZE,
     balance_crop_samples,
     compute_class_rates,
     evaluate,
@@ -139,9 +141,9 @@ def main() -> None:
         base = get_base_timestamp(fname)
         groups[base].append(idx)
 
-    # Split: 15% test (original images only), 85% train+val pool
+    # Split: 20% test (original images only), 80% train+val pool
     train_val_group_keys, test_group_keys = split_by_groups(
-        all_samples, test_size=0.15, seed=SEED
+        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
     )
 
     test_indices = []
@@ -188,7 +190,7 @@ def main() -> None:
 
         # Split into train / val (15% val for early stopping)
         sub_train_gk, sub_val_gk = split_by_groups(
-            selected_samples, test_size=0.15, seed=SEED
+            selected_samples, test_size=VAL_SIZE, seed=SEED
         )
         sub_groups: dict[str, list[int]] = defaultdict(list)
         for idx, (path, _) in enumerate(selected_samples):

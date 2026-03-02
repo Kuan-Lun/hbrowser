@@ -39,6 +39,7 @@ from .common import (
     SEARCH_PHASE1_EPOCHS,
     SEARCH_PHASE2_EPOCHS,
     SEED,
+    VAL_SIZE,
     WEIGHT_DECAY,
     build_model,
     evaluate,
@@ -161,7 +162,7 @@ def main() -> None:
         logger.error("No samples found. Check rawimage/ and labels.json.")
         return
     train_idx, val_idx = group_stratified_split(
-        samples, test_size=0.15, seed=SEED
+        samples, test_size=VAL_SIZE, seed=SEED
     )
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]

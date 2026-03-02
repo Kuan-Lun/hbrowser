@@ -35,6 +35,7 @@ from .common import (
     NUM_CLASSES,
     OUTPUT_CHECKPOINT,
     SEED,
+    VAL_SIZE,
     balance_crop_samples,
     compute_class_rates,
     evaluate,
@@ -141,7 +142,7 @@ def main() -> None:
 
     # ── Split train/val for each experiment ──
     # Experiment A: originals + all crops (biased)
-    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=0.15, seed=SEED)
+    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=VAL_SIZE, seed=SEED)
     groups_a: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_all):
         base = get_base_timestamp(os.path.basename(path))
@@ -150,7 +151,9 @@ def main() -> None:
     val_a = [train_val_all[i] for gk in val_gk_a for i in groups_a[gk]]
 
     # Experiment B: originals only
-    train_gk_b, val_gk_b = split_by_groups(train_val_orig, test_size=0.15, seed=SEED)
+    train_gk_b, val_gk_b = split_by_groups(
+        train_val_orig, test_size=VAL_SIZE, seed=SEED
+    )
     groups_b: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_orig):
         base = get_base_timestamp(os.path.basename(path))
@@ -160,7 +163,7 @@ def main() -> None:
 
     # Experiment C: originals + balanced crops
     train_gk_c, val_gk_c = split_by_groups(
-        train_val_balanced, test_size=0.15, seed=SEED
+        train_val_balanced, test_size=VAL_SIZE, seed=SEED
     )
     groups_c: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_balanced):
