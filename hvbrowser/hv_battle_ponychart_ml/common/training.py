@@ -18,6 +18,7 @@ from .constants import (
     BACKBONE,
     BATCH_SIZE,
     CLASS_NAMES,
+    INPUT_SIZE,
     LABEL_SMOOTHING,
     LR_CLASSIFIER,
     LR_FEATURES,
@@ -27,6 +28,7 @@ from .constants import (
     PATIENCE,
     PHASE1_EPOCHS,
     PHASE2_EPOCHS,
+    PRE_RESIZE,
     SCHEDULER_FACTOR,
     SCHEDULER_MIN_LR,
     SCHEDULER_PATIENCE,
@@ -173,6 +175,8 @@ def train_model(
     lr_features: float = LR_FEATURES,
     lr_classifier: float = LR_CLASSIFIER,
     pos_weight: torch.Tensor | None = None,
+    pre_resize: int = PRE_RESIZE,
+    input_size: int = INPUT_SIZE,
 ) -> tuple[nn.Module, list[float]]:
     """Train a model end-to-end.
 
@@ -205,11 +209,11 @@ def train_model(
     logger.info("=" * 60)
 
     if train_transform is None:
-        train_transform = get_transforms(is_train=True)
-    val_transform = get_transforms(is_train=False)
+        train_transform = get_transforms(is_train=True, input_size=input_size)
+    val_transform = get_transforms(is_train=False, input_size=input_size)
 
-    train_ds = PonyChartDataset(train_samples, train_transform)
-    val_ds = PonyChartDataset(val_samples, val_transform)
+    train_ds = PonyChartDataset(train_samples, train_transform, pre_resize=pre_resize)
+    val_ds = PonyChartDataset(val_samples, val_transform, pre_resize=pre_resize)
     train_loader = make_dataloader(
         train_ds,
         batch_size,
