@@ -33,7 +33,6 @@ from .common import (
     BATCH_SIZE,
     CLASS_NAMES,
     NUM_CLASSES,
-    OUTPUT_CHECKPOINT,
     SEED,
     VAL_SIZE,
     balance_crop_samples,
@@ -174,12 +173,7 @@ def main() -> None:
 
     criterion = nn.BCEWithLogitsLoss()
 
-    # Auto-detect checkpoint for resume training
-    resume_from = OUTPUT_CHECKPOINT if OUTPUT_CHECKPOINT.exists() else None
-    if resume_from is not None:
-        logger.info("Resuming all experiments from checkpoint: %s", resume_from)
-
-    # ---- Train experiments ----
+    # ---- Train experiments (all from ImageNet pretrained weights) ----
     model_a, thresholds_a = train_model(
         train_a,
         val_a,
@@ -187,7 +181,6 @@ def main() -> None:
         num_workers,
         "A: Originals + biased crops",
         backbone=BACKBONE,
-        resume_from=resume_from,
     )
 
     torch.manual_seed(SEED)
@@ -199,7 +192,6 @@ def main() -> None:
         num_workers,
         "B: Originals only (baseline)",
         backbone=BACKBONE,
-        resume_from=resume_from,
     )
 
     torch.manual_seed(SEED)
@@ -211,7 +203,6 @@ def main() -> None:
         num_workers,
         "C: Originals + balanced crops",
         backbone=BACKBONE,
-        resume_from=resume_from,
     )
 
     # ---- Evaluate all on test set ----
