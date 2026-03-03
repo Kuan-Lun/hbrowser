@@ -228,13 +228,14 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
         self,
         samples: list[tuple[str, list[int]]],
         transform: transforms.Compose | None = None,
+        pre_resize: int = PRE_RESIZE,
     ) -> None:
         self.samples = samples
         self.transform = transform
         self._cache: list[Image.Image] = []
         for path, _ in samples:
             img = Image.open(path).convert("RGB")
-            img = img.resize((PRE_RESIZE, PRE_RESIZE), Image.Resampling.BOX)
+            img = img.resize((pre_resize, pre_resize), Image.Resampling.BOX)
             self._cache.append(img)
 
     def __len__(self) -> int:
@@ -251,7 +252,7 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
 # ---------------------------------------------------------------------------
 # Transforms
 # ---------------------------------------------------------------------------
-def get_transforms(is_train: bool) -> transforms.Compose:
+def get_transforms(is_train: bool, input_size: int = INPUT_SIZE) -> transforms.Compose:
     """Return the default augmentation pipeline."""
     if is_train:
         return transforms.Compose(
@@ -261,7 +262,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
                 transforms.RandomAffine(
                     degrees=90, translate=(0.05, 0.05), scale=(0.9, 1.1)
                 ),
-                transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
+                transforms.RandomCrop((input_size, input_size)),
                 transforms.ColorJitter(
                     brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
                 ),
@@ -273,7 +274,7 @@ def get_transforms(is_train: bool) -> transforms.Compose:
         )
     return transforms.Compose(
         [
-            transforms.CenterCrop((INPUT_SIZE, INPUT_SIZE)),
+            transforms.CenterCrop((input_size, input_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
