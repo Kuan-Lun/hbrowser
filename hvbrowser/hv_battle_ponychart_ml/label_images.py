@@ -868,30 +868,32 @@ class LabelApp:
         k = e.keysym.lower()
 
         if self.crop.active:
-            if k == "return":
-                self._save_crop()
-            elif k == "escape":
-                self.crop.exit()
-                self._refresh()
+            match k:
+                case "return":
+                    self._save_crop()
+                case "escape":
+                    self.crop.exit()
+                    self._refresh()
             return
 
-        if k in ("1", "2", "3", "4", "5", "6"):
-            self._toggle_label(int(k))
-        elif k == "a":
-            self.nav.go_prev()
-            self._refresh()
-        elif k == "d":
-            self.nav.go_next()
-            self._refresh()
-        elif k == "s":
-            self._save()
-        elif k == "c":
-            self.crop.enter()
-            self.info_label.configure(
-                text="裁切模式：拖曳選取區域，Enter 確認，Escape 取消"
-            )
-        elif k == "g":
-            self._jump_to_image()
+        match k:
+            case "1" | "2" | "3" | "4" | "5" | "6":
+                self._toggle_label(int(k))
+            case "a":
+                self.nav.go_prev()
+                self._refresh()
+            case "d":
+                self.nav.go_next()
+                self._refresh()
+            case "s":
+                self._save()
+            case "c":
+                self.crop.enter()
+                self.info_label.configure(
+                    text="裁切模式：拖曳選取區域，Enter 確認，Escape 取消"
+                )
+            case "g":
+                self._jump_to_image()
 
 
 def main() -> None:

@@ -21,14 +21,15 @@ class PauseController:
                 self.pause_event.set()
                 while True:
                     cmd2 = input().strip().lower()
-                    if cmd2 == "continue":
-                        self.pause_event.clear()
-                        print("Resumed.")
-                        break
-                    elif cmd2 == "quit":
-                        self.quit_event.set()
-                        print("Exiting.")
-                        break
+                    match cmd2:
+                        case "continue":
+                            self.pause_event.clear()
+                            print("Resumed.")
+                            break
+                        case "quit":
+                            self.quit_event.set()
+                            print("Exiting.")
+                            break
 
     def pauseable(self, func: F) -> F:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
