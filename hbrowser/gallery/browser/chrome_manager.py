@@ -40,22 +40,23 @@ def _get_platform() -> str:
     system = platform.system()
     machine = platform.machine().lower()
 
-    if system == "Darwin":
-        # macOS
-        if machine == "arm64":
-            return "mac-arm64"
-        else:
-            return "mac-x64"
-    elif system == "Linux":
-        return "linux64"
-    elif system == "Windows":
-        # 檢查是否為 64 位元
-        if platform.machine().endswith("64"):
-            return "win64"
-        else:
-            return "win32"
-    else:
-        raise RuntimeError(f"Unsupported platform: {system} {machine}")
+    match system:
+        case "Darwin":
+            # macOS
+            if machine == "arm64":
+                return "mac-arm64"
+            else:
+                return "mac-x64"
+        case "Linux":
+            return "linux64"
+        case "Windows":
+            # 檢查是否為 64 位元
+            if platform.machine().endswith("64"):
+                return "win64"
+            else:
+                return "win32"
+        case _:
+            raise RuntimeError(f"Unsupported platform: {system} {machine}")
 
 
 def _get_cache_dir() -> Path:
