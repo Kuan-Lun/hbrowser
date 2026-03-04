@@ -37,6 +37,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     separate_orig_crop,
     split_by_groups,
@@ -150,10 +151,10 @@ def main() -> None:
     result = evaluate(model, test_loader, criterion, device, thresholds)
 
     # ── Report ──
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("HOLDOUT TEST SET EVALUATION (%d original images)", len(test_samples))
-    logger.info("=" * 70)
+    log_section(
+        logger, "HOLDOUT TEST SET EVALUATION (%d original images)",
+        len(test_samples), width=70,
+    )
     logger.info("Thresholds (from val set): %s", dict(zip(CLASS_NAMES, thresholds)))
     logger.info("")
     logger.info("  Macro F1: %.4f", result["macro_f1"])

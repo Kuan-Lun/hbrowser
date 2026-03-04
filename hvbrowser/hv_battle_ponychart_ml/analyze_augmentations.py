@@ -48,6 +48,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     separate_orig_crop,
     split_by_groups,
@@ -172,9 +173,7 @@ def main() -> None:
     logger.info("Test set (originals only): %d images", len(test_samples))
 
     # ── Train+val pool: originals + balanced crops from train groups ──
-    train_val_all = [
-        all_samples[idx] for gk in train_val_groups for idx in groups[gk]
-    ]
+    train_val_all = [all_samples[idx] for gk in train_val_groups for idx in groups[gk]]
     train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
     orig_rates = compute_class_rates(train_val_orig)
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
@@ -197,14 +196,10 @@ def main() -> None:
         train_val_balanced, test_size=VAL_SIZE, seed=SEED
     )
     sub_train_samples = [
-        train_val_balanced[idx]
-        for gk in train_gk
-        for idx in tv_groups_inner[gk]
+        train_val_balanced[idx] for gk in train_gk for idx in tv_groups_inner[gk]
     ]
     val_samples = [
-        train_val_balanced[idx]
-        for gk in val_gk
-        for idx in tv_groups_inner[gk]
+        train_val_balanced[idx] for gk in val_gk for idx in tv_groups_inner[gk]
     ]
     logger.info(
         "Train: %d  Val: %d  Test: %d",
@@ -216,8 +211,11 @@ def main() -> None:
     # Test set (shared)
     test_ds = PonyChartDataset(test_samples, get_transforms(is_train=False))
     test_loader = make_dataloader(
-        test_ds, BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, device=device,
+        test_ds,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
 
     criterion = nn.BCEWithLogitsLoss()
@@ -238,9 +236,7 @@ def main() -> None:
             backbone=BACKBONE,
             train_transform=train_tf,
         )
-        result = evaluate(
-            model, test_loader, criterion, device, thresholds
-        )
+        result = evaluate(model, test_loader, criterion, device, thresholds)
         results[cfg.name] = result
         logger.info(
             "  >> %s test F1=%.4f  thresholds=%s",
@@ -253,13 +249,11 @@ def main() -> None:
     baseline_f1 = results["none"]["macro_f1"]
     baseline_per_class = results["none"]["per_class_f1"]
 
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info(
+    log_section(
+        logger,
         "AUGMENTATION ABLATION RESULTS (test set, %d images)",
         len(test_samples),
     )
-    logger.info("=" * 90)
 
     # Macro F1 overview
     logger.info("")
@@ -274,9 +268,7 @@ def main() -> None:
     for cfg in EXPERIMENTS:
         r = results[cfg.name]
         delta = r["macro_f1"] - baseline_f1
-        delta_str = (
-            f"{delta:+.4f}" if cfg.name != "none" else "baseline"
-        )
+        delta_str = f"{delta:+.4f}" if cfg.name != "none" else "baseline"
         desc_parts = []
         if cfg.hflip:
             desc_parts.append("HFlip")
@@ -284,9 +276,7 @@ def main() -> None:
             desc_parts.append("VFlip")
         if cfg.degrees > 0:
             desc_parts.append(f"Rot({cfg.degrees:.0f})")
-        desc = (
-            " + ".join(desc_parts) if desc_parts else "(no spatial aug)"
-        )
+        desc = " + ".join(desc_parts) if desc_parts else "(no spatial aug)"
         logger.info(
             "%-12s  %-10.4f  %-10s  %s",
             cfg.name,
@@ -300,9 +290,7 @@ def main() -> None:
     logger.info("Per-class F1 (delta vs baseline):")
     header = "  %-20s" + "  %-12s" * len(EXPERIMENTS)
     logger.info(header, "Class", *[cfg.name for cfg in EXPERIMENTS])
-    logger.info(
-        "  " + "-" * (20 + 14 * len(EXPERIMENTS))
-    )
+    logger.info("  " + "-" * (20 + 14 * len(EXPERIMENTS)))
     for i, name in enumerate(CLASS_NAMES):
         row_parts = [f"  {name:<20s}"]
         for cfg in EXPERIMENTS:
@@ -315,10 +303,7 @@ def main() -> None:
         logger.info("".join(row_parts))
 
     # ── Flip analysis ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("FLIP ANALYSIS")
-    logger.info("=" * 90)
+    log_section(logger, "FLIP ANALYSIS")
 
     hflip_delta = results["hflip"]["macro_f1"] - baseline_f1
     vflip_delta = results["vflip"]["macro_f1"] - baseline_f1
@@ -348,19 +333,14 @@ def main() -> None:
     # Per-class flip impact
     logger.info("")
     logger.info("  Per-class flip impact (F1 delta vs baseline):")
-    logger.info(
-        "  %-20s  %-12s  %-12s", "Class", "HFlip", "VFlip"
-    )
+    logger.info("  %-20s  %-12s  %-12s", "Class", "HFlip", "VFlip")
     for i, name in enumerate(CLASS_NAMES):
         hd = results["hflip"]["per_class_f1"][i] - baseline_per_class[i]
         vd = results["vflip"]["per_class_f1"][i] - baseline_per_class[i]
         logger.info("  %-20s  %+.4f       %+.4f", name, hd, vd)
 
     # ── Rotation analysis ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("ROTATION ANALYSIS")
-    logger.info("=" * 90)
+    log_section(logger, "ROTATION ANALYSIS")
 
     rot_configs = [("rot15", 15), ("rot45", 45), ("rot90", 90)]
     best_rot_name = "none"
@@ -368,23 +348,17 @@ def main() -> None:
     for rname, deg in rot_configs:
         delta = results[rname]["macro_f1"] - baseline_f1
         rot_f1 = results[rname]["macro_f1"]
-        logger.info(
-            "  Rotation %3d: %+.4f (F1=%.4f)", deg, delta, rot_f1
-        )
+        logger.info("  Rotation %3d: %+.4f (F1=%.4f)", deg, delta, rot_f1)
         if results[rname]["macro_f1"] > best_rot_f1:
             best_rot_f1 = results[rname]["macro_f1"]
             best_rot_name = rname
 
     if best_rot_name == "none":
-        logger.info(
-            "  >> 所有旋轉角度皆無正面效果，建議移除旋轉增強"
-        )
+        logger.info("  >> 所有旋轉角度皆無正面效果，建議移除旋轉增強")
     else:
         best_deg = {"rot15": 15, "rot45": 45, "rot90": 90}[best_rot_name]
         delta = best_rot_f1 - baseline_f1
-        logger.info(
-            "  >> 最佳旋轉角度: %d (%+.4f F1)", best_deg, delta
-        )
+        logger.info("  >> 最佳旋轉角度: %d (%+.4f F1)", best_deg, delta)
         if delta > 0.005:
             logger.info("  >> 建議使用 %d 旋轉", best_deg)
         else:
@@ -393,58 +367,33 @@ def main() -> None:
     # Per-class rotation impact
     logger.info("")
     logger.info("  Per-class rotation impact (F1 delta vs baseline):")
-    logger.info(
-        "  %-20s  %-10s  %-10s  %-10s", "Class", "15", "45", "90"
-    )
+    logger.info("  %-20s  %-10s  %-10s  %-10s", "Class", "15", "45", "90")
     for i, name in enumerate(CLASS_NAMES):
         deltas = []
         for rname, _ in rot_configs:
-            d = (
-                results[rname]["per_class_f1"][i]
-                - baseline_per_class[i]
-            )
+            d = results[rname]["per_class_f1"][i] - baseline_per_class[i]
             deltas.append(d)
-        logger.info(
-            "  %-20s  %+.4f     %+.4f     %+.4f", name, *deltas
-        )
+        logger.info("  %-20s  %+.4f     %+.4f     %+.4f", name, *deltas)
 
     # ── Combined vs individual ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("COMBINED EFFECT ANALYSIS")
-    logger.info("=" * 90)
+    log_section(logger, "COMBINED EFFECT ANALYSIS")
 
     current_delta = results["current"]["macro_f1"] - baseline_f1
-    sum_individual = (
-        hflip_delta + vflip_delta + (best_rot_f1 - baseline_f1)
-    )
+    sum_individual = hflip_delta + vflip_delta + (best_rot_f1 - baseline_f1)
     interaction = current_delta - sum_individual
 
-    logger.info(
-        "  Current config (HFlip+VFlip+Rot90): %+.4f", current_delta
-    )
-    logger.info(
-        "  Sum of individual effects:           %+.4f", sum_individual
-    )
-    logger.info(
-        "  Interaction effect:                  %+.4f", interaction
-    )
+    logger.info("  Current config (HFlip+VFlip+Rot90): %+.4f", current_delta)
+    logger.info("  Sum of individual effects:           %+.4f", sum_individual)
+    logger.info("  Interaction effect:                  %+.4f", interaction)
     if interaction > 0.005:
         logger.info("  >> 組合使用有正向交互作用，建議同時啟用")
     elif interaction < -0.005:
-        logger.info(
-            "  >> 組合使用有負向交互作用，建議精簡增強組合"
-        )
+        logger.info("  >> 組合使用有負向交互作用，建議精簡增強組合")
     else:
-        logger.info(
-            "  >> 交互作用微小，各增強可獨立決定是否啟用"
-        )
+        logger.info("  >> 交互作用微小，各增強可獨立決定是否啟用")
 
     # ── Final recommendation ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("RECOMMENDATION")
-    logger.info("=" * 90)
+    log_section(logger, "RECOMMENDATION")
 
     best_name = max(results, key=lambda k: results[k]["macro_f1"])
     best_result = results[best_name]
@@ -469,9 +418,7 @@ def main() -> None:
         for part in recommended_parts:
             logger.info("    - %s", part)
     else:
-        logger.info(
-            "  建議移除所有空間增強（翻轉與旋轉），僅保留:"
-        )
+        logger.info("  建議移除所有空間增強（翻轉與旋轉），僅保留:")
         logger.info("    - RandomCrop")
         logger.info("    - ColorJitter")
         logger.info("    - GaussianBlur")
@@ -481,17 +428,11 @@ def main() -> None:
     logger.info("")
     diff = best_result["macro_f1"] - results["current"]["macro_f1"]
     if abs(diff) < 0.003:
-        logger.info(
-            "  目前設定 (current) 已接近最佳，無需調整"
-        )
+        logger.info("  目前設定 (current) 已接近最佳，無需調整")
     elif diff > 0:
-        logger.info(
-            "  切換至 '%s' 可提升 F1 約 %+.4f", best_name, diff
-        )
+        logger.info("  切換至 '%s' 可提升 F1 約 %+.4f", best_name, diff)
     else:
-        logger.info(
-            "  目前設定 (current) 即為最佳或接近最佳"
-        )
+        logger.info("  目前設定 (current) 即為最佳或接近最佳")
 
     logger.info("=" * 90)
 

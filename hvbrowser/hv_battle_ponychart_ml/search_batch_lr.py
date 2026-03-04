@@ -48,6 +48,7 @@ from .common import (
     get_transforms,
     group_stratified_split,
     load_samples,
+    log_section,
     make_dataloader,
     train_one_epoch,
 )
@@ -298,10 +299,7 @@ def main() -> None:
 
     # ── Recommendation ──
     best = results[0]
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("RECOMMENDATION")
-    logger.info("=" * 90)
+    log_section(logger, "RECOMMENDATION")
     logger.info("  Best config:")
     logger.info("    --batch-size %d", best["batch_size"])
     logger.info(

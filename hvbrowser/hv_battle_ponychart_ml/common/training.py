@@ -232,8 +232,8 @@ def train_model(
     resuming = resume_from is not None or resume_state_dict is not None
     if resume_from is not None:
         model = build_model(backbone=backbone, pretrained=False).to(device)
-        state_dict = torch.load(resume_from, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
+        ckpt = torch.load(resume_from, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["state_dict"])
         logger.info("Loaded checkpoint weights from %s", resume_from)
     elif resume_state_dict is not None:
         model = build_model(backbone=backbone, pretrained=False).to(device)

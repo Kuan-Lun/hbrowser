@@ -46,6 +46,13 @@ SCHEDULER_MIN_LR = 1e-7
 HOLDOUT_TEST_SIZE = 0.20
 VAL_SIZE = 0.15
 
+# Resume vs from-scratch threshold (updated by compare_resume_scratch analysis)
+# 當 (目前樣本數 - checkpoint 訓練樣本數) / checkpoint 訓練樣本數 > 此值時，
+# 使用 from-scratch 訓練；否則 resume from checkpoint。
+# 例：checkpoint 用 1000 張訓練，現在有 1400 張 → ratio=0.4 < 0.5 → resume
+# 例：checkpoint 用 1000 張訓練，現在有 1600 張 → ratio=0.6 > 0.5 → from-scratch
+RETRAIN_NEW_DATA_RATIO = 0.5
+
 # Reduced settings for hyperparameter search (derived from main settings)
 SEARCH_PHASE1_EPOCHS = PHASE1_EPOCHS
 SEARCH_PHASE2_EPOCHS = PHASE2_EPOCHS
