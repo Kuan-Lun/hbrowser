@@ -1,7 +1,6 @@
 from collections import defaultdict
 from typing import Any
 
-from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.by import By
 
 from .hv import HVDriver
@@ -29,45 +28,22 @@ class SkillManager:
     def _get_skill_xpath(self, key: str) -> str:
         return f"//div[not(@style)]/div/div[contains(text(), '{key}')]"
 
-    def _click_skill_menu(self) -> None:
-        # Use resilient locator-based click
-        try:
-            self.element_action_manager.click_resilient(
-                lambda: self.driver.find_element(By.ID, "ckey_skill")
-            )
-        except StaleElementReferenceException:
-            # One more direct attempt (DOM might have re-rendered menu container)
-            self.element_action_manager.click_resilient(
-                lambda: self.driver.find_element(By.ID, "ckey_skill")
-            )
+    def _is_pane_visible(self, pane_id: str) -> bool:
+        element = self.driver.find_element(By.ID, pane_id)
+        style: str = element.get_attribute("style") or ""
+        return style != "display: none;"
 
     def open_skills_menu(self) -> None:
-        attempts = 0
-        while True:
-            style = self.driver.find_element(By.ID, "pane_skill").get_attribute("style")
-            if style != "display: none;":
-                break
-            if attempts >= 5:  # safety cap
-                break
-            try:
-                self._click_skill_menu()
-            except StaleElementReferenceException:
-                pass
-            attempts += 1
+        self.element_action_manager.click_until(
+            lambda: self.driver.find_element(By.ID, "ckey_skill"),
+            lambda: self._is_pane_visible("pane_skill"),
+        )
 
     def open_spells_menu(self) -> None:
-        attempts = 0
-        while True:
-            style = self.driver.find_element(By.ID, "pane_magic").get_attribute("style")
-            if style != "display: none;":
-                break
-            if attempts >= 5:
-                break
-            try:
-                self._click_skill_menu()
-            except StaleElementReferenceException:
-                pass
-            attempts += 1
+        self.element_action_manager.click_until(
+            lambda: self.driver.find_element(By.ID, "ckey_skill"),
+            lambda: self._is_pane_visible("pane_magic"),
+        )
 
     def _click_skill(self, skill_xpath: str, iswait: bool) -> None:
         if iswait:

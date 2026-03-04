@@ -9,6 +9,7 @@ from random import random
 from typing import Any
 
 from selenium.common.exceptions import (
+    ElementNotInteractableException,
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
@@ -119,13 +120,13 @@ class Driver(ABC):
         """
         old_url = self.driver.current_url
 
-        # 重試機制處理 StaleElementReferenceException
+        # 重試機制處理 StaleElementReferenceException / ElementNotInteractableException
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 fun()
                 break
-            except StaleElementReferenceException:
+            except (StaleElementReferenceException, ElementNotInteractableException):
                 if attempt == max_retries - 1:
                     raise
                 # 短暫等待後重試

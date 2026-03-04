@@ -3,7 +3,10 @@ from collections.abc import Callable
 from typing import Any
 
 from hv_bie import parse_snapshot
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import (
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+)
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
@@ -32,19 +35,57 @@ class ElementActionManager:
         retries: int = 3,
         delay: float = 0.1,
     ) -> None:
-        """Click element returned by get_element with stale retries."""
+        """Click element returned by get_element with stale/interactable retries."""
         last_err: Exception | None = None
         for i in range(retries):
             try:
                 element = get_element()
                 self._click(element)
                 return
-            except StaleElementReferenceException as e:
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+            ) as e:
                 last_err = e
                 time.sleep(delay)
                 continue
         if last_err:
             raise last_err
+
+    def click_until(
+        self,
+        get_element: Callable[[], WebElement],
+        condition: Callable[[], bool],
+        max_attempts: int = 5,
+        delay: float = 0.1,
+        timeout: float = 0.3,
+    ) -> None:
+        """Click element repeatedly until condition returns True.
+
+        After each click, waits for page content to change before
+        re-checking the condition, preventing accidental double-toggle.
+
+        Resilience (stale/interactable retries) is handled internally.
+        Callers do not need to catch Selenium exceptions.
+        """
+        for _ in range(max_attempts):
+            if condition():
+                return
+            old_source = self.driver.page_source
+            try:
+                self.click_resilient(get_element, retries=3, delay=delay)
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+            ):
+                continue
+            # Wait until page content changes (click took effect)
+            deadline = time.monotonic() + timeout
+            while self.driver.page_source == old_source:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        # Best-effort: condition may still be False after max_attempts
 
     def click_and_wait_log_locator(
         self,
@@ -70,7 +111,10 @@ class ElementActionManager:
                 element = self.driver.find_element(by, value)
                 self._click(element)
                 break
-            except StaleElementReferenceException:
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+            ):
                 if attempt == stale_retries - 1:
                     raise
                 time.sleep(0.05)
