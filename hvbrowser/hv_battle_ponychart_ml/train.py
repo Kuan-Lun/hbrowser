@@ -25,13 +25,23 @@ import numpy as np
 import torch
 
 from .common import (
+    BACKBONE,
+    BATCH_SIZE,
     CLASS_NAMES,
+    INPUT_SIZE,
+    LABEL_SMOOTHING,
+    LR_CLASSIFIER,
+    LR_FEATURES,
+    LR_HEAD,
+    NUM_CLASSES,
     OUTPUT_CHECKPOINT,
     OUTPUT_ONNX,
     OUTPUT_THRESHOLDS,
+    PRE_RESIZE,
     RETRAIN_NEW_DATA_RATIO,
     SEED,
     VAL_SIZE,
+    WEIGHT_DECAY,
     balance_crop_samples,
     compute_class_rates,
     export_onnx,
@@ -97,29 +107,61 @@ def main() -> None:
     resume_from = None
     if not args.from_scratch and OUTPUT_CHECKPOINT.exists():
         ckpt = torch.load(OUTPUT_CHECKPOINT, map_location=device, weights_only=True)
-        ckpt_n = ckpt["n_samples"]
-        n_current = len(load_samples())
-        new_data_ratio = (n_current - ckpt_n) / ckpt_n
-        logger.info(
-            "Checkpoint: %d samples (created_at=%s), current: %d samples, "
-            "new_data_ratio=%.1f%%",
-            ckpt_n,
-            ckpt["created_at"],
-            n_current,
-            new_data_ratio * 100,
-        )
-        if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
+
+        # Check architecture compatibility
+        # (missing keys = legacy checkpoint, treat as incompatible)
+        arch_keys = {
+            "backbone": BACKBONE,
+            "input_size": INPUT_SIZE,
+            "pre_resize": PRE_RESIZE,
+            "num_classes": NUM_CLASSES,
+        }
+        missing = [k for k in arch_keys if k not in ckpt]
+        mismatches = {
+            k: (ckpt[k], v)
+            for k, v in arch_keys.items()
+            if k in ckpt and ckpt[k] != v
+        }
+        if missing:
             logger.warning(
-                "new_data_ratio (%.1f%%) 超過閾值 RETRAIN_NEW_DATA_RATIO (%.1f%%)，"
+                "Legacy checkpoint missing keys: %s. "
                 "自動切換為 from-scratch 訓練。",
-                new_data_ratio * 100,
-                RETRAIN_NEW_DATA_RATIO * 100,
+                ", ".join(missing),
             )
+        elif mismatches:
+            for k, (old, new) in mismatches.items():
+                logger.warning(
+                    "Architecture mismatch: %s: %s -> %s",
+                    k,
+                    old,
+                    new,
+                )
+            logger.warning("自動切換為 from-scratch 訓練。")
         else:
-            resume_from = OUTPUT_CHECKPOINT
+            ckpt_n = ckpt["n_samples"]
+            n_current = len(load_samples())
+            new_data_ratio = (n_current - ckpt_n) / ckpt_n
             logger.info(
-                "Found checkpoint: %s (use --from-scratch to ignore)", resume_from
+                "Checkpoint: %d samples (created_at=%s), current: %d samples, "
+                "new_data_ratio=%.1f%%",
+                ckpt_n,
+                ckpt["created_at"],
+                n_current,
+                new_data_ratio * 100,
             )
+            if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
+                logger.warning(
+                    "new_data_ratio (%.1f%%) 超過閾值 RETRAIN_NEW_DATA_RATIO (%.1f%%)，"
+                    "自動切換為 from-scratch 訓練。",
+                    new_data_ratio * 100,
+                    RETRAIN_NEW_DATA_RATIO * 100,
+                )
+            else:
+                resume_from = OUTPUT_CHECKPOINT
+                logger.info(
+                    "Found checkpoint: %s (use --from-scratch to ignore)",
+                    resume_from,
+                )
 
     # Train
     model, thresholds = train_model(
@@ -152,6 +194,19 @@ def main() -> None:
             "n_samples": n_current,
             "class_rates": orig_rates,
             "created_at": latest_timestamp,
+            # Model architecture (mismatch -> from-scratch)
+            "backbone": BACKBONE,
+            "input_size": INPUT_SIZE,
+            "pre_resize": PRE_RESIZE,
+            "num_classes": NUM_CLASSES,
+            # Training hyperparameters (informational)
+            "seed": SEED,
+            "batch_size": BATCH_SIZE,
+            "lr_head": LR_HEAD,
+            "lr_features": LR_FEATURES,
+            "lr_classifier": LR_CLASSIFIER,
+            "weight_decay": WEIGHT_DECAY,
+            "label_smoothing": LABEL_SMOOTHING,
         },
         OUTPUT_CHECKPOINT,
     )
