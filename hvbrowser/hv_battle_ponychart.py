@@ -14,7 +14,7 @@ from hbrowser.beep import beep_os_independent
 from hbrowser.gallery.utils import setup_logger
 
 from .hv import HVDriver
-from .hv_battle_ponychart_ml.common.constants import (
+from .hv_battle_ponychart_ml.model_spec import (
     CLASS_NAMES,
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -56,7 +56,7 @@ class _InlineModel:
         """BGR 圖片 -> NCHW float32 tensor (matching training transforms)."""
         resized = cv.resize(bgr, (PRE_RESIZE, PRE_RESIZE), interpolation=cv.INTER_AREA)
         offset = (PRE_RESIZE - INPUT_SIZE) // 2
-        cropped = resized[offset:offset + INPUT_SIZE, offset:offset + INPUT_SIZE]
+        cropped = resized[offset : offset + INPUT_SIZE, offset : offset + INPUT_SIZE]
         rgb = cv.cvtColor(cropped, cv.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - _IMAGENET_MEAN) / _IMAGENET_STD
         # HWC -> CHW -> NCHW
