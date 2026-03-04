@@ -1,8 +1,26 @@
-"""Shared constants for PonyChart ML scripts."""
+"""Training-specific constants for PonyChart ML scripts."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+from hvbrowser.hv_battle_ponychart_ml.model_spec import (  # noqa: F401
+    CLASS_NAMES,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    INPUT_SIZE,
+    NUM_CLASSES,
+    PRE_RESIZE,
+)
+
+__all__ = [
+    "CLASS_NAMES",
+    "IMAGENET_MEAN",
+    "IMAGENET_STD",
+    "INPUT_SIZE",
+    "NUM_CLASSES",
+    "PRE_RESIZE",
+]
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 RAWIMAGE_DIR = SCRIPT_DIR / "rawimage"
@@ -11,22 +29,8 @@ OUTPUT_ONNX = SCRIPT_DIR / "model.onnx"
 OUTPUT_CHECKPOINT = SCRIPT_DIR / "checkpoint.pt"
 OUTPUT_THRESHOLDS = SCRIPT_DIR / "thresholds.json"
 
-NUM_CLASSES = 6
-CLASS_NAMES = [
-    "Twilight Sparkle",
-    "Rarity",
-    "Fluttershy",
-    "Rainbow Dash",
-    "Pinkie Pie",
-    "Applejack",
-]
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
-
 # Training hyperparameters (single source of truth)
 BACKBONE = "efficientnet_b0"
-INPUT_SIZE = 320
-PRE_RESIZE = 384
 BATCH_SIZE = 32
 SEED = 42
 PHASE1_EPOCHS = 10
