@@ -39,6 +39,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     separate_orig_crop,
     split_by_groups,
@@ -168,12 +169,10 @@ def main() -> None:
     result_b = evaluate(model_b, test_loader, criterion, device, thresholds_b)
 
     # ── Report ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info(
-        "HOLDOUT TEST SET EVALUATION (%d original images)", len(test_samples)
+    log_section(
+        logger, "HOLDOUT TEST SET EVALUATION (%d original images)",
+        len(test_samples), width=80,
     )
-    logger.info("=" * 80)
     logger.info("  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a)))
     logger.info("  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b)))
     logger.info("")
@@ -221,10 +220,7 @@ def main() -> None:
         )
 
     # ── Summary ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("SUMMARY")
-    logger.info("=" * 80)
+    log_section(logger, "SUMMARY", width=80)
     logger.info(
         "  Macro F1:  A (Baseline)=%.4f  B (pos_weight)=%.4f  Delta=%+.4f",
         result_a["macro_f1"], result_b["macro_f1"], delta_f1,

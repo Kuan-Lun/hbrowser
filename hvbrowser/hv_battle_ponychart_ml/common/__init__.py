@@ -23,6 +23,7 @@ from .constants import (
     PHASE2_EPOCHS,
     PRE_RESIZE,
     RAWIMAGE_DIR,
+    RETRAIN_NEW_DATA_RATIO,
     SCHEDULER_FACTOR,
     SCHEDULER_MIN_LR,
     SCHEDULER_PATIENCE,
@@ -51,6 +52,7 @@ from .data import (
 )
 from .device import get_device, get_performance_cpu_count
 from .export import export_onnx
+from .log_helpers import log_section
 from .model import BACKBONE_REGISTRY, BackboneConfig, build_model
 from .training import (
     evaluate,
@@ -88,6 +90,7 @@ __all__ = [
     "PonyChartDataset",
     "PRE_RESIZE",
     "RAWIMAGE_DIR",
+    "RETRAIN_NEW_DATA_RATIO",
     "SCHEDULER_FACTOR",
     "SCHEDULER_MIN_LR",
     "SCHEDULER_PATIENCE",
@@ -108,6 +111,7 @@ __all__ = [
     "group_stratified_split",
     "is_original",
     "labels_to_binary",
+    "log_section",
     "load_samples",
     "make_dataloader",
     "optimize_thresholds",

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 
 import numpy as np
@@ -28,11 +29,13 @@ from .common import (
     OUTPUT_CHECKPOINT,
     OUTPUT_ONNX,
     OUTPUT_THRESHOLDS,
+    RETRAIN_NEW_DATA_RATIO,
     SEED,
     VAL_SIZE,
     balance_crop_samples,
     compute_class_rates,
     export_onnx,
+    get_base_timestamp,
     get_device,
     get_performance_cpu_count,
     group_stratified_split,
@@ -93,8 +96,30 @@ def main() -> None:
     # Auto-detect checkpoint for resume training
     resume_from = None
     if not args.from_scratch and OUTPUT_CHECKPOINT.exists():
-        resume_from = OUTPUT_CHECKPOINT
-        logger.info("Found checkpoint: %s (use --from-scratch to ignore)", resume_from)
+        ckpt = torch.load(OUTPUT_CHECKPOINT, map_location=device, weights_only=True)
+        ckpt_n = ckpt["n_samples"]
+        n_current = len(load_samples())
+        new_data_ratio = (n_current - ckpt_n) / ckpt_n
+        logger.info(
+            "Checkpoint: %d samples (created_at=%s), current: %d samples, "
+            "new_data_ratio=%.1f%%",
+            ckpt_n,
+            ckpt["created_at"],
+            n_current,
+            new_data_ratio * 100,
+        )
+        if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
+            logger.warning(
+                "new_data_ratio (%.1f%%) 超過閾值 RETRAIN_NEW_DATA_RATIO (%.1f%%)，"
+                "自動切換為 from-scratch 訓練。",
+                new_data_ratio * 100,
+                RETRAIN_NEW_DATA_RATIO * 100,
+            )
+        else:
+            resume_from = OUTPUT_CHECKPOINT
+            logger.info(
+                "Found checkpoint: %s (use --from-scratch to ignore)", resume_from
+            )
 
     # Train
     model, thresholds = train_model(
@@ -115,9 +140,27 @@ def main() -> None:
         json.dump(thresholds_dict, f, ensure_ascii=False, indent=2)
     logger.info("Thresholds saved: %s", OUTPUT_THRESHOLDS)
 
-    # Save checkpoint for future resume training
-    torch.save(model.state_dict(), OUTPUT_CHECKPOINT)
-    logger.info("Checkpoint saved: %s", OUTPUT_CHECKPOINT)
+    # Save checkpoint with metadata for future resume training
+    orig_timestamps = [
+        get_base_timestamp(os.path.basename(p)) for p, _ in orig_samples
+    ]
+    latest_timestamp = max(orig_timestamps)
+    n_current = len(load_samples())
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "n_samples": n_current,
+            "class_rates": orig_rates,
+            "created_at": latest_timestamp,
+        },
+        OUTPUT_CHECKPOINT,
+    )
+    logger.info(
+        "Checkpoint saved: %s (n_samples=%d, created_at=%s)",
+        OUTPUT_CHECKPOINT,
+        n_current,
+        latest_timestamp,
+    )
 
     # Export ONNX
     logger.info("Exporting ONNX...")

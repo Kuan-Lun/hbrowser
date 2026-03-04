@@ -754,10 +754,10 @@ class LabelApp:
 
             device = get_device()
             model = build_model(backbone=BACKBONE, pretrained=False).to(device)
-            state_dict = torch.load(
+            ckpt = torch.load(
                 CHECKPOINT_FILE, map_location=device, weights_only=True
             )
-            model.load_state_dict(state_dict)
+            model.load_state_dict(ckpt["state_dict"])
             model.eval()
 
             with open(THRESHOLDS_FILE, encoding="utf-8") as f:

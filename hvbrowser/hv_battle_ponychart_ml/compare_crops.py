@@ -44,6 +44,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     split_by_groups,
     train_model,
@@ -220,10 +221,7 @@ def main() -> None:
     result_c = evaluate(model_c, test_loader, criterion, device, thresholds_c)
 
     # ── Data split summary ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("DATA SPLIT SUMMARY")
-    logger.info("=" * 80)
+    log_section(logger, "DATA SPLIT SUMMARY", width=80)
     logger.info("Test set (shared, originals only): %d images", len(test_samples))
     logger.info("")
     logger.info("Experiment A (orig + biased crops):")
@@ -234,10 +232,7 @@ def main() -> None:
     logger.info("  Train: %d  Val: %d", len(train_c), len(val_c))
 
     # ── Distribution analysis ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("DISTRIBUTION ANALYSIS")
-    logger.info("=" * 80)
+    log_section(logger, "DISTRIBUTION ANALYSIS", width=80)
     log_distribution("Original images (train+val)", train_val_orig)
     crop_rates = log_distribution("Crop images (raw)", train_val_crop)
     log_distribution("Crop images (balanced)", balanced_crops)
@@ -250,10 +245,10 @@ def main() -> None:
         logger.info("    %-20s  %+.1f%%", name, bias * 100)
 
     # ── Print comparison ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("TEST SET EVALUATION (on %d original images)", len(test_samples))
-    logger.info("=" * 80)
+    log_section(
+        logger, "TEST SET EVALUATION (on %d original images)",
+        len(test_samples), width=80,
+    )
     logger.info("  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a)))
     logger.info("  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b)))
     logger.info("  C thresholds: %s", dict(zip(CLASS_NAMES, thresholds_c)))
@@ -313,10 +308,7 @@ def main() -> None:
         )
 
     # ── Effect decomposition ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("EFFECT DECOMPOSITION")
-    logger.info("=" * 80)
+    log_section(logger, "EFFECT DECOMPOSITION", width=80)
     total_effect = result_a["macro_f1"] - result_b["macro_f1"]
     augment_effect = result_c["macro_f1"] - result_b["macro_f1"]
     bias_effect = result_a["macro_f1"] - result_c["macro_f1"]
@@ -356,10 +348,7 @@ def main() -> None:
         )
 
     # ── Correlation: distribution bias vs F1 impact ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("CORRELATION ANALYSIS")
-    logger.info("=" * 80)
+    log_section(logger, "CORRELATION ANALYSIS", width=80)
     r_ab = _pearson_r(bias_per_class, f1_diff_ab)
     f1_diff_ac = [
         result_a["per_class_f1"][i] - result_c["per_class_f1"][i]
@@ -380,10 +369,7 @@ def main() -> None:
     logger.info("  Pearson r (bias vs A-C F1 diff): %.4f  %s", r_ac, ac_hint)
 
     # ── Summary ──
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("SUMMARY")
-    logger.info("=" * 80)
+    log_section(logger, "SUMMARY", width=80)
     logger.info(
         "  Macro F1:  A=%.4f  B=%.4f  C=%.4f",
         result_a["macro_f1"],
@@ -458,10 +444,7 @@ def main() -> None:
         )
     recommendations.sort(key=lambda x: x["score"], reverse=True)
 
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("CROP RECOMMENDATION")
-    logger.info("=" * 80)
+    log_section(logger, "CROP RECOMMENDATION", width=80)
     logger.info(
         "  估算方式: 讓各 class 的 crop 數量比例" "對齊原圖出現比例 (total crops=%d)",
         total_crops,

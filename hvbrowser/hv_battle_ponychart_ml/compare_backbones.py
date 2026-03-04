@@ -42,6 +42,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     separate_orig_crop,
     split_by_groups,
@@ -179,10 +180,7 @@ def main() -> None:
         np.random.seed(SEED)
 
         config = BACKBONE_REGISTRY[backbone_name]
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("BACKBONE: %s", config.description)
-        logger.info("=" * 70)
+        log_section(logger, "BACKBONE: %s", config.description, width=70)
 
         t0 = time.monotonic()
         model, thresholds = train_model(
@@ -224,10 +222,7 @@ def main() -> None:
         )
 
     # ── Comparison table ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("BACKBONE COMPARISON RESULTS")
-    logger.info("=" * 90)
+    log_section(logger, "BACKBONE COMPARISON RESULTS")
 
     logger.info("")
     logger.info(
@@ -289,10 +284,7 @@ def main() -> None:
             )
 
     # ── Recommendation ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("RECOMMENDATION")
-    logger.info("=" * 90)
+    log_section(logger, "RECOMMENDATION")
 
     best_name = max(
         BACKBONES,

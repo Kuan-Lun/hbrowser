@@ -36,6 +36,7 @@ from .common import (
     get_transforms,
     is_original,
     load_samples,
+    log_section,
     make_dataloader,
     split_by_groups,
     train_model,
@@ -111,9 +112,7 @@ def fit_power_law(
     return best_params
 
 
-def extrapolate_f1(
-    params: tuple[float, float, float], n: int
-) -> float:
+def extrapolate_f1(params: tuple[float, float, float], n: int) -> float:
     """Predict F1 at sample count n using fitted power-law parameters."""
     a, b, c = params
     return float(a - b * (n ** (-c)))
@@ -156,12 +155,13 @@ def main() -> None:
     logger.info("Test set (originals only): %d images", len(test_samples))
 
     # Prepare test loader (shared)
-    test_ds = PonyChartDataset(
-        test_samples, get_transforms(is_train=False)
-    )
+    test_ds = PonyChartDataset(test_samples, get_transforms(is_train=False))
     test_loader = make_dataloader(
-        test_ds, BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, device=device,
+        test_ds,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
     criterion = nn.BCEWithLogitsLoss()
 
@@ -198,24 +198,16 @@ def main() -> None:
             sub_groups[base].append(idx)
 
         raw_train_samples = [
-            selected_samples[i]
-            for gk in sub_train_gk
-            for i in sub_groups[gk]
+            selected_samples[i] for gk in sub_train_gk for i in sub_groups[gk]
         ]
-        val_samples = [
-            selected_samples[i]
-            for gk in sub_val_gk
-            for i in sub_groups[gk]
-        ]
+        val_samples = [selected_samples[i] for gk in sub_val_gk for i in sub_groups[gk]]
 
         # Crop balancing (same as train.py)
         orig_train = [
-            s for s in raw_train_samples
-            if is_original(os.path.basename(s[0]))
+            s for s in raw_train_samples if is_original(os.path.basename(s[0]))
         ]
         crop_train = [
-            s for s in raw_train_samples
-            if not is_original(os.path.basename(s[0]))
+            s for s in raw_train_samples if not is_original(os.path.basename(s[0]))
         ]
         orig_rates = compute_class_rates(orig_train)
         balanced_crops = balance_crop_samples(
@@ -238,9 +230,7 @@ def main() -> None:
         prev_state_dict = copy.deepcopy(model.state_dict())
 
         # Evaluate on shared test set
-        result = evaluate(
-            model, test_loader, criterion, device, thresholds
-        )
+        result = evaluate(model, test_loader, criterion, device, thresholds)
         result["fraction"] = frac
         result["n_samples"] = len(selected_samples)
         result["n_train"] = len(train_samples)
@@ -256,13 +246,11 @@ def main() -> None:
         )
 
     # ── Comparison table ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info(
+    log_section(
+        logger,
         "LEARNING CURVE RESULTS (test set: %d original images)",
         len(test_samples),
     )
-    logger.info("=" * 90)
 
     logger.info("")
     logger.info(
@@ -298,9 +286,7 @@ def main() -> None:
     for r in experiment_results:
         header += f"  {int(r['fraction'] * 100)}%".ljust(14)
     logger.info(header)
-    logger.info(
-        "  " + "-" * (20 + 14 * len(experiment_results))
-    )
+    logger.info("  " + "-" * (20 + 14 * len(experiment_results)))
 
     for i, name in enumerate(CLASS_NAMES):
         row = f"  {name:<20s}"
@@ -315,9 +301,7 @@ def main() -> None:
     for r in experiment_results:
         header += f"  {int(r['fraction'] * 100)}%".ljust(14)
     logger.info(header)
-    logger.info(
-        "  " + "-" * (20 + 14 * len(experiment_results))
-    )
+    logger.info("  " + "-" * (20 + 14 * len(experiment_results)))
 
     for i, name in enumerate(CLASS_NAMES):
         row = f"  {name:<20s}"
@@ -326,10 +310,7 @@ def main() -> None:
         logger.info(row)
 
     # ── Power-law extrapolation ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("POWER-LAW EXTRAPOLATION")
-    logger.info("=" * 90)
+    log_section(logger, "POWER-LAW EXTRAPOLATION")
 
     ns = [r["n_samples"] for r in experiment_results]
     macro_f1s = [r["macro_f1"] for r in experiment_results]
@@ -338,9 +319,7 @@ def main() -> None:
     params = fit_power_law(ns, macro_f1s)
     if params is not None:
         a, b, c = params
-        logger.info(
-            "  Fitted: F1 ~ %.4f - %.4f * N^(-%.2f)", a, b, c
-        )
+        logger.info("  Fitted: F1 ~ %.4f - %.4f * N^(-%.2f)", a, b, c)
         logger.info("  Asymptotic F1 (N->inf): %.4f", a)
         logger.info("")
 
@@ -371,8 +350,7 @@ def main() -> None:
             target_f1 = current_f1 + gap * target_pct
             if target_f1 >= a:
                 logger.info(
-                    "    %.0f%% of gap (F1=%.4f): "
-                    "unreachable (asymptote=%.4f)",
+                    "    %.0f%% of gap (F1=%.4f): " "unreachable (asymptote=%.4f)",
                     target_pct * 100,
                     target_f1,
                     a,
@@ -383,23 +361,17 @@ def main() -> None:
             needed_n = (b / (a - target_f1)) ** (1 / c)
             extra_needed = max(0, int(needed_n) - current_n)
             logger.info(
-                "    %.0f%% of gap (F1=%.4f): "
-                "~%d total samples (+%d new)",
+                "    %.0f%% of gap (F1=%.4f): " "~%d total samples (+%d new)",
                 target_pct * 100,
                 target_f1,
                 int(needed_n),
                 extra_needed,
             )
     else:
-        logger.info(
-            "  Power-law fitting failed (insufficient data points)."
-        )
+        logger.info("  Power-law fitting failed (insufficient data points).")
 
     # ── Per-class saturation analysis ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("PER-CLASS SATURATION ANALYSIS")
-    logger.info("=" * 90)
+    log_section(logger, "PER-CLASS SATURATION ANALYSIS")
 
     logger.info("")
     logger.info(
@@ -423,9 +395,7 @@ def main() -> None:
             f1_prev = experiment_results[-2]["per_class_f1"][i]
             n_prev = experiment_results[-2]["n_samples"]
             n_last = experiment_results[-1]["n_samples"]
-            slope = (
-                (f1_last - f1_prev) / max(n_last - n_prev, 1) * 100
-            )
+            slope = (f1_last - f1_prev) / max(n_last - n_prev, 1) * 100
         else:
             slope = 0.0
 
@@ -479,10 +449,7 @@ def main() -> None:
             logger.info("  %-20s  fitting failed", name)
 
     # ── Summary ──
-    logger.info("")
-    logger.info("=" * 90)
-    logger.info("SUMMARY")
-    logger.info("=" * 90)
+    log_section(logger, "SUMMARY")
     logger.info(
         "  Current: %d samples -> Macro F1=%.4f",
         ns[-1],
@@ -502,9 +469,7 @@ def main() -> None:
                 "  結論: 模型在目前架構下已接近飽和 (headroom < 0.01)，"
                 "加更多資料幾乎無法提升 F1。"
             )
-            logger.info(
-                "  建議: 考慮更大的模型架構、更好的特徵工程、或 ensemble。"
-            )
+            logger.info("  建議: 考慮更大的模型架構、更好的特徵工程、或 ensemble。")
         elif headroom < 0.03:
             logger.info(
                 "  結論: 剩餘提升空間有限 (headroom=%.4f)，"
@@ -518,8 +483,7 @@ def main() -> None:
             )
         else:
             logger.info(
-                "  結論: 仍有提升空間 (headroom=%.4f)，"
-                "加更多資料可能有效。",
+                "  結論: 仍有提升空間 (headroom=%.4f)，" "加更多資料可能有效。",
                 headroom,
             )
             pred_400 = extrapolate_f1(params, ns[-1] + 400)
