@@ -102,7 +102,11 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
         self._n_cached = n_cache
         if n_cache > 0:
             self._cache = torch.empty(
-                n_cache, pre_resize, pre_resize, 3, dtype=torch.uint8,
+                n_cache,
+                pre_resize,
+                pre_resize,
+                3,
+                dtype=torch.uint8,
             )
             for i in range(n_cache):
                 path = samples[i][0]
