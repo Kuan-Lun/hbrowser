@@ -27,6 +27,7 @@ from .constants import (
     NUM_CLASSES,
     PATIENCE,
     PHASE1_EPOCHS,
+    PHASE1_PATIENCE,
     PHASE2_EPOCHS,
     PRE_RESIZE,
     SCHEDULER_FACTOR,
@@ -190,9 +191,7 @@ def train_model(
     Returns (best_model, optimized_thresholds).
     """
     if resume_from is not None and resume_state_dict is not None:
-        raise ValueError(
-            "resume_from and resume_state_dict are mutually exclusive"
-        )
+        raise ValueError("resume_from and resume_state_dict are mutually exclusive")
     logger.info("=" * 60)
     logger.info("EXPERIMENT: %s", experiment_name)
     logger.info(
@@ -249,25 +248,42 @@ def train_model(
 
     # Phase 1: Head only (skipped when resuming from checkpoint)
     if not resuming:
-        logger.info("--- Phase 1: Head-only (%d epochs) ---", phase1_epochs)
+        logger.info("--- Phase 1: Head-only (up to %d epochs) ---", phase1_epochs)
         for param in model.features.parameters():
             param.requires_grad = False
         optimizer = torch.optim.AdamW(
             model.classifier.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY
         )
+        best_p1_loss = float("inf")
+        p1_patience_counter = 0
         for epoch in range(1, phase1_epochs + 1):
             train_loss = train_one_epoch(
                 model, train_loader, criterion, optimizer, device, label_smoothing
             )
             val_result = evaluate(model, val_loader, criterion, device)
+            val_loss = val_result["loss"]
+            p1_marker = ""
+            if val_loss < best_p1_loss - MIN_DELTA:
+                best_p1_loss = val_loss
+                p1_patience_counter = 0
+                p1_marker = " *"
+            else:
+                p1_patience_counter += 1
             logger.info(
-                "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f",
+                "  Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val_F1=%.4f%s",
                 epoch,
                 phase1_epochs,
                 train_loss,
-                val_result["loss"],
+                val_loss,
                 val_result["macro_f1"],
+                p1_marker,
             )
+            if p1_patience_counter >= PHASE1_PATIENCE:
+                logger.info(
+                    "  Phase 1 early stopping (no val_loss improvement for %d epochs)",
+                    PHASE1_PATIENCE,
+                )
+                break
     else:
         logger.info("--- Skipping Phase 1 (resuming from checkpoint) ---")
 
