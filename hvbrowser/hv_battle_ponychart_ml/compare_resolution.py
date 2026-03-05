@@ -46,7 +46,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,

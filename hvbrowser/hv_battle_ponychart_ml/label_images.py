@@ -637,9 +637,7 @@ class LabelApp:
                     crop_label_union.setdefault(raw_stem, set()).update(crop_labels)
             crop_mismatch_stems = set()
             for raw_stem, union_labels in crop_label_union.items():
-                raw_key = self.store.path_to_key(
-                    Path(IMAGE_DIR / f"{raw_stem}.png")
-                )
+                raw_key = self.store.path_to_key(Path(IMAGE_DIR / f"{raw_stem}.png"))
                 raw_labels = set(self.store.get(raw_key))
                 if not union_labels.issubset(raw_labels):
                     crop_mismatch_stems.add(raw_stem)
@@ -740,7 +738,8 @@ class LabelApp:
     # ── Model analysis ─────────────────────────────────────────
 
     def _set_suspicious_controls_state(
-        self, state: Literal["normal", "disabled"],
+        self,
+        state: Literal["normal", "disabled"],
     ) -> None:
         """Enable or disable suspicious filter controls."""
         self._suspicious_class_menu.configure(state=state)
@@ -770,9 +769,7 @@ class LabelApp:
                 samples.append((str(p), self.store.get(key)))
                 keys.append(key)
 
-        self._analyze_status.configure(
-            text=f"Analyzing {len(samples)} images..."
-        )
+        self._analyze_status.configure(text=f"Analyzing {len(samples)} images...")
         self._analysis_result = None
         self._analysis_error = None
         self._analysis_thread = threading.Thread(
@@ -801,13 +798,11 @@ class LabelApp:
                 get_transforms,
                 make_dataloader,
             )
-            from .common.data import PonyChartDataset
+            from .common.dataset import PonyChartDataset
 
             device = get_device()
             model = build_model(backbone=BACKBONE, pretrained=False).to(device)
-            ckpt = torch.load(
-                CHECKPOINT_FILE, map_location=device, weights_only=True
-            )
+            ckpt = torch.load(CHECKPOINT_FILE, map_location=device, weights_only=True)
             model.load_state_dict(ckpt["state_dict"])
             model.eval()
 

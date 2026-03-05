@@ -43,7 +43,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +94,7 @@ def main() -> None:
     logger.info("Test set (originals only): %d images", len(test_samples))
 
     # ── Train+val pool: originals + balanced crops from train groups ──
-    train_val_all = [
-        all_samples[idx] for gk in train_val_groups for idx in groups[gk]
-    ]
+    train_val_all = [all_samples[idx] for gk in train_val_groups for idx in groups[gk]]
     train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
     orig_rates = compute_class_rates(train_val_orig)
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
@@ -152,8 +150,10 @@ def main() -> None:
 
     # ── Report ──
     log_section(
-        logger, "HOLDOUT TEST SET EVALUATION (%d original images)",
-        len(test_samples), width=70,
+        logger,
+        "HOLDOUT TEST SET EVALUATION (%d original images)",
+        len(test_samples),
+        width=70,
     )
     logger.info("Thresholds (from val set): %s", dict(zip(CLASS_NAMES, thresholds)))
     logger.info("")

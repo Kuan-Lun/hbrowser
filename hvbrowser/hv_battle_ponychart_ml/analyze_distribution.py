@@ -21,7 +21,7 @@ from typing import Any
 from flask import Flask, render_template_string
 
 from .common import CLASS_NAMES, LABELS_FILE, NUM_CLASSES
-from .common.data import is_original
+from .common.sampling import is_original
 
 app = Flask(__name__)
 
@@ -129,9 +129,7 @@ def _load_all_stats() -> dict[str, Any]:
     with open(LABELS_FILE, encoding="utf-8") as f:
         raw: dict[str, list[int]] = json.load(f)
 
-    orig = {
-        k: v for k, v in raw.items() if is_original(os.path.basename(k))
-    }
+    orig = {k: v for k, v in raw.items() if is_original(os.path.basename(k))}
 
     return {
         "orig": _compute_stats_for(orig),

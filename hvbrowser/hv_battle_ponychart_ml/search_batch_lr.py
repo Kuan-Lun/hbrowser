@@ -5,11 +5,11 @@ Batch size x Learning rate 超參數搜尋。
 找出最佳配置後再套用至 train.py 做完整訓練。
 
 搜尋策略：
-  - batch_sizes: [32, 64, 128, 256]
-  - lr_scales: [0.5, 1.0, 2.0]（相對於 linear scaling rule 的倍率）
+  - batch_sizes: [32, 64]
+  - lr_scales: 依 batch_size 而異（見下方 SEARCH_GRID）
   - linear scaling rule: lr = base_lr * (batch_size / 32)
 
-共 4 x 3 = 12 組實驗，使用相同的 train/val split 確保公平比較。
+共 4 組實驗，使用相同的 train/val split 確保公平比較。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.search_batch_lr
@@ -52,7 +52,7 @@ from .common import (
     make_dataloader,
     train_one_epoch,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,9 +60,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Search grid
-BATCH_SIZES = [32, 64, 128, 256]
-LR_SCALES = [0.5, 1.0, 2.0]
+# Search grid – (batch_size, lr_scale) pairs
+SEARCH_GRID: list[tuple[int, float]] = [
+    (32, 1.0),  # baseline
+    (32, 0.5),  # lower LR
+    (64, 1.0),  # linear scaling rule
+    (64, 2.0),  # aggressive LR
+]
 
 # Base LRs from constants (single source of truth with train.py)
 BASE_LR_HEAD = LR_HEAD
@@ -85,12 +89,18 @@ def run_experiment(
     train_ds = PonyChartDataset(train_samples, get_transforms(is_train=True))
     val_ds = PonyChartDataset(val_samples, get_transforms(is_train=False))
     train_loader = make_dataloader(
-        train_ds, batch_size, shuffle=True,
-        num_workers=num_workers, device=device,
+        train_ds,
+        batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        device=device,
     )
     val_loader = make_dataloader(
-        val_ds, batch_size, shuffle=False,
-        num_workers=num_workers, device=device,
+        val_ds,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
 
     model = build_model(backbone=backbone, pretrained=True).to(device)
@@ -116,8 +126,11 @@ def run_experiment(
         weight_decay=WEIGHT_DECAY,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=SCHEDULER_FACTOR,
-        patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR,
+        optimizer,
+        mode="max",
+        factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE,
+        min_lr=SCHEDULER_MIN_LR,
     )
 
     best_f1 = 0.0
@@ -162,14 +175,12 @@ def main() -> None:
     if not samples:
         logger.error("No samples found. Check rawimage/ and labels.json.")
         return
-    train_idx, val_idx = group_stratified_split(
-        samples, test_size=VAL_SIZE, seed=SEED
-    )
+    train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
     logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
 
-    total_combos = len(BATCH_SIZES) * len(LR_SCALES)
+    total_combos = len(SEARCH_GRID)
     logger.info("")
     logger.info("=" * 70)
     logger.info(
@@ -177,8 +188,7 @@ def main() -> None:
         total_combos,
     )
     logger.info("  Backbone:    %s", BACKBONE)
-    logger.info("  Batch sizes: %s", BATCH_SIZES)
-    logger.info("  LR scales:   %s (x linear scaling rule)", LR_SCALES)
+    logger.info("  Grid:        %s", SEARCH_GRID)
     logger.info(
         "  Phase 1: %d epochs, Phase 2: %d epochs (patience=%d)",
         SEARCH_PHASE1_EPOCHS,
@@ -190,62 +200,58 @@ def main() -> None:
 
     # Run experiments sequentially on device
     results: list[dict[str, Any]] = []
-    run_idx = 0
-    for batch_size in BATCH_SIZES:
-        for lr_scale in LR_SCALES:
-            run_idx += 1
-            linear_factor = batch_size / 32.0
-            lr_head = BASE_LR_HEAD * linear_factor * lr_scale
-            lr_features = BASE_LR_FEATURES * linear_factor * lr_scale
-            lr_classifier = BASE_LR_CLASSIFIER * linear_factor * lr_scale
+    for run_idx, (batch_size, lr_scale) in enumerate(SEARCH_GRID, 1):
+        linear_factor = batch_size / 32.0
+        lr_head = BASE_LR_HEAD * linear_factor * lr_scale
+        lr_features = BASE_LR_FEATURES * linear_factor * lr_scale
+        lr_classifier = BASE_LR_CLASSIFIER * linear_factor * lr_scale
 
-            logger.info(
-                "  [%d/%d] batch=%d  lr_scale=%s  "
-                "(head=%.1e  feat=%.1e  cls=%.1e)",
-                run_idx,
-                total_combos,
-                batch_size,
-                lr_scale,
-                lr_head,
-                lr_features,
-                lr_classifier,
-            )
+        logger.info(
+            "  [%d/%d] batch=%d  lr_scale=%s  " "(head=%.1e  feat=%.1e  cls=%.1e)",
+            run_idx,
+            total_combos,
+            batch_size,
+            lr_scale,
+            lr_head,
+            lr_features,
+            lr_classifier,
+        )
 
-            torch.manual_seed(SEED)
-            np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
 
-            t0 = time.monotonic()
-            result = run_experiment(
-                train_samples,
-                val_samples,
-                device,
-                num_workers,
-                batch_size,
-                lr_head,
-                lr_features,
-                lr_classifier,
-                BACKBONE,
-            )
-            elapsed = time.monotonic() - t0
+        t0 = time.monotonic()
+        result = run_experiment(
+            train_samples,
+            val_samples,
+            device,
+            num_workers,
+            batch_size,
+            lr_head,
+            lr_features,
+            lr_classifier,
+            BACKBONE,
+        )
+        elapsed = time.monotonic() - t0
 
-            result.update(
-                {
-                    "batch_size": batch_size,
-                    "lr_scale": lr_scale,
-                    "lr_head": lr_head,
-                    "lr_features": lr_features,
-                    "lr_classifier": lr_classifier,
-                    "time_s": elapsed,
-                    "run_idx": run_idx,
-                }
-            )
-            results.append(result)
-            logger.info(
-                "    -> F1=%.4f  stopped_epoch=%d  time=%.1fs",
-                result["best_f1"],
-                result["stopped_epoch"],
-                result["time_s"],
-            )
+        result.update(
+            {
+                "batch_size": batch_size,
+                "lr_scale": lr_scale,
+                "lr_head": lr_head,
+                "lr_features": lr_features,
+                "lr_classifier": lr_classifier,
+                "time_s": elapsed,
+                "run_idx": run_idx,
+            }
+        )
+        results.append(result)
+        logger.info(
+            "    -> F1=%.4f  stopped_epoch=%d  time=%.1fs",
+            result["best_f1"],
+            result["stopped_epoch"],
+            result["time_s"],
+        )
 
     logger.info("")
 
@@ -270,8 +276,7 @@ def main() -> None:
     logger.info("  " + "-" * 85)
     for rank, r in enumerate(results, 1):
         logger.info(
-            "  #%-3d  %-6d  %-8s  %-10.1e  %-10.1e  %-10.1e"
-            "  %-8.4f  %-6d  %-7.1fs",
+            "  #%-3d  %-6d  %-8s  %-10.1e  %-10.1e  %-10.1e" "  %-8.4f  %-6d  %-7.1fs",
             rank,
             r["batch_size"],
             f"{r['lr_scale']:.1f}x",
@@ -302,9 +307,7 @@ def main() -> None:
     log_section(logger, "RECOMMENDATION")
     logger.info("  Best config:")
     logger.info("    --batch-size %d", best["batch_size"])
-    logger.info(
-        "    Phase 1 lr: %.1e  (train.py default: 1e-3)", best["lr_head"]
-    )
+    logger.info("    Phase 1 lr: %.1e  (train.py default: 1e-3)", best["lr_head"])
     logger.info(
         "    Phase 2 lr_features: %.1e  (train.py default: 3e-5)",
         best["lr_features"],
@@ -317,27 +320,19 @@ def main() -> None:
 
     # Compare with baseline (batch=32, scale=1.0)
     baseline = next(
-        (
-            r
-            for r in results
-            if r["batch_size"] == 32 and r["lr_scale"] == 1.0
-        ),
+        (r for r in results if r["batch_size"] == 32 and r["lr_scale"] == 1.0),
         None,
     )
     if baseline and best is not baseline:
         diff = best["best_f1"] - baseline["best_f1"]
-        speedup = (
-            baseline["time_s"] / best["time_s"] if best["time_s"] > 0 else 0
-        )
+        speedup = baseline["time_s"] / best["time_s"] if best["time_s"] > 0 else 0
         logger.info(
             "  vs baseline (batch=32, 1.0x): F1 %+.4f, %.1fx speed",
             diff,
             speedup,
         )
     elif baseline:
-        logger.info(
-            "  Baseline (batch=32, 1.0x) is already the best config."
-        )
+        logger.info("  Baseline (batch=32, 1.0x) is already the best config.")
     logger.info("=" * 90)
 
 

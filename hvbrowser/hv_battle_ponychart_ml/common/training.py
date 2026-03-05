@@ -35,8 +35,13 @@ from .constants import (
     SCHEDULER_PATIENCE,
     WEIGHT_DECAY,
 )
-from .data import PonyChartDataset, get_transforms, make_dataloader
-from .model import build_model
+from .dataset import (
+    PonyChartDataset,
+    compute_cache_budget,
+    get_transforms,
+    make_dataloader,
+)
+from .model import build_model, measure_training_memory
 
 logger = logging.getLogger(__name__)
 
@@ -211,8 +216,30 @@ def train_model(
         train_transform = get_transforms(is_train=True, input_size=input_size)
     val_transform = get_transforms(is_train=False, input_size=input_size)
 
-    train_ds = PonyChartDataset(train_samples, train_transform, pre_resize=pre_resize)
-    val_ds = PonyChartDataset(val_samples, val_transform, pre_resize=pre_resize)
+    training_reserve = measure_training_memory(
+        backbone, batch_size, input_size, device,
+    )
+    total_budget = compute_cache_budget(
+        pre_resize,
+        n_datasets=2,
+        training_reserve=training_reserve,
+    )
+    n_total = len(train_samples) + len(val_samples)
+    train_budget = int(total_budget * len(train_samples) / n_total)
+    val_budget = total_budget - train_budget
+
+    train_ds = PonyChartDataset(
+        train_samples,
+        train_transform,
+        pre_resize=pre_resize,
+        max_cached=train_budget,
+    )
+    val_ds = PonyChartDataset(
+        val_samples,
+        val_transform,
+        pre_resize=pre_resize,
+        max_cached=val_budget,
+    )
     train_loader = make_dataloader(
         train_ds,
         batch_size,

@@ -49,7 +49,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -246,8 +246,10 @@ def main() -> None:
 
     # ── Print comparison ──
     log_section(
-        logger, "TEST SET EVALUATION (on %d original images)",
-        len(test_samples), width=80,
+        logger,
+        "TEST SET EVALUATION (on %d original images)",
+        len(test_samples),
+        width=80,
     )
     logger.info("  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a)))
     logger.info("  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b)))

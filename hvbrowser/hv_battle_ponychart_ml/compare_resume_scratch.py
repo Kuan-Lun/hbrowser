@@ -50,7 +50,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -197,8 +197,12 @@ def main() -> None:
 
         # Step 1: Train from scratch on base data -> checkpoint
         log_section(
-            logger, "BASE %d%% (%d samples) -> new_data_ratio=%.1f%%",
-            pct, len(base_samples), new_ratio * 100, width=70,
+            logger,
+            "BASE %d%% (%d samples) -> new_data_ratio=%.1f%%",
+            pct,
+            len(base_samples),
+            new_ratio * 100,
+            width=70,
         )
 
         torch.manual_seed(SEED)
