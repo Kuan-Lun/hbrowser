@@ -381,6 +381,15 @@ class LabelApp:
         )
         self.uncropped_only_cb.pack(side="left", padx=(0, 8))
 
+        self.crop_mismatch_var = tk.BooleanVar(value=False)
+        self.crop_mismatch_cb = tk.Checkbutton(
+            filter_frame,
+            text="裁切標籤不符",
+            variable=self.crop_mismatch_var,
+            command=self._apply_filters,
+        )
+        self.crop_mismatch_cb.pack(side="left", padx=(0, 8))
+
         self.filter_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             filter_frame,
@@ -580,6 +589,7 @@ class LabelApp:
         raw_only = self.raw_only_var.get()
         uncropped_only = self.uncropped_only_var.get()
         unlabeled_only = self.filter_var.get()
+        crop_mismatch = self.crop_mismatch_var.get()
 
         show_mislabel = self._mislabel_var.get()
         show_missing = self._missing_var.get()
@@ -592,6 +602,7 @@ class LabelApp:
             not raw_only
             and not uncropped_only
             and not unlabeled_only
+            and not crop_mismatch
             and not suspicious_active
         ):
             return None
@@ -606,6 +617,31 @@ class LabelApp:
                     if m:
                         raw_stems_with_crops.add(m.group(1))
 
+        # 預計算裁切標籤不符的 raw stem 集合
+        crop_mismatch_stems: set[str] | None = None
+        if crop_mismatch:
+            # raw_stem -> union of crop labels
+            crop_label_union: dict[str, set[int]] = {}
+            for p in self.nav.all_paths:
+                if is_raw_image(p):
+                    continue
+                m = re.match(r"(pony_chart_\d{8}_\d{6})", p.stem)
+                if not m:
+                    continue
+                raw_stem = m.group(1)
+                key = self.store.path_to_key(p)
+                crop_labels = self.store.get(key)
+                if crop_labels:
+                    crop_label_union.setdefault(raw_stem, set()).update(crop_labels)
+            crop_mismatch_stems = set()
+            for raw_stem, union_labels in crop_label_union.items():
+                raw_key = self.store.path_to_key(
+                    Path(IMAGE_DIR / f"{raw_stem}.png")
+                )
+                raw_labels = set(self.store.get(raw_key))
+                if not union_labels.issubset(raw_labels):
+                    crop_mismatch_stems.add(raw_stem)
+
         store = self.store
         model_probs = self._model_probs
         model_thresholds = self._model_thresholds
@@ -619,6 +655,11 @@ class LabelApp:
                 return False
             if unlabeled_only and store.has(store.path_to_key(p)):
                 return False
+            if crop_mismatch_stems is not None:
+                if not is_raw_image(p):
+                    return False
+                if p.stem not in crop_mismatch_stems:
+                    return False
             if (
                 suspicious_active
                 and model_probs is not None
@@ -665,6 +706,7 @@ class LabelApp:
         """重置所有篩選 checkbox 並清除篩選。"""
         self.raw_only_var.set(False)
         self.uncropped_only_var.set(False)
+        self.crop_mismatch_var.set(False)
         self.filter_var.set(False)
         self.raw_only_cb.configure(state="normal")
         self.uncropped_only_cb.configure(state="normal")
