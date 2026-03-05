@@ -2,6 +2,9 @@
   // --- Python 分析設定 ---
   // 關閉 Pylance 型別檢查，統一由 mypy 負責（Pylance 仍提供補完/跳轉等語言服務）。
   "python.analysis.typeCheckingMode": "off",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingModuleSource": "none"
+  },
   // --- 格式化設定 ---
   // 使用 Black 作為唯一 formatter（僅作用於 Python）。
   "editor.formatOnSave": true,
