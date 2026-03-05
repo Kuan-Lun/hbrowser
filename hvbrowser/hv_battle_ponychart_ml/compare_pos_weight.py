@@ -45,7 +45,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,9 +91,7 @@ def main() -> None:
     logger.info("Test set (originals only): %d images", len(test_samples))
 
     # ── Train+val pool: originals + balanced crops ──
-    train_val_all = [
-        all_samples[idx] for gk in train_val_groups for idx in groups[gk]
-    ]
+    train_val_all = [all_samples[idx] for gk in train_val_groups for idx in groups[gk]]
     train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
     orig_rates = compute_class_rates(train_val_orig)
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
@@ -115,12 +113,8 @@ def main() -> None:
     train_gk, val_gk = split_by_groups(
         train_val_balanced, test_size=VAL_SIZE, seed=SEED
     )
-    train_samples = [
-        train_val_balanced[i] for gk in train_gk for i in tv_groups[gk]
-    ]
-    val_samples = [
-        train_val_balanced[i] for gk in val_gk for i in tv_groups[gk]
-    ]
+    train_samples = [train_val_balanced[i] for gk in train_gk for i in tv_groups[gk]]
+    val_samples = [train_val_balanced[i] for gk in val_gk for i in tv_groups[gk]]
     logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
 
     # ── Compute pos_weight from training data ──
@@ -170,8 +164,10 @@ def main() -> None:
 
     # ── Report ──
     log_section(
-        logger, "HOLDOUT TEST SET EVALUATION (%d original images)",
-        len(test_samples), width=80,
+        logger,
+        "HOLDOUT TEST SET EVALUATION (%d original images)",
+        len(test_samples),
+        width=80,
     )
     logger.info("  A thresholds: %s", dict(zip(CLASS_NAMES, thresholds_a)))
     logger.info("  B thresholds: %s", dict(zip(CLASS_NAMES, thresholds_b)))
@@ -179,18 +175,27 @@ def main() -> None:
 
     logger.info(
         "%-20s  %-18s  %-18s  %-10s",
-        "Metric", "A (Baseline)", "B (pos_weight)", "Delta",
+        "Metric",
+        "A (Baseline)",
+        "B (pos_weight)",
+        "Delta",
     )
     logger.info("-" * 70)
     delta_f1 = result_b["macro_f1"] - result_a["macro_f1"]
     logger.info(
         "%-20s  %-18.4f  %-18.4f  %+.4f",
-        "Macro F1", result_a["macro_f1"], result_b["macro_f1"], delta_f1,
+        "Macro F1",
+        result_a["macro_f1"],
+        result_b["macro_f1"],
+        delta_f1,
     )
     delta_loss = result_b["loss"] - result_a["loss"]
     logger.info(
         "%-20s  %-18.4f  %-18.4f  %+.4f",
-        "Loss", result_a["loss"], result_b["loss"], delta_loss,
+        "Loss",
+        result_a["loss"],
+        result_b["loss"],
+        delta_loss,
     )
 
     logger.info("")
@@ -198,8 +203,12 @@ def main() -> None:
     logger.info(
         "  %-20s  %-7s %-7s %-7s | %-7s %-7s %-7s | %-7s",
         "Class",
-        "A_P", "A_R", "A_F1",
-        "B_P", "B_R", "B_F1",
+        "A_P",
+        "A_R",
+        "A_F1",
+        "B_P",
+        "B_R",
+        "B_F1",
         "Delta",
     )
     logger.info("  " + "-" * 75)
@@ -223,14 +232,18 @@ def main() -> None:
     log_section(logger, "SUMMARY", width=80)
     logger.info(
         "  Macro F1:  A (Baseline)=%.4f  B (pos_weight)=%.4f  Delta=%+.4f",
-        result_a["macro_f1"], result_b["macro_f1"], delta_f1,
+        result_a["macro_f1"],
+        result_b["macro_f1"],
+        delta_f1,
     )
 
     improved = sum(1 for d in deltas if d > 0)
     degraded = sum(1 for d in deltas if d < 0)
     logger.info(
         "  Per-class: %d improved, %d degraded (of %d)",
-        improved, degraded, NUM_CLASSES,
+        improved,
+        degraded,
+        NUM_CLASSES,
     )
 
     if delta_f1 > 0.005:

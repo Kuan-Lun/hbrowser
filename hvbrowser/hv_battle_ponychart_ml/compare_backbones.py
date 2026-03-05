@@ -48,7 +48,7 @@ from .common import (
     split_by_groups,
     train_model,
 )
-from .common.data import PonyChartDataset
+from .common.dataset import PonyChartDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,9 +121,7 @@ def main() -> None:
     logger.info("Test set (originals only): %d images", len(test_samples))
 
     # ── Train+val pool: originals + balanced crops from train groups ──
-    train_val_all = [
-        all_samples[idx] for gk in train_val_groups for idx in groups[gk]
-    ]
+    train_val_all = [all_samples[idx] for gk in train_val_groups for idx in groups[gk]]
     train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
     orig_rates = compute_class_rates(train_val_orig)
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
@@ -146,14 +144,10 @@ def main() -> None:
         train_val_balanced, test_size=VAL_SIZE, seed=SEED
     )
     train_samples = [
-        train_val_balanced[idx]
-        for gk in train_gk
-        for idx in tv_groups_inner[gk]
+        train_val_balanced[idx] for gk in train_gk for idx in tv_groups_inner[gk]
     ]
     val_samples = [
-        train_val_balanced[idx]
-        for gk in val_gk
-        for idx in tv_groups_inner[gk]
+        train_val_balanced[idx] for gk in val_gk for idx in tv_groups_inner[gk]
     ]
     logger.info(
         "Train: %d  Val: %d  Test: %d",
@@ -163,12 +157,13 @@ def main() -> None:
     )
 
     # Prepare test loader (shared)
-    test_ds = PonyChartDataset(
-        test_samples, get_transforms(is_train=False)
-    )
+    test_ds = PonyChartDataset(test_samples, get_transforms(is_train=False))
     test_loader = make_dataloader(
-        test_ds, BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, device=device,
+        test_ds,
+        BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
     criterion = nn.BCEWithLogitsLoss()
 
@@ -194,9 +189,7 @@ def main() -> None:
         train_time = time.monotonic() - t0
 
         # Evaluate on test set
-        test_result = evaluate(
-            model, test_loader, criterion, device, thresholds
-        )
+        test_result = evaluate(model, test_loader, criterion, device, thresholds)
 
         # Model stats
         param_count = count_parameters(model)
@@ -212,8 +205,7 @@ def main() -> None:
         }
 
         logger.info(
-            ">> %s: test Macro F1=%.4f  params=%dK  ONNX=%.1fMB"
-            "  time=%.0fs",
+            ">> %s: test Macro F1=%.4f  params=%dK  ONNX=%.1fMB" "  time=%.0fs",
             backbone_name,
             test_result["macro_f1"],
             param_count // 1000,
@@ -239,9 +231,7 @@ def main() -> None:
     for name in BACKBONES:
         r = results[name]
         tr = r["test_result"]
-        thr_str = " ".join(
-            f"{t:.2f}" for t in r["thresholds"]
-        )
+        thr_str = " ".join(f"{t:.2f}" for t in r["thresholds"])
         logger.info(
             "  %-22s  %-10.4f  %-10s  %-10s  %-10s  %s",
             name,
@@ -293,9 +283,7 @@ def main() -> None:
     best_r = results[best_name]
     best_f1 = best_r["test_result"]["macro_f1"]
 
-    logger.info(
-        "  Best backbone: %s (Macro F1=%.4f)", best_name, best_f1
-    )
+    logger.info("  Best backbone: %s (Macro F1=%.4f)", best_name, best_f1)
     logger.info("")
 
     # Compare each to best
@@ -306,9 +294,7 @@ def main() -> None:
         if name == best_name:
             logger.info("  * %s: F1=%.4f (BEST)", name, f1)
         else:
-            logger.info(
-                "    %s: F1=%.4f (%+.4f vs best)", name, f1, diff
-            )
+            logger.info("    %s: F1=%.4f (%+.4f vs best)", name, f1, diff)
 
     # Efficiency analysis
     logger.info("")
@@ -318,14 +304,8 @@ def main() -> None:
         r = results[name]
         f1 = r["test_result"]["macro_f1"]
         gain = f1 - small_f1
-        size_ratio = (
-            r["onnx_size_mb"]
-            / results["mobilenet_v3_small"]["onnx_size_mb"]
-        )
-        time_ratio = (
-            r["train_time_s"]
-            / results["mobilenet_v3_small"]["train_time_s"]
-        )
+        size_ratio = r["onnx_size_mb"] / results["mobilenet_v3_small"]["onnx_size_mb"]
+        time_ratio = r["train_time_s"] / results["mobilenet_v3_small"]["train_time_s"]
         logger.info(
             "    %s: F1 %+.4f vs small, %.1fx size, %.1fx time",
             name,
@@ -335,12 +315,9 @@ def main() -> None:
         )
 
     logger.info("")
+    logger.info("  To use the best backbone for production training:")
     logger.info(
-        "  To use the best backbone for production training:"
-    )
-    logger.info(
-        "    uv run python -m hvbrowser.hv_battle_ponychart_ml.train"
-        " --backbone %s",
+        "    uv run python -m hvbrowser.hv_battle_ponychart_ml.train" " --backbone %s",
         best_name,
     )
     logger.info("=" * 90)

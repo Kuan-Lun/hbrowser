@@ -8,8 +8,8 @@ from pathlib import Path
 import torch
 
 from .common.constants import OUTPUT_CHECKPOINT
-from .common.data import load_samples, separate_orig_crop
 from .common.model import BACKBONE_REGISTRY, build_model
+from .common.sampling import load_samples, separate_orig_crop
 
 
 def _detect_backbone(state_dict: dict[str, object]) -> str:

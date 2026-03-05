@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import gc
+import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import psutil
+import torch
 import torch.nn as nn
 from torchvision import models
 
 from .constants import NUM_CLASSES
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -99,3 +106,53 @@ def build_model(
     model.classifier[layer_idx] = nn.Linear(in_features, NUM_CLASSES)
 
     return model
+
+
+def _get_rss_bytes() -> int:
+    """Return current process RSS in bytes."""
+    return psutil.Process(os.getpid()).memory_info().rss
+
+
+def measure_training_memory(
+    backbone: str,
+    batch_size: int,
+    input_size: int,
+    device: torch.device,
+) -> int:
+    """Measure system RAM needed for training via a dry-run forward+backward.
+
+    Returns 0 for CUDA (GPU VRAM is separate from system RAM).
+    For MPS/CPU, performs a single training step and measures the RSS delta.
+    """
+    if device.type == "cuda":
+        return 0
+
+    gc.collect()
+    rss_before = _get_rss_bytes()
+
+    model = build_model(backbone=backbone, pretrained=False).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    dummy = torch.randn(batch_size, 3, input_size, input_size, device=device)
+    target = torch.zeros(batch_size, NUM_CLASSES, device=device)
+
+    # Measure after forward (peak: weights + optimizer states + activations)
+    logits = model(dummy)
+    loss = criterion(logits, target)
+    rss_peak = _get_rss_bytes()
+
+    loss.backward()
+    optimizer.step()
+
+    gc.collect()
+    rss_after = _get_rss_bytes()
+
+    # Use the higher of peak (with activations) and post-step (with gradients)
+    total = max(rss_peak - rss_before, rss_after - rss_before, 0)
+    logger.info(
+        "Measured training memory: %.0f MB (device=%s)",
+        total / 1024 / 1024,
+        device.type,
+    )
+    return total
