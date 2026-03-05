@@ -11,6 +11,7 @@
 
 import glob
 import json
+import random
 import re
 import threading
 import tkinter as tk
@@ -329,7 +330,8 @@ class LabelApp:
         self.nav = ImageNavigator(image_paths, self.store)
 
         root.title(
-            "Pony Chart Labeler" " (1..6 標記 | A/D 切換 | S 儲存 | C 裁切 | G 跳轉)"
+            "Pony Chart Labeler"
+            " (1..6 標記 | A/D 切換 | S 儲存 | C 裁切 | G 跳轉 | R 隨機)"
         )
 
         # Canvas 用於圖片顯示與裁切
@@ -354,7 +356,7 @@ class LabelApp:
             root,
             text=(
                 "1..6 加/取消標籤  |  A 上一張  |  D 下一張"
-                "  |  S 儲存  |  C 裁切  |  G 跳轉"
+                "  |  S 儲存  |  C 裁切  |  G 跳轉  |  R 隨機"
             ),
             fg="#666",
         ).pack(pady=(0, 6))
@@ -716,6 +718,13 @@ class LabelApp:
         self._suspicious_class_var.set("All")
         self.nav.apply_filter(None)
 
+    def _jump_to_random(self) -> None:
+        if self.nav.total <= 1:
+            return
+        n = random.randint(1, self.nav.total)
+        self.nav.go_to(n)
+        self._refresh()
+
     def _jump_to_image(self) -> None:
         n = simpledialog.askinteger(
             "跳轉",
@@ -936,6 +945,8 @@ class LabelApp:
                 )
             case "g":
                 self._jump_to_image()
+            case "r":
+                self._jump_to_random()
 
 
 def main() -> None:
