@@ -63,7 +63,7 @@ def compute_cache_budget(
         reserve / 1024 / 1024,
         training_reserve / 1024 / 1024,
     )
-    return total_images
+    return int(total_images)
 
 
 # ---------------------------------------------------------------------------
@@ -72,15 +72,16 @@ def compute_cache_budget(
 class PonyChartDataset(Dataset):  # type: ignore[misc]
     """Dataset with adaptive image caching based on available memory.
 
-    *max_cached* controls how many images to keep in memory.  Use
-    :func:`compute_cache_budget` to determine a sensible total, then
-    split it among datasets proportionally.  Un-cached images are loaded
-    from disk on each access.
+    When *max_cached* is ``None`` (the default), the dataset
+    auto-computes a safe cache budget via :func:`compute_cache_budget`
+    so that it never exceeds available system memory.  Pass an explicit
+    integer to override.
 
     The cache is stored as a ``torch.uint8`` tensor in POSIX shared
     memory (``share_memory_()``), so DataLoader workers spawned via the
     ``spawn`` start method access the same physical pages without
-    per-worker duplication.
+    per-worker duplication.  Un-cached images are loaded from disk on
+    each access.
     """
 
     def __init__(
@@ -94,10 +95,9 @@ class PonyChartDataset(Dataset):  # type: ignore[misc]
         self.transform = transform
         self._pre_resize = pre_resize
 
-        if max_cached is not None:
-            n_cache = min(max_cached, len(samples))
-        else:
-            n_cache = len(samples)
+        if max_cached is None:
+            max_cached = compute_cache_budget(pre_resize, n_datasets=1)
+        n_cache = min(max_cached, len(samples))
 
         self._n_cached = n_cache
         if n_cache > 0:
@@ -171,6 +171,63 @@ def get_transforms(is_train: bool, input_size: int = INPUT_SIZE) -> transforms.C
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Data pipeline factory
+# ---------------------------------------------------------------------------
+def build_data_pipeline(
+    train_samples: list[tuple[str, list[int]]],
+    val_samples: list[tuple[str, list[int]]],
+    *,
+    batch_size: int,
+    device: torch.device,
+    num_workers: int,
+    training_reserve: int = 0,
+    pre_resize: int = PRE_RESIZE,
+    input_size: int = INPUT_SIZE,
+    train_transform: transforms.Compose | None = None,
+    val_transform: transforms.Compose | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    """Build train/val datasets with memory-safe caching and DataLoaders.
+
+    Computes a safe cache budget based on available system memory,
+    subtracting *training_reserve* bytes (use
+    :func:`~.model.measure_training_memory` to obtain this value).
+    The budget is split proportionally between train and val datasets.
+
+    Returns ``(train_loader, val_loader)``.
+    """
+    if train_transform is None:
+        train_transform = get_transforms(is_train=True, input_size=input_size)
+    if val_transform is None:
+        val_transform = get_transforms(is_train=False, input_size=input_size)
+
+    total_budget = compute_cache_budget(
+        pre_resize, n_datasets=2, training_reserve=training_reserve,
+    )
+    n_total = len(train_samples) + len(val_samples)
+    train_budget = int(total_budget * len(train_samples) / n_total)
+    val_budget = total_budget - train_budget
+
+    train_ds = PonyChartDataset(
+        train_samples, train_transform,
+        pre_resize=pre_resize, max_cached=train_budget,
+    )
+    val_ds = PonyChartDataset(
+        val_samples, val_transform,
+        pre_resize=pre_resize, max_cached=val_budget,
+    )
+
+    train_loader = make_dataloader(
+        train_ds, batch_size, shuffle=True,
+        num_workers=num_workers, device=device,
+    )
+    val_loader = make_dataloader(
+        val_ds, batch_size, shuffle=False,
+        num_workers=num_workers, device=device,
+    )
+    return train_loader, val_loader
 
 
 # ---------------------------------------------------------------------------
