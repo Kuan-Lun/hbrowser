@@ -119,14 +119,11 @@ def main() -> None:
         required_keys = list(arch_keys) + ["n_orig_at_full_train"]
         missing = [k for k in required_keys if k not in ckpt]
         mismatches = {
-            k: (ckpt[k], v)
-            for k, v in arch_keys.items()
-            if k in ckpt and ckpt[k] != v
+            k: (ckpt[k], v) for k, v in arch_keys.items() if k in ckpt and ckpt[k] != v
         }
         if missing:
             logger.warning(
-                "Legacy checkpoint missing keys: %s. "
-                "自動切換為 from-scratch 訓練。",
+                "Legacy checkpoint missing keys: %s. " "自動切換為 from-scratch 訓練。",
                 ", ".join(missing),
             )
         elif mismatches:
@@ -187,9 +184,7 @@ def main() -> None:
     logger.info("Thresholds saved: %s", OUTPUT_THRESHOLDS)
 
     # Save checkpoint with metadata for future resume training
-    orig_timestamps = [
-        get_base_timestamp(os.path.basename(p)) for p, _ in orig_samples
-    ]
+    orig_timestamps = [get_base_timestamp(os.path.basename(p)) for p, _ in orig_samples]
     latest_timestamp = max(orig_timestamps)
     n_orig_current = len(orig_samples)
     n_crop_current = len(crop_samples)
