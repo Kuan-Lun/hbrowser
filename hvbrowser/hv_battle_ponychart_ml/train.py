@@ -116,7 +116,8 @@ def main() -> None:
             "pre_resize": PRE_RESIZE,
             "num_classes": NUM_CLASSES,
         }
-        missing = [k for k in arch_keys if k not in ckpt]
+        required_keys = list(arch_keys) + ["n_orig_at_full_train"]
+        missing = [k for k in required_keys if k not in ckpt]
         mismatches = {
             k: (ckpt[k], v)
             for k, v in arch_keys.items()
@@ -138,20 +139,23 @@ def main() -> None:
                 )
             logger.warning("自動切換為 from-scratch 訓練。")
         else:
-            ckpt_n = ckpt["n_samples"]
-            n_current = len(load_samples())
-            new_data_ratio = (n_current - ckpt_n) / ckpt_n
+            n_orig_full_train = ckpt["n_orig_at_full_train"]
+            n_orig_current = len(separate_orig_crop(load_samples())[0])
+            new_data_ratio = (n_orig_current - n_orig_full_train) / n_orig_full_train
             logger.info(
-                "Checkpoint: %d samples (created_at=%s), current: %d samples, "
-                "new_data_ratio=%.1f%%",
-                ckpt_n,
+                "Checkpoint: %d orig at last full train, "
+                "%d orig at last save (created_at=%s), current: %d orig, "
+                "cumulative new_data_ratio=%.1f%%",
+                n_orig_full_train,
+                ckpt["n_orig"],
                 ckpt["created_at"],
-                n_current,
+                n_orig_current,
                 new_data_ratio * 100,
             )
             if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
                 logger.warning(
-                    "new_data_ratio (%.1f%%) 超過閾值 RETRAIN_NEW_DATA_RATIO (%.1f%%)，"
+                    "cumulative new_data_ratio (%.1f%%) 超過閾值 "
+                    "RETRAIN_NEW_DATA_RATIO (%.1f%%)，"
                     "自動切換為 from-scratch 訓練。",
                     new_data_ratio * 100,
                     RETRAIN_NEW_DATA_RATIO * 100,
@@ -187,11 +191,23 @@ def main() -> None:
         get_base_timestamp(os.path.basename(p)) for p, _ in orig_samples
     ]
     latest_timestamp = max(orig_timestamps)
-    n_current = len(load_samples())
+    n_orig_current = len(orig_samples)
+    n_crop_current = len(crop_samples)
+
+    # Track original sample count at last full training for cumulative drift detection.
+    # On from-scratch: set to current count. On resume: carry forward from checkpoint.
+    if resume_from is not None:
+        ckpt = torch.load(resume_from, map_location=device, weights_only=True)
+        n_orig_at_full_train = ckpt["n_orig_at_full_train"]
+    else:
+        n_orig_at_full_train = n_orig_current
+
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "n_samples": n_current,
+            "n_orig": n_orig_current,
+            "n_crop": n_crop_current,
+            "n_orig_at_full_train": n_orig_at_full_train,
             "class_rates": orig_rates,
             "created_at": latest_timestamp,
             # Model architecture (mismatch -> from-scratch)
@@ -211,9 +227,9 @@ def main() -> None:
         OUTPUT_CHECKPOINT,
     )
     logger.info(
-        "Checkpoint saved: %s (n_samples=%d, created_at=%s)",
+        "Checkpoint saved: %s (n_orig=%d, created_at=%s)",
         OUTPUT_CHECKPOINT,
-        n_current,
+        n_orig_current,
         latest_timestamp,
     )
 
