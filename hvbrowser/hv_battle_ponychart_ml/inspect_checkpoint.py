@@ -36,25 +36,54 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     print(f"File size  : {path.stat().st_size / 1024 / 1024:.2f} MB")
     print()
 
-    # --- training sample count ---
-    n_samples = ckpt.get("n_samples")
-    print(f"Training samples : {n_samples:,}")
+    # --- sample counts ---
+    n_orig = ckpt.get("n_orig")
+    n_crop = ckpt.get("n_crop")
+    n_orig_full = ckpt.get("n_orig_at_full_train")
 
-    # --- created_at timestamp ---
     created_at = ckpt.get("created_at")
-    print(f"Latest image ts  : {created_at}")
+    print(f"Latest image ts : {created_at}")
 
-    # --- current rawimage data ---
     samples = load_samples()
     orig, crop = separate_orig_crop(samples)
+
+    # Use full train baseline; fall back to last save if same (first train)
+    if n_orig_full is None:
+        n_orig_full = n_orig
+
+    def _fmt_diff(cur: int, base: int | None) -> str:
+        if base is None:
+            return ""
+        diff = cur - base
+        ratio = diff / base if base else 0
+        return f"{diff:+,d} ({ratio:+.1%})"
+
+    header = (
+        f"{'':14s} {'Full train':>12s} {'Last save':>12s}"
+        f" {'Current':>10s}   {'Since last':>16s}"
+        f"   {'Since full':>16s}"
+    )
     print()
-    print(f"Current rawimage total : {len(samples):,}")
-    print(f"  Originals            : {len(orig):,}")
-    print(f"  Crops                : {len(crop):,}")
-    if n_samples is not None:
-        new = len(samples) - n_samples
-        ratio = new / n_samples if n_samples else 0
-        print(f"  New since checkpoint : {new:+,d} ({ratio:+.1%})")
+    print(header)
+
+    def _row(
+        label: str,
+        val_full: int | None,
+        val_last: int | None,
+        val_cur: int,
+    ) -> str:
+        full_s = f"{val_full:>12,d}" if val_full is not None else f"{'-':>12s}"
+        last_s = f"{val_last:>12,d}" if val_last is not None else f"{'-':>12s}"
+        return (
+            f"{label:14s} {full_s} {last_s}"
+            f" {val_cur:>10,d}   {_fmt_diff(val_cur, val_last):>16s}"
+            f"   {_fmt_diff(val_cur, val_full):>16s}"
+        )
+
+    print(_row("Originals", n_orig_full, n_orig, len(orig)))
+    print(_row("Crops", None, n_crop, len(crop)))
+    n_total_last = (n_orig or 0) + (n_crop or 0) if n_orig is not None else None
+    print(_row("Total", None, n_total_last, len(orig) + len(crop)))
 
     # --- model architecture ---
     state_dict = ckpt.get("state_dict", {})
