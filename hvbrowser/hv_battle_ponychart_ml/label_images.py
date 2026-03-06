@@ -6,7 +6,7 @@
 - 支援裁切功能：按 C 進入裁切模式，拖曳選取區域，Enter 確認存檔
 - 支援跳轉功能：按 G 或點擊計數器跳到指定圖片
 使用：
-  uv run python -m hvbrowser.hv_battle_ponychart_ml.label_images.py
+  uv run python -m hvbrowser.hv_battle_ponychart_ml.label_images
 """
 
 import glob
