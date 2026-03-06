@@ -57,7 +57,11 @@ def load_samples() -> list[tuple[str, list[int]]]:
         filepath = str(RAWIMAGE_DIR / filename)
         if os.path.isfile(filepath):
             samples.append((filepath, label_list))
-    logger.info("Loaded %d samples (of %d labels.json entries)", len(samples), len(raw))
+    logger.info(
+        "Loaded %s samples (of %s labels.json entries)",
+        f"{len(samples):,}",
+        f"{len(raw):,}",
+    )
     return samples
 
 

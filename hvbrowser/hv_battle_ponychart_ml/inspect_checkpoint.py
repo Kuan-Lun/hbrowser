@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import torch
 from .common.constants import OUTPUT_CHECKPOINT
 from .common.model import BACKBONE_REGISTRY, build_model
 from .common.sampling import load_samples, separate_orig_crop
+
+logger = logging.getLogger(__name__)
 
 
 def _detect_backbone(state_dict: dict[str, object]) -> str:
@@ -26,15 +29,15 @@ def _detect_backbone(state_dict: dict[str, object]) -> str:
 
 def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     if not path.exists():
-        print(f"Checkpoint not found: {path}")
+        logger.error("Checkpoint not found: %s", path)
         sys.exit(1)
 
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
 
     # --- basic info ---
-    print(f"Checkpoint : {path}")
-    print(f"File size  : {path.stat().st_size / 1024 / 1024:.2f} MB")
-    print()
+    logger.info("Checkpoint : %s", path)
+    logger.info("File size  : %.2f MB", path.stat().st_size / 1024 / 1024)
+    logger.info("")
 
     # --- sample counts ---
     n_orig = ckpt.get("n_orig")
@@ -42,7 +45,7 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     n_orig_full = ckpt.get("n_orig_at_full_train")
 
     created_at = ckpt.get("created_at")
-    print(f"Latest image ts : {created_at}")
+    logger.info("Latest image ts : %s", created_at)
 
     samples = load_samples()
     orig, crop = separate_orig_crop(samples)
@@ -63,8 +66,8 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
         f" {'Current':>10s}   {'Since last':>16s}"
         f"   {'Since full':>16s}"
     )
-    print()
-    print(header)
+    logger.info("")
+    logger.info(header)
 
     def _row(
         label: str,
@@ -80,10 +83,10 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
             f"   {_fmt_diff(val_cur, val_full):>16s}"
         )
 
-    print(_row("Originals", n_orig_full, n_orig, len(orig)))
-    print(_row("Crops", None, n_crop, len(crop)))
+    logger.info(_row("Originals", n_orig_full, n_orig, len(orig)))
+    logger.info(_row("Crops", None, n_crop, len(crop)))
     n_total_last = (n_orig or 0) + (n_crop or 0) if n_orig is not None else None
-    print(_row("Total", None, n_total_last, len(orig) + len(crop)))
+    logger.info(_row("Total", None, n_total_last, len(orig) + len(crop)))
 
     # --- model architecture ---
     state_dict = ckpt.get("state_dict", {})
@@ -95,13 +98,13 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
         )
     )
     backbone_name = ckpt.get("backbone") or _detect_backbone(state_dict)
-    print()
-    print(f"Backbone         : {backbone_name}")
-    print(f"Input size       : {ckpt.get('input_size', 'N/A')}")
-    print(f"Pre-resize       : {ckpt.get('pre_resize', 'N/A')}")
-    print(f"Num classes      : {ckpt.get('num_classes', 'N/A')}")
-    print(f"Model parameters : {n_params:,}")
-    print(f"State dict keys  : {len(state_dict):,}")
+    logger.info("")
+    logger.info("Backbone         : %s", backbone_name)
+    logger.info("Input size       : %s", ckpt.get("input_size", "N/A"))
+    logger.info("Pre-resize       : %s", ckpt.get("pre_resize", "N/A"))
+    logger.info("Num classes      : %s", ckpt.get("num_classes", "N/A"))
+    logger.info("Model parameters : %s", f"{n_params:,}")
+    logger.info("State dict keys  : %s", f"{len(state_dict):,}")
 
     # --- training hyperparameters ---
     hp_keys = [
@@ -115,12 +118,12 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     ]
     has_hp = any(ckpt.get(k) is not None for k, _ in hp_keys)
     if has_hp:
-        print()
-        print("Training hyperparameters:")
+        logger.info("")
+        logger.info("Training hyperparameters:")
         for key, label in hp_keys:
             val = ckpt.get(key)
             if val is not None:
-                print(f"  {label:<18s} {val}")
+                logger.info("  %s %s", f"{label:<18s}", val)
 
 
 if __name__ == "__main__":

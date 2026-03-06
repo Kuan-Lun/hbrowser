@@ -122,7 +122,9 @@ def main() -> None:
     val_samples = [
         train_val_balanced[idx] for gk in val_gk for idx in tv_groups_inner[gk]
     ]
-    logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
+    logger.info(
+        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+    )
 
     # ── Train from scratch (never resume: different split → data leakage) ──
     model, thresholds = train_model(

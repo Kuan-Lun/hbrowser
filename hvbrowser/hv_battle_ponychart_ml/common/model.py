@@ -29,30 +29,22 @@ class BackboneConfig:
 
 
 def _build_mobilenet_v3_small(pretrained: bool) -> nn.Module:
-    weights = (
-        models.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-    )
+    weights = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
     return models.mobilenet_v3_small(weights=weights)
 
 
 def _build_mobilenet_v3_large(pretrained: bool) -> nn.Module:
-    weights = (
-        models.MobileNet_V3_Large_Weights.IMAGENET1K_V1 if pretrained else None
-    )
+    weights = models.MobileNet_V3_Large_Weights.IMAGENET1K_V1 if pretrained else None
     return models.mobilenet_v3_large(weights=weights)
 
 
 def _build_efficientnet_b0(pretrained: bool) -> nn.Module:
-    weights = (
-        models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
-    )
+    weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
     return models.efficientnet_b0(weights=weights)
 
 
 def _build_efficientnet_b2(pretrained: bool) -> nn.Module:
-    weights = (
-        models.EfficientNet_B2_Weights.IMAGENET1K_V1 if pretrained else None
-    )
+    weights = models.EfficientNet_B2_Weights.IMAGENET1K_V1 if pretrained else None
     return models.efficientnet_b2(weights=weights)
 
 
@@ -94,9 +86,7 @@ def build_model(
     """
     if backbone not in BACKBONE_REGISTRY:
         available = ", ".join(BACKBONE_REGISTRY.keys())
-        raise ValueError(
-            f"Unknown backbone '{backbone}'. Available: {available}"
-        )
+        raise ValueError(f"Unknown backbone '{backbone}'. Available: {available}")
 
     config = BACKBONE_REGISTRY[backbone]
     model = config.build_fn(pretrained)
@@ -159,8 +149,8 @@ def measure_training_memory(
         torch.mps.empty_cache()
 
     logger.info(
-        "Measured training memory: %.0f MB (device=%s)",
-        total / 1024 / 1024,
+        "Measured training memory: %s MB (device=%s)",
+        f"{total / 1024 / 1024:,.0f}",
         device.type,
     )
     return total

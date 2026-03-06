@@ -91,17 +91,19 @@ def main() -> None:
     balanced_crops = balance_crop_samples(crop_samples, orig_rates, rng)
     samples = orig_samples + balanced_crops
     logger.info(
-        "Orig: %d  Crop: %d -> Balanced: %d  Total: %d",
-        len(orig_samples),
-        len(crop_samples),
-        len(balanced_crops),
-        len(samples),
+        "Orig: %s  Crop: %s -> Balanced: %s  Total: %s",
+        f"{len(orig_samples):,}",
+        f"{len(crop_samples):,}",
+        f"{len(balanced_crops):,}",
+        f"{len(samples):,}",
     )
 
     train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
-    logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
+    logger.info(
+        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+    )
 
     # Auto-detect checkpoint for resume training
     resume_from = None
@@ -140,13 +142,13 @@ def main() -> None:
             n_orig_current = len(separate_orig_crop(load_samples())[0])
             new_data_ratio = (n_orig_current - n_orig_full_train) / n_orig_full_train
             logger.info(
-                "Checkpoint: %d orig at last full train, "
-                "%d orig at last save (created_at=%s), current: %d orig, "
+                "Checkpoint: %s orig at last full train, "
+                "%s orig at last save (created_at=%s), current: %s orig, "
                 "cumulative new_data_ratio=%.1f%%",
-                n_orig_full_train,
-                ckpt["n_orig"],
+                f"{n_orig_full_train:,}",
+                f"{ckpt['n_orig']:,}",
                 ckpt["created_at"],
-                n_orig_current,
+                f"{n_orig_current:,}",
                 new_data_ratio * 100,
             )
             if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
@@ -222,9 +224,9 @@ def main() -> None:
         OUTPUT_CHECKPOINT,
     )
     logger.info(
-        "Checkpoint saved: %s (n_orig=%d, created_at=%s)",
+        "Checkpoint saved: %s (n_orig=%s, created_at=%s)",
         OUTPUT_CHECKPOINT,
-        n_orig_current,
+        f"{n_orig_current:,}",
         latest_timestamp,
     )
 
