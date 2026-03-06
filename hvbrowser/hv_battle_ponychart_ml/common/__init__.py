@@ -38,6 +38,7 @@ from .constants import (
 )
 from .dataset import (
     PonyChartDataset,
+    build_data_pipeline,
     compute_cache_budget,
     get_transforms,
     make_dataloader,
@@ -108,6 +109,7 @@ __all__ = [
     "VAL_SIZE",
     "WEIGHT_DECAY",
     "balance_crop_samples",
+    "build_data_pipeline",
     "build_model",
     "compute_cache_budget",
     "compute_class_rates",

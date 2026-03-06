@@ -35,12 +35,7 @@ from .constants import (
     SCHEDULER_PATIENCE,
     WEIGHT_DECAY,
 )
-from .dataset import (
-    PonyChartDataset,
-    compute_cache_budget,
-    get_transforms,
-    make_dataloader,
-)
+from .dataset import build_data_pipeline
 from .model import build_model, measure_training_memory
 
 logger = logging.getLogger(__name__)
@@ -212,47 +207,19 @@ def train_model(
         logger.info("  Resuming from in-memory state_dict")
     logger.info("=" * 60)
 
-    if train_transform is None:
-        train_transform = get_transforms(is_train=True, input_size=input_size)
-    val_transform = get_transforms(is_train=False, input_size=input_size)
-
     training_reserve = measure_training_memory(
         backbone, batch_size, input_size, device,
     )
-    total_budget = compute_cache_budget(
-        pre_resize,
-        n_datasets=2,
-        training_reserve=training_reserve,
-    )
-    n_total = len(train_samples) + len(val_samples)
-    train_budget = int(total_budget * len(train_samples) / n_total)
-    val_budget = total_budget - train_budget
-
-    train_ds = PonyChartDataset(
+    train_loader, val_loader = build_data_pipeline(
         train_samples,
-        train_transform,
-        pre_resize=pre_resize,
-        max_cached=train_budget,
-    )
-    val_ds = PonyChartDataset(
         val_samples,
-        val_transform,
+        batch_size=batch_size,
+        device=device,
+        num_workers=num_workers,
+        training_reserve=training_reserve,
         pre_resize=pre_resize,
-        max_cached=val_budget,
-    )
-    train_loader = make_dataloader(
-        train_ds,
-        batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        device=device,
-    )
-    val_loader = make_dataloader(
-        val_ds,
-        batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        device=device,
+        input_size=input_size,
+        train_transform=train_transform,
     )
 
     resuming = resume_from is not None or resume_state_dict is not None

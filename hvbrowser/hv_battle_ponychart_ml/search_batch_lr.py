@@ -5,11 +5,10 @@ Batch size x Learning rate 超參數搜尋。
 找出最佳配置後再套用至 train.py 做完整訓練。
 
 搜尋策略：
-  - batch_sizes: [32, 64]
-  - lr_scales: 依 batch_size 而異（見下方 SEARCH_GRID）
-  - linear scaling rule: lr = base_lr * (batch_size / 32)
+  - batch_sizes: [64, 128]
+  - linear scaling rule: lr = base_lr * (batch_size / BATCH_SIZE)
 
-共 4 組實驗，使用相同的 train/val split 確保公平比較。
+共 2 組實驗，使用相同的 train/val split 確保公平比較。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.search_batch_lr
@@ -17,6 +16,7 @@ Batch size x Learning rate 超參數搜尋。
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from typing import Any
@@ -27,11 +27,14 @@ import torch.nn as nn
 
 from .common import (
     BACKBONE,
+    BATCH_SIZE,
     CLASS_NAMES,
+    INPUT_SIZE,
     LR_CLASSIFIER,
     LR_FEATURES,
     LR_HEAD,
     MIN_DELTA,
+    PRE_RESIZE,
     SCHEDULER_FACTOR,
     SCHEDULER_MIN_LR,
     SCHEDULER_PATIENCE,
@@ -45,14 +48,14 @@ from .common import (
     evaluate,
     get_device,
     get_performance_cpu_count,
-    get_transforms,
     group_stratified_split,
     load_samples,
     log_section,
     make_dataloader,
+    measure_training_memory,
     train_one_epoch,
 )
-from .common.dataset import PonyChartDataset
+from .common.dataset import PonyChartDataset, compute_cache_budget, get_transforms
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,11 +64,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Search grid – (batch_size, lr_scale) pairs
+# linear scaling rule: lr = base_lr * (batch_size / BATCH_SIZE)
 SEARCH_GRID: list[tuple[int, float]] = [
-    (32, 1.0),  # baseline
-    (32, 0.5),  # lower LR
-    (64, 1.0),  # linear scaling rule
-    (64, 2.0),  # aggressive LR
+    (64, 1.0),  # baseline (current BATCH_SIZE)
+    (128, 1.0),  # 2x batch, 2x LR (linear scaling)
 ]
 
 # Base LRs from constants (single source of truth with train.py)
@@ -75,8 +77,8 @@ BASE_LR_CLASSIFIER = LR_CLASSIFIER
 
 
 def run_experiment(
-    train_samples: list[tuple[str, list[int]]],
-    val_samples: list[tuple[str, list[int]]],
+    train_ds: PonyChartDataset,
+    val_ds: PonyChartDataset,
     device: torch.device,
     num_workers: int,
     batch_size: int,
@@ -86,21 +88,13 @@ def run_experiment(
     backbone: str,
 ) -> dict[str, Any]:
     """Run one training experiment, return results dict."""
-    train_ds = PonyChartDataset(train_samples, get_transforms(is_train=True))
-    val_ds = PonyChartDataset(val_samples, get_transforms(is_train=False))
     train_loader = make_dataloader(
-        train_ds,
-        batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        device=device,
+        train_ds, batch_size, shuffle=True,
+        num_workers=num_workers, device=device,
     )
     val_loader = make_dataloader(
-        val_ds,
-        batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        device=device,
+        val_ds, batch_size, shuffle=False,
+        num_workers=num_workers, device=device,
     )
 
     model = build_model(backbone=backbone, pretrained=True).to(device)
@@ -198,10 +192,31 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("")
 
+    # Build datasets once (shared across all experiments)
+    max_batch = max(bs for bs, _ in SEARCH_GRID)
+    training_reserve = measure_training_memory(
+        BACKBONE, max_batch, INPUT_SIZE, device,
+    )
+    total_budget = compute_cache_budget(
+        PRE_RESIZE, n_datasets=2, training_reserve=training_reserve,
+    )
+    n_total = len(train_samples) + len(val_samples)
+    train_budget = int(total_budget * len(train_samples) / n_total)
+    val_budget = total_budget - train_budget
+
+    train_ds = PonyChartDataset(
+        train_samples, get_transforms(is_train=True),
+        max_cached=train_budget,
+    )
+    val_ds = PonyChartDataset(
+        val_samples, get_transforms(is_train=False),
+        max_cached=val_budget,
+    )
+
     # Run experiments sequentially on device
     results: list[dict[str, Any]] = []
     for run_idx, (batch_size, lr_scale) in enumerate(SEARCH_GRID, 1):
-        linear_factor = batch_size / 32.0
+        linear_factor = batch_size / BATCH_SIZE
         lr_head = BASE_LR_HEAD * linear_factor * lr_scale
         lr_features = BASE_LR_FEATURES * linear_factor * lr_scale
         lr_classifier = BASE_LR_CLASSIFIER * linear_factor * lr_scale
@@ -222,8 +237,8 @@ def main() -> None:
 
         t0 = time.monotonic()
         result = run_experiment(
-            train_samples,
-            val_samples,
+            train_ds,
+            val_ds,
             device,
             num_workers,
             batch_size,
@@ -233,6 +248,12 @@ def main() -> None:
             BACKBONE,
         )
         elapsed = time.monotonic() - t0
+
+        # Flush MPS allocator cache so experiment memory is returned to OS
+        # before the next experiment allocates a new model.
+        gc.collect()
+        if device.type == "mps":
+            torch.mps.empty_cache()
 
         result.update(
             {
@@ -307,32 +328,39 @@ def main() -> None:
     log_section(logger, "RECOMMENDATION")
     logger.info("  Best config:")
     logger.info("    --batch-size %d", best["batch_size"])
-    logger.info("    Phase 1 lr: %.1e  (train.py default: 1e-3)", best["lr_head"])
     logger.info(
-        "    Phase 2 lr_features: %.1e  (train.py default: 3e-5)",
-        best["lr_features"],
+        "    Phase 1 lr: %.1e  (train.py default: %.1e)", best["lr_head"], LR_HEAD
     )
     logger.info(
-        "    Phase 2 lr_classifier: %.1e  (train.py default: 3e-4)",
+        "    Phase 2 lr_features: %.1e  (train.py default: %.1e)",
+        best["lr_features"],
+        LR_FEATURES,
+    )
+    logger.info(
+        "    Phase 2 lr_classifier: %.1e  (train.py default: %.1e)",
         best["lr_classifier"],
+        LR_CLASSIFIER,
     )
     logger.info("")
 
-    # Compare with baseline (batch=32, scale=1.0)
+    # Compare with baseline (batch=BATCH_SIZE, scale=1.0)
     baseline = next(
-        (r for r in results if r["batch_size"] == 32 and r["lr_scale"] == 1.0),
+        (r for r in results if r["batch_size"] == BATCH_SIZE and r["lr_scale"] == 1.0),
         None,
     )
     if baseline and best is not baseline:
         diff = best["best_f1"] - baseline["best_f1"]
         speedup = baseline["time_s"] / best["time_s"] if best["time_s"] > 0 else 0
         logger.info(
-            "  vs baseline (batch=32, 1.0x): F1 %+.4f, %.1fx speed",
+            "  vs baseline (batch=%d, 1.0x): F1 %+.4f, %.1fx speed",
+            BATCH_SIZE,
             diff,
             speedup,
         )
     elif baseline:
-        logger.info("  Baseline (batch=32, 1.0x) is already the best config.")
+        logger.info(
+            "  Baseline (batch=%d, 1.0x) is already the best config.", BATCH_SIZE
+        )
     logger.info("=" * 90)
 
 

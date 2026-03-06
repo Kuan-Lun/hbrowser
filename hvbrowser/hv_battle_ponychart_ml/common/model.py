@@ -110,7 +110,7 @@ def build_model(
 
 def _get_rss_bytes() -> int:
     """Return current process RSS in bytes."""
-    return psutil.Process(os.getpid()).memory_info().rss
+    return int(psutil.Process(os.getpid()).memory_info().rss)
 
 
 def measure_training_memory(
@@ -150,6 +150,14 @@ def measure_training_memory(
 
     # Use the higher of peak (with activations) and post-step (with gradients)
     total = max(rss_peak - rss_before, rss_after - rss_before, 0)
+
+    # Release MPS allocator cache back to OS so that subsequent
+    # psutil.virtual_memory().available readings are accurate.
+    del model, optimizer, criterion, dummy, target, logits, loss
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+
     logger.info(
         "Measured training memory: %.0f MB (device=%s)",
         total / 1024 / 1024,
