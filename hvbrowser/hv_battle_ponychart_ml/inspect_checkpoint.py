@@ -127,5 +127,6 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else OUTPUT_CHECKPOINT
     inspect(path)
