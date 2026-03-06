@@ -55,13 +55,13 @@ def compute_cache_budget(
     budget = max(mem.available - reserve - training_reserve, 0)
     total_images = budget // per_image
     logger.info(
-        "Cache budget: %d images across %d datasets "
-        "(available %.0f MB, reserve %.0f MB, training %.0f MB)",
-        total_images,
+        "Cache budget: %s images across %d datasets "
+        "(available %s MB, reserve %s MB, training %s MB)",
+        f"{total_images:,}",
         n_datasets,
-        mem.available / 1024 / 1024,
-        reserve / 1024 / 1024,
-        training_reserve / 1024 / 1024,
+        f"{mem.available / 1024 / 1024:,.0f}",
+        f"{reserve / 1024 / 1024:,.0f}",
+        f"{training_reserve / 1024 / 1024:,.0f}",
     )
     return int(total_images)
 
@@ -204,28 +204,40 @@ def build_data_pipeline(
         val_transform = get_transforms(is_train=False, input_size=input_size)
 
     total_budget = compute_cache_budget(
-        pre_resize, n_datasets=2, training_reserve=training_reserve,
+        pre_resize,
+        n_datasets=2,
+        training_reserve=training_reserve,
     )
     n_total = len(train_samples) + len(val_samples)
     train_budget = int(total_budget * len(train_samples) / n_total)
     val_budget = total_budget - train_budget
 
     train_ds = PonyChartDataset(
-        train_samples, train_transform,
-        pre_resize=pre_resize, max_cached=train_budget,
+        train_samples,
+        train_transform,
+        pre_resize=pre_resize,
+        max_cached=train_budget,
     )
     val_ds = PonyChartDataset(
-        val_samples, val_transform,
-        pre_resize=pre_resize, max_cached=val_budget,
+        val_samples,
+        val_transform,
+        pre_resize=pre_resize,
+        max_cached=val_budget,
     )
 
     train_loader = make_dataloader(
-        train_ds, batch_size, shuffle=True,
-        num_workers=num_workers, device=device,
+        train_ds,
+        batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        device=device,
     )
     val_loader = make_dataloader(
-        val_ds, batch_size, shuffle=False,
-        num_workers=num_workers, device=device,
+        val_ds,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
     return train_loader, val_loader
 

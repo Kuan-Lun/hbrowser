@@ -222,14 +222,16 @@ def main() -> None:
 
     # ── Data split summary ──
     log_section(logger, "DATA SPLIT SUMMARY", width=80)
-    logger.info("Test set (shared, originals only): %d images", len(test_samples))
+    logger.info(
+        "Test set (shared, originals only): %s images", f"{len(test_samples):,}"
+    )
     logger.info("")
     logger.info("Experiment A (orig + biased crops):")
-    logger.info("  Train: %d  Val: %d", len(train_a), len(val_a))
+    logger.info("  Train: %s  Val: %s", f"{len(train_a):,}", f"{len(val_a):,}")
     logger.info("Experiment B (originals only):")
-    logger.info("  Train: %d  Val: %d", len(train_b), len(val_b))
+    logger.info("  Train: %s  Val: %s", f"{len(train_b):,}", f"{len(val_b):,}")
     logger.info("Experiment C (orig + balanced crops):")
-    logger.info("  Train: %d  Val: %d", len(train_c), len(val_c))
+    logger.info("  Train: %s  Val: %s", f"{len(train_c):,}", f"{len(val_c):,}")
 
     # ── Distribution analysis ──
     log_section(logger, "DISTRIBUTION ANALYSIS", width=80)

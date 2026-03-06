@@ -195,9 +195,9 @@ def train_model(
     logger.info("=" * 60)
     logger.info("EXPERIMENT: %s", experiment_name)
     logger.info(
-        "  Train: %d samples, Val: %d samples",
-        len(train_samples),
-        len(val_samples),
+        "  Train: %s samples, Val: %s samples",
+        f"{len(train_samples):,}",
+        f"{len(val_samples):,}",
     )
     logger.info("  Backbone: %s", backbone)
     logger.info("  LR features: %.1e, LR classifier: %.1e", lr_features, lr_classifier)
@@ -208,7 +208,10 @@ def train_model(
     logger.info("=" * 60)
 
     training_reserve = measure_training_memory(
-        backbone, batch_size, input_size, device,
+        backbone,
+        batch_size,
+        input_size,
+        device,
     )
     train_loader, val_loader = build_data_pipeline(
         train_samples,

@@ -115,7 +115,9 @@ def main() -> None:
     )
     train_samples = [train_val_balanced[i] for gk in train_gk for i in tv_groups[gk]]
     val_samples = [train_val_balanced[i] for gk in val_gk for i in tv_groups[gk]]
-    logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
+    logger.info(
+        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+    )
 
     # ── Compute pos_weight from training data ──
     pw = compute_pos_weight(train_samples)

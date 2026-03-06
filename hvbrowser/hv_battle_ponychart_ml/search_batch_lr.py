@@ -66,11 +66,11 @@ logger = logging.getLogger(__name__)
 # Search grid – (batch_size, lr_scale) pairs
 # 固定 batch_size=64，搜尋不同 LR 倍率
 SEARCH_GRID: list[tuple[int, float]] = [
-    (64, 0.5),   # 0.5x LR (more conservative)
-    (64, 1.0),   # baseline
-    (64, 1.5),   # 1.5x LR
-    (64, 2.0),   # 2x LR
-    (64, 3.0),   # 3x LR (aggressive)
+    (64, 0.5),  # 0.5x LR (more conservative)
+    (64, 1.0),  # baseline
+    (64, 1.5),  # 1.5x LR
+    (64, 2.0),  # 2x LR
+    (64, 3.0),  # 3x LR (aggressive)
 ]
 
 # Base LRs from constants (single source of truth with train.py)
@@ -92,12 +92,18 @@ def run_experiment(
 ) -> dict[str, Any]:
     """Run one training experiment, return results dict."""
     train_loader = make_dataloader(
-        train_ds, batch_size, shuffle=True,
-        num_workers=num_workers, device=device,
+        train_ds,
+        batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        device=device,
     )
     val_loader = make_dataloader(
-        val_ds, batch_size, shuffle=False,
-        num_workers=num_workers, device=device,
+        val_ds,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        device=device,
     )
 
     model = build_model(backbone=backbone, pretrained=True).to(device)
@@ -175,7 +181,9 @@ def main() -> None:
     train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
-    logger.info("Train: %d  Val: %d", len(train_samples), len(val_samples))
+    logger.info(
+        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+    )
 
     total_combos = len(SEARCH_GRID)
     logger.info("")
@@ -198,21 +206,28 @@ def main() -> None:
     # Build datasets once (shared across all experiments)
     max_batch = max(bs for bs, _ in SEARCH_GRID)
     training_reserve = measure_training_memory(
-        BACKBONE, max_batch, INPUT_SIZE, device,
+        BACKBONE,
+        max_batch,
+        INPUT_SIZE,
+        device,
     )
     total_budget = compute_cache_budget(
-        PRE_RESIZE, n_datasets=2, training_reserve=training_reserve,
+        PRE_RESIZE,
+        n_datasets=2,
+        training_reserve=training_reserve,
     )
     n_total = len(train_samples) + len(val_samples)
     train_budget = int(total_budget * len(train_samples) / n_total)
     val_budget = total_budget - train_budget
 
     train_ds = PonyChartDataset(
-        train_samples, get_transforms(is_train=True),
+        train_samples,
+        get_transforms(is_train=True),
         max_cached=train_budget,
     )
     val_ds = PonyChartDataset(
-        val_samples, get_transforms(is_train=False),
+        val_samples,
+        get_transforms(is_train=False),
         max_cached=val_budget,
     )
 
