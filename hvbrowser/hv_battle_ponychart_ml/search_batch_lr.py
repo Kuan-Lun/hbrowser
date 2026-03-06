@@ -1,14 +1,14 @@
 """
-Batch size x Learning rate 超參數搜尋。
+Learning rate 超參數搜尋。
 
-以縮短的訓練流程測試不同組合，
-找出最佳配置後再套用至 train.py 做完整訓練。
+固定 batch_size=64，測試不同 LR 倍率，
+找出能加速收斂且不降低 F1 的最佳 LR。
 
 搜尋策略：
-  - batch_sizes: [64, 128]
-  - linear scaling rule: lr = base_lr * (batch_size / BATCH_SIZE)
+  - batch_size: 64 (固定)
+  - lr_scale: [0.5, 1.0, 1.5, 2.0, 3.0]
 
-共 2 組實驗，使用相同的 train/val split 確保公平比較。
+共 5 組實驗，使用相同的 train/val split 確保公平比較。
 
 使用方式：
   uv run python -m hvbrowser.hv_battle_ponychart_ml.search_batch_lr
@@ -64,10 +64,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Search grid – (batch_size, lr_scale) pairs
-# linear scaling rule: lr = base_lr * (batch_size / BATCH_SIZE)
+# 固定 batch_size=64，搜尋不同 LR 倍率
 SEARCH_GRID: list[tuple[int, float]] = [
-    (64, 1.0),  # baseline (current BATCH_SIZE)
-    (128, 1.0),  # 2x batch, 2x LR (linear scaling)
+    (64, 0.5),   # 0.5x LR (more conservative)
+    (64, 1.0),   # baseline
+    (64, 1.5),   # 1.5x LR
+    (64, 2.0),   # 2x LR
+    (64, 3.0),   # 3x LR (aggressive)
 ]
 
 # Base LRs from constants (single source of truth with train.py)
@@ -309,10 +312,10 @@ def main() -> None:
             r["time_s"],
         )
 
-    # ── Per-class detail for top 3 ──
+    # ── Per-class detail for all ──
     logger.info("")
-    logger.info("Per-class F1 for top 3:")
-    for rank, r in enumerate(results[:3], 1):
+    logger.info("Per-class F1 for all configs:")
+    for rank, r in enumerate(results, 1):
         logger.info(
             "  #%d (batch=%d, scale=%.1fx, F1=%.4f):",
             rank,
