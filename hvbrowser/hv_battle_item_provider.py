@@ -1,6 +1,8 @@
 from typing import Any
 
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
@@ -62,6 +64,10 @@ class ItemProvider:
 
         if not self.is_open_items_menu():
             self.click_items_menu()
+            # Wait for item panel to be visible before interacting
+            WebDriverWait(self.driver, 2).until(
+                EC.visibility_of_element_located((By.ID, "pane_item"))
+            )
             item_button_list = self.get_item_elements(item)
         # Use locator-based click (derive unique locator via first
         # element's id attribute if present)
