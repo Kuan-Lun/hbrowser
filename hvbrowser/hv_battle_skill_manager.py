@@ -52,9 +52,7 @@ class SkillManager:
                 By.XPATH, skill_xpath
             )
         else:
-            self.element_action_manager.click_resilient(
-                lambda: self.driver.find_element(By.XPATH, skill_xpath)
-            )
+            self.element_action_manager.click_locator(By.XPATH, skill_xpath)
 
     def cast(self, key: str, iswait: bool = True) -> bool:
         if key not in self.get_skills_and_spells():

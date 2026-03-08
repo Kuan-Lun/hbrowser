@@ -52,6 +52,19 @@ class ElementActionManager:
             timeout=timeout,
         )
 
+    def click_locator(
+        self,
+        by: str | By,
+        value: str,
+        retries: int = 3,
+        wait_timeout: float = 2.0,
+        delay: float = 0.1,
+    ) -> None:
+        """Wait for element to be clickable by locator, then click."""
+        self._action.click_locator(
+            by, value, retries=retries, wait_timeout=wait_timeout, delay=delay
+        )
+
     # --- Battle-specific methods ---
     def click_and_wait_log_locator(
         self,
