@@ -125,7 +125,7 @@ def main() -> None:
     )
 
     # ── Train from scratch (never resume: different split → data leakage) ──
-    model, thresholds = train_model(
+    result = train_model(
         train_samples,
         val_samples,
         device,
@@ -134,6 +134,7 @@ def main() -> None:
         backbone=BACKBONE,
         verbose=True,
     )
+    model, thresholds = result.model, result.thresholds
 
     # ── Evaluate on holdout test set (originals only) ──
     criterion = nn.BCEWithLogitsLoss()

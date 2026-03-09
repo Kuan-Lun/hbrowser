@@ -148,6 +148,9 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     logger.info("Model parameters : %s", f"{n_params:,}")
     logger.info("State dict keys  : %s", f"{len(state_dict):,}")
     logger.info("Val size         : %s", ckpt.get("val_size", "N/A"))
+    val_f1 = ckpt.get("val_f1")
+    val_f1_str = f"{val_f1:.4f}" if val_f1 is not None else "N/A"
+    logger.info("Val F1           : %s", val_f1_str)
 
     # --- training hyperparameters ---
     hp_keys = [

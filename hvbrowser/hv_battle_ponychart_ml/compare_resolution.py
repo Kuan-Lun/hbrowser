@@ -141,7 +141,7 @@ def main() -> None:
         )
 
         t0 = time.monotonic()
-        model, thresholds = train_model(
+        result = train_model(
             train_samples,
             val_samples,
             device,
@@ -151,6 +151,7 @@ def main() -> None:
             pre_resize=pre_resize,
             input_size=input_size,
         )
+        model, thresholds = result.model, result.thresholds
         train_time = time.monotonic() - t0
 
         # Each resolution needs its own test transforms and dataset

@@ -225,7 +225,7 @@ def main() -> None:
         np.random.seed(SEED)
 
         train_tf = build_train_transform(cfg)
-        model, thresholds = train_model(
+        train_result = train_model(
             sub_train_samples,
             val_samples,
             device,
@@ -234,6 +234,7 @@ def main() -> None:
             backbone=BACKBONE,
             train_transform=train_tf,
         )
+        model, thresholds = train_result.model, train_result.thresholds
         result = evaluate(model, test_loader, criterion, device, thresholds)
         results[cfg.name] = result
         logger.info(

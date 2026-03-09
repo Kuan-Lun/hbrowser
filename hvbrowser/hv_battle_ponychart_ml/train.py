@@ -191,7 +191,7 @@ def main() -> None:
     )
 
     # Train
-    model, thresholds = train_model(
+    result = train_model(
         train_samples,
         val_samples,
         device,
@@ -200,6 +200,21 @@ def main() -> None:
         verbose=True,
         resume_from=resume_from,
     )
+    model, thresholds, best_f1 = result.model, result.thresholds, result.best_f1
+
+    # Guard: skip overwrite if resume training produced worse val_F1
+    if resume_from is not None:
+        ckpt = torch.load(resume_from, map_location=device, weights_only=True)
+        prev_f1 = ckpt.get("val_f1")
+        if prev_f1 is not None and best_f1 < prev_f1:
+            logger.warning(
+                "Resume training val_F1 (%.4f) < previous val_F1 (%.4f). "
+                "Skipping checkpoint/ONNX/thresholds overwrite.",
+                best_f1,
+                prev_f1,
+            )
+            logger.info("Done! (no files updated)")
+            return
 
     # Save thresholds
     thresholds_dict = dict(zip(CLASS_NAMES, thresholds))
@@ -224,7 +239,6 @@ def main() -> None:
         for p, labels in orig_samples + crop_samples
     }
     if resume_from is not None:
-        ckpt = torch.load(resume_from, map_location=device, weights_only=True)
         labels_at_full_train = ckpt["labels_at_full_train"]
     else:
         labels_at_full_train = current_labels
@@ -232,6 +246,7 @@ def main() -> None:
     torch.save(
         {
             "state_dict": model.state_dict(),
+            "val_f1": best_f1,
             "n_orig": n_orig_current,
             "n_crop": n_crop_current,
             "labels_at_full_train": labels_at_full_train,
@@ -257,9 +272,10 @@ def main() -> None:
         OUTPUT_CHECKPOINT,
     )
     logger.info(
-        "Checkpoint saved: %s (n_orig=%s, created_at=%s)",
+        "Checkpoint saved: %s (n_orig=%s, val_f1=%.4f, created_at=%s)",
         OUTPUT_CHECKPOINT,
         f"{n_orig_current:,}",
+        best_f1,
         latest_timestamp,
     )
 

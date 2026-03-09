@@ -65,6 +65,7 @@ from .sampling import (
 )
 from .splitting import group_hash_split, split_by_groups
 from .training import (
+    TrainResult,
     evaluate,
     optimize_thresholds,
     train_model,
@@ -107,6 +108,7 @@ __all__ = [
     "SEARCH_PHASE1_EPOCHS",
     "SEARCH_PHASE2_EPOCHS",
     "SEED",
+    "TrainResult",
     "VAL_SIZE",
     "WEIGHT_DECAY",
     "balance_crop_samples",

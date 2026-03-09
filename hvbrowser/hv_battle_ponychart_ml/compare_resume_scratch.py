@@ -164,7 +164,7 @@ def main() -> None:
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    scratch_model, scratch_thresholds = train_model(
+    scratch_train_result = train_model(
         full_train,
         full_val,
         device,
@@ -173,7 +173,11 @@ def main() -> None:
         backbone=BACKBONE,
     )
     scratch_result = evaluate(
-        scratch_model, test_loader, criterion, device, scratch_thresholds
+        scratch_train_result.model,
+        test_loader,
+        criterion,
+        device,
+        scratch_train_result.thresholds,
     )
     scratch_f1 = scratch_result["macro_f1"]
     logger.info(">> Baseline scratch F1: %.4f", scratch_f1)
@@ -210,7 +214,7 @@ def main() -> None:
         base_train, base_val = prepare_train_val(base_samples, SEED)
         logger.info("  Base train=%d  val=%d", len(base_train), len(base_val))
 
-        base_model, _ = train_model(
+        base_train_result = train_model(
             base_train,
             base_val,
             device,
@@ -218,12 +222,12 @@ def main() -> None:
             f"Base {pct}% from scratch",
             backbone=BACKBONE,
         )
-        base_state_dict = copy.deepcopy(base_model.state_dict())
+        base_state_dict = copy.deepcopy(base_train_result.model.state_dict())
 
         # Step 2: Resume from base checkpoint with 100% data
         torch.manual_seed(SEED)
         np.random.seed(SEED)
-        resume_model, resume_thresholds = train_model(
+        resume_train_result = train_model(
             full_train,
             full_val,
             device,
@@ -233,7 +237,11 @@ def main() -> None:
             resume_state_dict=base_state_dict,
         )
         resume_result = evaluate(
-            resume_model, test_loader, criterion, device, resume_thresholds
+            resume_train_result.model,
+            test_loader,
+            criterion,
+            device,
+            resume_train_result.thresholds,
         )
 
         delta = scratch_f1 - resume_result["macro_f1"]

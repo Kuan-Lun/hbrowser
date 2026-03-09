@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,15 @@ from .dataset import build_data_pipeline
 from .model import build_model, measure_training_memory
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrainResult:
+    """Result of a training run."""
+
+    model: nn.Module
+    thresholds: list[float]
+    best_f1: float
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +188,7 @@ def train_model(
     pos_weight: torch.Tensor | None = None,
     pre_resize: int = PRE_RESIZE,
     input_size: int = INPUT_SIZE,
-) -> tuple[nn.Module, list[float]]:
+) -> TrainResult:
     """Train a model end-to-end.
 
     When *resume_from* points to an existing checkpoint (``.pt`` file),
@@ -366,4 +376,4 @@ def train_model(
     thresholds = optimize_thresholds(model, val_loader, device)
     logger.info("Optimized thresholds: %s", dict(zip(CLASS_NAMES, thresholds)))
 
-    return model, thresholds
+    return TrainResult(model=model, thresholds=thresholds, best_f1=best_f1)

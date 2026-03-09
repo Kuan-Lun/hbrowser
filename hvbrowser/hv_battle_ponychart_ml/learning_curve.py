@@ -216,7 +216,7 @@ def main() -> None:
         pct = int(frac * 100)
         name = f"{pct}% data ({len(selected_samples)} samples)"
 
-        model, thresholds = train_model(
+        train_result = train_model(
             train_samples,
             val_samples,
             device,
@@ -225,6 +225,7 @@ def main() -> None:
             backbone=BACKBONE,
             resume_state_dict=prev_state_dict,
         )
+        model, thresholds = train_result.model, train_result.thresholds
         prev_state_dict = copy.deepcopy(model.state_dict())
 
         # Evaluate on shared test set

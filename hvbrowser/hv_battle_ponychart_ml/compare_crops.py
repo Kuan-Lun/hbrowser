@@ -169,7 +169,7 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss()
 
     # ---- Train experiments (all from ImageNet pretrained weights) ----
-    model_a, thresholds_a = train_model(
+    result_a = train_model(
         train_a,
         val_a,
         device,
@@ -177,10 +177,11 @@ def main() -> None:
         "A: Originals + biased crops",
         backbone=BACKBONE,
     )
+    model_a, thresholds_a = result_a.model, result_a.thresholds
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    model_b, thresholds_b = train_model(
+    result_b = train_model(
         train_b,
         val_b,
         device,
@@ -188,10 +189,11 @@ def main() -> None:
         "B: Originals only (baseline)",
         backbone=BACKBONE,
     )
+    model_b, thresholds_b = result_b.model, result_b.thresholds
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    model_c, thresholds_c = train_model(
+    result_c = train_model(
         train_c,
         val_c,
         device,
@@ -199,6 +201,7 @@ def main() -> None:
         "C: Originals + balanced crops",
         backbone=BACKBONE,
     )
+    model_c, thresholds_c = result_c.model, result_c.thresholds
 
     # ---- Evaluate all on test set ----
     test_ds = PonyChartDataset(test_samples, get_transforms(is_train=False))

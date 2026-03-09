@@ -124,7 +124,7 @@ def main() -> None:
     # ── Experiment A: Baseline (no pos_weight) ──
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    model_a, thresholds_a = train_model(
+    result_a = train_model(
         train_samples,
         val_samples,
         device,
@@ -133,11 +133,12 @@ def main() -> None:
         backbone=BACKBONE,
         verbose=True,
     )
+    model_a, thresholds_a = result_a.model, result_a.thresholds
 
     # ── Experiment B: With pos_weight ──
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    model_b, thresholds_b = train_model(
+    train_result_b = train_model(
         train_samples,
         val_samples,
         device,
@@ -147,6 +148,7 @@ def main() -> None:
         pos_weight=pw,
         verbose=True,
     )
+    model_b, thresholds_b = train_result_b.model, train_result_b.thresholds
 
     # ── Evaluate both on holdout test set ──
     criterion = nn.BCEWithLogitsLoss()

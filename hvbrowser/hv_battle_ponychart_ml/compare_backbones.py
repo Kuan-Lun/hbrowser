@@ -176,7 +176,7 @@ def main() -> None:
         log_section(logger, "BACKBONE: %s", config.description, width=70)
 
         t0 = time.monotonic()
-        model, thresholds = train_model(
+        result = train_model(
             train_samples,
             val_samples,
             device,
@@ -187,6 +187,7 @@ def main() -> None:
         train_time = time.monotonic() - t0
 
         # Evaluate on test set
+        model, thresholds = result.model, result.thresholds
         test_result = evaluate(model, test_loader, criterion, device, thresholds)
 
         # Model stats
