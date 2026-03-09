@@ -112,14 +112,19 @@ def main() -> None:
             "pre_resize": PRE_RESIZE,
             "num_classes": NUM_CLASSES,
         }
-        required_keys = list(arch_keys) + ["labels_at_full_train"]
+        required_keys = list(arch_keys) + [
+            "labels_at_full_train",
+            "val_size",
+            "n_orig",
+            "created_at",
+        ]
         missing = [k for k in required_keys if k not in ckpt]
         mismatches = {
             k: (ckpt[k], v) for k, v in arch_keys.items() if k in ckpt and ckpt[k] != v
         }
         if missing:
             logger.warning(
-                "Legacy checkpoint missing keys: %s. " "自動切換為 from-scratch 訓練。",
+                "Checkpoint missing keys: %s. " "自動切換為 from-scratch 訓練。",
                 ", ".join(missing),
             )
         elif mismatches:
@@ -148,6 +153,7 @@ def main() -> None:
                 f"{n_orig_current:,}",
                 new_data_ratio * 100,
             )
+            should_retrain = False
             if new_data_ratio > RETRAIN_NEW_DATA_RATIO:
                 logger.warning(
                     "cumulative new_data_ratio (%.1f%%) 超過閾值 "
@@ -156,7 +162,17 @@ def main() -> None:
                     new_data_ratio * 100,
                     RETRAIN_NEW_DATA_RATIO * 100,
                 )
-            else:
+                should_retrain = True
+            if VAL_SIZE > ckpt["val_size"]:
+                logger.warning(
+                    "VAL_SIZE increased (%.2f -> %.2f), "
+                    "hash split leakage risk. "
+                    "自動切換為 from-scratch 訓練。",
+                    ckpt["val_size"],
+                    VAL_SIZE,
+                )
+                should_retrain = True
+            if not should_retrain:
                 resume_from = OUTPUT_CHECKPOINT
                 logger.info(
                     "Found checkpoint: %s (use --from-scratch to ignore)",
@@ -223,6 +239,8 @@ def main() -> None:
             "input_size": INPUT_SIZE,
             "pre_resize": PRE_RESIZE,
             "num_classes": NUM_CLASSES,
+            # Split config (val_size increase -> from-scratch)
+            "val_size": VAL_SIZE,
             # Training hyperparameters (informational)
             "seed": SEED,
             "batch_size": BATCH_SIZE,
