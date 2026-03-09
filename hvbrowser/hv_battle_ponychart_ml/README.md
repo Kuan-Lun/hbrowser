@@ -93,7 +93,7 @@ uv run python -m hvbrowser.hv_battle_ponychart_ml.train --from-scratch
 | `SEED` | 42 | 隨機種子 |
 | `PHASE1_EPOCHS` | 10 | Phase 1 (head-only) 訓練輪數 |
 | `PHASE2_EPOCHS` | 100 | Phase 2 (full fine-tuning) 最大訓練輪數 |
-| `PATIENCE` | 12 | Early stopping patience |
+| `PHASE2_PATIENCE` | 12 | Phase 2 early stopping patience |
 
 ## 支援的 Backbone
 
