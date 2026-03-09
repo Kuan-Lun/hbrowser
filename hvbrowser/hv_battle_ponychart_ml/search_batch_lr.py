@@ -48,7 +48,7 @@ from .common import (
     evaluate,
     get_device,
     get_performance_cpu_count,
-    group_stratified_split,
+    group_hash_split,
     load_samples,
     log_section,
     make_dataloader,
@@ -178,7 +178,7 @@ def main() -> None:
     if not samples:
         logger.error("No samples found. Check rawimage/ and labels.json.")
         return
-    train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
+    train_idx, val_idx = group_hash_split(samples, test_size=VAL_SIZE)
     train_samples = [samples[i] for i in train_idx]
     val_samples = [samples[i] for i in val_idx]
     logger.info(

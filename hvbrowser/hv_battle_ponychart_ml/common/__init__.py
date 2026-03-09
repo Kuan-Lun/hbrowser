@@ -63,7 +63,7 @@ from .sampling import (
     load_samples,
     separate_orig_crop,
 )
-from .splitting import group_stratified_split, split_by_groups
+from .splitting import group_hash_split, split_by_groups
 from .training import (
     evaluate,
     optimize_thresholds,
@@ -122,7 +122,7 @@ __all__ = [
     "get_device",
     "get_performance_cpu_count",
     "get_transforms",
-    "group_stratified_split",
+    "group_hash_split",
     "is_original",
     "labels_to_binary",
     "load_labels",

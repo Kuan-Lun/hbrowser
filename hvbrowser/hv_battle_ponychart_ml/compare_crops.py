@@ -100,9 +100,7 @@ def main() -> None:
     logger.info("Total samples loaded: %d", len(all_samples))
 
     # Split groups: 10% test, 90% train+val
-    train_val_groups, test_groups = split_by_groups(
-        all_samples, test_size=0.10, seed=SEED
-    )
+    train_val_groups, test_groups = split_by_groups(all_samples, test_size=0.10)
 
     # Build index from base timestamp to sample indices
     groups: dict[str, list[int]] = defaultdict(list)
@@ -142,7 +140,7 @@ def main() -> None:
 
     # ── Split train/val for each experiment ──
     # Experiment A: originals + all crops (biased)
-    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=VAL_SIZE, seed=SEED)
+    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=VAL_SIZE)
     groups_a: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_all):
         base = get_base_timestamp(os.path.basename(path))
@@ -151,9 +149,7 @@ def main() -> None:
     val_a = [train_val_all[i] for gk in val_gk_a for i in groups_a[gk]]
 
     # Experiment B: originals only
-    train_gk_b, val_gk_b = split_by_groups(
-        train_val_orig, test_size=VAL_SIZE, seed=SEED
-    )
+    train_gk_b, val_gk_b = split_by_groups(train_val_orig, test_size=VAL_SIZE)
     groups_b: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_orig):
         base = get_base_timestamp(os.path.basename(path))
@@ -162,9 +158,7 @@ def main() -> None:
     val_b = [train_val_orig[i] for gk in val_gk_b for i in groups_b[gk]]
 
     # Experiment C: originals + balanced crops
-    train_gk_c, val_gk_c = split_by_groups(
-        train_val_balanced, test_size=VAL_SIZE, seed=SEED
-    )
+    train_gk_c, val_gk_c = split_by_groups(train_val_balanced, test_size=VAL_SIZE)
     groups_c: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_balanced):
         base = get_base_timestamp(os.path.basename(path))

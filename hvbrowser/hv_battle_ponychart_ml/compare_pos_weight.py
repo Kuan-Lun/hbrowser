@@ -72,7 +72,7 @@ def main() -> None:
 
     # ── Split groups: 80% train+val, 20% test ──
     train_val_groups, test_groups = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
+        all_samples, test_size=HOLDOUT_TEST_SIZE
     )
 
     # Build group index
@@ -110,9 +110,7 @@ def main() -> None:
         base = get_base_timestamp(os.path.basename(path))
         tv_groups[base].append(idx)
 
-    train_gk, val_gk = split_by_groups(
-        train_val_balanced, test_size=VAL_SIZE, seed=SEED
-    )
+    train_gk, val_gk = split_by_groups(train_val_balanced, test_size=VAL_SIZE)
     train_samples = [train_val_balanced[i] for gk in train_gk for i in tv_groups[gk]]
     val_samples = [train_val_balanced[i] for gk in val_gk for i in tv_groups[gk]]
     logger.info(

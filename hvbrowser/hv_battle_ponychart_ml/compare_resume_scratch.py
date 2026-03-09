@@ -81,7 +81,7 @@ def prepare_train_val(
         base = get_base_timestamp(os.path.basename(path))
         sub_groups[base].append(idx)
 
-    train_gk, val_gk = split_by_groups(balanced, test_size=VAL_SIZE, seed=seed)
+    train_gk, val_gk = split_by_groups(balanced, test_size=VAL_SIZE)
     train_samples = [balanced[i] for gk in train_gk for i in sub_groups[gk]]
     val_samples = [balanced[i] for gk in val_gk for i in sub_groups[gk]]
     return train_samples, val_samples
@@ -128,7 +128,7 @@ def main() -> None:
 
     # ── Split: 20% test (originals only), 80% train+val pool ──
     train_val_group_keys, test_group_keys = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
+        all_samples, test_size=HOLDOUT_TEST_SIZE
     )
 
     test_indices = []

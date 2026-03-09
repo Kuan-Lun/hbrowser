@@ -48,7 +48,7 @@ from .common import (
     get_base_timestamp,
     get_device,
     get_performance_cpu_count,
-    group_stratified_split,
+    group_hash_split,
     is_original,
     load_samples,
     separate_orig_crop,
@@ -97,13 +97,6 @@ def main() -> None:
         f"{len(crop_samples):,}",
         f"{len(balanced_crops):,}",
         f"{len(samples):,}",
-    )
-
-    train_idx, val_idx = group_stratified_split(samples, test_size=VAL_SIZE, seed=SEED)
-    train_samples = [samples[i] for i in train_idx]
-    val_samples = [samples[i] for i in val_idx]
-    logger.info(
-        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
     )
 
     # Auto-detect checkpoint for resume training
@@ -169,6 +162,13 @@ def main() -> None:
                     "Found checkpoint: %s (use --from-scratch to ignore)",
                     resume_from,
                 )
+
+    train_idx, val_idx = group_hash_split(samples, test_size=VAL_SIZE)
+    train_samples = [samples[i] for i in train_idx]
+    val_samples = [samples[i] for i in val_idx]
+    logger.info(
+        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+    )
 
     # Train
     model, thresholds = train_model(

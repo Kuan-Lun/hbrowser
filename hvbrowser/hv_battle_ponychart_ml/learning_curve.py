@@ -142,7 +142,7 @@ def main() -> None:
 
     # Split: 20% test (original images only), 80% train+val pool
     train_val_group_keys, test_group_keys = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE, seed=SEED
+        all_samples, test_size=HOLDOUT_TEST_SIZE
     )
 
     test_indices = []
@@ -189,9 +189,7 @@ def main() -> None:
         selected_samples = [all_samples[i] for i in selected_indices]
 
         # Split into train / val (15% val for early stopping)
-        sub_train_gk, sub_val_gk = split_by_groups(
-            selected_samples, test_size=VAL_SIZE, seed=SEED
-        )
+        sub_train_gk, sub_val_gk = split_by_groups(selected_samples, test_size=VAL_SIZE)
         sub_groups: dict[str, list[int]] = defaultdict(list)
         for idx, (path, _) in enumerate(selected_samples):
             base = get_base_timestamp(os.path.basename(path))
