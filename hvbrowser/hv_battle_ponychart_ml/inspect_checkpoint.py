@@ -10,7 +10,7 @@ import torch
 
 from .common.constants import OUTPUT_CHECKPOINT
 from .common.model import BACKBONE_REGISTRY, build_model
-from .common.sampling import load_samples, separate_orig_crop
+from .common.sampling import is_original, load_labels, load_samples, separate_orig_crop
 
 logger = logging.getLogger(__name__)
 
@@ -42,21 +42,23 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     # --- sample counts ---
     n_orig = ckpt.get("n_orig")
     n_crop = ckpt.get("n_crop")
-    n_orig_full = ckpt.get("n_orig_at_full_train")
+    labels_full: dict[str, list[int]] = ckpt["labels_at_full_train"]
+    labels_last: dict[str, list[int]] = ckpt["labels_at_last_save"]
 
     created_at = ckpt.get("created_at")
     logger.info("Latest image ts : %s", created_at)
 
     samples = load_samples()
     orig, crop = separate_orig_crop(samples)
+    labels_current = load_labels()
 
-    # Use full train baseline; fall back to last save if same (first train)
-    if n_orig_full is None:
-        n_orig_full = n_orig
+    def _count_orig_crop(labels: dict[str, list[int]]) -> tuple[int, int]:
+        n_o = sum(1 for k in labels if is_original(k.split("/")[-1]))
+        return n_o, len(labels) - n_o
 
-    def _fmt_diff(cur: int, base: int | None) -> str:
-        if base is None:
-            return ""
+    n_orig_full, n_crop_full = _count_orig_crop(labels_full)
+
+    def _fmt_diff(cur: int, base: int) -> str:
         diff = cur - base
         ratio = diff / base if base else 0
         return f"{diff:+,d} ({ratio:+.1%})"
@@ -71,22 +73,59 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
 
     def _row(
         label: str,
-        val_full: int | None,
+        val_full: int,
         val_last: int | None,
         val_cur: int,
     ) -> str:
-        full_s = f"{val_full:>12,d}" if val_full is not None else f"{'-':>12s}"
+        full_s = f"{val_full:>12,d}"
         last_s = f"{val_last:>12,d}" if val_last is not None else f"{'-':>12s}"
+        since_last = _fmt_diff(val_cur, val_last) if val_last is not None else ""
         return (
             f"{label:14s} {full_s} {last_s}"
-            f" {val_cur:>10,d}   {_fmt_diff(val_cur, val_last):>16s}"
+            f" {val_cur:>10,d}   {since_last:>16s}"
             f"   {_fmt_diff(val_cur, val_full):>16s}"
         )
 
     logger.info(_row("Originals", n_orig_full, n_orig, len(orig)))
-    logger.info(_row("Crops", None, n_crop, len(crop)))
+    logger.info(_row("Crops", n_crop_full, n_crop, len(crop)))
     n_total_last = (n_orig or 0) + (n_crop or 0) if n_orig is not None else None
-    logger.info(_row("Total", None, n_total_last, len(orig) + len(crop)))
+    logger.info(_row("Total", len(labels_full), n_total_last, len(orig) + len(crop)))
+
+    # --- changes detail ---
+    def _diff_labels(
+        baseline: dict[str, list[int]], current: dict[str, list[int]]
+    ) -> tuple[set[str], set[str], set[str]]:
+        base_keys = set(baseline)
+        cur_keys = set(current)
+        added = cur_keys - base_keys
+        removed = base_keys - cur_keys
+        relabeled = {k for k in base_keys & cur_keys if baseline[k] != current[k]}
+        return added, removed, relabeled
+
+    def _split_orig_crop(keys: set[str]) -> tuple[int, int]:
+        n_o = sum(1 for k in keys if is_original(k.split("/")[-1]))
+        return n_o, len(keys) - n_o
+
+    def _log_changes(title: str, baseline: dict[str, list[int]]) -> None:
+        added, removed, relabeled = _diff_labels(baseline, labels_current)
+        if not added and not removed and not relabeled:
+            logger.info("%s: no changes", title)
+            return
+        logger.info("%s:", title)
+        fmt = "  %-11s %4d images (%d orig, %d crop)"
+        if added:
+            ao, ac = _split_orig_crop(added)
+            logger.info(fmt, "Added", len(added), ao, ac)
+        if removed:
+            ro, rc = _split_orig_crop(removed)
+            logger.info(fmt, "Removed", len(removed), ro, rc)
+        if relabeled:
+            lo, lc = _split_orig_crop(relabeled)
+            logger.info(fmt, "Relabeled", len(relabeled), lo, lc)
+
+    logger.info("")
+    _log_changes("Changes since full train", labels_full)
+    _log_changes("Changes since last save", labels_last)
 
     # --- model architecture ---
     state_dict = ckpt.get("state_dict", {})

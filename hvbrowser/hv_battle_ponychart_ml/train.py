@@ -49,6 +49,8 @@ from .common import (
     get_device,
     get_performance_cpu_count,
     group_stratified_split,
+    is_original,
+    load_labels,
     load_samples,
     separate_orig_crop,
     train_model,
@@ -118,7 +120,7 @@ def main() -> None:
             "pre_resize": PRE_RESIZE,
             "num_classes": NUM_CLASSES,
         }
-        required_keys = list(arch_keys) + ["n_orig_at_full_train"]
+        required_keys = list(arch_keys) + ["labels_at_full_train"]
         missing = [k for k in required_keys if k not in ckpt]
         mismatches = {
             k: (ckpt[k], v) for k, v in arch_keys.items() if k in ckpt and ckpt[k] != v
@@ -138,7 +140,10 @@ def main() -> None:
                 )
             logger.warning("自動切換為 from-scratch 訓練。")
         else:
-            n_orig_full_train = ckpt["n_orig_at_full_train"]
+            labels_full = ckpt["labels_at_full_train"]
+            n_orig_full_train = sum(
+                1 for k in labels_full if is_original(k.split("/")[-1])
+            )
             n_orig_current = len(separate_orig_crop(load_samples())[0])
             new_data_ratio = (n_orig_current - n_orig_full_train) / n_orig_full_train
             logger.info(
@@ -191,20 +196,22 @@ def main() -> None:
     n_orig_current = len(orig_samples)
     n_crop_current = len(crop_samples)
 
-    # Track original sample count at last full training for cumulative drift detection.
-    # On from-scratch: set to current count. On resume: carry forward from checkpoint.
+    # Track labels snapshot at full training and last save for drift detection.
+    # From-scratch: snapshot current labels. Resume: carry forward from checkpoint.
+    current_labels = load_labels()
     if resume_from is not None:
         ckpt = torch.load(resume_from, map_location=device, weights_only=True)
-        n_orig_at_full_train = ckpt["n_orig_at_full_train"]
+        labels_at_full_train = ckpt["labels_at_full_train"]
     else:
-        n_orig_at_full_train = n_orig_current
+        labels_at_full_train = current_labels
 
     torch.save(
         {
             "state_dict": model.state_dict(),
             "n_orig": n_orig_current,
             "n_crop": n_crop_current,
-            "n_orig_at_full_train": n_orig_at_full_train,
+            "labels_at_full_train": labels_at_full_train,
+            "labels_at_last_save": current_labels,
             "class_rates": orig_rates,
             "created_at": latest_timestamp,
             # Model architecture (mismatch -> from-scratch)

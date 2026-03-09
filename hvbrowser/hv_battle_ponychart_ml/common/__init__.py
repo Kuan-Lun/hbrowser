@@ -59,6 +59,7 @@ from .sampling import (
     get_base_timestamp,
     is_original,
     labels_to_binary,
+    load_labels,
     load_samples,
     separate_orig_crop,
 )
@@ -124,6 +125,7 @@ __all__ = [
     "group_stratified_split",
     "is_original",
     "labels_to_binary",
+    "load_labels",
     "load_samples",
     "log_section",
     "make_dataloader",

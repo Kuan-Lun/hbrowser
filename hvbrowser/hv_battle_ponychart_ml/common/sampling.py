@@ -44,13 +44,19 @@ def get_base_timestamp(filename: str) -> str:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+def load_labels() -> dict[str, list[int]]:
+    """Load raw labels.json as a dict mapping keys to label lists."""
+    with open(LABELS_FILE, encoding="utf-8") as f:
+        result: dict[str, list[int]] = json.load(f)
+    return result
+
+
 def load_samples() -> list[tuple[str, list[int]]]:
     """Load labeled samples from labels.json.
 
     Returns list of (image_path, [1-indexed labels]).
     """
-    with open(LABELS_FILE, encoding="utf-8") as f:
-        raw: dict[str, list[int]] = json.load(f)
+    raw = load_labels()
     samples = []
     for key, label_list in raw.items():
         filename = key.split("/")[-1]
