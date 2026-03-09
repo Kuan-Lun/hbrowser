@@ -181,9 +181,13 @@ def main() -> None:
 
     train_idx, val_idx = group_hash_split(samples, test_size=VAL_SIZE)
     train_samples = [samples[i] for i in train_idx]
-    val_samples = [samples[i] for i in val_idx]
+    val_samples = [
+        s for s in (samples[i] for i in val_idx) if is_original(os.path.basename(s[0]))
+    ]
     logger.info(
-        "Train: %s  Val: %s", f"{len(train_samples):,}", f"{len(val_samples):,}"
+        "Train: %s  Val: %s (orig only)",
+        f"{len(train_samples):,}",
+        f"{len(val_samples):,}",
     )
 
     # Train

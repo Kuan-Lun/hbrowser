@@ -395,13 +395,19 @@ def main() -> None:
         )
     logger.info("=" * 80)
 
-    # ── Crop recommendation ──
+    # ── Crop recommendation (based on train crops only) ──
+    train_gk_set_c = set(train_gk_c)
+    train_crops = [
+        s
+        for s in train_val_crop
+        if get_base_timestamp(os.path.basename(s[0])) in train_gk_set_c
+    ]
     crop_counts_per_class = [0] * NUM_CLASSES
-    for _, labels in train_val_crop:
+    for _, labels in train_crops:
         for lbl in labels:
             crop_counts_per_class[lbl - 1] += 1
 
-    total_crops = len(train_val_crop)
+    total_crops = len(train_crops)
 
     orig_rate_sum = sum(orig_rates)
     target_per_class = [
@@ -444,7 +450,8 @@ def main() -> None:
 
     log_section(logger, "CROP RECOMMENDATION", width=80)
     logger.info(
-        "  估算方式: 讓各 class 的 crop 數量比例" "對齊原圖出現比例 (total crops=%d)",
+        "  估算方式: 讓各 class 的 train crop 數量比例"
+        "對齊原圖出現比例 (train crops=%d)",
         total_crops,
     )
     logger.info("")

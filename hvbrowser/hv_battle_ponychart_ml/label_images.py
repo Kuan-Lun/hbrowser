@@ -22,6 +22,9 @@ from typing import Literal
 
 from PIL import Image, ImageTk
 
+from .common.constants import VAL_SIZE
+from .common.splitting import group_hash_split
+
 # 所有路徑以此腳本所在目錄為基準
 _SCRIPT_DIR = Path(__file__).resolve().parent
 IMAGE_SUBDIR = "rawimage"  # labels.json 中 key 的前綴
@@ -418,6 +421,14 @@ class LabelApp:
             text="只顯示未標註",
             variable=self.filter_var,
             command=self._on_filter_toggle,
+        ).pack(side="left", padx=(0, 8))
+
+        self.train_only_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            filter_frame,
+            text="只顯示 Train",
+            variable=self.train_only_var,
+            command=self._apply_filters,
         ).pack(side="left")
 
         # Model analysis state
@@ -689,6 +700,7 @@ class LabelApp:
         uncropped_only = self.uncropped_only_var.get()
         unlabeled_only = self.filter_var.get()
         crop_mismatch = self.crop_mismatch_var.get()
+        train_only = self.train_only_var.get()
 
         show_mislabel = self._mislabel_var.get()
         show_missing = self._missing_var.get()
@@ -702,9 +714,23 @@ class LabelApp:
             and not uncropped_only
             and not unlabeled_only
             and not crop_mismatch
+            and not train_only
             and not suspicious_active
         ):
             return None
+
+        # 預計算 train group 的 base timestamp 集合
+        train_base_timestamps: set[str] | None = None
+        if train_only:
+            samples = [
+                (str(p), self.store.get(self.store.path_to_key(p)))
+                for p in self.nav.all_paths
+                if self.store.has(self.store.path_to_key(p))
+            ]
+            train_idx, _ = group_hash_split(samples, test_size=VAL_SIZE)
+            train_base_timestamps = {
+                "_".join(Path(samples[i][0]).stem.split("_")[:4]) for i in train_idx
+            }
 
         # 預計算已有裁切圖的 raw stem 集合（避免 O(n²)）
         raw_stems_with_crops: set[str] | None = None
@@ -752,6 +778,10 @@ class LabelApp:
                 return False
             if unlabeled_only and store.has(store.path_to_key(p)):
                 return False
+            if train_base_timestamps is not None:
+                base_ts = "_".join(p.stem.split("_")[:4])
+                if base_ts not in train_base_timestamps:
+                    return False
             if crop_mismatch_stems is not None:
                 if not is_raw_image(p):
                     return False
@@ -805,6 +835,7 @@ class LabelApp:
         self.uncropped_only_var.set(False)
         self.crop_mismatch_var.set(False)
         self.filter_var.set(False)
+        self.train_only_var.set(False)
         self.raw_only_cb.configure(state="normal")
         self.uncropped_only_cb.configure(state="normal")
         self._mislabel_var.set(False)
