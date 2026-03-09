@@ -33,7 +33,7 @@ from .common import (
     LR_CLASSIFIER,
     LR_FEATURES,
     LR_HEAD,
-    MIN_DELTA,
+    MIN_DELTA_F1,
     PRE_RESIZE,
     SCHEDULER_FACTOR,
     SCHEDULER_MIN_LR,
@@ -147,7 +147,7 @@ def run_experiment(
         val_f1 = val_result["macro_f1"]
         scheduler.step(val_f1)
 
-        if val_f1 > best_f1 + MIN_DELTA:
+        if val_f1 > best_f1 + MIN_DELTA_F1:
             best_f1 = val_f1
             best_per_class = list(val_result["per_class_f1"])
             patience_counter = 0

@@ -24,7 +24,8 @@ from .constants import (
     LR_CLASSIFIER,
     LR_FEATURES,
     LR_HEAD,
-    MIN_DELTA,
+    MIN_DELTA_F1,
+    MIN_DELTA_LOSS,
     NUM_CLASSES,
     PHASE1_EPOCHS,
     PHASE1_PATIENCE,
@@ -270,7 +271,7 @@ def train_model(
             val_result = evaluate(model, val_loader, criterion, device)
             val_loss = val_result["loss"]
             p1_marker = ""
-            if val_loss < best_p1_loss - MIN_DELTA:
+            if val_loss < best_p1_loss - MIN_DELTA_LOSS:
                 best_p1_loss = val_loss
                 p1_patience_counter = 0
                 p1_marker = " *"
@@ -326,7 +327,7 @@ def train_model(
         scheduler.step(val_f1)
 
         marker = ""
-        if val_f1 > best_f1 + MIN_DELTA:
+        if val_f1 > best_f1 + MIN_DELTA_F1:
             best_f1 = val_f1
             best_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
