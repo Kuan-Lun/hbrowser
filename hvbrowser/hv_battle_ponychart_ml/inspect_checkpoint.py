@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import torch
 
 from .common.constants import OUTPUT_CHECKPOINT
 from .common.model import BACKBONE_REGISTRY, build_model
-from .common.sampling import is_original, load_labels, load_samples, separate_orig_crop
+from .common.sampling import is_original, load_samples, separate_orig_crop
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,9 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
 
     samples = load_samples()
     orig, crop = separate_orig_crop(samples)
-    labels_current = load_labels()
+    labels_current = {
+        f"rawimage/{os.path.basename(p)}": labels for p, labels in samples
+    }
 
     def _count_orig_crop(labels: dict[str, list[int]]) -> tuple[int, int]:
         n_o = sum(1 for k in labels if is_original(k.split("/")[-1]))

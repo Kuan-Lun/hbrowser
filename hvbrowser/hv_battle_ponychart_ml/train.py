@@ -50,7 +50,6 @@ from .common import (
     get_performance_cpu_count,
     group_stratified_split,
     is_original,
-    load_labels,
     load_samples,
     separate_orig_crop,
     train_model,
@@ -198,7 +197,12 @@ def main() -> None:
 
     # Track labels snapshot at full training and last save for drift detection.
     # From-scratch: snapshot current labels. Resume: carry forward from checkpoint.
-    current_labels = load_labels()
+    # Build labels snapshot from loaded samples (filtered by file existence)
+    # to stay consistent with n_orig / n_crop counts.
+    current_labels = {
+        f"rawimage/{os.path.basename(p)}": labels
+        for p, labels in orig_samples + crop_samples
+    }
     if resume_from is not None:
         ckpt = torch.load(resume_from, map_location=device, weights_only=True)
         labels_at_full_train = ckpt["labels_at_full_train"]

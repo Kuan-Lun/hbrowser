@@ -100,6 +100,13 @@ class LabelStore:
         """刪除指定 key 的標籤。"""
         self._data.pop(key, None)
 
+    def purge_orphans(self, base_dir: Path) -> list[str]:
+        """移除檔案不存在的孤兒 entries，回傳被清除的 keys。"""
+        orphans = [k for k in self._data if not (base_dir / k).is_file()]
+        for k in orphans:
+            del self._data[k]
+        return orphans
+
     def save(self) -> None:
         self._file.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),
@@ -433,6 +440,12 @@ class LabelApp:
         )
         self._delete_btn.pack(side="left", padx=(0, 16))
 
+        tk.Button(
+            action_frame,
+            text="清理孤兒標籤",
+            command=self._purge_orphans,
+        ).pack(side="left")
+
         # Analyze button
         analyze_frame = tk.Frame(root)
         analyze_frame.pack(pady=(0, 4))
@@ -630,6 +643,28 @@ class LabelApp:
                 self._show_no_images()
                 return
         self._refresh()
+
+    def _purge_orphans(self) -> None:
+        """清理 labels.json 中檔案不存在的孤兒 entries。"""
+        orphans = self.store.purge_orphans(_SCRIPT_DIR)
+        if not orphans:
+            messagebox.showinfo("清理孤兒標籤", "沒有孤兒標籤。")
+            return
+        confirm = messagebox.askyesno(
+            "清理孤兒標籤",
+            f"發現 {len(orphans)} 筆孤兒標籤"
+            f"（檔案不存在）：\n\n"
+            + "\n".join(orphans[:20])
+            + ("\n..." if len(orphans) > 20 else "")
+            + "\n\n確定要從 labels.json 移除？",
+        )
+        if not confirm:
+            return
+        self.store.save()
+        messagebox.showinfo(
+            "清理孤兒標籤",
+            f"已移除 {len(orphans)} 筆孤兒標籤。",
+        )
 
     def _on_filter_toggle(self) -> None:
         self._apply_filters()
