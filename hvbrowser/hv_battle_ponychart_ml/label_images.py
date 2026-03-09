@@ -96,6 +96,10 @@ class LabelStore:
     def has(self, key: str) -> bool:
         return key in self._data
 
+    def delete(self, key: str) -> None:
+        """刪除指定 key 的標籤。"""
+        self._data.pop(key, None)
+
     def save(self) -> None:
         self._file.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),
@@ -228,6 +232,15 @@ class ImageNavigator:
             self._idx = next(i for i, p in enumerate(self._paths) if p == path)
         except StopIteration:
             pass
+
+    def remove_path(self, path: Path) -> None:
+        """移除圖片並調整索引。"""
+        self._all_paths = [p for p in self._all_paths if p != path]
+        self._paths = [p for p in self._paths if p != path]
+        if self._paths:
+            self._idx = min(self._idx, len(self._paths) - 1)
+        else:
+            self._idx = 0
 
     def contains_key(self, key: str) -> bool:
         """目前篩選後的列表中是否包含指定 key。"""
@@ -407,6 +420,19 @@ class LabelApp:
         self._analysis_result: tuple[dict[str, list[float]], list[float]] | None = None
         self._analysis_error: str | None = None
 
+        # Action buttons
+        action_frame = tk.Frame(root)
+        action_frame.pack(pady=(0, 4))
+
+        self._delete_btn = tk.Button(
+            action_frame,
+            text="刪除此裁切圖",
+            fg="red",
+            command=self._delete_crop,
+            state="disabled",
+        )
+        self._delete_btn.pack(side="left", padx=(0, 16))
+
         # Analyze button
         analyze_frame = tk.Frame(root)
         analyze_frame.pack(pady=(0, 4))
@@ -512,6 +538,11 @@ class LabelApp:
         self.crop.exit()
         self._load_image(self.nav.current_path)
         self.current_labels = sorted(set(self.store.get(self.nav.current_key)))
+        # 只有裁切圖才能刪除
+        if is_raw_image(self.nav.current_path):
+            self._delete_btn.configure(state="disabled")
+        else:
+            self._delete_btn.configure(state="normal")
         self._update_display()
 
     def _load_image(self, path: Path) -> None:
@@ -567,6 +598,37 @@ class LabelApp:
             self.nav.go_to_key(key)
         elif not self.nav.contains_key(key):
             self.nav.advance_after_label(key)
+        self._refresh()
+
+    def _delete_crop(self) -> None:
+        """刪除目前的裁切圖片檔案及其標籤。原圖無法刪除。"""
+        if self.nav.is_empty:
+            return
+        path = self.nav.current_path
+        if is_raw_image(path):
+            messagebox.showwarning("刪除", "無法刪除原圖。")
+            return
+
+        confirm = messagebox.askyesno(
+            "確認刪除",
+            f"確定要刪除此裁切圖嗎？\n{path.name}\n\n此操作無法復原。",
+        )
+        if not confirm:
+            return
+
+        key = self.nav.current_key
+        self.store.delete(key)
+        self.store.save()
+        self.nav.remove_path(path)
+        path.unlink(missing_ok=True)
+
+        if self.nav.is_empty:
+            if self.nav.is_filtered:
+                messagebox.showinfo("Info", "篩選結果為空。")
+                self._reset_all_filters()
+            if self.nav.is_empty:
+                self._show_no_images()
+                return
         self._refresh()
 
     def _on_filter_toggle(self) -> None:
