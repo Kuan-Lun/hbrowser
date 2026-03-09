@@ -5,7 +5,7 @@ from functools import partial, wraps
 from random import random
 from typing import Any, TypeVar
 
-from selenium.common.exceptions import UnexpectedAlertPresentException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery.utils import setup_logger
@@ -504,18 +504,20 @@ class BattleDriver(HVDriver):
 
     def battle(self) -> None:
         self._create_last_debuff_monster_id()
-        # Open skill menu twice using resilient locator-based click
-        # (no element caching & no log wait)
-        from selenium.webdriver.common.by import (
-            By as _By,
-        )  # local import to avoid top-level clutter
 
-        for _ in range(2):
-            self.element_action_manager.click_resilient(
-                lambda: self.driver.find_element(_By.ID, "ckey_skill")
-            )
-            time.sleep(0.05)
-
+        max_retries = 3
+        retry_count = 0
         while True:
-            if not self.pausecontroller.pauseable(self.battle_in_turn)():
-                break
+            try:
+                if not self.pausecontroller.pauseable(self.battle_in_turn)():
+                    break
+                retry_count = 0
+            except TimeoutException:
+                retry_count += 1
+                logger.warning(
+                    "TimeoutException caught, reloading page "
+                    f"(attempt {retry_count}/{max_retries})"
+                )
+                if retry_count >= max_retries:
+                    raise
+                self.driver.get(self.driver.current_url)
