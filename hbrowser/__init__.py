@@ -1,5 +1,6 @@
 __all__ = [
     "beep_os_independent",
+    "notify",
     "EHDriver",
     "ExHDriver",
     "Tag",
@@ -11,3 +12,4 @@ from .gallery import (
     ExHDriver,
     Tag,
 )
+from .notify import notify

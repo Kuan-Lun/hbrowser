@@ -11,6 +11,7 @@ import onnxruntime as ort
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery.utils import setup_logger
+from hbrowser.notify import notify
 
 from .hv import HVDriver
 from .hv_battle_ponychart_ml.model_spec import (
@@ -190,6 +191,8 @@ class PonyChart:
             return isponychart
 
         img_path = self._save_pony_chart_image()
+
+        notify("PonyChart", "PonyChart detected")
 
         # 新增：自動填入答案（若失敗不影響原流程）
         try:
