@@ -431,6 +431,21 @@ class LabelApp:
             command=self._apply_filters,
         ).pack(side="left")
 
+        # Class filter (independent, always enabled)
+        class_frame = tk.Frame(root)
+        class_frame.pack(pady=(0, 4))
+        tk.Label(class_frame, text="Class:").pack(side="left")
+        self._class_vars: list[tk.BooleanVar] = []
+        for short in CLASS_NAMES_LIST:
+            var = tk.BooleanVar(value=False)
+            self._class_vars.append(var)
+            tk.Checkbutton(
+                class_frame,
+                text=short,
+                variable=var,
+                command=self._apply_filters,
+            ).pack(side="left", padx=(2, 2))
+
         # Model analysis state
         self._model_probs: dict[str, list[float]] | None = None
         self._model_thresholds: list[float] | None = None
@@ -472,16 +487,6 @@ class LabelApp:
         # Suspicious filter frame (initially disabled)
         suspicious_frame = tk.Frame(root)
         suspicious_frame.pack(pady=(0, 4))
-
-        tk.Label(suspicious_frame, text="Class:").pack(side="left")
-        self._suspicious_class_var = tk.StringVar(value="All")
-        self._suspicious_class_menu = tk.OptionMenu(
-            suspicious_frame,
-            self._suspicious_class_var,
-            *["All", *CLASS_NAMES_LIST],
-            command=lambda _: self._apply_filters(),
-        )
-        self._suspicious_class_menu.pack(side="left", padx=(2, 8))
 
         self._mislabel_var = tk.BooleanVar(value=False)
         self._mislabel_cb = tk.Checkbutton(
@@ -702,6 +707,10 @@ class LabelApp:
         crop_mismatch = self.crop_mismatch_var.get()
         train_only = self.train_only_var.get()
 
+        # Class filter: which class indices are selected (0-based)
+        selected_classes = [i for i, var in enumerate(self._class_vars) if var.get()]
+        class_filter_active = len(selected_classes) > 0
+
         show_mislabel = self._mislabel_var.get()
         show_missing = self._missing_var.get()
         show_ambiguous = self._ambiguous_var.get()
@@ -715,6 +724,7 @@ class LabelApp:
             and not unlabeled_only
             and not crop_mismatch
             and not train_only
+            and not class_filter_active
             and not suspicious_active
         ):
             return None
@@ -768,7 +778,11 @@ class LabelApp:
         store = self.store
         model_probs = self._model_probs
         model_thresholds = self._model_thresholds
-        selected_class = self._suspicious_class_var.get()
+
+        # Suspicious checks: use selected classes if any, otherwise all
+        suspicious_classes = (
+            selected_classes if selected_classes else list(range(len(CLASS_NAMES_LIST)))
+        )
 
         def predicate(p: Path) -> bool:
             if raw_only or uncropped_only:
@@ -787,6 +801,10 @@ class LabelApp:
                     return False
                 if p.stem not in crop_mismatch_stems:
                     return False
+            if class_filter_active:
+                labels = store.get(store.path_to_key(p))
+                if not all((ci + 1) in labels for ci in selected_classes):
+                    return False
             if (
                 suspicious_active
                 and model_probs is not None
@@ -797,12 +815,8 @@ class LabelApp:
                     return False
                 probs = model_probs[key]
                 labels = store.get(key)
-                if selected_class == "All":
-                    classes_to_check: range | list[int] = range(len(CLASS_NAMES_LIST))
-                else:
-                    classes_to_check = [CLASS_NAMES_LIST.index(selected_class)]
                 match = False
-                for ci in classes_to_check:
+                for ci in suspicious_classes:
                     has_label = (ci + 1) in labels
                     prob = probs[ci]
                     thr = model_thresholds[ci]
@@ -841,7 +855,8 @@ class LabelApp:
         self._mislabel_var.set(False)
         self._missing_var.set(False)
         self._ambiguous_var.set(False)
-        self._suspicious_class_var.set("All")
+        for var in self._class_vars:
+            var.set(False)
         self.nav.apply_filter(None)
 
     def _jump_to_random(self) -> None:
@@ -870,7 +885,6 @@ class LabelApp:
         state: Literal["normal", "disabled"],
     ) -> None:
         """Enable or disable suspicious filter controls."""
-        self._suspicious_class_menu.configure(state=state)
         self._mislabel_cb.configure(state=state)
         self._missing_cb.configure(state=state)
         self._ambiguous_cb.configure(state=state)

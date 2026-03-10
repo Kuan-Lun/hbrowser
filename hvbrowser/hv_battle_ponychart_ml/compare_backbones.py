@@ -100,10 +100,8 @@ def main() -> None:
         return
     logger.info("Total samples loaded: %d", len(all_samples))
 
-    # ── Split groups: 80% train+val, 20% test ──
-    train_val_groups, test_groups = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE
-    )
+    # ── Split groups: test / val / train ──
+    gsp = split_by_groups(all_samples, test_size=HOLDOUT_TEST_SIZE, val_size=VAL_SIZE)
 
     # Build group index
     groups: dict[str, list[int]] = defaultdict(list)
@@ -114,14 +112,16 @@ def main() -> None:
     # ── Test set: only originals from test groups ──
     test_samples = [
         all_samples[idx]
-        for gk in test_groups
+        for gk in gsp.test
         for idx in groups[gk]
         if is_original(os.path.basename(all_samples[idx][0]))
     ]
     logger.info("Test set (originals only): %d images", len(test_samples))
 
-    # ── Train+val pool: originals + balanced crops from train groups ──
-    train_val_all = [all_samples[idx] for gk in train_val_groups for idx in groups[gk]]
+    # ── Train+val pool: originals + balanced crops ──
+    train_val_all = [
+        all_samples[idx] for gk in gsp.train + gsp.val for idx in groups[gk]
+    ]
     train_val_orig, train_val_crop = separate_orig_crop(train_val_all)
     orig_rates = compute_class_rates(train_val_orig)
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
@@ -134,18 +134,24 @@ def main() -> None:
         len(train_val_balanced),
     )
 
-    # ── Split train/val within pool ──
+    # ── Split train/val within balanced pool ──
+    val_gk_set = set(gsp.val)
     tv_groups_inner: dict[str, list[int]] = defaultdict(list)
     for idx, (path, _) in enumerate(train_val_balanced):
         base = get_base_timestamp(os.path.basename(path))
         tv_groups_inner[base].append(idx)
 
-    train_gk, val_gk = split_by_groups(train_val_balanced, test_size=VAL_SIZE)
     train_samples = [
-        train_val_balanced[idx] for gk in train_gk for idx in tv_groups_inner[gk]
+        train_val_balanced[idx]
+        for gk, indices in tv_groups_inner.items()
+        if gk not in val_gk_set
+        for idx in indices
     ]
     val_samples = [
-        train_val_balanced[idx] for gk in val_gk for idx in tv_groups_inner[gk]
+        train_val_balanced[idx]
+        for gk, indices in tv_groups_inner.items()
+        if gk in val_gk_set
+        for idx in indices
     ]
     logger.info(
         "Train: %d  Val: %d  Test: %d",

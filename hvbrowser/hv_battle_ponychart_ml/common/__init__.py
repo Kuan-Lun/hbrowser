@@ -64,7 +64,7 @@ from .sampling import (
     load_samples,
     separate_orig_crop,
 )
-from .splitting import group_hash_split, split_by_groups
+from .splitting import GroupSplit, group_hash_split, split_by_groups
 from .training import (
     TrainResult,
     evaluate,
@@ -78,6 +78,7 @@ __all__ = [
     "BACKBONE_REGISTRY",
     "BATCH_SIZE",
     "BackboneConfig",
+    "GroupSplit",
     "CLASS_NAMES",
     "HOLDOUT_TEST_SIZE",
     "IMAGENET_MEAN",

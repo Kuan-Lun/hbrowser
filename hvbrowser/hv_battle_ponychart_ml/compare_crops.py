@@ -99,8 +99,9 @@ def main() -> None:
     all_samples = load_samples()
     logger.info("Total samples loaded: %d", len(all_samples))
 
-    # Split groups: 10% test, 90% train+val
-    train_val_groups, test_groups = split_by_groups(all_samples, test_size=0.10)
+    # Split groups: test / val / train
+    gsp = split_by_groups(all_samples, test_size=0.10, val_size=VAL_SIZE)
+    val_gk_set = set(gsp.val)
 
     # Build index from base timestamp to sample indices
     groups: dict[str, list[int]] = defaultdict(list)
@@ -111,7 +112,7 @@ def main() -> None:
 
     # Test set: only original images from test groups
     test_indices = []
-    for gk in test_groups:
+    for gk in gsp.test:
         for idx in groups[gk]:
             fname = os.path.basename(all_samples[idx][0])
             if is_original(fname):
@@ -121,7 +122,7 @@ def main() -> None:
     # Collect train+val indices, separate originals and crops
     train_val_indices_orig = []
     train_val_indices_crop = []
-    for gk in train_val_groups:
+    for gk in gsp.train + gsp.val:
         for idx in groups[gk]:
             fname = os.path.basename(all_samples[idx][0])
             if is_original(fname):
@@ -129,7 +130,7 @@ def main() -> None:
             else:
                 train_val_indices_crop.append(idx)
 
-    train_val_all = [all_samples[i] for gk in train_val_groups for i in groups[gk]]
+    train_val_all = [all_samples[i] for gk in gsp.train + gsp.val for i in groups[gk]]
     train_val_orig = [all_samples[i] for i in train_val_indices_orig]
     train_val_crop = [all_samples[i] for i in train_val_indices_crop]
 
@@ -138,33 +139,37 @@ def main() -> None:
     balanced_crops = balance_crop_samples(train_val_crop, orig_rates, rng)
     train_val_balanced = train_val_orig + balanced_crops
 
+    # ── Helper: split a sample list into train/val using pre-computed groups ──
+    def _train_val_split(
+        samples: list[tuple[str, list[int]]],
+    ) -> tuple[list[tuple[str, list[int]]], list[tuple[str, list[int]]]]:
+        idx_groups: dict[str, list[int]] = defaultdict(list)
+        for idx, (path, _) in enumerate(samples):
+            base = get_base_timestamp(os.path.basename(path))
+            idx_groups[base].append(idx)
+        train = [
+            samples[i]
+            for gk, indices in idx_groups.items()
+            if gk not in val_gk_set
+            for i in indices
+        ]
+        val = [
+            samples[i]
+            for gk, indices in idx_groups.items()
+            if gk in val_gk_set
+            for i in indices
+        ]
+        return train, val
+
     # ── Split train/val for each experiment ──
     # Experiment A: originals + all crops (biased)
-    train_gk_a, val_gk_a = split_by_groups(train_val_all, test_size=VAL_SIZE)
-    groups_a: dict[str, list[int]] = defaultdict(list)
-    for idx, (path, _) in enumerate(train_val_all):
-        base = get_base_timestamp(os.path.basename(path))
-        groups_a[base].append(idx)
-    train_a = [train_val_all[i] for gk in train_gk_a for i in groups_a[gk]]
-    val_a = [train_val_all[i] for gk in val_gk_a for i in groups_a[gk]]
+    train_a, val_a = _train_val_split(train_val_all)
 
     # Experiment B: originals only
-    train_gk_b, val_gk_b = split_by_groups(train_val_orig, test_size=VAL_SIZE)
-    groups_b: dict[str, list[int]] = defaultdict(list)
-    for idx, (path, _) in enumerate(train_val_orig):
-        base = get_base_timestamp(os.path.basename(path))
-        groups_b[base].append(idx)
-    train_b = [train_val_orig[i] for gk in train_gk_b for i in groups_b[gk]]
-    val_b = [train_val_orig[i] for gk in val_gk_b for i in groups_b[gk]]
+    train_b, val_b = _train_val_split(train_val_orig)
 
     # Experiment C: originals + balanced crops
-    train_gk_c, val_gk_c = split_by_groups(train_val_balanced, test_size=VAL_SIZE)
-    groups_c: dict[str, list[int]] = defaultdict(list)
-    for idx, (path, _) in enumerate(train_val_balanced):
-        base = get_base_timestamp(os.path.basename(path))
-        groups_c[base].append(idx)
-    train_c = [train_val_balanced[i] for gk in train_gk_c for i in groups_c[gk]]
-    val_c = [train_val_balanced[i] for gk in val_gk_c for i in groups_c[gk]]
+    train_c, val_c = _train_val_split(train_val_balanced)
 
     criterion = nn.BCEWithLogitsLoss()
 
@@ -399,11 +404,11 @@ def main() -> None:
     logger.info("=" * 80)
 
     # ── Crop recommendation (based on train crops only) ──
-    train_gk_set_c = set(train_gk_c)
+    train_gk_set = set(gsp.train)
     train_crops = [
         s
         for s in train_val_crop
-        if get_base_timestamp(os.path.basename(s[0])) in train_gk_set_c
+        if get_base_timestamp(os.path.basename(s[0])) in train_gk_set
     ]
     crop_counts_per_class = [0] * NUM_CLASSES
     for _, labels in train_crops:

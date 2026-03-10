@@ -68,6 +68,7 @@ SAFETY_MARGIN = 0.75
 def prepare_train_val(
     samples: list[tuple[str, list[int]]],
     seed: int,
+    val_gk_set: set[str],
 ) -> tuple[list[tuple[str, list[int]]], list[tuple[str, list[int]]]]:
     """Apply orig/crop balance + train/val split (same pipeline as train.py)."""
     orig, crop = separate_orig_crop(samples)
@@ -81,9 +82,18 @@ def prepare_train_val(
         base = get_base_timestamp(os.path.basename(path))
         sub_groups[base].append(idx)
 
-    train_gk, val_gk = split_by_groups(balanced, test_size=VAL_SIZE)
-    train_samples = [balanced[i] for gk in train_gk for i in sub_groups[gk]]
-    val_samples = [balanced[i] for gk in val_gk for i in sub_groups[gk]]
+    train_samples = [
+        balanced[i]
+        for gk, indices in sub_groups.items()
+        if gk not in val_gk_set
+        for i in indices
+    ]
+    val_samples = [
+        balanced[i]
+        for gk, indices in sub_groups.items()
+        if gk in val_gk_set
+        for i in indices
+    ]
     return train_samples, val_samples
 
 
@@ -126,13 +136,12 @@ def main() -> None:
         base = get_base_timestamp(fname)
         groups[base].append(idx)
 
-    # ── Split: 20% test (originals only), 80% train+val pool ──
-    train_val_group_keys, test_group_keys = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE
-    )
+    # ── Split: test / val / train ──
+    gsp = split_by_groups(all_samples, test_size=HOLDOUT_TEST_SIZE, val_size=VAL_SIZE)
+    val_gk_set = set(gsp.val)
 
     test_indices = []
-    for gk in test_group_keys:
+    for gk in gsp.test:
         for idx in groups[gk]:
             fname = os.path.basename(all_samples[idx][0])
             if is_original(fname):
@@ -148,6 +157,7 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss()
 
     # ── Collect pool samples ──
+    train_val_group_keys = gsp.train + gsp.val
     pool_indices = [idx for gk in train_val_group_keys for idx in groups[gk]]
     pool_samples = [all_samples[i] for i in pool_indices]
 
@@ -156,7 +166,7 @@ def main() -> None:
     logger.info("Pool groups (chronological): %d", len(sorted_pool_groups))
 
     # ── Full train/val split for baseline and resume targets ──
-    full_train, full_val = prepare_train_val(pool_samples, SEED)
+    full_train, full_val = prepare_train_val(pool_samples, SEED, val_gk_set)
     logger.info("Full pool: train=%d  val=%d", len(full_train), len(full_val))
 
     # ── Baseline: 100% from scratch ──
@@ -211,7 +221,7 @@ def main() -> None:
 
         torch.manual_seed(SEED)
         np.random.seed(SEED)
-        base_train, base_val = prepare_train_val(base_samples, SEED)
+        base_train, base_val = prepare_train_val(base_samples, SEED, val_gk_set)
         logger.info("  Base train=%d  val=%d", len(base_train), len(base_val))
 
         base_train_result = train_model(

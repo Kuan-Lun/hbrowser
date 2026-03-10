@@ -140,13 +140,13 @@ def main() -> None:
         base = get_base_timestamp(fname)
         groups[base].append(idx)
 
-    # Split: 20% test (original images only), 80% train+val pool
-    train_val_group_keys, test_group_keys = split_by_groups(
-        all_samples, test_size=HOLDOUT_TEST_SIZE
-    )
+    # Split: test / val / train
+    gsp = split_by_groups(all_samples, test_size=HOLDOUT_TEST_SIZE, val_size=VAL_SIZE)
+    val_gk_set = set(gsp.val)
+    train_val_group_keys = gsp.train + gsp.val
 
     test_indices = []
-    for gk in test_group_keys:
+    for gk in gsp.test:
         for idx in groups[gk]:
             fname = os.path.basename(all_samples[idx][0])
             if is_original(fname):
@@ -188,17 +188,24 @@ def main() -> None:
             selected_indices.extend(groups[gk])
         selected_samples = [all_samples[i] for i in selected_indices]
 
-        # Split into train / val (15% val for early stopping)
-        sub_train_gk, sub_val_gk = split_by_groups(selected_samples, test_size=VAL_SIZE)
+        # Split into train / val using pre-computed group assignments
         sub_groups: dict[str, list[int]] = defaultdict(list)
         for idx, (path, _) in enumerate(selected_samples):
             base = get_base_timestamp(os.path.basename(path))
             sub_groups[base].append(idx)
 
         raw_train_samples = [
-            selected_samples[i] for gk in sub_train_gk for i in sub_groups[gk]
+            selected_samples[i]
+            for gk, indices in sub_groups.items()
+            if gk not in val_gk_set
+            for i in indices
         ]
-        val_samples = [selected_samples[i] for gk in sub_val_gk for i in sub_groups[gk]]
+        val_samples = [
+            selected_samples[i]
+            for gk, indices in sub_groups.items()
+            if gk in val_gk_set
+            for i in indices
+        ]
 
         # Crop balancing (same as train.py)
         orig_train = [
