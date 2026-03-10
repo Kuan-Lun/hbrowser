@@ -10,7 +10,6 @@ import numpy as np
 import onnxruntime as ort
 from selenium.webdriver.common.by import By
 
-from hbrowser.beep import beep_os_independent
 from hbrowser.gallery.utils import setup_logger
 
 from .hv import HVDriver
@@ -191,8 +190,6 @@ class PonyChart:
             return isponychart
 
         img_path = self._save_pony_chart_image()
-
-        beep_os_independent()
 
         # 新增：自動填入答案（若失敗不影響原流程）
         try:
