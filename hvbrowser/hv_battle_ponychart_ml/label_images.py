@@ -908,7 +908,7 @@ class LabelApp:
             self._table_frame.pack_forget()
             return
 
-        self._table_frame.pack(pady=(0, 4))
+        self._table_frame.pack(before=self.counter_label, pady=(0, 4))
         probs = self._model_probs[key]
         thresholds = self._model_thresholds
         labels = self.current_labels
@@ -926,13 +926,13 @@ class LabelApp:
             confident = abs(prob - thr) >= SUSPICIOUS_MARGIN
             if has_label and pred:
                 text = "==" if confident else "="
-                self._table_labels[(1, c)].configure(text=text, fg="green")
+                self._table_labels[(1, c)].configure(text=text)
             elif has_label and not pred:
                 text = "−−" if confident else "−"
-                self._table_labels[(1, c)].configure(text=text, fg="red")
+                self._table_labels[(1, c)].configure(text=text)
             elif not has_label and pred:
                 text = "++" if confident else "+"
-                self._table_labels[(1, c)].configure(text=text, fg="red")
+                self._table_labels[(1, c)].configure(text=text)
             else:
                 self._table_labels[(1, c)].configure(text="")
 
