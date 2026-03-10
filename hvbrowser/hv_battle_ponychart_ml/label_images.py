@@ -43,13 +43,10 @@ LABEL_MAP = {
 CHECKPOINT_FILE = _SCRIPT_DIR / "checkpoint.pt"
 THRESHOLDS_FILE = _SCRIPT_DIR / "thresholds.json"
 
-# Suspicious sample thresholds
-SUSPICIOUS_FN_PROB = 0.10  # label=1 but prob below this → possible mislabel
-SUSPICIOUS_FP_PROB = 0.80  # label=0 but prob above this → possible missing label
+# Suspicious sample threshold
 SUSPICIOUS_MARGIN = 0.15  # |prob - threshold| below this → ambiguous
 
 CLASS_NAMES_LIST = [LABEL_MAP[i] for i in range(1, 7)]
-CLASS_SHORT = ["TS", "Ra", "FS", "RD", "PP", "AJ"]
 
 
 class LabelStore:
@@ -484,14 +481,19 @@ class LabelApp:
         self._analyze_status = tk.Label(analyze_frame, text="", fg="#999")
         self._analyze_status.pack(side="left")
 
-        # Suspicious filter frame (initially disabled)
+        # Model analysis table (hidden until analysis is done)
+        self._table_frame = tk.Frame(root)
+        self._table_labels: dict[tuple[int, int], tk.Label] = {}
+        self._build_analysis_table()
+
+        # Suspicious filter checkboxes
         suspicious_frame = tk.Frame(root)
         suspicious_frame.pack(pady=(0, 4))
 
         self._mislabel_var = tk.BooleanVar(value=False)
         self._mislabel_cb = tk.Checkbutton(
             suspicious_frame,
-            text="Mislabel",
+            text="Mislabel (−)",
             variable=self._mislabel_var,
             command=self._apply_filters,
         )
@@ -500,20 +502,11 @@ class LabelApp:
         self._missing_var = tk.BooleanVar(value=False)
         self._missing_cb = tk.Checkbutton(
             suspicious_frame,
-            text="Missing label",
+            text="Missing (+)",
             variable=self._missing_var,
             command=self._apply_filters,
         )
         self._missing_cb.pack(side="left", padx=(0, 4))
-
-        self._ambiguous_var = tk.BooleanVar(value=False)
-        self._ambiguous_cb = tk.Checkbutton(
-            suspicious_frame,
-            text="Ambiguous",
-            variable=self._ambiguous_var,
-            command=self._apply_filters,
-        )
-        self._ambiguous_cb.pack(side="left")
 
         self._set_suspicious_controls_state("disabled")
 
@@ -537,20 +530,11 @@ class LabelApp:
     def _update_display(self, extra: str = "") -> None:
         self.counter_label.configure(text=f"{self.nav.index + 1} / {self.nav.total}")
         label_names = [LABEL_MAP.get(i, str(i)) for i in self.current_labels]
-        info = f"labels: {label_names}\n"
-        if self._model_probs is not None:
-            key = self.nav.current_key
-            if key in self._model_probs:
-                probs = self._model_probs[key]
-                parts = []
-                for i, (short, prob) in enumerate(zip(CLASS_SHORT, probs)):
-                    marker = "*" if (i + 1) in self.current_labels else " "
-                    parts.append(f"{short}={prob:.2f}{marker}")
-                info += "Model: " + "  ".join(parts) + "\n"
-        info += self.nav.current_key
+        info = f"labels: {label_names}\n{self.nav.current_key}"
         if extra:
             info += f"  ({extra})"
         self.info_label.configure(text=info)
+        self._update_analysis_table()
 
     def _refresh(self) -> None:
         if self.nav.is_empty:
@@ -713,9 +697,8 @@ class LabelApp:
 
         show_mislabel = self._mislabel_var.get()
         show_missing = self._missing_var.get()
-        show_ambiguous = self._ambiguous_var.get()
         suspicious_active = self._model_probs is not None and (
-            show_mislabel or show_missing or show_ambiguous
+            show_mislabel or show_missing
         )
 
         if (
@@ -820,13 +803,11 @@ class LabelApp:
                     has_label = (ci + 1) in labels
                     prob = probs[ci]
                     thr = model_thresholds[ci]
-                    if show_mislabel and has_label and prob < SUSPICIOUS_FN_PROB:
+                    pred = prob >= thr
+                    if show_mislabel and has_label and not pred:
                         match = True
                         break
-                    if show_missing and not has_label and prob > SUSPICIOUS_FP_PROB:
-                        match = True
-                        break
-                    if show_ambiguous and abs(prob - thr) < SUSPICIOUS_MARGIN:
+                    if show_missing and not has_label and pred:
                         match = True
                         break
                 if not match:
@@ -854,7 +835,6 @@ class LabelApp:
         self.uncropped_only_cb.configure(state="normal")
         self._mislabel_var.set(False)
         self._missing_var.set(False)
-        self._ambiguous_var.set(False)
         for var in self._class_vars:
             var.set(False)
         self.nav.apply_filter(None)
@@ -880,6 +860,82 @@ class LabelApp:
 
     # ── Model analysis ─────────────────────────────────────────
 
+    def _build_analysis_table(self) -> None:
+        """Build the grid-based analysis table (initially hidden)."""
+        row_headers = ["Prob", "Label"]
+        col_headers = list(LABEL_MAP.values())
+
+        # Top-left empty cell
+        tk.Label(self._table_frame, text="", width=10).grid(row=0, column=0)
+
+        # Column headers (class names)
+        for c, name in enumerate(col_headers):
+            lbl = tk.Label(
+                self._table_frame,
+                text=name,
+                font=("Consolas", 10, "bold"),
+                width=12,
+            )
+            lbl.grid(row=0, column=c + 1, padx=2)
+
+        # Row headers + data cells
+        for r, header in enumerate(row_headers):
+            tk.Label(
+                self._table_frame,
+                text=header,
+                font=("Consolas", 10, "bold"),
+                width=10,
+                anchor="w",
+            ).grid(row=r + 1, column=0, padx=(0, 4))
+            for c in range(len(col_headers)):
+                lbl = tk.Label(
+                    self._table_frame,
+                    text="",
+                    font=("Consolas", 10),
+                    width=12,
+                )
+                lbl.grid(row=r + 1, column=c + 1, padx=2)
+                self._table_labels[(r, c)] = lbl
+
+    def _update_analysis_table(self) -> None:
+        """Update the analysis table for the current image."""
+        if self._model_probs is None or self._model_thresholds is None:
+            self._table_frame.pack_forget()
+            return
+
+        key = self.nav.current_key
+        if key not in self._model_probs:
+            self._table_frame.pack_forget()
+            return
+
+        self._table_frame.pack(pady=(0, 4))
+        probs = self._model_probs[key]
+        thresholds = self._model_thresholds
+        labels = self.current_labels
+
+        for c in range(len(CLASS_NAMES_LIST)):
+            prob = probs[c]
+            thr = thresholds[c]
+            has_label = (c + 1) in labels
+            pred = prob >= thr
+
+            # Row 0: Prob
+            self._table_labels[(0, c)].configure(text=f"{prob:.2f}")
+
+            # Row 1: Label
+            confident = abs(prob - thr) >= SUSPICIOUS_MARGIN
+            if has_label and pred:
+                text = "==" if confident else "="
+                self._table_labels[(1, c)].configure(text=text, fg="green")
+            elif has_label and not pred:
+                text = "−−" if confident else "−"
+                self._table_labels[(1, c)].configure(text=text, fg="red")
+            elif not has_label and pred:
+                text = "++" if confident else "+"
+                self._table_labels[(1, c)].configure(text=text, fg="red")
+            else:
+                self._table_labels[(1, c)].configure(text="")
+
     def _set_suspicious_controls_state(
         self,
         state: Literal["normal", "disabled"],
@@ -887,7 +943,6 @@ class LabelApp:
         """Enable or disable suspicious filter controls."""
         self._mislabel_cb.configure(state=state)
         self._missing_cb.configure(state=state)
-        self._ambiguous_cb.configure(state=state)
 
     def _start_analysis(self) -> None:
         """Start model analysis in a background thread."""
