@@ -3,6 +3,7 @@ from collections.abc import Callable
 from typing import Any
 
 from hv_bie import parse_snapshot
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 
@@ -109,4 +110,6 @@ class ElementActionManager:
                         check_interval=check_interval,
                     )
                 else:
-                    raise TimeoutError("Battle action timeout waiting for log update")
+                    raise TimeoutException(
+                        "Battle action timeout waiting for log update"
+                    )
