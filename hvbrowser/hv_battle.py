@@ -9,6 +9,7 @@ from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentE
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery.utils import setup_logger
+from hbrowser.notify import notify
 
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
@@ -502,7 +503,18 @@ class BattleDriver(HVDriver):
     def _create_last_debuff_monster_id(self) -> None:
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
+    def _is_in_battle(self) -> bool:
+        self.battle_dashboard.battle_subject.notify()
+        return (
+            bool(self.battle_dashboard.overview_monsters.alive_monster_name)
+            or PonyChart(self).check()
+        )
+
     def battle(self) -> None:
+        if not self._is_in_battle():
+            logger.info("No battle detected, exiting.")
+            return
+
         self._create_last_debuff_monster_id()
 
         max_retries = 3
@@ -521,3 +533,14 @@ class BattleDriver(HVDriver):
                 if retry_count >= max_retries:
                     raise
                 self.driver.get(self.driver.current_url)
+
+        notify("HBrowser", "Battle complete")
+        logger.info("Battle complete, waiting 300s for user to start next battle...")
+        wait_timeout = 300
+        poll_interval = 5
+        for _ in range(wait_timeout // poll_interval):
+            time.sleep(poll_interval)
+            if self._is_in_battle():
+                self.battle()
+                return
+        logger.info("No new battle detected after 300s, exiting.")
