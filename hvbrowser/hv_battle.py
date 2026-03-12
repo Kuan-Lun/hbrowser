@@ -510,9 +510,19 @@ class BattleDriver(HVDriver):
             or PonyChart(self).check()
         )
 
+    def _wait_for_battle(self, timeout: int = 300, interval: int = 5) -> bool:
+        if self._is_in_battle():
+            return True
+        logger.info(f"Waiting up to {timeout}s for user to start a battle...")
+        for _ in range(timeout // interval):
+            time.sleep(interval)
+            if self._is_in_battle():
+                return True
+        return False
+
     def battle(self) -> None:
-        if not self._is_in_battle():
-            logger.info("No battle detected, exiting.")
+        if not self._wait_for_battle():
+            logger.info("No battle detected after waiting, exiting.")
             return
 
         self._create_last_debuff_monster_id()
@@ -536,11 +546,5 @@ class BattleDriver(HVDriver):
 
         notify("HBrowser", "Battle complete")
         logger.info("Battle complete, waiting 300s for user to start next battle...")
-        wait_timeout = 300
-        poll_interval = 5
-        for _ in range(wait_timeout // poll_interval):
-            time.sleep(poll_interval)
-            if self._is_in_battle():
-                self.battle()
-                return
-        logger.info("No new battle detected after 300s, exiting.")
+
+        self.battle()
