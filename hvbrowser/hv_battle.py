@@ -504,7 +504,7 @@ class BattleDriver(HVDriver):
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
     def _is_in_battle(self) -> bool:
-        self.battle_dashboard.battle_subject.notify()
+        self.battle_dashboard.update()
         return (
             bool(self.battle_dashboard.overview_monsters.alive_monster_name)
             or PonyChart(self).check()
