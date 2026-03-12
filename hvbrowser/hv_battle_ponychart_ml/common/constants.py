@@ -56,9 +56,9 @@ VAL_SIZE = 0.15
 # 以「上次 from-scratch 訓練時的樣本數」為基準計算累積 ratio：
 #   cumulative_ratio = (目前樣本數 - n_samples_at_full_train) / n_samples_at_full_train
 # 超過此值時自動切換為 from-scratch 訓練，避免多次增量訓練累積偏差。
-# 例：full_train 用 1000 張，現在有 1400 張 → ratio=0.4 < 0.5 → resume
-# 例：full_train 用 1000 張，現在有 1600 張 → ratio=0.6 > 0.5 → from-scratch
-RETRAIN_NEW_DATA_RATIO = 0.5
+# 例：full_train 用 1000 張，現在有 1040 張 → ratio=0.04 < 0.05 → resume
+# 例：full_train 用 1000 張，現在有 1060 張 → ratio=0.06 > 0.05 → from-scratch
+RETRAIN_NEW_DATA_RATIO = 0.05
 
 # Reduced settings for hyperparameter search (derived from main settings)
 SEARCH_PHASE1_EPOCHS = PHASE1_EPOCHS
