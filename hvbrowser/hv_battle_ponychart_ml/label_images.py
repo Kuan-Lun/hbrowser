@@ -24,6 +24,7 @@ from PIL import Image, ImageTk
 
 from .common.constants import VAL_SIZE
 from .common.splitting import group_hash_split
+from .model_spec import select_predictions
 
 # 所有路徑以此腳本所在目錄為基準
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -798,12 +799,11 @@ class LabelApp:
                     return False
                 probs = model_probs[key]
                 labels = store.get(key)
+                predicted_set = set(select_predictions(probs, model_thresholds))
                 match = False
                 for ci in suspicious_classes:
                     has_label = (ci + 1) in labels
-                    prob = probs[ci]
-                    thr = model_thresholds[ci]
-                    pred = prob >= thr
+                    pred = ci in predicted_set
                     if show_mislabel and has_label and not pred:
                         match = True
                         break
@@ -912,12 +912,13 @@ class LabelApp:
         probs = self._model_probs[key]
         thresholds = self._model_thresholds
         labels = self.current_labels
+        predicted_set = set(select_predictions(probs, thresholds))
 
         for c in range(len(CLASS_NAMES_LIST)):
             prob = probs[c]
             thr = thresholds[c]
             has_label = (c + 1) in labels
-            pred = prob >= thr
+            pred = c in predicted_set
 
             # Row 0: Prob
             self._table_labels[(0, c)].configure(text=f"{prob:.2f}")
@@ -957,14 +958,13 @@ class LabelApp:
 
         self._analyze_btn.configure(state="disabled")
 
-        # Build sample list (only labeled images)
+        # Build sample list (all images, unlabeled ones get empty labels)
         samples: list[tuple[str, list[int]]] = []
         keys: list[str] = []
         for p in self.nav.all_paths:
             key = self.store.path_to_key(p)
-            if self.store.has(key):
-                samples.append((str(p), self.store.get(key)))
-                keys.append(key)
+            samples.append((str(p), self.store.get(key)))
+            keys.append(key)
 
         self._analyze_status.configure(text=f"Analyzing {len(samples)} images...")
         self._analysis_result = None

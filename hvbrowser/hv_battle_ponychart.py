@@ -20,6 +20,7 @@ from .hv_battle_ponychart_ml.model_spec import (
     IMAGENET_STD,
     INPUT_SIZE,
     PRE_RESIZE,
+    select_predictions,
 )
 
 logger = setup_logger(__name__)
@@ -76,23 +77,9 @@ class _InlineModel:
         probs = 1.0 / (1.0 + np.exp(-logits[0]))
 
         scores = {self.classes[i]: float(probs[i]) for i in range(len(self.classes))}
-        picked = [c for c, p in scores.items() if p >= self.thresholds.get(c, 0.5)]
-        if len(picked) < min_k:
-            picked = [
-                c
-                for c, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[
-                    :max_k
-                ]
-            ]
-        elif len(picked) > max_k:
-            picked = [
-                c
-                for c, _ in sorted(
-                    ((c, scores[c]) for c in picked),
-                    key=lambda kv: kv[1],
-                    reverse=True,
-                )[:max_k]
-            ]
+        thresholds = [self.thresholds.get(c, 0.5) for c in self.classes]
+        indices = select_predictions(list(probs), thresholds, min_k=min_k, max_k=max_k)
+        picked = [self.classes[i] for i in indices]
         return picked, scores
 
 
