@@ -1,9 +1,5 @@
 import threading
-from collections.abc import Callable
 from time import sleep
-from typing import Any, TypeVar
-
-F = TypeVar("F", bound=Callable[..., Any])
 
 
 class PauseController:
@@ -31,12 +27,6 @@ class PauseController:
                             print("Exiting.")
                             break
 
-    def pauseable(self, func: F) -> F:
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            while not self.quit_event.is_set():
-                if self.pause_event.is_set():
-                    sleep(0.5)
-                    continue
-                return func(*args, **kwargs)
-
-        return wrapper  # type: ignore[return-value]
+    def wait_if_paused(self) -> None:
+        while self.pause_event.is_set() and not self.quit_event.is_set():
+            sleep(0.5)

@@ -1,3 +1,4 @@
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -5,6 +6,7 @@ from functools import partial, wraps
 from random import random
 from typing import Any, TypeVar
 
+from ponychart_classifier import preload as preload_model
 from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
 from selenium.webdriver.common.by import By
 
@@ -16,8 +18,6 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_observer_pattern import BattleDashboard
-from ponychart_classifier import preload as preload_model
-
 from .hv_battle_ponychart import PonyChart
 from .hv_battle_skill_manager import SkillManager
 from .pause_controller import PauseController
@@ -109,7 +109,7 @@ class BattleDriver(HVDriver):
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
-        self.pausecontroller = PauseController()
+        self.pausecontroller = PauseController() if sys.stdin.isatty() else None
         self.turn = -1
         self.round = -1
         self.pround = -1
@@ -533,7 +533,9 @@ class BattleDriver(HVDriver):
         retry_count = 0
         while True:
             try:
-                if not self.pausecontroller.pauseable(self.battle_in_turn)():
+                if self.pausecontroller:
+                    self.pausecontroller.wait_if_paused()
+                if not self.battle_in_turn():
                     break
                 retry_count = 0
             except TimeoutException:
