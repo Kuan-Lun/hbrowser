@@ -1,111 +1,23 @@
-import json
 import os
 import sys
 import time
 from datetime import datetime
 from typing import Any
 
-import cv2 as cv
-import numpy as np
-import onnxruntime as ort
+from ponychart_classifier import predict
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
 
 from .hv import HVDriver
-from .hv_battle_ponychart_ml.model_spec import (
-    CLASS_NAMES,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
-    INPUT_SIZE,
-    PRE_RESIZE,
-    select_predictions,
-)
 
 logger = setup_logger(__name__)
-
-_IMAGENET_MEAN = np.array(IMAGENET_MEAN, dtype=np.float32)
-_IMAGENET_STD = np.array(IMAGENET_STD, dtype=np.float32)
-
-
-class _InlineModel:
-    def __init__(self) -> None:
-        self.loaded = False
-        self.session: Any = None
-        self.classes: list[str] = list(CLASS_NAMES)
-        self.thresholds: dict[str, float] = {}
-
-    def _dir(self) -> str:
-        return os.path.join(os.path.dirname(__file__), "hv_battle_ponychart_ml")
-
-    def load(self) -> None:
-        if self.loaded:
-            return
-
-        d = self._dir()
-        model_path = os.path.join(d, "model.onnx")
-        th_path = os.path.join(d, "thresholds.json")
-        self.session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"]
-        )
-        with open(th_path, encoding="utf-8") as f:
-            self.thresholds = json.load(f)
-        self.loaded = True
-
-    def _preprocess(self, bgr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
-        """BGR 圖片 -> NCHW float32 tensor (matching training transforms)."""
-        resized = cv.resize(bgr, (PRE_RESIZE, PRE_RESIZE), interpolation=cv.INTER_AREA)
-        offset = (PRE_RESIZE - INPUT_SIZE) // 2
-        cropped = resized[offset : offset + INPUT_SIZE, offset : offset + INPUT_SIZE]
-        rgb = cv.cvtColor(cropped, cv.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        normalized = (rgb - _IMAGENET_MEAN) / _IMAGENET_STD
-        # HWC -> CHW -> NCHW
-        return normalized.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
-
-    def predict(
-        self, img_path: str, min_k: int = 1, max_k: int = 3
-    ) -> tuple[list[str], dict[str, float]]:
-        self.load()
-        img = cv.imread(img_path, cv.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"無法讀取圖片: {img_path}")
-
-        input_tensor = self._preprocess(img)
-        input_name: str = self.session.get_inputs()[0].name
-        logits = self.session.run(None, {input_name: input_tensor})[0]
-        probs = 1.0 / (1.0 + np.exp(-logits[0]))
-
-        scores = {self.classes[i]: float(probs[i]) for i in range(len(self.classes))}
-        thresholds = [self.thresholds.get(c, 0.5) for c in self.classes]
-        indices = select_predictions(list(probs), thresholds, min_k=min_k, max_k=max_k)
-        picked = [self.classes[i] for i in indices]
-        return picked, scores
-
-
-_model = _InlineModel()
-
-
-def preload_model() -> None:
-    """預先載入 ONNX 模型，在 BattleDriver 初始化時呼叫以提早發現依賴問題。"""
-    try:
-        _model.load()
-    except ImportError as e:
-        msg = "onnxruntime 載入失敗。"
-        if sys.platform == "win32" and "DLL load failed" in str(e):
-            msg += (
-                "\n可能原因：缺少 Microsoft Visual C++ Redistributable。"
-                "\n請至 https://aka.ms/vs/17/release/vc_redist.x64.exe 下載安裝後重試。"
-            )
-        else:
-            msg += "\n請執行: pip install onnxruntime"
-        raise RuntimeError(msg) from e
 
 
 class PonyChart:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver = driver
-        self._model = _model
 
     @property
     def driver(self) -> Any:  # WebDriver from EHDriver is untyped
@@ -147,7 +59,8 @@ class PonyChart:
     # ---------------- ML & 自動作答邏輯 ----------------
     def _auto_answer(self, img_path: str) -> list[str] | None:
         """最簡化：模型推論 -> 依角色名稱精確比對 label 文字 -> 點擊。"""
-        labels, _ = self._model.predict(img_path)
+        labels: list[str]
+        labels, _ = predict(img_path)
         drv = self.driver
         # 收集所有 label.lc 並建立標準化對照
         label_elements = drv.find_elements(By.CSS_SELECTOR, "label.lc")

@@ -16,7 +16,9 @@ from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_observer_pattern import BattleDashboard
-from .hv_battle_ponychart import PonyChart, preload_model
+from ponychart_classifier import preload as preload_model
+
+from .hv_battle_ponychart import PonyChart
 from .hv_battle_skill_manager import SkillManager
 from .pause_controller import PauseController
 

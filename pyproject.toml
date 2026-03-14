@@ -17,12 +17,10 @@ dependencies = [
     "selenium>=4.40.0",
     "beautifulsoup4>=4.14.3",
     "hv-bie>=0.3.7",
-    "numpy>=2.2.6",
-    "opencv-python>=4.12.0.88",
-    "onnxruntime>=1.15.0",
     "2captcha-python>=2.0.2",
     "undetected-chromedriver>=3.5.5",
     "setuptools>=82.0.0",
+    "ponychart-classifier>=0.1.0",
 ]
 
 classifiers = [
@@ -39,15 +37,6 @@ classifiers = [
 publish = [
     "build",
     "twine",
-]
-train = [
-    "torch>=2.0",
-    "torchvision>=0.15",
-    "scikit-learn>=1.3",
-    "onnx>=1.20.1",
-    "onnxscript>=0.6.2",
-    "flask>=3.0",
-    "psutil>=5.9",
 ]
 
 [project.urls]
@@ -67,11 +56,7 @@ include = ["hbrowser*", "hvbrowser*"]
 "hbrowser.gallery" = ["py.typed"]
 "hbrowser.gallery.browser" = ["py.typed"]
 "hbrowser.gallery.captcha" = ["py.typed"]
-"hvbrowser" = [
-    "py.typed",
-    "hv_battle_ponychart_ml/model.onnx",
-    "hv_battle_ponychart_ml/thresholds.json",
-]
+"hvbrowser" = ["py.typed"]
 
 [tool.ruff]
 line-length = 88
