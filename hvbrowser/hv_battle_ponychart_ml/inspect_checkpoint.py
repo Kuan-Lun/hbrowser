@@ -9,9 +9,9 @@ from pathlib import Path
 
 import torch
 
-from .common.constants import OUTPUT_CHECKPOINT
+from .common.constants import OUTPUT_CHECKPOINT, RAWIMAGE_DIR
 from .common.model import BACKBONE_REGISTRY, build_model
-from .common.sampling import is_original, load_samples, separate_orig_crop
+from .common.sampling import is_original, load_samples
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +50,14 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
     logger.info("Latest image ts : %s", created_at)
 
     samples = load_samples()
-    orig, crop = separate_orig_crop(samples)
     labels_current = {
         f"rawimage/{os.path.basename(p)}": labels for p, labels in samples
     }
+
+    # Count current images by scanning rawimage/ directory
+    all_files = [f for f in os.listdir(RAWIMAGE_DIR) if f.endswith((".png", ".jpg"))]
+    n_cur_orig = sum(1 for f in all_files if is_original(f))
+    n_cur_crop = len(all_files) - n_cur_orig
 
     def _count_orig_crop(labels: dict[str, list[int]]) -> tuple[int, int]:
         n_o = sum(1 for k in labels if is_original(k.split("/")[-1]))
@@ -89,10 +93,15 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
             f"   {_fmt_diff(val_cur, val_full):>16s}"
         )
 
-    logger.info(_row("Originals", n_orig_full, n_orig, len(orig)))
-    logger.info(_row("Crops", n_crop_full, n_crop, len(crop)))
+    logger.info(_row("Originals", n_orig_full, n_orig, n_cur_orig))
+    logger.info(_row("Crops", n_crop_full, n_crop, n_cur_crop))
     n_total_last = (n_orig or 0) + (n_crop or 0) if n_orig is not None else None
-    logger.info(_row("Total", len(labels_full), n_total_last, len(orig) + len(crop)))
+    logger.info(_row("Total", len(labels_full), n_total_last, n_cur_orig + n_cur_crop))
+
+    n_unlabeled = len(all_files) - len(labels_current)
+    # Align "(N unlabeled)" under the Current column
+    pad = 14 + 1 + 12 + 1 + 12 + 1  # label + spaces + Full train + Last save
+    logger.info("%s(%d unlabeled)", " " * pad, n_unlabeled)
 
     # --- changes detail ---
     def _diff_labels(
@@ -109,26 +118,29 @@ def inspect(path: Path = OUTPUT_CHECKPOINT) -> None:
         n_o = sum(1 for k in keys if is_original(k.split("/")[-1]))
         return n_o, len(keys) - n_o
 
-    def _log_changes(title: str, baseline: dict[str, list[int]]) -> None:
+    def _diff_detail(
+        baseline: dict[str, list[int]],
+    ) -> list[tuple[int, int, int]]:
         added, removed, relabeled = _diff_labels(baseline, labels_current)
-        if not added and not removed and not relabeled:
-            logger.info("%s: no changes", title)
-            return
-        logger.info("%s:", title)
-        fmt = "  %-11s %4d images (%d orig, %d crop)"
-        if added:
-            ao, ac = _split_orig_crop(added)
-            logger.info(fmt, "Added", len(added), ao, ac)
-        if removed:
-            ro, rc = _split_orig_crop(removed)
-            logger.info(fmt, "Removed", len(removed), ro, rc)
-        if relabeled:
-            lo, lc = _split_orig_crop(relabeled)
-            logger.info(fmt, "Relabeled", len(relabeled), lo, lc)
+        return [(len(s), *_split_orig_crop(s)) for s in (added, removed, relabeled)]
+
+    full_detail = _diff_detail(labels_full)
+    last_detail = _diff_detail(labels_last)
+
+    def _detail_cell(total: int, n_o: int, n_c: int) -> str:
+        return f"{total:>4d} ({n_o} orig, {n_c} crop)"
 
     logger.info("")
-    _log_changes("Changes since full train", labels_full)
-    _log_changes("Changes since last save", labels_last)
+    logger.info("%14s %24s %24s", "", "Since full train", "Since last save")
+    for label, fd, ld in zip(
+        ("Added", "Removed", "Relabeled"), full_detail, last_detail
+    ):
+        logger.info(
+            "%-14s %24s %24s",
+            label,
+            _detail_cell(*fd),
+            _detail_cell(*ld),
+        )
 
     # --- model architecture ---
     state_dict = ckpt.get("state_dict", {})
