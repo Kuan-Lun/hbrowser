@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hbrowser"
-version = "0.22.0"
+version = "0.22.1"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -20,7 +20,7 @@ dependencies = [
     "2captcha-python>=2.0.2",
     "undetected-chromedriver>=3.5.5",
     "setuptools>=82.0.0",
-    "ponychart-classifier>=0.1.0",
+    "ponychart-classifier>=0.1.1",
 ]
 
 classifiers = [
