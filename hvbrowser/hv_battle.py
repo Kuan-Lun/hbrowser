@@ -506,7 +506,12 @@ class BattleDriver(HVDriver):
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
     def _is_in_battle(self) -> bool:
-        self.battle_dashboard.update()
+        try:
+            self.battle_dashboard.update()
+        except UnexpectedAlertPresentException:
+            logger.info("Alert detected, accepting it.")
+            self.driver.switch_to.alert.accept()
+            return False
         return (
             bool(self.battle_dashboard.overview_monsters.alive_monster_name)
             or PonyChart(self).check()
