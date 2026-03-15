@@ -512,12 +512,17 @@ class BattleDriver(HVDriver):
             or PonyChart(self).check()
         )
 
-    def _wait_for_battle(self, timeout: int = 300, interval: int = 5) -> bool:
+    def _wait_if_paused(self) -> None:
+        if self.pausecontroller:
+            self.pausecontroller.wait_if_paused()
+
+    def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
         if self._is_in_battle():
             return True
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
         for _ in range(timeout // interval):
             time.sleep(interval)
+            self._wait_if_paused()
             if self._is_in_battle():
                 return True
         return False
@@ -532,9 +537,8 @@ class BattleDriver(HVDriver):
         max_retries = 3
         retry_count = 0
         while True:
+            self._wait_if_paused()
             try:
-                if self.pausecontroller:
-                    self.pausecontroller.wait_if_paused()
                 if not self.battle_in_turn():
                     break
                 retry_count = 0
