@@ -6,7 +6,7 @@ from functools import partial, wraps
 from random import random
 from typing import Any, TypeVar
 
-from ponychart_classifier import preload as preload_model
+from ponychart_classifier import update as update_model
 from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
 from selenium.webdriver.common.by import By
 
@@ -114,7 +114,7 @@ class BattleDriver(HVDriver):
         self.round = -1
         self.pround = -1
 
-        preload_model()
+        update_model()
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
