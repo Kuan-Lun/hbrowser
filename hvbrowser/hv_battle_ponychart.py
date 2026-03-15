@@ -57,10 +57,10 @@ class PonyChart:
         return filepath
 
     # ---------------- ML & 自動作答邏輯 ----------------
-    def _auto_answer(self, img_path: str) -> list[str] | None:
+    def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """最簡化：模型推論 -> 依角色名稱精確比對 label 文字 -> 點擊。"""
-        labels: list[str]
-        labels, _ = predict(img_path)
+        result = predict(img_path)
+        labels: frozenset[str] = result.labels
         drv = self.driver
         # 收集所有 label.lc 並建立標準化對照
         label_elements = drv.find_elements(By.CSS_SELECTOR, "label.lc")
