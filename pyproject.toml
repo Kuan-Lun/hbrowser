@@ -20,7 +20,7 @@ dependencies = [
     "2captcha-python>=2.0.2",
     "undetected-chromedriver>=3.5.5",
     "setuptools>=82.0.0",
-    "ponychart-classifier>=0.3.4",
+    "ponychart-classifier>=0.3.5",
 ]
 
 classifiers = [
