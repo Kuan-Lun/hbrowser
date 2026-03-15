@@ -9,6 +9,8 @@ cProfile_result.txt
 .DS_Store
 
 !/.gitignore
+!/.github/
+!.github/**
 !/.vscode/
 !.vscode/**
 
