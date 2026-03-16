@@ -13,6 +13,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
@@ -75,12 +76,18 @@ class Driver(ABC):
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if exc_type:
             self.logger.error(f"Exception occurred: {exc_type.__name__}: {exc_val}")
-            error_file = os.path.join(get_log_dir(), "error.txt")
-            with open(error_file, "w", errors="ignore") as f:
-                f.write(self.driver.page_source)
-            self.logger.debug(f"Error page saved to: {error_file}")
+            try:
+                error_file = os.path.join(get_log_dir(), "error.txt")
+                with open(error_file, "w", errors="ignore") as f:
+                    f.write(self.driver.page_source)
+                self.logger.debug(f"Error page saved to: {error_file}")
+            except WebDriverException:
+                self.logger.error("Failed to save error page (browser session invalid)")
         self.logger.info("Closing browser driver")
-        self.driver.quit()
+        try:
+            self.driver.quit()
+        except WebDriverException:
+            pass
 
     def gohomepage(self) -> None:
         """前往主頁"""
