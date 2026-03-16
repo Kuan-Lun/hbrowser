@@ -25,9 +25,6 @@ class SkillManager:
     def driver(self) -> Any:  # WebDriver from EHDriver is untyped
         return self.hvdriver.driver
 
-    def _get_skill_xpath(self, key: str) -> str:
-        return f"//div[not(@style)]/div/div[contains(text(), '{key}')]"
-
     def _is_pane_visible(self, pane_id: str) -> bool:
         element = self.driver.find_element(By.ID, pane_id)
         style: str = element.get_attribute("style") or ""
@@ -45,30 +42,28 @@ class SkillManager:
             lambda: self._is_pane_visible("pane_magic"),
         )
 
-    def _click_skill(self, skill_xpath: str, iswait: bool) -> None:
+    def _click_skill(self, element_id: str, iswait: bool) -> None:
         if iswait:
-            # Use locator-based wait+click so stale elements are re-found
-            self.element_action_manager.click_and_wait_log_locator(
-                By.XPATH, skill_xpath
-            )
+            self.element_action_manager.click_and_wait_log_locator(By.ID, element_id)
         else:
-            self.element_action_manager.click_locator(By.XPATH, skill_xpath)
+            self.element_action_manager.click_locator(By.ID, element_id)
 
     def cast(self, key: str, iswait: bool = True) -> bool:
         if key not in self.get_skills_and_spells():
             return False
 
+        ability = self.get_skills_and_spells()[key]
+
         self.skills_cost[key] = max(
             self.get_max_skill_mp_cost_by_name(key), self.skills_cost[key]
         )
 
-        if self.get_skills_and_spells()[key].available:
+        if ability.available:
             if key in self.battle_dashboard.snap.abilities.skills:
                 self.open_skills_menu()
             if key in self.battle_dashboard.snap.abilities.spells:
                 self.open_spells_menu()
-            skill_xpath = self._get_skill_xpath(key)
-            self._click_skill(skill_xpath, iswait)
+            self._click_skill(ability.element_id, iswait)
             return True
         else:
             return False
