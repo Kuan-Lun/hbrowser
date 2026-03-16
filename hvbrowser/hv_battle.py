@@ -7,7 +7,11 @@ from random import random
 from typing import Any, TypeVar
 
 from ponychart_classifier import update as update_model
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
+from selenium.common.exceptions import (
+    NoAlertPresentException,
+    TimeoutException,
+    UnexpectedAlertPresentException,
+)
 from selenium.webdriver.common.by import By
 
 from hbrowser.gallery.utils import setup_logger
@@ -510,7 +514,10 @@ class BattleDriver(HVDriver):
             self.battle_dashboard.update()
         except UnexpectedAlertPresentException:
             logger.info("Alert detected, accepting it.")
-            self.driver.switch_to.alert.accept()
+            try:
+                self.driver.switch_to.alert.accept()
+            except NoAlertPresentException:
+                logger.debug("Alert already dismissed before we could accept it.")
             return False
         return (
             bool(self.battle_dashboard.overview_monsters.alive_monster_name)
