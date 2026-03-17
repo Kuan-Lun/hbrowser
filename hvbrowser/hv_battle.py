@@ -512,6 +512,10 @@ class BattleDriver(HVDriver):
     def _is_in_battle(self) -> bool:
         try:
             self.battle_dashboard.update()
+            return (
+                bool(self.battle_dashboard.overview_monsters.alive_monster_name)
+                or PonyChart(self).check()
+            )
         except UnexpectedAlertPresentException:
             logger.info("Alert detected, accepting it.")
             try:
@@ -519,10 +523,6 @@ class BattleDriver(HVDriver):
             except NoAlertPresentException:
                 logger.debug("Alert already dismissed before we could accept it.")
             return False
-        return (
-            bool(self.battle_dashboard.overview_monsters.alive_monster_name)
-            or PonyChart(self).check()
-        )
 
     def _wait_if_paused(self) -> None:
         if self.pausecontroller:
