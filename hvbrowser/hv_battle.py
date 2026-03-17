@@ -545,7 +545,7 @@ class BattleDriver(HVDriver):
                 if self._is_in_battle():
                     logger.info(f"Page recovered after {(i + 1) * poll_interval}s")
                     return True
-            except Exception:
+            except TimeoutException:
                 pass
         logger.warning(f"Page did not recover within {timeout}s")
         return False
