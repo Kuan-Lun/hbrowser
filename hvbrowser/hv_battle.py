@@ -556,12 +556,18 @@ class BattleDriver(HVDriver):
                 retry_count = 0
             except TimeoutException:
                 retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(
+                        "TimeoutException caught, max retries reached "
+                        f"({max_retries}/{max_retries})"
+                    )
+                    raise
                 logger.warning(
                     "TimeoutException caught, reloading page "
                     f"(attempt {retry_count}/{max_retries})"
                 )
-                if retry_count >= max_retries:
-                    raise
+                logger.info("Waiting 300s before reloading page...")
+                time.sleep(300)
                 self.driver.get(self.driver.current_url)
 
         notify("HBrowser", "Battle complete")
