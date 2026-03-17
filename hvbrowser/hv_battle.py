@@ -528,6 +528,28 @@ class BattleDriver(HVDriver):
         if self.pausecontroller:
             self.pausecontroller.wait_if_paused()
 
+    def _wait_for_page_recovery(
+        self, timeout: int = 300, poll_interval: int = 30
+    ) -> bool:
+        """Poll the page periodically to detect early recovery.
+
+        Returns True if the page recovered within the timeout.
+        """
+        for i in range(timeout // poll_interval):
+            logger.info(
+                f"Waiting for recovery... ({(i + 1) * poll_interval}/{timeout}s)"
+            )
+            time.sleep(poll_interval)
+            try:
+                self.driver.get(self.driver.current_url)
+                if self._is_in_battle():
+                    logger.info(f"Page recovered after {(i + 1) * poll_interval}s")
+                    return True
+            except Exception:
+                pass
+        logger.warning(f"Page did not recover within {timeout}s")
+        return False
+
     def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
         if self._is_in_battle():
             return True
@@ -566,9 +588,8 @@ class BattleDriver(HVDriver):
                     "TimeoutException caught, reloading page "
                     f"(attempt {retry_count}/{max_retries})"
                 )
-                logger.info("Waiting 300s before reloading page...")
-                time.sleep(300)
-                self.driver.get(self.driver.current_url)
+                if self._wait_for_page_recovery():
+                    retry_count = 0
 
         notify("HBrowser", "Battle complete")
         logger.info("Battle complete, waiting 300s for user to start next battle...")
