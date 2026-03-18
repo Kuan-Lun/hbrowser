@@ -109,7 +109,7 @@ class BattleDriver(HVDriver):
         self.battle_dashboard = BattleDashboard(self)
         self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
 
-        self.with_ofc = "isekai" not in self.driver.current_url
+        self.with_ofc = not self.is_isekai
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
@@ -288,8 +288,12 @@ class BattleDriver(HVDriver):
         return False
 
     def go_next_battle(self) -> bool:
+        arena_url = f'{self.url["HentaiVerse"]}{self.path_prefix}/?s=Battle&ss=ar'
+        if self.driver.current_url != arena_url:
+            return False
         elements = self.driver.find_elements(
-            By.CSS_SELECTOR, 'img[src="/y/arena/startchallenge.png"]'
+            By.CSS_SELECTOR,
+            f'img[src="{self.path_prefix}/y/arena/startchallenge.png"]',
         )
         if elements:
             elements[-1].click()

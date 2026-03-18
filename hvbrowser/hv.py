@@ -18,12 +18,6 @@ def genxpath(imagepath: str) -> str:
     return f'//img[@src="{imagepath}"]'
 
 
-def searchxpath_fun(srclist: list[Any] | tuple[Any, ...] | set[Any]) -> str:
-    return " | ".join(
-        [genxpath(s + imagepath) for imagepath in srclist for s in ["", "/isekai"]]
-    )
-
-
 class BSItems(ABC):
     def __init__(
         self,
@@ -56,6 +50,19 @@ class HVDriver(EHDriver):
 
     def _setlogin(self) -> str:
         return "My Home"
+
+    @property
+    def is_isekai(self) -> bool:
+        return "isekai" in self.driver.current_url
+
+    @property
+    def path_prefix(self) -> str:
+        return "/isekai" if self.is_isekai else ""
+
+    def searchxpath(self, srclist: list[Any] | tuple[Any, ...] | set[Any]) -> str:
+        return " | ".join(
+            [genxpath(self.path_prefix + imagepath) for imagepath in srclist]
+        )
 
     def goisekai(self) -> None:
         logger.info("Navigating to HentaiVerse isekai page")
@@ -139,7 +146,7 @@ class HVDriver(EHDriver):
             # 嘗試找到圖片元素
             images = self.driver.find_elements(
                 By.XPATH,
-                searchxpath_fun([f"/y/monster/{key}allmonsters.png"]),
+                self.searchxpath([f"/y/monster/{key}allmonsters.png"]),
             )
 
             # 如果存在，則執行 JavaScript
