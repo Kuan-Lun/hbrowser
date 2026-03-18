@@ -1,4 +1,3 @@
-import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -17,6 +16,7 @@ from selenium.webdriver.common.by import By
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
 
+from .control_panel import ControlPanel
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
@@ -24,7 +24,6 @@ from .hv_battle_item_provider import ItemProvider
 from .hv_battle_observer_pattern import BattleDashboard
 from .hv_battle_ponychart import PonyChart
 from .hv_battle_skill_manager import SkillManager
-from .pause_controller import PauseController
 
 logger = setup_logger(__name__)
 
@@ -113,12 +112,17 @@ class BattleDriver(HVDriver):
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
-        self.pausecontroller = PauseController() if sys.stdin.isatty() else None
+        self.control_panel = ControlPanel()
+        self.control_panel.register_toggle("auto_next_battle")
         self.turn = -1
         self.round = -1
         self.pround = -1
 
         update_model()
+
+    @property
+    def auto_next_battle(self) -> bool:
+        return self.control_panel.get_toggle("auto_next_battle")
 
     def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
@@ -132,7 +136,29 @@ class BattleDriver(HVDriver):
         self, statthreshold: StatThreshold, forbidden_skills: list[str]
     ) -> None:
         self.statthreshold = statthreshold
-        self.forbidden_skills = forbidden_skills
+        debuff_skills = sorted(MONSTER_DEBUFF_TO_CHARACTER_SKILL.values())
+        buff_skills = sorted(
+            {
+                "Health Draught",
+                "Mana Draught",
+                "Spirit Draught",
+                "Regen",
+                "Scroll of Life",
+                "Scroll of Absorption",
+                "Absorb",
+                "Scroll of Protection",
+                "Heartseeker",
+                *(s for s in forbidden_skills if s not in debuff_skills),
+            }
+        )
+        self.control_panel.set_skills(
+            {"Debuff Skills": debuff_skills, "Buff Skills": buff_skills},
+            forbidden_skills,
+        )
+
+    @property
+    def forbidden_skills(self) -> list[str]:
+        return self.control_panel.get_forbidden_skills()
 
     def click_skill(self, key: str, iswait: bool = True) -> bool:
         if key in self.forbidden_skills:
@@ -496,6 +522,7 @@ class BattleDriver(HVDriver):
                 logger.info(log_line)
 
         for fun in [
+            *([] if not self.auto_next_battle else [self.go_next_battle]),
             self.go_next_floor,
             PonyChart(self).check,
             self.check_hp,
@@ -538,8 +565,7 @@ class BattleDriver(HVDriver):
             return False
 
     def _wait_if_paused(self) -> None:
-        if self.pausecontroller:
-            self.pausecontroller.wait_if_paused()
+        self.control_panel.wait_if_paused()
 
     def _wait_for_page_recovery(
         self, timeout: int = 300, poll_interval: int = 30
