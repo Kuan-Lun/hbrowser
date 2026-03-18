@@ -8,7 +8,6 @@ from typing import Any
 
 
 def _run_gui(
-    is_isekai: bool,
     pause_flag: Any,
     toggle_dict: Any,
     skill_dict: Any,
@@ -17,8 +16,7 @@ def _run_gui(
 ) -> None:
     """Entry point for the GUI subprocess. Runs on its own main thread."""
     root = tk.Tk()
-    mode = "Isekai" if is_isekai else "Persistent"
-    root.title(f"Battle Control Panel ({mode})")
+    root.title("Battle Control Panel")
     root.minsize(width=300, height=0)
 
     btn_frame = tk.Frame(root)
@@ -53,17 +51,17 @@ def _run_gui(
 
     def poll_commands() -> None:
         """Process commands from the main process."""
-        try:
-            while not cmd_queue.empty():
-                cmd, args = cmd_queue.get_nowait()
-                if cmd == "register_toggle":
+        while not cmd_queue.empty():
+            cmd, args = cmd_queue.get_nowait()
+            match cmd:
+                case "register_toggle":
                     name, default = args
                     var = tk.BooleanVar(value=default)
                     local_toggles[name] = var
                     toggle_dict[name] = default
                     cb = tk.Checkbutton(root, text=name, variable=var)
                     cb.pack(anchor="w", padx=10, pady=2)
-                elif cmd == "set_skills":
+                case "set_skills":
                     skill_groups, forbidden = args
                     for widget in skill_container.winfo_children():
                         widget.destroy()
@@ -78,11 +76,11 @@ def _run_gui(
                             skill_dict[skill] = val
                             cb = tk.Checkbutton(frame, text=skill, variable=var)
                             cb.pack(anchor="w", padx=5, pady=1)
-                elif cmd == "destroy":
+                case "set_title":
+                    root.title(args)
+                case "destroy":
                     root.destroy()
                     return
-        except Exception:
-            pass
         root.after(100, poll_commands)
 
     root.after(100, poll_commands)
@@ -92,7 +90,7 @@ def _run_gui(
 
 
 class ControlPanel:
-    def __init__(self, is_isekai: bool = False) -> None:
+    def __init__(self) -> None:
         manager = multiprocessing.Manager()
         self._pause_flag = manager.Event()
         self._toggle_dict = manager.dict()
@@ -103,7 +101,6 @@ class ControlPanel:
         self._process = multiprocessing.Process(
             target=_run_gui,
             args=(
-                is_isekai,
                 self._pause_flag,
                 self._toggle_dict,
                 self._skill_dict,
@@ -114,6 +111,9 @@ class ControlPanel:
         )
         self._process.start()
         ready_event.wait()
+
+    def set_title(self, title: str) -> None:
+        self._cmd_queue.put(("set_title", title))
 
     def register_toggle(self, name: str, default: bool = False) -> None:
         self._cmd_queue.put(("register_toggle", (name, default)))

@@ -112,7 +112,7 @@ class BattleDriver(HVDriver):
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
-        self.control_panel = ControlPanel(is_isekai=self.is_isekai)
+        self.control_panel = ControlPanel()
         self.control_panel.register_toggle("auto_next_battle")
         self.turn = -1
         self.round = -1
@@ -515,6 +515,9 @@ class BattleDriver(HVDriver):
 
     @retry_on_server_fail
     def battle_in_turn(self) -> bool:
+        if self.turn == -1:
+            mode = "Isekai" if self.is_isekai else "Persistent"
+            self.control_panel.set_title(f"Battle Control Panel ({mode})")
         self.turn += 1
         self.clear_cache()
         # Log the current round logs
