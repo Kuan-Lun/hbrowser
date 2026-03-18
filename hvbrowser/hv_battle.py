@@ -287,6 +287,15 @@ class BattleDriver(HVDriver):
             return True
         return False
 
+    def go_next_battle(self) -> bool:
+        elements = self.driver.find_elements(
+            By.CSS_SELECTOR, 'img[src="/y/arena/startchallenge.png"]'
+        )
+        if elements:
+            elements[-1].click()
+            return True
+        return False
+
     def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
         if debuff_skill in self.forbidden_skills:
