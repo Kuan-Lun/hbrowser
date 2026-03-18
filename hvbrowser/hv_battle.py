@@ -323,6 +323,7 @@ class BattleDriver(HVDriver):
         )
         if elements:
             elements[-1].click()
+            self.driver.switch_to.alert.accept()
             return True
         return False
 
