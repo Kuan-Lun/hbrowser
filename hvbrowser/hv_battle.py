@@ -5,7 +5,7 @@ from functools import partial, wraps
 from random import random
 from typing import Any, TypeVar
 
-from ponychart_classifier import update as update_model
+from ponychart_classifier import update as update_ponychart_classifier
 from selenium.common.exceptions import (
     NoAlertPresentException,
     TimeoutException,
@@ -40,6 +40,22 @@ MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
     "Vital Theft": "Drain",
     "Silenced": "Silence",
 }
+
+
+def update_ponychart_on(expected: bool) -> Callable[[_F], _F]:
+    """當被修飾的函數回傳值等於 expected 時，呼叫 update_ponychart_classifier()"""
+
+    def decorator(func: _F) -> _F:
+        @wraps(func)
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = func(self, *args, **kwargs)
+            if result is expected:
+                update_ponychart_classifier()
+            return result
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
 
 
 def retry_on_server_fail(func: _F) -> _F:
@@ -118,7 +134,7 @@ class BattleDriver(HVDriver):
         self.round = -1
         self.pround = -1
 
-        update_model()
+        update_ponychart_classifier()
 
     @property
     def auto_next_battle(self) -> bool:
@@ -305,6 +321,7 @@ class BattleDriver(HVDriver):
             return self.apply_buff("Spirit Stance")
         return False
 
+    @update_ponychart_on(True)
     def go_next_floor(self) -> bool:
         # Use locator-based click to avoid stale element caching
         if self.driver.find_elements(By.ID, "btcp"):
@@ -313,6 +330,7 @@ class BattleDriver(HVDriver):
             return True
         return False
 
+    @update_ponychart_on(True)
     def go_next_battle(self) -> bool:
         arena_url = f'{self.url["HentaiVerse"]}{self.path_prefix}/?s=Battle&ss=ar'
         if self.driver.current_url != arena_url:
