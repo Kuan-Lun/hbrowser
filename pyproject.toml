@@ -11,16 +11,16 @@ authors = [{ name = "Kuan-Lun Wang" }]
 license = { text = "GNU Affero General Public License v3" }
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "webdriver-manager>=4.0.2",
+    "2captcha-python>=2.0.5",
+    "beautifulsoup4>=4.14.3",
     "fake-useragent>=2.2.0",
     "h2h-galleryinfo-parser>=0.2.2",
-    "selenium>=4.41.0",
-    "beautifulsoup4>=4.14.3",
     "hv-bie>=0.4.1",
-    "2captcha-python>=2.0.5",
-    "undetected-chromedriver>=3.5.5",
+    "ponychart-classifier>=0.3.13",
+    "selenium>=4.41.0",
     "setuptools>=82.0.1",
-    "ponychart-classifier>=0.3.12",
+    "undetected-chromedriver>=3.5.5",
+    "webdriver-manager>=4.0.2",
 ]
 
 classifiers = [
