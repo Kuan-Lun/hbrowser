@@ -18,7 +18,6 @@ dependencies = [
     "hv-bie>=0.4.1",
     "ponychart-classifier>=0.3.13",
     "selenium>=4.41.0",
-    "setuptools>=82.0.1",
     "undetected-chromedriver>=3.5.5",
     "webdriver-manager>=4.0.2",
 ]
