@@ -10,7 +10,6 @@ from typing import Any
 
 from selenium.common.exceptions import (
     ElementNotInteractableException,
-    NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -67,7 +66,7 @@ class Driver(ABC):
         solver = TwoCaptchaAdapter(max_wait=180)
         self.captcha_manager = CaptchaManager(solver)
 
-        self.get(self.url["My Home"])
+        self.get(self.url["Forums"])
 
     def __enter__(self) -> "Driver":
         self.login()
@@ -156,74 +155,80 @@ class Driver(ABC):
         else:
             time.sleep(sleeptime)
 
-    def login(self, isfirst: bool = True) -> None:
-        """登入流程"""
+    def login(self) -> None:
+        """
+        登入流程
+
+        透過 Forums 頁面登入：
+        1. 進入 Forums 首頁（Cloudflare 驗證在此發生）
+        2. 點擊 "Log In" 連結進入登入頁面
+        3. 輸入帳號密碼並點擊 "Log me in"
+        4. 驗證登入成功後前往主頁
+        """
         self.logger.info("Starting login process")
-        # 打開登入網頁
-        self.driver.myget(self.url["My Home"])
-        try:
-            self.driver.find_element(By.XPATH, "//a[contains(text(), 'Hentai@Home')]")
-            iscontinue = False
-        except NoSuchElementException:
-            iscontinue = True
-        if not iscontinue:
+
+        # 進入 Forums 首頁
+        self.driver.myget(self.url["Forums"])
+
+        # 檢測並解決 Cloudflare 驗證
+        det = self.captcha_manager.detect(self.driver, timeout=3.0)
+        if det.kind != "none":
+            self.logger.warning(f"Challenge detected: {det.kind}")
+            login_page_path = os.path.join(get_log_dir(), "login_page.html")
+            with open(login_page_path, "w", errors="ignore") as f:
+                f.write(self.driver.page_source)
+            self.logger.debug(f"Challenge page saved to: {login_page_path}")
+
+            self.logger.info(f"Attempting to solve {det.kind} challenge...")
+            success = self.captcha_manager.solve(det, self.driver)
+            if not success:
+                self.logger.error("Failed to solve captcha challenge")
+                raise Exception("Failed to solve captcha challenge")
+            self.logger.info("Challenge solved successfully")
+        else:
+            self.logger.info("No challenge detected on Forums page")
+
+        # 檢查是否已登入（已登入時不會出現 userlinksguest）
+        if not self.driver.find_elements(By.ID, "userlinksguest"):
             self.logger.info("Already logged in, skipping login")
+            self.gohomepage()
             return
+
+        # 點擊 "Log In" 連結進入登入頁面
+        self.logger.info("Clicking 'Log In' link on Forums page")
+        login_link = self.driver.find_element(
+            By.CSS_SELECTOR, "#userlinksguest a[href*='act=Login&CODE=00']"
+        )
+        old_url = self.driver.current_url
+        login_link.click()
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.current_url != old_url
+        )
+
+        # 等待登入表單載入
         WebDriverWait(self.driver, 10).until(
             EC.presence_of_element_located((By.NAME, "UserName"))
         )
 
-        if self.driver.find_elements(By.NAME, "PassWord"):
-            element_present = EC.presence_of_element_located((By.NAME, "UserName"))
-            WebDriverWait(self.driver, 10).until(element_present)
+        # 輸入帳號密碼
+        username_input = self.driver.find_element(By.NAME, "UserName")
+        username_input.send_keys(self.username)
 
-            # 定位用戶名輸入框並輸入用戶名
-            username_input = self.driver.find_element(By.NAME, "UserName")
-            username_input.send_keys(self.username)
+        password_input = self.driver.find_element(By.NAME, "PassWord")
+        password_input.send_keys(self.password)
 
-            # 定位密碼輸入框並輸入密碼
-            password_input = self.driver.find_element(By.NAME, "PassWord")
-            password_input.send_keys(self.password)
+        # 點擊 "Log me in" 按鈕
+        old_url = self.driver.current_url
+        submit_button = self.driver.find_element(
+            By.CSS_SELECTOR, "input[type='submit'][value='Log me in']"
+        )
+        submit_button.click()
+        self.logger.info("'Log me in' button clicked, waiting for redirect...")
 
-            # 獲取點擊之前的 URL
-            old_url = self.driver.current_url
-
-            # 定位登入按鈕並點擊它
-            login_button = self.driver.find_element(By.NAME, "ipb_login_submit")
-            login_button.click()
-
-            # 顯式等待，直到 URL 改變
-            wait = WebDriverWait(self.driver, 10)
-            wait.until(lambda driver: driver.current_url != old_url)
-            self.logger.info("Login button clicked, checking for challenges...")
-
-            # 檢測是否遇到 Cloudflare 驗證
-            det = self.captcha_manager.detect(self.driver, timeout=3.0)
-
-            if det.kind != "none":
-                self.logger.warning(f"Challenge detected: {det.kind}")
-                # 保存登入後的頁面以供調試
-                login_page_path = os.path.join(get_log_dir(), "login_page.html")
-                with open(login_page_path, "w", errors="ignore") as f:
-                    f.write(self.driver.page_source)
-                self.logger.debug(f"Login page saved to: {login_page_path}")
-
-                # 嘗試解決驗證
-                self.logger.info(f"Attempting to solve {det.kind} challenge...")
-                success = self.captcha_manager.solve(det, self.driver)
-                if not success:
-                    self.logger.error("Failed to solve captcha challenge")
-                    raise Exception("Failed to solve captcha challenge")
-                self.logger.info("Challenge solved successfully")
-            else:
-                self.logger.info("No challenge detected, proceeding with login...")
-
-            # 假設跳轉後的頁面有一個具有 NAME=reset_imagelimit 的元素
-            element_present = EC.presence_of_element_located(
-                (By.NAME, "reset_imagelimit")
-            )
-            self.logger.debug("Waiting for homepage to load...")
-            WebDriverWait(self.driver, 10).until(element_present)
-            self.logger.info("Login completed successfully")
+        # 等待登入完成（URL 變化）
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.current_url != old_url
+        )
+        self.logger.info("Login completed successfully")
 
         self.gohomepage()
