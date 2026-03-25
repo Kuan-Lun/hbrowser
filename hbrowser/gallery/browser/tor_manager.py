@@ -124,9 +124,7 @@ def _get_tor_binary(plat: str, base_dir: Path) -> str:
     if plat.startswith("win"):
         return str(base_dir / "Browser" / "TorBrowser" / "Tor" / "tor.exe")
     elif plat == "macos":
-        return str(
-            base_dir / "Tor Browser.app" / "Contents" / "MacOS" / "Tor" / "tor.real"
-        )
+        return str(base_dir / "Tor Browser.app" / "Contents" / "MacOS" / "Tor" / "tor")
     else:
         # Linux
         return str(base_dir / "tor-browser" / "Browser" / "TorBrowser" / "Tor" / "tor")
