@@ -1,107 +1,99 @@
 """瀏覽器 WebDriver 工廠"""
 
+import atexit
 import os
 import platform
 import subprocess
 import tempfile
-import zipfile
+import time
+from pathlib import Path
 from typing import Any
 
-import undetected_chromedriver as uc
-from fake_useragent import UserAgent
-from undetected_chromedriver.patcher import Patcher
+from selenium.webdriver import Firefox
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
 
 from ..utils import setup_logger
 from .ban_handler import handle_ban_decorator
-from .chrome_manager import ensure_chrome_installed
+from .tor_manager import ensure_tor_installed
 
 logger = setup_logger(__name__)
 
+# Tor SOCKS proxy 預設端口
+_TOR_SOCKS_PORT = 9150
 
-def _create_proxy_extension(
-    proxy_host: str, proxy_port: int, proxy_user: str, proxy_pass: str
-) -> str:
+
+def _find_available_port(start: int = 9150) -> int:
+    """找到一個可用的端口"""
+    import socket
+
+    for port in range(start, start + 100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No available port found in range {start}-{start + 99}")
+
+
+def _start_tor_process(tor_binary: str, socks_port: int) -> subprocess.Popen[bytes]:
     """
-    創建一個 Chrome 擴充功能來處理代理認證
+    啟動 Tor SOCKS proxy 進程
+
+    Args:
+        tor_binary: tor 執行檔路徑
+        socks_port: SOCKS proxy 端口
 
     Returns:
-        擴充功能 zip 檔案的路徑
+        tor 進程的 Popen 物件
     """
-    manifest_json = """
-{
-    "version": "1.0.0",
-    "manifest_version": 2,
-    "name": "Chrome Proxy",
-    "permissions": [
-        "proxy",
-        "tabs",
-        "unlimitedStorage",
-        "storage",
-        "<all_urls>",
-        "webRequest",
-        "webRequestBlocking"
-    ],
-    "background": {
-        "scripts": ["background.js"]
-    },
-    "minimum_chrome_version":"22.0.0"
-}
-"""
+    # 建立臨時資料目錄
+    data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
 
-    background_js = f"""
-var config = {{
-        mode: "fixed_servers",
-        rules: {{
-          singleProxy: {{
-            scheme: "http",
-            host: "{proxy_host}",
-            port: parseInt({proxy_port})
-          }},
-          bypassList: ["localhost"]
-        }}
-      }};
+    logger.info(f"Starting Tor process on SOCKS port {socks_port}...")
+    tor_process = subprocess.Popen(
+        [
+            tor_binary,
+            "--SocksPort",
+            str(socks_port),
+            "--DataDirectory",
+            str(data_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
 
-chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+    # 等待 Tor bootstrap 完成
+    bootstrap_timeout = 90
+    start_time = time.time()
 
-function callbackFn(details) {{
-    return {{
-        authCredentials: {{
-            username: "{proxy_user}",
-            password: "{proxy_pass}"
-        }}
-    }};
-}}
+    while time.time() - start_time < bootstrap_timeout:
+        if tor_process.poll() is not None:
+            raise RuntimeError(
+                f"Tor process exited unexpectedly with code {tor_process.returncode}"
+            )
 
-chrome.webRequest.onAuthRequired.addListener(
-            callbackFn,
-            {{urls: ["<all_urls>"]}},
-            ['blocking']
-);
-"""
+        if tor_process.stdout is None:
+            time.sleep(0.5)
+            continue
 
-    # 創建臨時目錄
-    plugin_dir = tempfile.mkdtemp()
+        line = tor_process.stdout.readline().decode("utf-8", errors="replace")
+        if "Bootstrapped 100%" in line:
+            logger.info("Tor bootstrap completed successfully")
+            return tor_process
 
-    # 寫入 manifest.json
-    with open(os.path.join(plugin_dir, "manifest.json"), "w") as f:
-        f.write(manifest_json)
+        if line:
+            logger.debug(f"Tor: {line.strip()}")
 
-    # 寫入 background.js
-    with open(os.path.join(plugin_dir, "background.js"), "w") as f:
-        f.write(background_js)
-
-    # 創建 zip 檔案
-    plugin_file = os.path.join(tempfile.gettempdir(), "proxy_auth_plugin.zip")
-    with zipfile.ZipFile(plugin_file, "w") as zp:
-        zp.write(os.path.join(plugin_dir, "manifest.json"), "manifest.json")
-        zp.write(os.path.join(plugin_dir, "background.js"), "background.js")
-
-    return plugin_file
+    # 超時
+    tor_process.terminate()
+    raise RuntimeError(f"Tor failed to bootstrap within {bootstrap_timeout} seconds")
 
 
 def create_driver(headless: bool = True) -> Any:
     """
-    創建 WebDriver 實例
+    創建 WebDriver 實例（使用 Tor Browser）
 
     Args:
         headless: 是否使用無頭模式
@@ -110,129 +102,81 @@ def create_driver(headless: bool = True) -> Any:
         配置好的 WebDriver 實例
     """
     logger.info(f"Creating WebDriver (headless: {headless})")
-    # 設定瀏覽器參數
-    options = uc.ChromeOptions()
 
-    # 住宅代理設定（從環境變數讀取）
-    rp_username = os.getenv("RP_USERNAME")
-    rp_password = os.getenv("RP_PASSWORD")
-    rp_dns = os.getenv("RP_DNS")
+    # 確保 Tor Browser 和 GeckoDriver 已安裝
+    tor_paths = ensure_tor_installed()
 
-    proxy_extension = None
-    if rp_username and rp_password and rp_dns:
-        # 解析代理地址和端口
-        if ":" in rp_dns:
-            proxy_host, proxy_port = rp_dns.split(":", 1)
-        else:
-            proxy_host = rp_dns
-            proxy_port = "8080"
+    # 啟動 Tor SOCKS proxy
+    socks_port = _find_available_port(_TOR_SOCKS_PORT)
+    tor_process = _start_tor_process(tor_paths.tor_binary, socks_port)
 
-        logger.info(f"Using residential proxy: {rp_username}@{proxy_host}:{proxy_port}")
+    # 註冊 atexit 確保 Tor 進程被清理
+    def _cleanup_tor() -> None:
+        try:
+            tor_process.terminate()
+            tor_process.wait(timeout=5)
+        except Exception:
+            tor_process.kill()
 
-        # 創建代理認證擴充功能
-        proxy_extension = _create_proxy_extension(
-            proxy_host=proxy_host,
-            proxy_port=int(proxy_port),
-            proxy_user=rp_username,
-            proxy_pass=rp_password,
-        )
-        logger.debug(f"Proxy extension created at: {proxy_extension}")
-    else:
-        logger.info(
-            "No residential proxy configured "
-            "(set RP_USERNAME, RP_PASSWORD, RP_DNS to enable)"
-        )
+    atexit.register(_cleanup_tor)
 
-    # 檢測是否為 Linux + Xvfb 環境
-    is_xvfb_env = (
-        platform.system() == "Linux"
-        and os.environ.get("DISPLAY")
-        and ":" in os.environ.get("DISPLAY", "")
-    )
+    # 設定 Firefox 選項
+    options = FirefoxOptions()
+    options.binary_location = tor_paths.browser
 
-    # 基本設定
-    # 注意：如果使用代理擴充功能，不能禁用擴充功能
-    if not proxy_extension:
-        options.add_argument("--disable-extensions")
-    options.add_argument("--no-sandbox")  # 解決DevToolsActivePort文件不存在的問題
-    options.add_argument("--window-size=1600,900")
-    options.add_argument("--disable-dev-shm-usage")
+    # Tor SOCKS proxy 設定
+    options.set_preference("network.proxy.type", 1)
+    options.set_preference("network.proxy.socks", "127.0.0.1")
+    options.set_preference("network.proxy.socks_port", socks_port)
+    options.set_preference("network.proxy.socks_remote_dns", True)
+    # 不使用系統 proxy 設定
+    options.set_preference("network.proxy.no_proxies_on", "")
 
-    # Headless 模式設定
-    if headless:
-        options.add_argument("--headless=new")  # 使用新的無頭模式
-
-        # 檢測是否為 Linux server 環境（通常沒有 GPU）
-        # 在 Linux 且檢測到 DISPLAY 環境變數為空或 Xvfb 時，認為是 server 環境
-        is_linux_server = platform.system() == "Linux" and (
-            not os.environ.get("DISPLAY") or "Xvfb" in os.environ.get("DISPLAY", "")
-        )
-
-        # 只在 Linux server 環境下添加 GPU 相關參數
-        # 在 macOS/Windows 或有實體顯示的 Linux 桌面環境，
-        # 不添加這些參數以保持更真實的瀏覽器指紋
-        if is_linux_server:
-            options.add_argument("--disable-gpu")  # 無 GPU 環境必須
-            options.add_argument("--disable-software-rasterizer")
-
-    # Xvfb 環境下不添加 --disable-gpu 參數
-    # 原因：讓 Chrome 使用 SwiftShader 軟體渲染可能有更自然的指紋
-    # 明確禁用 GPU 反而容易被 Cloudflare 偵測
-    if is_xvfb_env and not headless:
-        logger.info(
-            "Detected Xvfb environment, "
-            "using default GPU settings for better fingerprint"
-        )
-
-    # 反偵測參數 - 降低被 Cloudflare 識別的機率
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-
-    # User Agent
-    options.add_argument("user-agent={ua}".format(ua=UserAgent()["google chrome"]))
+    # 禁用自動更新和遙測
+    options.set_preference("app.update.enabled", False)
+    options.set_preference("datareporting.policy.dataSubmissionEnabled", False)
+    options.set_preference("toolkit.telemetry.enabled", False)
 
     # 頁面加載策略
-    options.page_load_strategy = "normal"  # 等待加载图片normal eager none
+    options.page_load_strategy = "normal"
 
-    # 如果有代理擴充功能，添加到選項中
-    if proxy_extension:
-        options.add_extension(proxy_extension)
+    # Headless 模式
+    if headless:
+        options.add_argument("-headless")
 
-    # macOS: 避免 Chrome for Testing 存取系統鑰匙圈時彈出授權提示
+    # 視窗大小
+    options.add_argument("--width=1600")
+    options.add_argument("--height=900")
+
+    # macOS: 避免系統鑰匙圈提示
     if platform.system() == "Darwin":
-        options.add_argument("--use-mock-keychain")
+        os.environ.setdefault("MOZ_HEADLESS_WIDTH", "1600")
+        os.environ.setdefault("MOZ_HEADLESS_HEIGHT", "900")
 
-    # 確保 Chrome 和 ChromeDriver 已安裝
-    chrome_paths = ensure_chrome_installed()
-    options.binary_location = chrome_paths.chrome
+    # 使用 GeckoDriver 初始化 Firefox WebDriver
+    service = FirefoxService(executable_path=tor_paths.geckodriver)
 
-    # macOS: 先用 Patcher 手動 patch chromedriver，再 codesign
-    # 這樣 uc.Chrome() 偵測到已 patch 就不會再修改二進位，簽名保持有效
-    if platform.system() == "Darwin":
-        patcher = Patcher(executable_path=chrome_paths.chromedriver)
-        if not patcher.is_binary_patched():
-            patcher.patch_exe()
-            logger.debug("ChromeDriver patched for undetected-chromedriver")
-        subprocess.run(
-            ["codesign", "--force", "--sign", "-", chrome_paths.chromedriver],
-            check=False,
-            capture_output=True,
-        )
-        logger.debug("ChromeDriver codesigned")
+    logger.debug("Initializing Tor Browser driver...")
+    driver = Firefox(service=service, options=options)
+    logger.info("Tor Browser driver initialized successfully")
 
-    # 使用 undetected-chromedriver 初始化 WebDriver
-    # 注意: undetected-chromedriver 已經內建處理了
-    # excludeSwitches 和 useAutomationExtension
-    # 所以我們不需要手動設定這些選項
-    logger.debug("Initializing Chrome driver...")
-    driver = uc.Chrome(
-        options=options,
-        use_subprocess=True,
-        driver_executable_path=chrome_paths.chromedriver,
-    )
-    logger.info("Chrome driver initialized successfully")
+    # 將 tor 進程附加到 driver 上，以便在 driver.quit() 時清理
+    driver._tor_process = tor_process
+
+    # 包裝 quit() 以同時清理 tor 進程
+    original_quit = driver.quit
+
+    def _quit_with_tor_cleanup() -> None:
+        try:
+            original_quit()
+        finally:
+            try:
+                tor_process.terminate()
+                tor_process.wait(timeout=5)
+            except Exception:
+                tor_process.kill()
+
+    driver.quit = _quit_with_tor_cleanup
 
     # 添加 ban 檢查裝飾器
     driver.myget = handle_ban_decorator(driver)
