@@ -255,18 +255,23 @@ def create_driver(headless: bool = True) -> Any:
     driver = Firefox(service=service, options=options)
     logger.info("Tor Browser driver initialized successfully")
 
-    # Tor Browser 啟動時可能覆蓋 proxy 設定，透過 JavaScript 強制重新設定
-    driver.execute_script(
-        """
-        Services.prefs.setIntPref("network.proxy.type", 1);
-        Services.prefs.setCharPref("network.proxy.socks", "127.0.0.1");
-        Services.prefs.setIntPref("network.proxy.socks_port", arguments[0]);
-        Services.prefs.setBoolPref("network.proxy.socks_remote_dns", true);
-        Services.prefs.setCharPref("network.proxy.no_proxies_on", "");
-        """,
-        socks_port,
-    )
-    logger.debug(f"Proxy settings enforced: SOCKS5 127.0.0.1:{socks_port}")
+    # Tor Browser 啟動時可能覆蓋 proxy 設定
+    # 使用 Firefox chrome context（特權模式）來存取 Services API
+    driver.set_context("chrome")
+    try:
+        driver.execute_script(
+            """
+            Services.prefs.setIntPref("network.proxy.type", 1);
+            Services.prefs.setCharPref("network.proxy.socks", "127.0.0.1");
+            Services.prefs.setIntPref("network.proxy.socks_port", arguments[0]);
+            Services.prefs.setBoolPref("network.proxy.socks_remote_dns", true);
+            Services.prefs.setCharPref("network.proxy.no_proxies_on", "");
+            """,
+            socks_port,
+        )
+        logger.debug(f"Proxy settings enforced: SOCKS5 127.0.0.1:{socks_port}")
+    finally:
+        driver.set_context("content")
 
     # 將 tor 進程附加到 driver 上，以便在 driver.quit() 時清理
     driver._tor_process = tor_process
