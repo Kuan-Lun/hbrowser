@@ -227,6 +227,10 @@ def create_driver(headless: bool = True) -> Any:
     options.set_preference("extensions.torlauncher.start_tor", False)
     options.set_preference("extensions.torlauncher.prompt_at_startup", False)
 
+    # 禁用語言切換提示對話框（「將語言設定切換為英文」）
+    options.set_preference("intl.accept_languages", "en-US, en")
+    options.set_preference("privacy.spoof_english", 2)  # 2 = 自動使用英文，不詢問
+
     # 禁用自動更新和遙測
     options.set_preference("app.update.enabled", False)
     options.set_preference("datareporting.policy.dataSubmissionEnabled", False)
@@ -238,6 +242,9 @@ def create_driver(headless: bool = True) -> Any:
     # Headless 模式
     if headless:
         options.add_argument("-headless")
+
+    # 允許 chrome context 存取（用於強制設定 proxy）
+    options.add_argument("-remote-allow-system-access")
 
     # 視窗大小
     options.add_argument("--width=1600")
