@@ -49,6 +49,9 @@ def _start_tor_process(tor_binary: str, socks_port: int) -> subprocess.Popen[byt
     Returns:
         tor 進程的 Popen 物件
     """
+    import fcntl
+    import select
+
     # 建立臨時資料目錄
     data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
 
@@ -65,9 +68,22 @@ def _start_tor_process(tor_binary: str, socks_port: int) -> subprocess.Popen[byt
         stderr=subprocess.STDOUT,
     )
 
-    # 等待 Tor bootstrap 完成
-    bootstrap_timeout = 90
+    # 等待 Tor bootstrap 完成（使用非阻塞 I/O）
+    bootstrap_timeout = 120
     start_time = time.time()
+
+    if tor_process.stdout is None:
+        raise RuntimeError("Failed to capture Tor process output")
+
+    # 設定 stdout 為非阻塞模式
+    fd = tor_process.stdout.fileno()
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    buffer = b""
+    last_status_time = start_time
+    last_bootstrap_pct = "0%"
+    status_interval = 10  # 每 10 秒顯示一次狀態
 
     while time.time() - start_time < bootstrap_timeout:
         if tor_process.poll() is not None:
@@ -75,17 +91,49 @@ def _start_tor_process(tor_binary: str, socks_port: int) -> subprocess.Popen[byt
                 f"Tor process exited unexpectedly with code {tor_process.returncode}"
             )
 
-        if tor_process.stdout is None:
-            time.sleep(0.5)
+        now = time.time()
+
+        # 每 10 秒顯示一次等待狀態
+        if now - last_status_time >= status_interval:
+            elapsed = int(now - start_time)
+            remaining = bootstrap_timeout - elapsed
+            logger.info(
+                f"Tor bootstrapping... {last_bootstrap_pct} "
+                f"({elapsed}s elapsed, {remaining}s remaining)"
+            )
+            last_status_time = now
+
+        # 等待最多 1 秒看是否有新輸出
+        ready, _, _ = select.select([tor_process.stdout], [], [], 1.0)
+        if not ready:
             continue
 
-        line = tor_process.stdout.readline().decode("utf-8", errors="replace")
-        if "Bootstrapped 100%" in line:
-            logger.info("Tor bootstrap completed successfully")
-            return tor_process
+        chunk = tor_process.stdout.read(4096)
+        if not chunk:
+            continue
 
-        if line:
-            logger.debug(f"Tor: {line.strip()}")
+        buffer += chunk
+        while b"\n" in buffer:
+            line_bytes, buffer = buffer.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+
+            if not line:
+                continue
+
+            if "Bootstrapped 100%" in line:
+                elapsed = int(time.time() - start_time)
+                logger.info(f"Tor bootstrap completed successfully ({elapsed}s)")
+                return tor_process
+
+            # 擷取目前的 bootstrap 百分比
+            if "Bootstrapped " in line:
+                import re
+
+                match = re.search(r"Bootstrapped (\d+%)", line)
+                if match:
+                    last_bootstrap_pct = match.group(1)
+
+            logger.debug(f"Tor: {line}")
 
     # 超時
     tor_process.terminate()
