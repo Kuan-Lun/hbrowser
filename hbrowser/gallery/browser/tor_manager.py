@@ -33,6 +33,7 @@ class TorPaths(NamedTuple):
     browser: str
     geckodriver: str
     tor_binary: str
+    browser_omni_ja: str
     version: str
 
 
@@ -128,6 +129,24 @@ def _get_tor_binary(plat: str, base_dir: Path) -> str:
     else:
         # Linux
         return str(base_dir / "tor-browser" / "Browser" / "TorBrowser" / "Tor" / "tor")
+
+
+def _get_browser_omni_ja(plat: str, base_dir: Path) -> str:
+    """取得 Tor Browser 的 browser/omni.ja 路徑（包含預設 profile 設定）"""
+    if plat.startswith("win"):
+        return str(base_dir / "Browser" / "browser" / "omni.ja")
+    elif plat == "macos":
+        return str(
+            base_dir
+            / "Tor Browser.app"
+            / "Contents"
+            / "Resources"
+            / "browser"
+            / "omni.ja"
+        )
+    else:
+        # Linux
+        return str(base_dir / "tor-browser" / "Browser" / "browser" / "omni.ja")
 
 
 def _get_geckodriver_executable_name(plat: str) -> str:
@@ -509,9 +528,12 @@ def ensure_tor_installed(force_download: bool = False) -> TorPaths:
     # 建立 PID 專屬的 geckodriver 副本
     geckodriver_copy = _create_geckodriver_copy(geckodriver_path, running_dir, plat)
 
+    omni_ja_path = Path(_get_browser_omni_ja(plat, version_dir))
+
     return TorPaths(
         browser=str(browser_path),
         geckodriver=str(geckodriver_copy),
         tor_binary=str(tor_binary_path),
+        browser_omni_ja=str(omni_ja_path),
         version=tor_version,
     )

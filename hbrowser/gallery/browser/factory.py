@@ -220,16 +220,35 @@ def create_driver(headless: bool = True) -> Any:
     options.set_preference("network.proxy.socks", "127.0.0.1")
     options.set_preference("network.proxy.socks_port", socks_port)
     options.set_preference("network.proxy.socks_remote_dns", True)
-    # 不使用系統 proxy 設定
     options.set_preference("network.proxy.no_proxies_on", "")
 
-    # 禁用 Tor Launcher 擴充功能的彈窗
+    # 禁用 Tor Launcher（我們自行管理 tor 進程）
     options.set_preference("extensions.torlauncher.start_tor", False)
     options.set_preference("extensions.torlauncher.prompt_at_startup", False)
 
-    # 禁用語言切換提示對話框（「將語言設定切換為英文」）
+    # 核心隱私 / 反指紋設定（與 Tor Browser 預設一致）
+    options.set_preference("privacy.resistFingerprinting", True)
+    options.set_preference(
+        "privacy.resistFingerprinting.randomDataOnCanvasExtract", True
+    )
+    options.set_preference("privacy.resistFingerprinting.letterboxing", True)
+    options.set_preference("webgl.enable-webgl2", False)
+    options.set_preference("gfx.offscreencanvas.enabled", False)
+    options.set_preference("media.navigator.enabled", False)
+    options.set_preference("dom.battery.enabled", False)
+    options.set_preference("dom.netinfo.enabled", False)
+    options.set_preference("dom.gamepad.enabled", False)
+    options.set_preference("media.peerconnection.enabled", False)
+    options.set_preference("geo.enabled", False)
+
+    # 隱私模式（與 Tor Browser 預設一致）
+    options.set_preference("browser.privatebrowsing.autostart", True)
+    options.set_preference("browser.cache.disk.enable", False)
+    options.set_preference("permissions.memory_only", True)
+
+    # 禁用語言切換提示
     options.set_preference("intl.accept_languages", "en-US, en")
-    options.set_preference("privacy.spoof_english", 2)  # 2 = 自動使用英文，不詢問
+    options.set_preference("privacy.spoof_english", 2)
 
     # 禁用自動更新和遙測
     options.set_preference("app.update.enabled", False)
@@ -262,8 +281,7 @@ def create_driver(headless: bool = True) -> Any:
     driver = Firefox(service=service, options=options)
     logger.info("Tor Browser driver initialized successfully")
 
-    # Tor Browser 啟動時可能覆蓋 proxy 設定
-    # 使用 Firefox chrome context（特權模式）來存取 Services API
+    # 使用 chrome context 強制設定 proxy（防止 Tor Browser 啟動時覆蓋）
     driver.set_context("chrome")
     try:
         driver.execute_script(
