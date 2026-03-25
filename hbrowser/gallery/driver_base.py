@@ -51,6 +51,7 @@ class Driver(ABC):
             url["ExHentai"] = "https://exhentai.org/"
             url["HentaiVerse"] = "https://hentaiverse.org"
             url["HentaiVerse isekai"] = "https://hentaiverse.org/isekai/"
+            url["Forums"] = "https://forums.e-hentai.org/"
             return url
 
         self.logger = setup_logger(__name__)
