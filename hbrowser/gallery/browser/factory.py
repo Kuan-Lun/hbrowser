@@ -207,6 +207,10 @@ def create_driver(headless: bool = True) -> Any:
 
     atexit.register(_cleanup_tor)
 
+    # 告訴 Tor Browser 不要自行啟動 tor（我們已經啟動了）
+    os.environ["TOR_SKIP_LAUNCH"] = "1"
+    os.environ["TOR_SOCKS_PORT"] = str(socks_port)
+
     # 設定 Firefox 選項
     options = FirefoxOptions()
     options.binary_location = tor_paths.browser
@@ -218,6 +222,10 @@ def create_driver(headless: bool = True) -> Any:
     options.set_preference("network.proxy.socks_remote_dns", True)
     # 不使用系統 proxy 設定
     options.set_preference("network.proxy.no_proxies_on", "")
+
+    # 禁用 Tor Launcher 擴充功能的彈窗
+    options.set_preference("extensions.torlauncher.start_tor", False)
+    options.set_preference("extensions.torlauncher.prompt_at_startup", False)
 
     # 禁用自動更新和遙測
     options.set_preference("app.update.enabled", False)
