@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 from selenium.webdriver import Firefox
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
@@ -89,6 +90,44 @@ def _start_tor_process(tor_binary: str, socks_port: int) -> subprocess.Popen[byt
     # 超時
     tor_process.terminate()
     raise RuntimeError(f"Tor failed to bootstrap within {bootstrap_timeout} seconds")
+
+
+def _get_local_ip() -> str:
+    """透過直接連線取得本機的公開 IP"""
+    with urlopen("https://api.ipify.org", timeout=10) as response:
+        ip: str = response.read().decode("utf-8").strip()
+    return ip
+
+
+def _get_tor_ip(driver: Any) -> str:
+    """透過 Tor Browser 取得 Tor 出口節點的 IP"""
+    driver.get("https://api.ipify.org")
+    ip: str = driver.find_element("tag name", "body").text.strip()
+    return ip
+
+
+def _verify_tor_ip(driver: Any) -> None:
+    """
+    驗證 Tor 連線的 IP 與本機 IP 不同
+
+    Raises:
+        RuntimeError: 如果 Tor IP 與本機 IP 相同（代表 Tor 未正確運作）
+    """
+    try:
+        local_ip = _get_local_ip()
+        tor_ip = _get_tor_ip(driver)
+
+        if local_ip == tor_ip:
+            raise RuntimeError(
+                f"Tor IP safety check failed: Tor IP ({tor_ip}) is the same "
+                f"as local IP ({local_ip}). Tor may not be working properly."
+            )
+
+        logger.info(f"Tor IP verified: {tor_ip} (local: {local_ip})")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning(f"Could not verify Tor IP (non-fatal): {e}")
 
 
 def create_driver(headless: bool = True) -> Any:
@@ -180,5 +219,8 @@ def create_driver(headless: bool = True) -> Any:
 
     # 添加 ban 檢查裝飾器
     driver.myget = handle_ban_decorator(driver)
+
+    # 驗證 Tor IP 與本機 IP 不同
+    _verify_tor_ip(driver)
 
     return driver
