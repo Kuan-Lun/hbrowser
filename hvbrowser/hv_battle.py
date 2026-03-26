@@ -130,7 +130,6 @@ class BattleDriver(HVDriver):
         self._buffmanager = BuffManager(self, self.battle_dashboard)
         self.control_panel = ControlPanel()
         self.control_panel.register_toggle("auto_next_battle")
-        self.control_panel.set_skills(self._build_skill_groups(), [])
         self.turn = -1
         self.round = -1
         self.pround = -1
