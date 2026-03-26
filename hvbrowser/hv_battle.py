@@ -20,6 +20,11 @@ from .control_panel import ControlPanel
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
+from .hv_battle_defaults import (
+    DEFAULT_FORBIDDEN_SKILLS,
+    DEFAULT_STATTHRESHOLD,
+    StatThreshold,
+)
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_observer_pattern import BattleDashboard
 from .hv_battle_ponychart import PonyChart
@@ -86,41 +91,17 @@ def retry_on_server_fail(func: _F) -> _F:
     return wrapper  # type: ignore[return-value]
 
 
-class StatThreshold:
+class BattleDriver(HVDriver):
     def __init__(
         self,
-        hp: tuple[int, int],
-        mp: tuple[int, int],
-        sp: tuple[int, int],
-        overcharge: tuple[int, int],
-        countmonster: tuple[int, int],
+        *args: Any,
+        statthreshold: StatThreshold | None = None,
+        forbidden_skills: list[str] | None = None,
+        **kwargs: Any,
     ) -> None:
-        if len(hp) != 2:
-            raise ValueError("hp should be a list with 2 elements.")
-
-        if len(mp) != 2:
-            raise ValueError("mp should be a list with 2 elements.")
-
-        if len(sp) != 2:
-            raise ValueError("sp should be a list with 2 elements.")
-
-        if len(overcharge) != 2:
-            raise ValueError("overcharge should be a list with 2 elements.")
-
-        if len(countmonster) != 2:
-            raise ValueError("countmonster should be a list with 2 elements.")
-
-        self.hp = hp
-        self.mp = mp
-        self.sp = sp
-        self.overcharge = overcharge
-        self.countmonster = countmonster
-
-
-class BattleDriver(HVDriver):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
+        self.statthreshold = statthreshold or DEFAULT_STATTHRESHOLD
         self.battle_dashboard = BattleDashboard(self)
         self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
 
@@ -130,6 +111,23 @@ class BattleDriver(HVDriver):
         self._buffmanager = BuffManager(self, self.battle_dashboard)
         self.control_panel = ControlPanel()
         self.control_panel.register_toggle("auto_next_battle")
+
+        forbidden_lower = [
+            s.lower() for s in (forbidden_skills or DEFAULT_FORBIDDEN_SKILLS)
+        ]
+        skill_groups = self._build_skill_groups()
+        extra_buff_skills = sorted(
+            s
+            for s in forbidden_lower
+            if s not in skill_groups["Debuff Skills"]
+            and s not in skill_groups["Buff Skills"]
+        )
+        if extra_buff_skills:
+            skill_groups["Buff Skills"] = sorted(
+                set(skill_groups["Buff Skills"]) | set(extra_buff_skills)
+            )
+        self.control_panel.set_skills(skill_groups, forbidden_lower)
+
         self.turn = -1
         self.round = -1
         self.pround = -1
@@ -164,26 +162,6 @@ class BattleDriver(HVDriver):
             }
         )
         return {"Debuff Skills": debuff_skills, "Buff Skills": buff_skills}
-
-    def set_battle_parameters(
-        self, statthreshold: StatThreshold, forbidden_skills: list[str]
-    ) -> None:
-        self.statthreshold = statthreshold
-        forbidden_lower = [s.lower() for s in forbidden_skills]
-        user_forbidden = set(self.control_panel.get_forbidden_skills())
-        merged_forbidden = sorted(user_forbidden | set(forbidden_lower))
-        skill_groups = self._build_skill_groups()
-        extra_buff_skills = sorted(
-            s
-            for s in forbidden_lower
-            if s not in skill_groups["Debuff Skills"]
-            and s not in skill_groups["Buff Skills"]
-        )
-        if extra_buff_skills:
-            skill_groups["Buff Skills"] = sorted(
-                set(skill_groups["Buff Skills"]) | set(extra_buff_skills)
-            )
-        self.control_panel.set_skills(skill_groups, merged_forbidden)
 
     @property
     def forbidden_skills(self) -> list[str]:
@@ -246,7 +224,7 @@ class BattleDriver(HVDriver):
         return apply_buff()
 
     def check_hp(self) -> bool:
-        if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
+        if self.get_stat_percent("hp") < self.statthreshold.hp_low:
             for fun in [
                 partial(self.use_item, "health gem"),
                 partial(self.click_skill, "full-cure"),
@@ -258,7 +236,7 @@ class BattleDriver(HVDriver):
                 if fun():
                     return True
 
-        if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
+        if self.get_stat_percent("hp") < self.statthreshold.hp_high:
             for fun in [
                 partial(self.use_item, "health gem"),
                 partial(self.click_skill, "cure"),
@@ -270,7 +248,7 @@ class BattleDriver(HVDriver):
         return False
 
     def check_mp(self) -> bool:
-        if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
+        if self.get_stat_percent("mp") < self.statthreshold.mp_low:
             for fun in [
                 partial(self.use_item, "mana gem"),
                 partial(self.use_item, "mana potion"),
@@ -280,7 +258,7 @@ class BattleDriver(HVDriver):
                 if fun():
                     return True
 
-        if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
+        if self.get_stat_percent("mp") < self.statthreshold.mp_high:
             for fun in [
                 partial(self.use_item, "mana gem"),
                 partial(self.use_item, "mana potion"),
@@ -291,7 +269,7 @@ class BattleDriver(HVDriver):
         return False
 
     def check_sp(self) -> bool:
-        if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
+        if self.get_stat_percent("sp") < self.statthreshold.sp_low:
             for fun in [
                 partial(self.use_item, "spirit gem"),
                 partial(self.use_item, "spirit potion"),
@@ -301,7 +279,7 @@ class BattleDriver(HVDriver):
                 if fun():
                     return True
 
-        if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
+        if self.get_stat_percent("sp") < self.statthreshold.sp_high:
             for fun in [
                 partial(self.use_item, "spirit gem"),
                 partial(self.use_item, "spirit potion"),
@@ -318,16 +296,17 @@ class BattleDriver(HVDriver):
             if any(
                 [
                     self.get_stat_percent("overcharge")
-                    < self.statthreshold.overcharge[0],
-                    self.get_stat_percent("sp") < self.statthreshold.sp[0],
+                    < self.statthreshold.overcharge_low,
+                    self.get_stat_percent("sp") < self.statthreshold.sp_low,
                 ]
             ):
                 return self.apply_buff("spirit stance", force=True)
 
         if all(
             [
-                self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1],
-                self.get_stat_percent("sp") > self.statthreshold.sp[0],
+                self.get_stat_percent("overcharge")
+                > self.statthreshold.overcharge_high,
+                self.get_stat_percent("sp") > self.statthreshold.sp_low,
                 not self._buffmanager.has_buff("spirit stance"),
             ]
         ):
@@ -428,7 +407,7 @@ class BattleDriver(HVDriver):
             and self.get_stat_percent("overcharge") > 220
             and self._buffmanager.has_buff("spirit stance")
             and len(self.battle_dashboard.overview_monsters.alive_monster)
-            >= self.statthreshold.countmonster[1]
+            >= self.statthreshold.countmonster_high
             and "Orbital Friendship Cannon"
             in self.battle_dashboard.snap.abilities.skills
             and self.battle_dashboard.snap.abilities.skills[
@@ -447,7 +426,7 @@ class BattleDriver(HVDriver):
         # Get the list of monster IDs that are not debuffed with the specified debuffs
         if (
             len(monster_alive_ids) > 3
-            and self.get_stat_percent("mp") > self.statthreshold.mp[1]
+            and self.get_stat_percent("mp") > self.statthreshold.mp_high
         ):
             for debuff in MONSTER_DEBUFF_TO_CHARACTER_SKILL:
                 if debuff in ["imperiled"]:
@@ -466,7 +445,7 @@ class BattleDriver(HVDriver):
         monster_with_imperil: list[int]
         if (
             "imperil" not in self.forbidden_skills
-            and self.get_stat_percent("mp") > self.statthreshold.mp[1]
+            and self.get_stat_percent("mp") > self.statthreshold.mp_high
         ):
             monster_with_imperil = (
                 self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(

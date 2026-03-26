@@ -3,8 +3,15 @@ __all__ = [
     "SellItems",
     "BattleDriver",
     "StatThreshold",
+    "DEFAULT_STATTHRESHOLD",
+    "DEFAULT_FORBIDDEN_SKILLS",
 ]
 
 
 from .hv import HVDriver, SellItems
-from .hv_battle import BattleDriver, StatThreshold
+from .hv_battle import BattleDriver
+from .hv_battle_defaults import (
+    DEFAULT_FORBIDDEN_SKILLS,
+    DEFAULT_STATTHRESHOLD,
+    StatThreshold,
+)
