@@ -590,21 +590,24 @@ class BattleDriver(HVDriver):
         self.control_panel.wait_if_paused()
 
     def _wait_for_page_recovery(
-        self, timeout: int = 300, poll_interval: int = 30
+        self, timeout: int = 300, poll_interval: int = 5, log_interval: int = 30
     ) -> bool:
         """Poll the page periodically to detect early recovery.
+
+        Refreshes every ``poll_interval`` seconds but only logs progress every
+        ``log_interval`` seconds.
 
         Returns True if the page recovered within the timeout.
         """
         for i in range(timeout // poll_interval):
-            logger.info(
-                f"Waiting for recovery... ({(i + 1) * poll_interval}/{timeout}s)"
-            )
             time.sleep(poll_interval)
+            elapsed = (i + 1) * poll_interval
+            if elapsed % log_interval == 0:
+                logger.info(f"Waiting for recovery... ({elapsed}/{timeout}s)")
             try:
                 self.driver.get(self.driver.current_url)
                 if self._is_in_battle():
-                    logger.info(f"Page recovered after {(i + 1) * poll_interval}s")
+                    logger.info(f"Page recovered after {elapsed}s")
                     return True
             except TimeoutException:
                 pass
