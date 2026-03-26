@@ -130,6 +130,7 @@ class BattleDriver(HVDriver):
         self._buffmanager = BuffManager(self, self.battle_dashboard)
         self.control_panel = ControlPanel()
         self.control_panel.register_toggle("auto_next_battle")
+        self.control_panel.set_skills(self._build_skill_groups(), [])
         self.turn = -1
         self.round = -1
         self.pround = -1
@@ -148,10 +149,7 @@ class BattleDriver(HVDriver):
     def reset_pround(self) -> None:
         self.pround = self.round
 
-    def set_battle_parameters(
-        self, statthreshold: StatThreshold, forbidden_skills: list[str]
-    ) -> None:
-        self.statthreshold = statthreshold
+    def _build_skill_groups(self) -> dict[str, list[str]]:
         debuff_skills = sorted(MONSTER_DEBUFF_TO_CHARACTER_SKILL.values())
         buff_skills = sorted(
             {
@@ -164,13 +162,28 @@ class BattleDriver(HVDriver):
                 "absorb",
                 "scroll of protection",
                 "heartseeker",
-                *(s for s in forbidden_skills if s not in debuff_skills),
             }
         )
-        self.control_panel.set_skills(
-            {"Debuff Skills": debuff_skills, "Buff Skills": buff_skills},
-            forbidden_skills,
+        return {"Debuff Skills": debuff_skills, "Buff Skills": buff_skills}
+
+    def set_battle_parameters(
+        self, statthreshold: StatThreshold, forbidden_skills: list[str]
+    ) -> None:
+        self.statthreshold = statthreshold
+        user_forbidden = set(self.control_panel.get_forbidden_skills())
+        merged_forbidden = sorted(user_forbidden | set(forbidden_skills))
+        skill_groups = self._build_skill_groups()
+        extra_buff_skills = sorted(
+            s
+            for s in forbidden_skills
+            if s not in skill_groups["Debuff Skills"]
+            and s not in skill_groups["Buff Skills"]
         )
+        if extra_buff_skills:
+            skill_groups["Buff Skills"] = sorted(
+                set(skill_groups["Buff Skills"]) | set(extra_buff_skills)
+            )
+        self.control_panel.set_skills(skill_groups, merged_forbidden)
 
     @property
     def forbidden_skills(self) -> list[str]:
