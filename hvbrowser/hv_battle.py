@@ -170,12 +170,13 @@ class BattleDriver(HVDriver):
         self, statthreshold: StatThreshold, forbidden_skills: list[str]
     ) -> None:
         self.statthreshold = statthreshold
+        forbidden_lower = [s.lower() for s in forbidden_skills]
         user_forbidden = set(self.control_panel.get_forbidden_skills())
-        merged_forbidden = sorted(user_forbidden | set(forbidden_skills))
+        merged_forbidden = sorted(user_forbidden | set(forbidden_lower))
         skill_groups = self._build_skill_groups()
         extra_buff_skills = sorted(
             s
-            for s in forbidden_skills
+            for s in forbidden_lower
             if s not in skill_groups["Debuff Skills"]
             and s not in skill_groups["Buff Skills"]
         )
