@@ -30,15 +30,15 @@ logger = setup_logger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
-    "Imperiled": "imperil",
-    "Weakened": "weaken",
-    "Slowed": "slow",
-    "Asleep": "sleep",
-    "Confused": "confuse",
-    "Magically Snared": "magnet",
-    "Blinded": "blind",
-    "Vital Theft": "drain",
-    "Silenced": "silence",
+    "imperiled": "imperil",
+    "weakened": "weaken",
+    "slowed": "slow",
+    "asleep": "sleep",
+    "confused": "confuse",
+    "magically snared": "magnet",
+    "blinded": "blind",
+    "vital theft": "drain",
+    "silenced": "silence",
 }
 
 
@@ -299,7 +299,7 @@ class BattleDriver(HVDriver):
         return False
 
     def check_overcharge(self) -> bool:
-        if self._buffmanager.has_buff("Spirit Stance"):
+        if self._buffmanager.has_buff("spirit stance"):
             # If Spirit Stance is active, check if Overcharge and SP
             # are below thresholds
             if any(
@@ -309,16 +309,16 @@ class BattleDriver(HVDriver):
                     self.get_stat_percent("sp") < self.statthreshold.sp[0],
                 ]
             ):
-                return self.apply_buff("Spirit Stance", force=True)
+                return self.apply_buff("spirit stance", force=True)
 
         if all(
             [
                 self.get_stat_percent("overcharge") > self.statthreshold.overcharge[1],
                 self.get_stat_percent("sp") > self.statthreshold.sp[0],
-                not self._buffmanager.has_buff("Spirit Stance"),
+                not self._buffmanager.has_buff("spirit stance"),
             ]
         ):
-            return self.apply_buff("Spirit Stance")
+            return self.apply_buff("spirit stance")
         return False
 
     @update_ponychart_on(True)
@@ -413,7 +413,7 @@ class BattleDriver(HVDriver):
         if (
             self.with_ofc
             and self.get_stat_percent("overcharge") > 220
-            and self._buffmanager.has_buff("Spirit Stance")
+            and self._buffmanager.has_buff("spirit stance")
             and len(self.battle_dashboard.overview_monsters.alive_monster)
             >= self.statthreshold.countmonster[1]
             and "Orbital Friendship Cannon"
@@ -437,7 +437,7 @@ class BattleDriver(HVDriver):
             and self.get_stat_percent("mp") > self.statthreshold.mp[1]
         ):
             for debuff in MONSTER_DEBUFF_TO_CHARACTER_SKILL:
-                if debuff in ["Imperiled"]:
+                if debuff in ["imperiled"]:
                     continue
                 debuffed_monsters = (
                     self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(
@@ -457,7 +457,7 @@ class BattleDriver(HVDriver):
         ):
             monster_with_imperil = (
                 self.battle_dashboard.overview_monsters.alive_monster_with_buff.get(
-                    "Imperiled", []
+                    "imperiled", []
                 )
             )
         else:
@@ -468,7 +468,7 @@ class BattleDriver(HVDriver):
             if n in monster_with_imperil:
                 if self.get_stat_percent(
                     "overcharge"
-                ) > 200 and self._buffmanager.has_buff("Spirit Stance"):
+                ) > 200 and self._buffmanager.has_buff("spirit stance"):
                     monster_health = self.battle_dashboard.snap.monsters[n].hp_percent
                     if (
                         monster_health < 25
@@ -492,24 +492,24 @@ class BattleDriver(HVDriver):
                         self.attack_monster(n)
                 else:
                     self.attack_monster(n)
-                self.last_debuff_monster_id["Imperiled"] = -1
+                self.last_debuff_monster_id["imperiled"] = -1
             else:
-                if n == self.last_debuff_monster_id["Imperiled"]:
+                if n == self.last_debuff_monster_id["imperiled"]:
                     if random() < 0.5:
                         self.attack_monster_by_skill(n, "imperil")
                     else:
                         self.attack_monster(n)
                 else:
                     self.attack_monster_by_skill(
-                        n, MONSTER_DEBUFF_TO_CHARACTER_SKILL["Imperiled"]
+                        n, MONSTER_DEBUFF_TO_CHARACTER_SKILL["imperiled"]
                     )
-                    self.last_debuff_monster_id["Imperiled"] = n
+                    self.last_debuff_monster_id["imperiled"] = n
             return True
         else:
             return False
 
     def use_channeling(self) -> bool:
-        if "Channeling" in self.battle_dashboard.snap.player.buffs:
+        if "channeling" in self.battle_dashboard.snap.player.buffs:
             skill_names = ["regen", "heartseeker"]
             skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:

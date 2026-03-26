@@ -19,21 +19,21 @@ ITEM_BUFFS = {
 }
 
 SKILLS_TO_CHARACTER_BUFFS = {
-    "absorb": "Absorbing Ward",
-    "scroll of absorption": "Absorbing Ward",
-    "scroll of protection": "Protection",
-    "scroll of life": "Spark of Life",
-    "health draught": "Regeneration",
-    "mana draught": "Replenishment",
-    "spirit draught": "Refreshment",
+    "absorb": "absorbing ward",
+    "scroll of absorption": "absorbing ward",
+    "scroll of protection": "protection",
+    "scroll of life": "spark of life",
+    "health draught": "regeneration",
+    "mana draught": "replenishment",
+    "spirit draught": "refreshment",
 }
 
-AutoCast_BUFFS = {
-    "Spark of Life",
-    "Spirit Shield",
-    "Shadow Veil",
-    "Protection",
-    "Hastened",
+AUTOCAST_BUFFS = {
+    "spark of life",
+    "spirit shield",
+    "shadow veil",
+    "protection",
+    "haste",
 }
 
 SKILL_BUFFS = {
@@ -112,7 +112,7 @@ class BuffManager:
 
         remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
 
-        if key in AutoCast_BUFFS:
+        if key in AUTOCAST_BUFFS:
             return bool(float("inf") > remaining_turns >= 0)
         else:
             return bool(remaining_turns >= 0)
@@ -140,7 +140,7 @@ class BuffManager:
 
         # Special cases
         match key:
-            case "Spirit Stance":
+            case "spirit stance":
                 # Use locator-based resilient click; Spirit Stance toggles instantly
                 self.element_action_manager.click_and_wait_log_locator(
                     By.ID, "ckey_spirit"
