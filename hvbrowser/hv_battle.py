@@ -30,15 +30,15 @@ logger = setup_logger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 MONSTER_DEBUFF_TO_CHARACTER_SKILL = {
-    "Imperiled": "Imperil",
-    "Weakened": "Weaken",
-    "Slowed": "Slow",
-    "Asleep": "Sleep",
-    "Confused": "Confuse",
-    "Magically Snared": "MagNet",
-    "Blinded": "Blind",
-    "Vital Theft": "Drain",
-    "Silenced": "Silence",
+    "Imperiled": "imperil",
+    "Weakened": "weaken",
+    "Slowed": "slow",
+    "Asleep": "sleep",
+    "Confused": "confuse",
+    "Magically Snared": "magnet",
+    "Blinded": "blind",
+    "Vital Theft": "drain",
+    "Silenced": "silence",
 }
 
 
@@ -155,15 +155,15 @@ class BattleDriver(HVDriver):
         debuff_skills = sorted(MONSTER_DEBUFF_TO_CHARACTER_SKILL.values())
         buff_skills = sorted(
             {
-                "Health Draught",
-                "Mana Draught",
-                "Spirit Draught",
-                "Regen",
-                "Scroll of Life",
-                "Scroll of Absorption",
-                "Absorb",
-                "Scroll of Protection",
-                "Heartseeker",
+                "health draught",
+                "mana draught",
+                "spirit draught",
+                "regen",
+                "scroll of life",
+                "scroll of absorption",
+                "absorb",
+                "scroll of protection",
+                "heartseeker",
                 *(s for s in forbidden_skills if s not in debuff_skills),
             }
         )
@@ -215,17 +215,17 @@ class BattleDriver(HVDriver):
         apply_buff = partial(self._buffmanager.apply_buff, key=key, force=force)
         if not force:
             match key:
-                case "Health Draught":
+                case "health draught":
                     if self.get_stat_percent("hp") < 90:
                         return apply_buff()
                     else:
                         return False
-                case "Mana Draught":
+                case "mana draught":
                     if self.get_stat_percent("mp") < 90:
                         return apply_buff()
                     else:
                         return False
-                case "Spirit Draught":
+                case "spirit draught":
                     if self.get_stat_percent("sp") < 90:
                         return apply_buff()
                     else:
@@ -235,21 +235,21 @@ class BattleDriver(HVDriver):
     def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp[0]:
             for fun in [
-                partial(self.use_item, "Health Gem"),
-                partial(self.click_skill, "Full-Cure"),
-                partial(self.use_item, "Health Potion"),
-                partial(self.use_item, "Health Elixir"),
-                partial(self.use_item, "Last Elixir"),
-                partial(self.click_skill, "Cure"),
+                partial(self.use_item, "health gem"),
+                partial(self.click_skill, "full-cure"),
+                partial(self.use_item, "health potion"),
+                partial(self.use_item, "health elixir"),
+                partial(self.use_item, "last elixir"),
+                partial(self.click_skill, "cure"),
             ]:
                 if fun():
                     return True
 
         if self.get_stat_percent("hp") < self.statthreshold.hp[1]:
             for fun in [
-                partial(self.use_item, "Health Gem"),
-                partial(self.click_skill, "Cure"),
-                partial(self.use_item, "Health Potion"),
+                partial(self.use_item, "health gem"),
+                partial(self.click_skill, "cure"),
+                partial(self.use_item, "health potion"),
             ]:
                 if fun():
                     return True
@@ -259,18 +259,18 @@ class BattleDriver(HVDriver):
     def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp[0]:
             for fun in [
-                partial(self.use_item, "Mana Gem"),
-                partial(self.use_item, "Mana Potion"),
-                partial(self.use_item, "Mana Elixir"),
-                partial(self.use_item, "Last Elixir"),
+                partial(self.use_item, "mana gem"),
+                partial(self.use_item, "mana potion"),
+                partial(self.use_item, "mana elixir"),
+                partial(self.use_item, "last elixir"),
             ]:
                 if fun():
                     return True
 
         if self.get_stat_percent("mp") < self.statthreshold.mp[1]:
             for fun in [
-                partial(self.use_item, "Mana Gem"),
-                partial(self.use_item, "Mana Potion"),
+                partial(self.use_item, "mana gem"),
+                partial(self.use_item, "mana potion"),
             ]:
                 if fun():
                     return True
@@ -280,18 +280,18 @@ class BattleDriver(HVDriver):
     def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp[0]:
             for fun in [
-                partial(self.use_item, "Spirit Gem"),
-                partial(self.use_item, "Spirit Potion"),
-                partial(self.use_item, "Spirit Elixir"),
-                partial(self.use_item, "Last Elixir"),
+                partial(self.use_item, "spirit gem"),
+                partial(self.use_item, "spirit potion"),
+                partial(self.use_item, "spirit elixir"),
+                partial(self.use_item, "last elixir"),
             ]:
                 if fun():
                     return True
 
         if self.get_stat_percent("sp") < self.statthreshold.sp[1]:
             for fun in [
-                partial(self.use_item, "Spirit Gem"),
-                partial(self.use_item, "Spirit Potion"),
+                partial(self.use_item, "spirit gem"),
+                partial(self.use_item, "spirit potion"),
             ]:
                 if fun():
                     return True
@@ -452,7 +452,7 @@ class BattleDriver(HVDriver):
         # Get the list of monster IDs that are not debuffed with Imperil
         monster_with_imperil: list[int]
         if (
-            "Imperil" not in self.forbidden_skills
+            "imperil" not in self.forbidden_skills
             and self.get_stat_percent("mp") > self.statthreshold.mp[1]
         ):
             monster_with_imperil = (
@@ -472,22 +472,22 @@ class BattleDriver(HVDriver):
                     monster_health = self.battle_dashboard.snap.monsters[n].hp_percent
                     if (
                         monster_health < 25
-                        and "Merciful Blow"
+                        and "merciful blow"
                         in self.battle_dashboard.snap.abilities.skills
                         and self.battle_dashboard.snap.abilities.skills[
-                            "Merciful Blow"
+                            "merciful blow"
                         ].available
                     ):
-                        self.attack_monster_by_skill(n, "Merciful Blow")
+                        self.attack_monster_by_skill(n, "merciful blow")
                     elif (
                         monster_health > 5
-                        and "Vital Strike"
+                        and "vital strike"
                         in self.battle_dashboard.snap.abilities.skills
                         and self.battle_dashboard.snap.abilities.skills[
-                            "Vital Strike"
+                            "vital strike"
                         ].available
                     ):
-                        self.attack_monster_by_skill(n, "Vital Strike")
+                        self.attack_monster_by_skill(n, "vital strike")
                     else:
                         self.attack_monster(n)
                 else:
@@ -496,7 +496,7 @@ class BattleDriver(HVDriver):
             else:
                 if n == self.last_debuff_monster_id["Imperiled"]:
                     if random() < 0.5:
-                        self.attack_monster_by_skill(n, "Imperil")
+                        self.attack_monster_by_skill(n, "imperil")
                     else:
                         self.attack_monster(n)
                 else:
@@ -510,7 +510,7 @@ class BattleDriver(HVDriver):
 
     def use_channeling(self) -> bool:
         if "Channeling" in self.battle_dashboard.snap.player.buffs:
-            skill_names = ["Regen", "Heartseeker"]
+            skill_names = ["regen", "heartseeker"]
             skill2remaining: dict[str, float] = dict()
             for skill_name in skill_names:
                 remaining_turns = self._buffmanager.get_buff_remaining_turns(skill_name)
@@ -551,15 +551,15 @@ class BattleDriver(HVDriver):
             self.check_mp,
             self.check_sp,
             self.check_overcharge,
-            lambda: self.apply_buff("Health Draught"),
-            lambda: self.apply_buff("Mana Draught"),
-            lambda: self.apply_buff("Spirit Draught"),
-            lambda: self.apply_buff("Regen"),
-            lambda: self.apply_buff("Scroll of Life"),
-            lambda: self.apply_buff("Scroll of Absorption"),
-            lambda: self.apply_buff("Absorb"),
-            lambda: self.apply_buff("Scroll of Protection"),
-            lambda: self.apply_buff("Heartseeker"),
+            lambda: self.apply_buff("health draught"),
+            lambda: self.apply_buff("mana draught"),
+            lambda: self.apply_buff("spirit draught"),
+            lambda: self.apply_buff("regen"),
+            lambda: self.apply_buff("scroll of life"),
+            lambda: self.apply_buff("scroll of absorption"),
+            lambda: self.apply_buff("absorb"),
+            lambda: self.apply_buff("scroll of protection"),
+            lambda: self.apply_buff("heartseeker"),
             self.use_channeling,
             self.attack,
         ]:

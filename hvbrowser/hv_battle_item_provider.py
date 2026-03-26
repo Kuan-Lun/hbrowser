@@ -8,7 +8,7 @@ from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_observer_pattern import BattleDashboard
 
-GEM_ITEMS = {"Mystic Gem", "Health Gem", "Mana Gem", "Spirit Gem"}
+GEM_ITEMS = {"mystic gem", "health gem", "mana gem", "spirit gem"}
 
 
 class ItemProvider:

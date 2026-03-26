@@ -10,22 +10,22 @@ from .hv_battle_observer_pattern import BattleDashboard
 from .hv_battle_skill_manager import SkillManager
 
 ITEM_BUFFS = {
-    "Health Draught",
-    "Mana Draught",
-    "Spirit Draught",
-    "Scroll of Absorption",
-    "Scroll of Life",
-    "Scroll of Protection",
+    "health draught",
+    "mana draught",
+    "spirit draught",
+    "scroll of absorption",
+    "scroll of life",
+    "scroll of protection",
 }
 
 SKILLS_TO_CHARACTER_BUFFS = {
-    "Absorb": "Absorbing Ward",
-    "Scroll of Absorption": "Absorbing Ward",
-    "Scroll of Protection": "Protection",
-    "Scroll of Life": "Spark of Life",
-    "Health Draught": "Regeneration",
-    "Mana Draught": "Replenishment",
-    "Spirit Draught": "Refreshment",
+    "absorb": "Absorbing Ward",
+    "scroll of absorption": "Absorbing Ward",
+    "scroll of protection": "Protection",
+    "scroll of life": "Spark of Life",
+    "health draught": "Regeneration",
+    "mana draught": "Replenishment",
+    "spirit draught": "Refreshment",
 }
 
 AutoCast_BUFFS = {
@@ -37,11 +37,11 @@ AutoCast_BUFFS = {
 }
 
 SKILL_BUFFS = {
-    "Absorb",
-    "Heartseeker",
-    "Regen",
-    "Shadow Veil",
-    "Spark of Life",
+    "absorb",
+    "heartseeker",
+    "regen",
+    "shadow veil",
+    "spark of life",
 }
 
 # BUFF2ICONS = {
@@ -151,7 +151,7 @@ class BuffManager:
             return self._item_provider.use(key)
 
         if key in SKILL_BUFFS:
-            self._item_provider.use("Mystic Gem")
+            self._item_provider.use("mystic gem")
             return self._cast_skill(key)
 
         raise ValueError(f"Unknown buff key: {key}")
