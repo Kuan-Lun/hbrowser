@@ -66,9 +66,9 @@ def _run_gui(
                     for widget in skill_container.winfo_children():
                         widget.destroy()
                     local_skills.clear()
-                    for group_name, skills in skill_groups.items():
+                    for col, (group_name, skills) in enumerate(skill_groups.items()):
                         frame = tk.LabelFrame(skill_container, text=group_name)
-                        frame.pack(padx=5, pady=3, fill="x")
+                        frame.grid(row=0, column=col, padx=5, pady=3, sticky="nsew")
                         for skill in skills:
                             val = skill not in forbidden
                             var = tk.BooleanVar(value=val)
@@ -76,6 +76,8 @@ def _run_gui(
                             skill_dict[skill] = val
                             cb = tk.Checkbutton(frame, text=skill, variable=var)
                             cb.pack(anchor="w", padx=5, pady=1)
+                    for col in range(len(skill_groups)):
+                        skill_container.columnconfigure(col, weight=1)
                 case "set_title":
                     root.title(args)
                 case "destroy":
