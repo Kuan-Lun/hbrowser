@@ -2,16 +2,18 @@
 
 ## Setup
 
-### Prerequisites
+### Tor Proxy (Optional)
 
-HBrowser routes all traffic through the Tor network for IP privacy. You need to install **Tor Browser** before using HBrowser:
+HBrowser can route all traffic through the Tor network for IP privacy. If Tor Browser is installed, HBrowser will automatically detect and use it. To install:
 
 1. Download and install from https://www.torproject.org/download/
 2. HBrowser will automatically locate the `tor` binary from the default installation path:
    - **macOS**: `/Applications/Tor Browser.app/Contents/MacOS/Tor/tor`
    - **Linux**: `/usr/bin/tor`
    - **Windows**: Searches common installation paths (`Desktop`, `AppData`, `Program Files`)
-3. If your Tor Browser is installed in a non-standard location, set the `TOR_BINARY_PATH` environment variable.
+3. If Tor Browser is not installed, HBrowser will use a direct connection instead.
+4. To force disable Tor even when installed, set `USE_TOR=0`.
+5. If your Tor Browser is installed in a non-standard location, set the `TOR_BINARY_PATH` environment variable.
 
 ### Environment Variables
 
@@ -21,6 +23,7 @@ HBrowser requires the following environment variables:
 - `EH_PASSWORD`: Your E-Hentai account password
 - `APIKEY_2CAPTCHA`: Your 2Captcha API key for solving CAPTCHA challenges
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
+- `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
 
 Set the environment variables before running the script:
@@ -31,7 +34,8 @@ export EH_USERNAME=your_username
 export EH_PASSWORD=your_password
 export APIKEY_2CAPTCHA=your_api_key_here
 export HBROWSER_LOG_LEVEL=INFO          # Optional
-export TOR_BINARY_PATH=/path/to/tor     # Optional
+export USE_TOR=0                        # Optional: disable Tor proxy
+export TOR_BINARY_PATH=/path/to/tor     # Optional: custom tor path
 ```
 
 **Fish:**
@@ -40,7 +44,8 @@ set -x EH_USERNAME your_username
 set -x EH_PASSWORD your_password
 set -x APIKEY_2CAPTCHA your_api_key_here
 set -x HBROWSER_LOG_LEVEL INFO          # Optional
-set -x TOR_BINARY_PATH /path/to/tor     # Optional
+set -x USE_TOR 0                        # Optional: disable Tor proxy
+set -x TOR_BINARY_PATH /path/to/tor     # Optional: custom tor path
 ```
 
 **Windows Command Prompt:**
@@ -49,6 +54,7 @@ set EH_USERNAME=your_username
 set EH_PASSWORD=your_password
 set APIKEY_2CAPTCHA=your_api_key_here
 set HBROWSER_LOG_LEVEL=INFO
+set USE_TOR=0
 set TOR_BINARY_PATH=C:\path\to\tor.exe
 ```
 
@@ -58,6 +64,7 @@ $env:EH_USERNAME="your_username"
 $env:EH_PASSWORD="your_password"
 $env:APIKEY_2CAPTCHA="your_api_key_here"
 $env:HBROWSER_LOG_LEVEL="INFO"
+$env:USE_TOR="0"
 $env:TOR_BINARY_PATH="C:\path\to\tor.exe"
 ```
 

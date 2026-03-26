@@ -301,19 +301,35 @@ def create_driver(headless: bool = True) -> Any:
     """
     logger.info(f"Creating WebDriver (headless: {headless})")
 
-    # 啟動 Tor SOCKS proxy
-    socks_port = _find_available_port(_TOR_SOCKS_PORT)
-    tor_process = _start_tor_process(socks_port)
-
-    # 註冊 atexit 確保 Tor 進程被清理
-    def _cleanup_tor() -> None:
+    # 判斷是否啟用 Tor
+    # 預設：偵測到 tor 就啟用，設定 USE_TOR=0 可強制關閉
+    use_tor_env = os.getenv("USE_TOR")
+    if use_tor_env is not None:
+        use_tor = use_tor_env.lower() not in ("0", "false", "no", "off")
+    else:
+        # 未設定環境變數：有 tor 就用，沒有就不用
         try:
-            tor_process.terminate()
-            tor_process.wait(timeout=5)
-        except Exception:
-            tor_process.kill()
+            _find_tor_binary()
+            use_tor = True
+        except FileNotFoundError:
+            use_tor = False
 
-    atexit.register(_cleanup_tor)
+    tor_process: subprocess.Popen[bytes] | None = None
+    if use_tor:
+        socks_port = _find_available_port(_TOR_SOCKS_PORT)
+        tor_process = _start_tor_process(socks_port)
+
+        # 註冊 atexit 確保 Tor 進程被清理
+        _tor = tor_process
+
+        def _cleanup_tor() -> None:
+            try:
+                _tor.terminate()
+                _tor.wait(timeout=5)
+            except Exception:
+                _tor.kill()
+
+        atexit.register(_cleanup_tor)
 
     # 設定瀏覽器參數
     options = uc.ChromeOptions()
@@ -342,10 +358,11 @@ def create_driver(headless: bool = True) -> Any:
             proxy_pass=rp_password,
         )
         logger.debug(f"Proxy extension created at: {proxy_extension}")
-    else:
-        # 使用 Tor SOCKS proxy
+    elif use_tor:
         options.add_argument(f"--proxy-server=socks5://127.0.0.1:{socks_port}")
         logger.info(f"Using Tor SOCKS proxy on port {socks_port}")
+    else:
+        logger.info("No proxy configured (direct connection)")
 
     # 檢測是否為 Linux + Xvfb 環境
     is_xvfb_env = (
@@ -451,24 +468,27 @@ def create_driver(headless: bool = True) -> Any:
     )
 
     # 包裝 quit() 以同時清理 tor 進程
-    original_quit = driver.quit
+    if tor_process is not None:
+        original_quit = driver.quit
+        _tor = tor_process
 
-    def _quit_with_tor_cleanup() -> None:
-        try:
-            original_quit()
-        finally:
+        def _quit_with_tor_cleanup() -> None:
             try:
-                tor_process.terminate()
-                tor_process.wait(timeout=5)
-            except Exception:
-                tor_process.kill()
+                original_quit()
+            finally:
+                try:
+                    _tor.terminate()
+                    _tor.wait(timeout=5)
+                except Exception:
+                    _tor.kill()
 
-    driver.quit = _quit_with_tor_cleanup
+        driver.quit = _quit_with_tor_cleanup
 
     # 添加 ban 檢查裝飾器
     driver.myget = handle_ban_decorator(driver)
 
     # 驗證 Tor IP 與本機 IP 不同
-    _verify_tor_ip(driver)
+    if use_tor and not (rp_username and rp_password and rp_dns):
+        _verify_tor_ip(driver)
 
     return driver
