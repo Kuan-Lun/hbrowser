@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.request import urlopen, urlretrieve
 
-from ..utils import setup_logger
+from ..utils import (
+    get_chrome_executable_name,
+    get_chromedriver_executable_name,
+    get_platform,
+    setup_logger,
+)
 
 logger = setup_logger(__name__)
 
@@ -30,35 +35,6 @@ class ChromePaths(NamedTuple):
     version: str
 
 
-def _get_platform() -> str:
-    """
-    根據作業系統和架構取得對應的平台代碼
-
-    Returns:
-        平台代碼 (mac-arm64, mac-x64, linux64, win64, win32)
-    """
-    system = platform.system()
-    machine = platform.machine().lower()
-
-    match system:
-        case "Darwin":
-            # macOS
-            if machine == "arm64":
-                return "mac-arm64"
-            else:
-                return "mac-x64"
-        case "Linux":
-            return "linux64"
-        case "Windows":
-            # 檢查是否為 64 位元
-            if platform.machine().endswith("64"):
-                return "win64"
-            else:
-                return "win32"
-        case _:
-            raise RuntimeError(f"Unsupported platform: {system} {machine}")
-
-
 def _get_cache_dir() -> Path:
     """
     取得快取目錄路徑（~/.cache/chrome-for-testing）
@@ -72,24 +48,6 @@ def _get_cache_dir() -> Path:
     """
     cache_dir = Path.home() / ".cache" / "chrome-for-testing"
     return cache_dir
-
-
-def _get_chrome_executable_name(plat: str) -> str:
-    """取得 Chrome 執行檔名稱"""
-    if plat.startswith("win"):
-        return "chrome.exe"
-    elif plat.startswith("mac"):
-        return "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-    else:
-        return "chrome"
-
-
-def _get_chromedriver_executable_name(plat: str) -> str:
-    """取得 ChromeDriver 執行檔名稱"""
-    if plat.startswith("win"):
-        return "chromedriver.exe"
-    else:
-        return "chromedriver"
 
 
 def _fetch_stable_version_info() -> dict[str, Any]:
@@ -207,9 +165,7 @@ def _cleanup_stale_drivers(running_dir: Path) -> None:
                 pass
 
 
-def _create_chromedriver_copy(
-    source: Path, running_dir: Path, plat: str
-) -> Path:
+def _create_chromedriver_copy(source: Path, running_dir: Path, plat: str) -> Path:
     """
     建立 chromedriver 的 PID 專屬副本
 
@@ -264,7 +220,7 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
     Returns:
         ChromePaths 包含 chrome 和 chromedriver 的執行檔路徑
     """
-    plat = _get_platform()
+    plat = get_platform()
     cache_dir = _get_cache_dir()
 
     logger.info(f"Platform: {plat}")
@@ -279,12 +235,12 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
 
     # Chrome 路徑
     chrome_folder = f"chrome-{plat}"
-    chrome_exe_name = _get_chrome_executable_name(plat)
+    chrome_exe_name = get_chrome_executable_name(plat)
     chrome_path = version_dir / chrome_folder / chrome_exe_name
 
     # ChromeDriver 原始路徑
     chromedriver_folder = f"chromedriver-{plat}"
-    chromedriver_exe_name = _get_chromedriver_executable_name(plat)
+    chromedriver_exe_name = get_chromedriver_executable_name(plat)
     chromedriver_path = version_dir / chromedriver_folder / chromedriver_exe_name
 
     # 檢查是否需要下載
@@ -329,9 +285,7 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
     _cleanup_stale_drivers(running_dir)
 
     # 建立 PID 專屬的 chromedriver 副本
-    chromedriver_copy = _create_chromedriver_copy(
-        chromedriver_path, running_dir, plat
-    )
+    chromedriver_copy = _create_chromedriver_copy(chromedriver_path, running_dir, plat)
 
     return ChromePaths(
         chrome=str(chrome_path),
