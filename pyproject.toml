@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
@@ -33,30 +33,12 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 
-[project.optional-dependencies]
-publish = [
-    "build",
-    "twine",
-]
-
 [project.urls]
 Homepage = "https://github.com/Kuan-Lun/hbrowser"
 Tracker = "https://github.com/Kuan-Lun/hbrowser/issues"
 
-[tool.setuptools]
-# Use automatic package discovery (PEP 621 recommended approach)
-include-package-data = true
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["hbrowser*", "hvbrowser*"]
-
-[tool.setuptools.package-data]
-"hbrowser" = ["py.typed"]
-"hbrowser.gallery" = ["py.typed"]
-"hbrowser.gallery.browser" = ["py.typed"]
-"hbrowser.gallery.captcha" = ["py.typed"]
-"hvbrowser" = ["py.typed"]
+[tool.hatch.build.targets.wheel]
+packages = ["hbrowser", "hvbrowser"]
 
 [tool.ruff]
 line-length = 88
