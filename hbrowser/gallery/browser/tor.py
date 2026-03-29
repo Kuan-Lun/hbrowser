@@ -4,15 +4,13 @@ import atexit
 import os
 import platform
 import re
-import socket
 import subprocess
 import tempfile
 import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
-from urllib.request import urlopen
+from types import MappingProxyType
 
 from ..utils import setup_logger
 
@@ -22,23 +20,23 @@ logger = setup_logger(__name__)
 TOR_SOCKS_PORT = 9150
 
 # Tor 執行檔路徑（使用者需自行安裝 Tor Browser）
-_TOR_BINARY_CANDIDATES: dict[str, list[str]] = {
-    "Darwin": [
-        "/Applications/Tor Browser.app/Contents/MacOS/Tor/tor",
-    ],
-    "Linux": [
-        "/usr/bin/tor",
-        os.path.expanduser("~/tor-browser/Browser/TorBrowser/Tor/tor"),
-    ],
-    "Windows": [
-        os.path.expandvars(
-            r"%USERPROFILE%\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
+_TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "Darwin": ("/Applications/Tor Browser.app/Contents/MacOS/Tor/tor",),
+        "Linux": (
+            "/usr/bin/tor",
+            os.path.expanduser("~/tor-browser/Browser/TorBrowser/Tor/tor"),
         ),
-        os.path.expandvars(r"%APPDATA%\Tor Browser\Browser\TorBrowser\Tor\tor.exe"),
-        r"C:\Program Files\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
-        r"C:\Program Files (x86)\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
-    ],
-}
+        "Windows": (
+            os.path.expandvars(
+                r"%USERPROFILE%\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
+            ),
+            os.path.expandvars(r"%APPDATA%\Tor Browser\Browser\TorBrowser\Tor\tor.exe"),
+            r"C:\Program Files\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
+            r"C:\Program Files (x86)\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
+        ),
+    }
+)
 
 
 def _find_tor_binary() -> str:
@@ -52,7 +50,7 @@ def _find_tor_binary() -> str:
         return env_path
 
     plat = platform.system()
-    candidates = _TOR_BINARY_CANDIDATES.get(plat, [])
+    candidates = _TOR_BINARY_CANDIDATES.get(plat, ())
     for path in candidates:
         if os.path.isfile(path):
             return path
@@ -65,18 +63,6 @@ def _find_tor_binary() -> str:
         "Please install Tor Browser (https://www.torproject.org/download/) "
         "or set TOR_BINARY_PATH environment variable."
     )
-
-
-def find_available_port(start: int = 9150) -> int:
-    """找到一個可用的端口"""
-    for port in range(start, start + 100):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(f"No available port found in range {start}-{start + 99}")
 
 
 def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
@@ -228,25 +214,3 @@ def start_tor_with_retry(
 
     atexit.register(_cleanup_tor)
     return tor_process
-
-
-def verify_tor_ip(driver: Any) -> None:
-    """驗證 Tor 連線的 IP 與本機 IP 不同"""
-    try:
-        with urlopen("https://api.ipify.org", timeout=10) as response:
-            local_ip: str = response.read().decode("utf-8").strip()
-
-        driver.get("https://api.ipify.org")
-        tor_ip: str = driver.find_element("tag name", "body").text.strip()
-
-        if local_ip == tor_ip:
-            raise RuntimeError(
-                f"Tor IP safety check failed: Tor IP ({tor_ip}) is the same "
-                f"as local IP ({local_ip}). Tor may not be working properly."
-            )
-
-        logger.info(f"Tor IP verified: {tor_ip} (local: {local_ip})")
-    except RuntimeError:
-        raise
-    except Exception as e:
-        logger.warning(f"Could not verify Tor IP (non-fatal): {e}")

@@ -12,13 +12,16 @@ from undetected_chromedriver.patcher import Patcher
 from ..utils import setup_logger
 from .ban_handler import handle_ban_decorator
 from .chrome_manager import ensure_chrome_installed
-from .proxy import configure_proxy, has_residential_proxy
+from .proxy import (
+    configure_proxy,
+    find_available_port,
+    has_residential_proxy,
+    verify_proxy_ip,
+)
 from .tor import (
     TOR_SOCKS_PORT,
-    find_available_port,
     should_use_tor,
     start_tor_with_retry,
-    verify_tor_ip,
 )
 
 logger = setup_logger(__name__)
@@ -162,7 +165,7 @@ def _post_create_setup(
 
     # 驗證 Tor IP 與本機 IP 不同（僅在使用 Tor 且無住宅代理時）
     if use_tor and not has_residential_proxy():
-        verify_tor_ip(driver)
+        verify_proxy_ip(driver)
 
 
 def create_driver(headless: bool = True) -> Any:

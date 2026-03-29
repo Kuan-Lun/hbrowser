@@ -1,8 +1,11 @@
 """代理設定"""
 
 import os
+import socket
 import tempfile
 import zipfile
+from typing import Any
+from urllib.request import urlopen
 
 from ..utils import setup_logger
 
@@ -124,3 +127,37 @@ def configure_proxy() -> str | None:
 def has_residential_proxy() -> bool:
     """檢查是否有設定住宅代理環境變數。"""
     return all(os.getenv(k) for k in ("RP_USERNAME", "RP_PASSWORD", "RP_DNS"))
+
+
+def find_available_port(start: int = 9150) -> int:
+    """找到一個可用的端口"""
+    for port in range(start, start + 100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No available port found in range {start}-{start + 99}")
+
+
+def verify_proxy_ip(driver: Any) -> None:
+    """驗證代理連線的 IP 與本機 IP 不同"""
+    try:
+        with urlopen("https://api.ipify.org", timeout=10) as response:
+            local_ip: str = response.read().decode("utf-8").strip()
+
+        driver.get("https://api.ipify.org")
+        proxy_ip: str = driver.find_element("tag name", "body").text.strip()
+
+        if local_ip == proxy_ip:
+            raise RuntimeError(
+                f"Proxy IP safety check failed: proxy IP ({proxy_ip}) is the same "
+                f"as local IP ({local_ip}). Proxy may not be working properly."
+            )
+
+        logger.info(f"Proxy IP verified: {proxy_ip} (local: {local_ip})")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning(f"Could not verify proxy IP (non-fatal): {e}")
