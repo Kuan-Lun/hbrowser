@@ -3,9 +3,13 @@
 import atexit
 import os
 import platform
+import re
+import socket
 import subprocess
 import tempfile
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -65,8 +69,6 @@ def _find_tor_binary() -> str:
 
 def find_available_port(start: int = 9150) -> int:
     """找到一個可用的端口"""
-    import socket
-
     for port in range(start, start + 100):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -87,10 +89,6 @@ def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
     Returns:
         tor 進程的 Popen 物件
     """
-    import re
-    import threading
-    from collections import deque
-
     tor_binary = _find_tor_binary()
     data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
 
