@@ -19,7 +19,7 @@ from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .browser import create_driver
+from .browser import DriverRestartRotator, ProxyRotator, create_driver
 from .captcha import CaptchaManager, TwoCaptchaAdapter
 from .utils import get_log_dir, matchurl, setup_logger
 
@@ -42,6 +42,8 @@ class Driver(ABC):
     def __init__(
         self,
         headless: bool = True,
+        proxy_rotator: ProxyRotator | None = None,
+        max_captcha_retries: int = 3,
     ) -> None:
         def seturl() -> dict[str, str]:
             url: dict[str, str] = dict()
@@ -58,7 +60,10 @@ class Driver(ABC):
         self.password = os.getenv("EH_PASSWORD")
         self.url = seturl()
         self.name = self._setname()
+        self.headless = headless
         self.driver = create_driver(headless=headless)
+        self.proxy_rotator = proxy_rotator or DriverRestartRotator()
+        self.max_captcha_retries = max_captcha_retries
 
         # 初始化驗證碼管理器
         # 使用 180 秒（3 分鐘）的等待時間，
@@ -155,6 +160,67 @@ class Driver(ABC):
         else:
             time.sleep(sleeptime)
 
+    def _rotate_proxy(self) -> None:
+        """透過 ProxyRotator 輪換代理，替換當前 driver。"""
+        self.driver = self.proxy_rotator.rotate(self.driver, self.headless)
+
+    def detect_and_solve_with_rotation(
+        self,
+        url: str,
+        detect_timeout: float = 3.0,
+    ) -> None:
+        """檢測並解決 Cloudflare 驗證，失敗時自動輪換代理重試。
+
+        可在任何需要通過 Cloudflare 驗證的地方呼叫此方法。
+
+        Args:
+            url: 要存取的 URL（輪換代理後需重新導航）
+            detect_timeout: 驗證碼檢測超時時間（秒）
+
+        Raises:
+            Exception: 所有重試都失敗後拋出
+        """
+        for attempt in range(1, self.max_captcha_retries + 1):
+            det = self.captcha_manager.detect(self.driver, timeout=detect_timeout)
+            if det.kind == "none":
+                self.logger.info("No challenge detected")
+                return
+
+            self.logger.warning(
+                f"Challenge detected: {det.kind} "
+                f"(attempt {attempt}/{self.max_captcha_retries})"
+            )
+
+            # 儲存驗證頁面供除錯
+            challenge_page_path = os.path.join(get_log_dir(), "challenge_page.html")
+            with open(challenge_page_path, "w", errors="ignore") as f:
+                f.write(self.driver.page_source)
+            self.logger.debug(f"Challenge page saved to: {challenge_page_path}")
+
+            self.logger.info(f"Attempting to solve {det.kind} challenge...")
+            try:
+                success = self.captcha_manager.solve(det, self.driver)
+            except Exception:
+                success = False
+
+            if success:
+                self.logger.info("Challenge solved successfully")
+                return
+
+            # 解決失敗，輪換代理重試
+            self.logger.warning(
+                f"Failed to solve challenge "
+                f"(attempt {attempt}/{self.max_captcha_retries})"
+            )
+            if attempt < self.max_captcha_retries:
+                self._rotate_proxy()
+                self.driver.myget(url)
+
+        raise Exception(
+            f"Failed to solve captcha after {self.max_captcha_retries} attempts "
+            f"with proxy rotation"
+        )
+
     def login(self) -> None:
         """
         登入流程
@@ -170,23 +236,8 @@ class Driver(ABC):
         # 進入 Forums 首頁
         self.driver.myget(self.url["Forums"])
 
-        # 檢測並解決 Cloudflare 驗證
-        det = self.captcha_manager.detect(self.driver, timeout=3.0)
-        if det.kind != "none":
-            self.logger.warning(f"Challenge detected: {det.kind}")
-            login_page_path = os.path.join(get_log_dir(), "login_page.html")
-            with open(login_page_path, "w", errors="ignore") as f:
-                f.write(self.driver.page_source)
-            self.logger.debug(f"Challenge page saved to: {login_page_path}")
-
-            self.logger.info(f"Attempting to solve {det.kind} challenge...")
-            success = self.captcha_manager.solve(det, self.driver)
-            if not success:
-                self.logger.error("Failed to solve captcha challenge")
-                raise Exception("Failed to solve captcha challenge")
-            self.logger.info("Challenge solved successfully")
-        else:
-            self.logger.info("No challenge detected on Forums page")
+        # 檢測並解決 Cloudflare 驗證（失敗時自動輪換代理重試）
+        self.detect_and_solve_with_rotation(self.url["Forums"])
 
         # 檢查是否已登入（已登入時不會出現 userlinksguest）
         if not self.driver.find_elements(By.ID, "userlinksguest"):
