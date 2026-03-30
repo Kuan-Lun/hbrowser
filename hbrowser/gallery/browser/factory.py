@@ -105,6 +105,17 @@ def _configure_chrome_options(
     if platform.system() == "Darwin":
         options.add_argument("--use-mock-keychain")
 
+    # 禁用密碼儲存提示與翻譯提示
+    options.add_experimental_option(
+        "prefs",
+        {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "translate_blocked_languages": ["en", "ja", "zh-TW", "zh-CN"],
+            "translate": {"enabled": False},
+        },
+    )
+
     # 隱私強化 - 禁用可能洩漏資訊的 API
     options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
     options.add_argument("--enforce-webrtc-ip-permission-check")
