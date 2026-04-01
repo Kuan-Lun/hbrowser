@@ -6,7 +6,7 @@ __pycache__
 build
 dist
 cProfile_result.txt
-.DS_Store
+tmp
 
 !/.gitignore
 !/.github/
@@ -16,5 +16,5 @@ cProfile_result.txt
 
 uv.lock
 
-hvbrowser/hv_battle_ponychart_ml/rawimage/*
-hvbrowser/hv_battle_ponychart_ml/labels.json
+# macOS
+.DS_Store
