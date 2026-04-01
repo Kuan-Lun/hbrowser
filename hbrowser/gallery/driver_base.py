@@ -164,6 +164,57 @@ class Driver(ABC):
         """透過 ProxyRotator 輪換代理，替換當前 driver。"""
         self.driver = self.proxy_rotator.rotate(self.driver, self.headless)
 
+    def _handle_login_recaptcha(self, manual_timeout: float = 300.0) -> None:
+        """處理登入表單上的 reCAPTCHA v2。
+
+        先嘗試透過 2Captcha 自動解決，若失敗則等待使用者手動完成。
+
+        Args:
+            manual_timeout: 等待手動完成的超時時間（秒），預設 300 秒
+        """
+        det = self.captcha_manager.detect(self.driver, timeout=3.0)
+        if det.kind != "recaptcha_v2":
+            return
+
+        self.logger.info("reCAPTCHA v2 detected on login form")
+
+        # 嘗試透過 2Captcha 自動解決
+        try:
+            result = self.captcha_manager.solve(det, self.driver)
+            if result:
+                self.logger.info("reCAPTCHA v2 solved automatically")
+                return
+        except Exception:
+            self.logger.debug("Auto-solve failed, will wait for manual completion")
+
+        # 檢查 token 是否已就緒（可能由自動解決部分注入）
+        token = self.driver.execute_script(
+            "var el = document.getElementById('g-recaptcha-response');"
+            "return el ? el.value : '';"
+        )
+        if token:
+            self.logger.info("reCAPTCHA token already present")
+            return
+
+        # 等待使用者手動完成 reCAPTCHA
+        self.logger.info(
+            "Please complete the reCAPTCHA manually in the browser. "
+            f"Waiting up to {manual_timeout:.0f} seconds..."
+        )
+        try:
+            WebDriverWait(self.driver, manual_timeout).until(
+                lambda d: d.execute_script(
+                    "var el = document.getElementById('g-recaptcha-response');"
+                    "return el && el.value.length > 0;"
+                )
+            )
+            self.logger.info("reCAPTCHA completed by user")
+        except TimeoutException:
+            self.logger.warning(
+                "reCAPTCHA manual completion timed out, "
+                "proceeding with login attempt anyway"
+            )
+
     def detect_and_solve_with_rotation(
         self,
         url: str,
@@ -267,6 +318,9 @@ class Driver(ABC):
 
         password_input = self.driver.find_element(By.NAME, "PassWord")
         password_input.send_keys(self.password)
+
+        # 處理登入表單上的 reCAPTCHA v2
+        self._handle_login_recaptcha()
 
         # 點擊 "Log me in" 按鈕
         old_url = self.driver.current_url

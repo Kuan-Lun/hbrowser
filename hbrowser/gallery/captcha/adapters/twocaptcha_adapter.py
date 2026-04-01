@@ -443,10 +443,13 @@ class TwoCaptchaAdapter(CaptchaSolver):
             logger.info("Token injected successfully, waiting for page to respond...")
             time.sleep(3)
 
-            # 檢查是否通過驗證
-            detector = CaptchaDetector()
-            current_det = detector.detect(driver, timeout=1.0)
-            if current_det.kind == "none":
+            # 透過檢查 g-recaptcha-response 欄位值確認 token 是否注入成功
+            # （reCAPTCHA div 在 token 注入後不會消失，因此不能用 re-detect 判斷）
+            token_value = driver.execute_script(
+                "var el = document.getElementById('g-recaptcha-response');"
+                "return el ? el.value : '';"
+            )
+            if token_value:
                 logger.info("reCAPTCHA v2 challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
         else:
