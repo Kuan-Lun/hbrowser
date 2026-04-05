@@ -2,12 +2,18 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from hv_bie import parse_snapshot
-
 from hbrowser.gallery.element_action import ElementAction
 
 from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard
+
+# 用輕量 JS 取得 log 區塊的 innerHTML，避免每次都抓整頁 HTML
+_LOG_SNIPPET_JS = (
+    "(() => {"
+    "const el = document.getElementById('battlelog');"
+    "return el ? el.innerHTML : '';"
+    "})()"
+)
 
 
 class ElementActionManager:
@@ -69,36 +75,32 @@ class ElementActionManager:
         is_retry: bool = True,
         stale_retries: int = 3,
         timeout: float = 5.0,
-        check_interval: float = 0.05,
+        check_interval: float = 0.3,
     ) -> None:
         """
-        Like click_and_wait_log but takes a CSS selector so we can re-find
-        element if it turns stale or after a refresh.
-        """
-        # Pre-click snapshot
-        html = await self.hvdriver.page.get_content()
-        pre_lines = self.battle_dashboard.log_entries.get_new_lines(
-            parse_snapshot(html)
-        )
+        點擊元素並等待戰鬥 log 更新。
 
-        # Wait for element to be clickable, then click with retries
+        使用輕量 JS 輪詢 battlelog innerHTML 偵測變化，
+        避免頻繁呼叫 get_content() + parse_snapshot() 阻塞 CDP 連線。
+        """
+        # 用輕量 JS 取得 pre-click log 快照
+        pre_log = await self.hvdriver.page.evaluate(_LOG_SNIPPET_JS)
+
+        # 點擊
         await self._action.click_locator(
             selector, retries=stale_retries, wait_timeout=2.0, delay=0.1
         )
 
+        # 輪詢：用輕量 JS 偵測 log 變化
         waited = 0.0
         while True:
-            current_html = await self.hvdriver.page.get_content()
-            current_lines = self.battle_dashboard.log_entries.get_new_lines(
-                parse_snapshot(current_html)
-            )
-            if pre_lines != current_lines:
-                break
             await asyncio.sleep(check_interval)
             waited += check_interval
+            current_log = await self.hvdriver.page.evaluate(_LOG_SNIPPET_JS)
+            if current_log != pre_log:
+                break
             if waited >= timeout:
                 if is_retry:
-                    # Soft recovery: browser refresh, then attempt once more
                     await self.hvdriver.page.reload()
                     return await self.click_and_wait_log_locator(
                         selector,
