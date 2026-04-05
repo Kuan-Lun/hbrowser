@@ -9,19 +9,17 @@ HBrowser is a Python library for browser automation on E-Hentai/ExHentai website
 ## Build & Development Commands
 
 ```bash
-# Install dependencies (using uv or pip)
+# Install dependencies
 uv pip install -e .
-# or
-pip install -e .
 
 # Type checking (strict mode configured in mypy.ini)
-mypy hbrowser hvbrowser
+uv run mypy hbrowser hvbrowser
 
 # Linting with ruff (rules in pyproject.toml: E, F, I, UP)
-ruff check .
+uv run ruff check .
 
 # Formatting with black (88 char line length)
-black .
+uv run black .
 ```
 
 ## Environment Variables
