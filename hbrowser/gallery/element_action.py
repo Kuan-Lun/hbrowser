@@ -1,64 +1,54 @@
-"""通用的 Selenium 元素操作工具，提供帶重試機制的點擊功能"""
+"""通用的元素操作工具，提供帶重試機制的點擊功能（async zendriver 版本）"""
 
-import time
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import Any
 
-from selenium.common.exceptions import (
-    ElementNotInteractableException,
-    StaleElementReferenceException,
-)
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import zendriver as zd
 
 
 class ElementAction:
     """通用的元素操作類，提供帶重試和等待機制的點擊功能。
 
-    只依賴 Selenium WebDriver，不綁定任何業務邏輯。
+    只依賴 zendriver Tab，不綁定任何業務邏輯。
     """
 
-    def __init__(self, driver: object) -> None:
-        self._driver = driver
+    def __init__(self, page: zd.Tab) -> None:
+        self._page = page
 
     @property
-    def driver(self) -> object:
-        return self._driver
+    def page(self) -> zd.Tab:
+        return self._page
 
-    def click(self, element: WebElement) -> None:
-        """使用 ActionChains 點擊元素"""
-        actions = ActionChains(self._driver)
-        actions.move_to_element(element).click().perform()
+    async def click(self, element: Any) -> None:
+        """使用 mouse_move + mouse_click 點擊元素"""
+        await element.mouse_move()
+        await element.mouse_click()
 
-    def click_resilient(
+    async def click_resilient(
         self,
-        get_element: Callable[[], WebElement],
+        get_element: Callable[[], Coroutine[Any, Any, Any]],
         retries: int = 3,
         delay: float = 0.1,
     ) -> None:
-        """點擊元素，自動重試 stale/interactable 錯誤"""
+        """點擊元素，自動重試錯誤"""
         last_err: Exception | None = None
-        for i in range(retries):
+        for _ in range(retries):
             try:
-                element = get_element()
-                self.click(element)
+                element = await get_element()
+                await self.click(element)
                 return
-            except (
-                StaleElementReferenceException,
-                ElementNotInteractableException,
-            ) as e:
+            except Exception as e:
                 last_err = e
-                time.sleep(delay)
+                await asyncio.sleep(delay)
                 continue
         if last_err:
             raise last_err
 
-    def click_until(
+    async def click_until(
         self,
-        get_element: Callable[[], WebElement],
-        condition: Callable[[], bool],
+        get_element: Callable[[], Coroutine[Any, Any, Any]],
+        condition: Callable[[], Coroutine[Any, Any, bool]],
         max_attempts: int = 5,
         delay: float = 0.1,
         timeout: float = 0.3,
@@ -68,42 +58,33 @@ class ElementAction:
         每次點擊後等待頁面內容變化，避免意外雙重觸發。
         """
         for _ in range(max_attempts):
-            if condition():
+            if await condition():
                 return
-            old_source = self._driver.page_source  # type: ignore[attr-defined]
+            old_source = await self._page.get_content()
             try:
-                self.click_resilient(get_element, retries=3, delay=delay)
-            except (
-                StaleElementReferenceException,
-                ElementNotInteractableException,
-            ):
+                await self.click_resilient(get_element, retries=3, delay=delay)
+            except Exception:
                 continue
-            deadline = time.monotonic() + timeout
-            while self._driver.page_source == old_source:  # type: ignore[attr-defined]
-                if time.monotonic() >= deadline:
+            deadline = asyncio.get_event_loop().time() + timeout
+            while await self._page.get_content() == old_source:
+                if asyncio.get_event_loop().time() >= deadline:
                     break
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
 
-    def click_locator(
+    async def click_locator(
         self,
-        by: str | By,
-        value: str,
+        selector: str,
         retries: int = 3,
         wait_timeout: float = 2.0,
         delay: float = 0.1,
     ) -> None:
-        """透過 locator 找到元素，等待可點擊後點擊，自動重試"""
+        """透過 CSS selector 找到元素，等待後點擊，自動重試"""
         for attempt in range(retries):
             try:
-                element = WebDriverWait(self._driver, wait_timeout).until(
-                    EC.element_to_be_clickable((by, value))
-                )
-                self.click(element)
+                element = await self._page.select(selector, timeout=wait_timeout)
+                await self.click(element)
                 return
-            except (
-                StaleElementReferenceException,
-                ElementNotInteractableException,
-            ):
+            except Exception:
                 if attempt == retries - 1:
                     raise
-                time.sleep(delay)
+                await asyncio.sleep(delay)

@@ -1,8 +1,6 @@
 from collections import defaultdict
 from typing import Any
 
-from selenium.webdriver.common.by import By
-
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_item_provider import ItemProvider
@@ -44,29 +42,6 @@ SKILL_BUFFS = {
     "spark of life",
 }
 
-# BUFF2ICONS = {
-#     # Item icons
-#     "Health Draught": {"/y/e/healthpot.png"},
-#     "Mana Draught": {"/y/e/manapot.png"},
-#     "Spirit Draught": {"/y/e/spiritpot.png"},
-#     "Scroll of Life": {"/y/e/sparklife_scroll.png"},
-#     "Scroll of Protection": {"/y/e/protection_scroll.png"},
-#     # Skill icons
-#     "Absorb": {"/y/e/absorb.png", "/y/e/absorb_scroll.png"},
-#     "Heartseeker": {"/y/e/heartseeker.png"},
-#     "Regen": {"/y/e/regen.png"},
-#     "Shadow Veil": {"/y/e/shadowveil.png"},
-#     "Spark of Life": {"/y/e/sparklife.png", "/y/e/sparklife_scroll.png"},
-#     # Spirit icon
-#     "Spirit Stance": {"/y/battle/spirit_a.png"},
-# }
-
-# BUFF2ITEMS = {
-#     "Absorb": ["Scroll of Absorption"],
-#     "Protection": ["Scroll of Protection"],
-#     "Spark of Life": ["Scroll of Life"],
-# }
-
 
 class BuffManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
@@ -80,8 +55,8 @@ class BuffManager:
         self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
 
     @property
-    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
-        return self.hvdriver.driver
+    def page(self) -> Any:
+        return self.hvdriver.page
 
     def get_buff_remaining_turns(self, key: str) -> int | float:
         """
@@ -97,8 +72,8 @@ class BuffManager:
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
 
-    def _cast_skill(self, key: str) -> bool:
-        iscast = self._skill_manager.cast(key)
+    async def _cast_skill(self, key: str) -> bool:
+        iscast = await self._skill_manager.cast(key)
         if iscast:
             self.get_buff_remaining_turns(key)
         return iscast
@@ -117,17 +92,17 @@ class BuffManager:
         else:
             return bool(remaining_turns >= 0)
 
-    def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
+    async def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
         """
         Apply buff that can be cast from both item and skill.
         Try item first, fallback to skill if item fails.
         """
-        if self._item_provider.use(item_name):
+        if await self._item_provider.use(item_name):
             return True
         else:
-            return self._cast_skill(key)
+            return await self._cast_skill(key)
 
-    def apply_buff(self, key: str, force: bool) -> bool:
+    async def apply_buff(self, key: str, force: bool) -> bool:
         """
         Apply the buff if it is not already active.
         """
@@ -142,16 +117,16 @@ class BuffManager:
         match key:
             case "spirit stance":
                 # Use locator-based resilient click; Spirit Stance toggles instantly
-                self.element_action_manager.click_and_wait_log_locator(
-                    By.ID, "ckey_spirit"
+                await self.element_action_manager.click_and_wait_log_locator(
+                    "#ckey_spirit"
                 )
                 return True
 
         if key in ITEM_BUFFS:
-            return self._item_provider.use(key)
+            return await self._item_provider.use(key)
 
         if key in SKILL_BUFFS:
-            self._item_provider.use("mystic gem")
-            return self._cast_skill(key)
+            await self._item_provider.use("mystic gem")
+            return await self._cast_skill(key)
 
         raise ValueError(f"Unknown buff key: {key}")

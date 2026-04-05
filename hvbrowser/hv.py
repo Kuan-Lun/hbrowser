@@ -1,12 +1,8 @@
+import asyncio
 import re
-import time
 from abc import ABC
 from random import random
 from typing import Any
-
-from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
 
 from hbrowser.gallery import EHDriver
 from hbrowser.gallery.utils import setup_logger
@@ -48,57 +44,54 @@ class HVDriver(EHDriver):
     def _setname(self) -> str:
         return "HentaiVerse"
 
-    def _setlogin(self) -> str:
-        return "My Home"
-
     @property
-    def is_isekai(self) -> bool:
-        return "isekai" in self.driver.current_url
+    async def is_isekai(self) -> bool:
+        url = await self.page.evaluate("window.location.href")
+        return "isekai" in url
 
-    @property
-    def path_prefix(self) -> str:
-        return "/isekai" if self.is_isekai else ""
+    async def _get_path_prefix(self) -> str:
+        return "/isekai" if await self.is_isekai else ""
 
     def searchxpath(self, srclist: list[Any] | tuple[Any, ...] | set[Any]) -> str:
-        return " | ".join(
-            [genxpath(self.path_prefix + imagepath) for imagepath in srclist]
-        )
+        return " | ".join([genxpath(imagepath) for imagepath in srclist])
 
-    def goisekai(self) -> None:
+    async def goisekai(self) -> None:
         logger.info("Navigating to HentaiVerse isekai page")
-        self.get(self.url["HentaiVerse isekai"])
+        await self.get(self.url["HentaiVerse isekai"])
 
-    def loetterycheck(self, num: int) -> None:
+    async def loetterycheck(self, num: int) -> None:
         logger.info(f"Checking lottery tickets (target: {num})")
-        self.gohomepage()
+        await self.gohomepage()
 
         for lettory in ["Weapon Lottery", "Armor Lottery"]:
             logger.debug(f"Processing {lettory}")
-            element: dict[str, Any] = dict()
-            element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
-            element[lettory] = self.driver.find_element(
-                By.XPATH, f"//div[contains(text(), '{lettory}')]"
-            )
-            actions = ActionChains(self.driver)
-            self.wait(
-                actions.move_to_element(element["Bazaar"])
-                .move_to_element(element[lettory])
-                .click()
-                .perform,
-                ischangeurl=False,
-            )
+            bazaar = await self.page.select("#parent_Bazaar")
+            lettory_xpath = f"//div[contains(text(), '{lettory}')]"
+            lettory_elements = await self.page.xpath(lettory_xpath, timeout=5)
+            if not lettory_elements:
+                continue
+            lettory_elem = lettory_elements[0]
 
-            html_element = self.driver.find_element(
-                By.XPATH, "//*[contains(text(), 'You currently have')]"
-            )
+            # Hover bazaar then click lottery
+            await bazaar.mouse_move()
+            await lettory_elem.mouse_move()
+            await lettory_elem.mouse_click()
+            await self.page.wait(1)
 
-            numbers: list[str] = re.findall(r"[\d,]+", html_element.text)
+            currently_elements = await self.page.xpath(
+                "//*[contains(text(), 'You currently have')]", timeout=5
+            )
+            if not currently_elements:
+                continue
+            numbers: list[str] = re.findall(r"[\d,]+", currently_elements[0].text)
             currently_number = numbers[0].replace(",", "")
-            html_element = self.driver.find_element(
-                By.XPATH, "//*[contains(text(), 'You hold')]"
-            )
 
-            numbers = re.findall(r"[\d,]+", html_element.text)
+            hold_elements = await self.page.xpath(
+                "//*[contains(text(), 'You hold')]", timeout=5
+            )
+            if not hold_elements:
+                continue
+            numbers = re.findall(r"[\d,]+", hold_elements[0].text)
             buy_number = numbers[0].replace(",", "")
 
             logger.info(
@@ -109,90 +102,91 @@ class HVDriver(EHDriver):
             if int(buy_number) < num and int(currently_number) > (num * 1000):
                 purchase_amount = num - int(buy_number)
                 logger.info(f"Purchasing {purchase_amount} tickets for {lettory}")
-                html_element = self.driver.find_element(By.ID, "ticket_temp")
-                html_element.clear()
-                html_element.send_keys(purchase_amount)
-                self.driver.execute_script("submit_buy()")
+                html_element = await self.page.select("#ticket_temp")
+                await html_element.clear_input()
+                await html_element.send_keys(str(purchase_amount))
+                await self.page.evaluate("submit_buy()")
             else:
                 logger.debug(
                     f"No purchase needed for {lettory} "
                     f"(tickets: {buy_number}, credits: {currently_number})"
                 )
 
-    def monstercheck(self) -> None:
+    async def monstercheck(self) -> None:
         logger.info("Starting monster check")
-        self.gohomepage()
+        await self.gohomepage()
 
         # 進入 Monster Lab
         logger.debug("Navigating to Monster Lab")
-        element: dict[str, Any] = dict()
-        element["Bazaar"] = self.driver.find_element(By.ID, "parent_Bazaar")
-        element["Monster Lab"] = self.driver.find_element(
-            By.XPATH, "//div[contains(text(), 'Monster Lab')]"
+        bazaar = await self.page.select("#parent_Bazaar")
+        monster_lab_elements = await self.page.xpath(
+            "//div[contains(text(), 'Monster Lab')]", timeout=5
         )
-        actions = ActionChains(self.driver)
-        self.wait(
-            actions.move_to_element(element["Bazaar"])
-            .move_to_element(element["Monster Lab"])
-            .click()
-            .perform,
-            ischangeurl=False,
-        )
+        if not monster_lab_elements:
+            return
+        monster_lab = monster_lab_elements[0]
 
+        await bazaar.mouse_move()
+        await monster_lab.mouse_move()
+        await monster_lab.mouse_click()
+        await self.page.wait(1)
+
+        path_prefix = await self._get_path_prefix()
         keypair: dict[str, str] = dict()
         keypair["feed"] = "food"
         keypair["drug"] = "drugs"
         for key in keypair:
             # 嘗試找到圖片元素
-            images = self.driver.find_elements(
-                By.XPATH,
-                self.searchxpath([f"/y/monster/{key}allmonsters.png"]),
-            )
+            xpath = self.searchxpath([f"{path_prefix}/y/monster/{key}allmonsters.png"])
+            images = await self.page.xpath(xpath, timeout=2)
 
             # 如果存在，則執行 JavaScript
             if images:
                 logger.info(f"Feeding all monsters with {keypair[key]}")
-                self.driver.execute_script(f"do_feed_all('{keypair[key]}')")
-                self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
+                await self.page.evaluate(f"do_feed_all('{keypair[key]}')")
+                await self.page.wait(10)
             else:
                 logger.debug(f"No feed all option available for {keypair[key]}")
 
-    def marketcheck(self, sellitems: SellItems) -> None:
+    async def marketcheck(self, sellitems: SellItems) -> None:
         logger.info("Starting market check for selling items")
 
-        def marketpage() -> None:
-            # 進入 Market
+        async def marketpage() -> None:
             logger.debug("Navigating to market page")
-            self.get("https://hentaiverse.org/?s=Bazaar&ss=mk")
+            await self.get("https://hentaiverse.org/?s=Bazaar&ss=mk")
 
-        def filterpage(key: str, ischangeurl: bool) -> None:
+        async def filterpage(key: str, ischangeurl: bool) -> None:
             logger.debug(f"Filtering page by: {key}")
-            self.wait(
-                self.driver.find_element(
-                    By.XPATH, f"//div[contains(text(), '{key}')]/.."
-                ).click,
-                ischangeurl=ischangeurl,
+            filter_elements = await self.page.xpath(
+                f"//div[contains(text(), '{key}')]/..", timeout=5
             )
+            if filter_elements:
+                await self.wait(filter_elements[0].click, ischangeurl=ischangeurl)
 
-        def itempage() -> bool:
+        async def itempage(tr_element: Any) -> bool:
             try:
-                # 获取<tr>元素中第二个<td>的文本
-                quantity_text = tr_element.find_element(By.XPATH, ".//td[2]").text
-
-                # 检查数量是否非零
-                iszero = quantity_text == ""
-            except NoSuchElementException:
+                td_elements = await tr_element.query_selector_all("td")
+                if len(td_elements) >= 2:
+                    quantity_text = td_elements[1].text
+                    iszero = quantity_text == ""
+                else:
+                    iszero = True
+            except Exception:
                 iszero = True
             return bool(iszero)
 
-        def resell() -> None:
+        async def resell() -> None:
             # 定位到元素
-            element = self.driver.find_element(
-                By.XPATH, "//td[contains(@onclick, 'autofill_from_sell_order')]"
+            resell_elements = await self.page.xpath(
+                "//td[contains(@onclick, 'autofill_from_sell_order')]", timeout=5
             )
+            if not resell_elements:
+                logger.warning("Unable to find sell order element")
+                return
+            element = resell_elements[0]
 
             # 獲取 onclick 屬性值
-            onclick_attr = element.get_attribute("onclick")
+            onclick_attr = element.attrs.get("onclick", "")
 
             # 使用正則表達式從屬性值中提取數字
             match = re.search(r"autofill_from_sell_order\((\d+),0,0\)", onclick_attr)
@@ -202,54 +196,49 @@ class HVDriver(EHDriver):
             else:
                 logger.warning("Unable to extract number from onclick attribute")
                 return
-            # 假設 driver 是你的 WebDriver 實例
-            self.driver.execute_script(f"autofill_from_sell_order({number},0,0);")
 
-            for id in ["sell_order_stock_field", "sellorder_update"]:
-                Sell_button = self.driver.find_element(
-                    By.ID, id
-                )  # 查找方法可能需要根據實際情況調整
-                Sell_button.click()
-            self.driver.implicitly_wait(10)  # 隱式等待，最多等待10秒
-            time.sleep(2 * random())
+            await self.page.evaluate(f"autofill_from_sell_order({number},0,0);")
 
-            filterpage(marketkey, ischangeurl=False)
+            for id_val in ["sell_order_stock_field", "sellorder_update"]:
+                sell_button = await self.page.select(f"#{id_val}")
+                await sell_button.click()
+            await self.page.wait(10)
+            await asyncio.sleep(2 * random())
 
-        self.gohomepage()
-        marketpage()
+            await filterpage(marketkey, ischangeurl=False)
+
+        await self.gohomepage()
+        await marketpage()
 
         # 存錢
         logger.info("Depositing credits to account")
-        self.driver.find_element(
-            By.XPATH, "//div[contains(text(), 'Account Balance')]"
-        ).click()
-        self.wait(
-            self.driver.find_element(By.NAME, "account_deposit").click,
-            ischangeurl=False,
+        deposit_elements = await self.page.xpath(
+            "//div[contains(text(), 'Account Balance')]", timeout=5
         )
+        if deposit_elements:
+            await deposit_elements[0].click()
+        deposit_button = await self.page.select("[name='account_deposit']")
+        await self.wait(deposit_button.click, ischangeurl=False)
 
         marketurl: dict[str, str] = dict()
-        # Consumables
         marketurl["Consumables"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=co"
         )
-        # Materials
         marketurl["Materials"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=ma"
         )
-        # Monster Items
         marketurl["Monster Items"] = (
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=mo"
         )
 
-        filterpage("Browse Items", ischangeurl=True)
+        await filterpage("Browse Items", ischangeurl=True)
         for marketkey in marketurl:
-            filterpage(marketkey, ischangeurl=False)
+            await filterpage(marketkey, ischangeurl=False)
             sellidx: list[int] = list()
-            # 使用find_elements方法获取页面上所有<tr>元素
-            tr_elements = self.driver.find_elements(By.XPATH, "//tr")
+            tr_elements = await self.page.xpath("//tr", timeout=5)
             for idx, tr_element in enumerate(tr_elements[1:]):
-                itemname = tr_element.find_element(By.XPATH, ".//td[1]").text
+                td_elements = await tr_element.query_selector_all("td")
+                itemname = td_elements[0].text if td_elements else ""
                 thecheckitemlist: list[str]
                 match marketkey:
                     case "Consumables":
@@ -268,28 +257,32 @@ class HVDriver(EHDriver):
                         raise KeyError()
                 if itemname not in thecheckitemlist:
                     continue
-                if itempage():
+                if await itempage(tr_element):
                     continue
                 sellidx.append(idx + 1)
             logger.info(f"Found {len(sellidx)} items to sell in {marketkey}")
             for idx in sellidx:
-                tr_element = self.driver.find_element(By.XPATH, f"//tr[{idx + 1}]")
-                self.wait(tr_element.click, ischangeurl=False)
-                resell()
+                tr_xpath = f"//tr[{idx + 1}]"
+                tr_results = await self.page.xpath(tr_xpath, timeout=5)
+                if tr_results:
+                    await self.wait(tr_results[0].click, ischangeurl=False)
+                await resell()
 
-        filterpage("My Sell Orders", ischangeurl=True)
+        await filterpage("My Sell Orders", ischangeurl=True)
         logger.info("Checking existing sell orders for re-listing")
         for marketkey in marketurl:
-            filterpage(marketkey, ischangeurl=False)
+            await filterpage(marketkey, ischangeurl=False)
             try:
-                tr_elements = self.driver.find_elements(By.XPATH, "//tr")
+                tr_elements = await self.page.xpath("//tr", timeout=5)
                 sellitemnum = len(tr_elements) - 1
                 logger.debug(f"Found {sellitemnum} existing sell orders in {marketkey}")
                 for n in range(sellitemnum):
-                    tr_element = self.driver.find_element(By.XPATH, f"//tr[{n + 2}]")
-                    self.wait(tr_element.click, ischangeurl=False)
-                    resell()
-            except NoSuchElementException:
+                    tr_xpath = f"//tr[{n + 2}]"
+                    tr_results = await self.page.xpath(tr_xpath, timeout=5)
+                    if tr_results:
+                        await self.wait(tr_results[0].click, ischangeurl=False)
+                    await resell()
+            except Exception:
                 logger.debug(f"No existing sell orders found in {marketkey}")
                 pass
         logger.info("Market check completed")

@@ -1,8 +1,6 @@
 """Chrome for Testing 自動下載管理器"""
 
-import atexit
 import json
-import os
 import platform
 import shutil
 import stat
@@ -14,7 +12,6 @@ from urllib.request import urlopen, urlretrieve
 
 from ..utils import (
     get_chrome_executable_name,
-    get_chromedriver_executable_name,
     get_platform,
     setup_logger,
 )
@@ -28,10 +25,9 @@ CHROME_FOR_TESTING_API = (
 
 
 class ChromePaths(NamedTuple):
-    """Chrome 和 ChromeDriver 的執行檔路徑"""
+    """Chrome 的執行檔路徑"""
 
     chrome: str
-    chromedriver: str
     version: str
 
 
@@ -131,94 +127,18 @@ def _find_download_url(downloads: list[dict[str, str]], plat: str) -> str | None
     return None
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """檢查指定的 PID 是否仍在運行"""
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _cleanup_stale_drivers(running_dir: Path) -> None:
-    """清理已結束進程留下的 chromedriver 副本"""
-    if not running_dir.exists():
-        return
-
-    for path in running_dir.iterdir():
-        # 檔名格式: chromedriver_<pid> 或 chromedriver_<pid>.exe
-        name = path.stem  # 去掉 .exe 後綴
-        parts = name.rsplit("_", 1)
-        if len(parts) != 2:
-            continue
-
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            continue
-
-        if not _is_pid_alive(pid):
-            try:
-                path.unlink()
-                logger.debug(f"Cleaned up stale chromedriver copy: {path.name}")
-            except OSError:
-                pass
-
-
-def _create_chromedriver_copy(source: Path, running_dir: Path, plat: str) -> Path:
-    """
-    建立 chromedriver 的 PID 專屬副本
-
-    Args:
-        source: 原始 chromedriver 路徑
-        running_dir: running 目錄路徑
-        plat: 平台代碼
-
-    Returns:
-        副本的路徑
-    """
-    running_dir.mkdir(parents=True, exist_ok=True)
-
-    pid = os.getpid()
-    if plat.startswith("win"):
-        copy_name = f"chromedriver_{pid}.exe"
-    else:
-        copy_name = f"chromedriver_{pid}"
-
-    copy_path = running_dir / copy_name
-    shutil.copy2(source, copy_path)
-    _make_executable(copy_path)
-
-    # 註冊 atexit 清理
-    def _cleanup() -> None:
-        try:
-            if copy_path.exists():
-                copy_path.unlink()
-                logger.debug(f"Cleaned up chromedriver copy: {copy_path.name}")
-        except OSError:
-            pass
-
-    atexit.register(_cleanup)
-
-    logger.debug(f"Created chromedriver copy: {copy_path.name}")
-    return copy_path
-
-
 def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
     """
-    確保 Chrome 和 ChromeDriver 已安裝
+    確保 Chrome 已安裝
 
     如果快取中已有對應版本，直接回傳路徑。
     否則自動下載最新的 stable 版本。
-
-    回傳的 chromedriver 路徑為 PID 專屬副本，
-    避免多個進程同時使用同一個 chromedriver 執行檔的衝突。
 
     Args:
         force_download: 強制重新下載
 
     Returns:
-        ChromePaths 包含 chrome 和 chromedriver 的執行檔路徑
+        ChromePaths 包含 chrome 的執行檔路徑和版本
     """
     plat = get_platform()
     cache_dir = _get_cache_dir()
@@ -238,16 +158,10 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
     chrome_exe_name = get_chrome_executable_name(plat)
     chrome_path = version_dir / chrome_folder / chrome_exe_name
 
-    # ChromeDriver 原始路徑
-    chromedriver_folder = f"chromedriver-{plat}"
-    chromedriver_exe_name = get_chromedriver_executable_name(plat)
-    chromedriver_path = version_dir / chromedriver_folder / chromedriver_exe_name
-
     # 檢查是否需要下載
     need_chrome = force_download or not chrome_path.exists()
-    need_chromedriver = force_download or not chromedriver_path.exists()
 
-    if need_chrome or need_chromedriver:
+    if need_chrome:
         if force_download and version_dir.exists():
             logger.info("Force download requested, removing existing cache...")
             shutil.rmtree(version_dir)
@@ -257,38 +171,18 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
         downloads = version_info["downloads"]
 
         # 下載 Chrome
-        if need_chrome:
-            chrome_url = _find_download_url(downloads["chrome"], plat)
-            if not chrome_url:
-                raise RuntimeError(f"No Chrome download found for platform: {plat}")
-            _download_and_extract(chrome_url, version_dir, "Chrome")
-            _make_executable(chrome_path)
-            _remove_quarantine(version_dir / chrome_folder)
+        chrome_url = _find_download_url(downloads["chrome"], plat)
+        if not chrome_url:
+            raise RuntimeError(f"No Chrome download found for platform: {plat}")
+        _download_and_extract(chrome_url, version_dir, "Chrome")
+        _make_executable(chrome_path)
+        _remove_quarantine(version_dir / chrome_folder)
 
-        # 下載 ChromeDriver
-        if need_chromedriver:
-            chromedriver_url = _find_download_url(downloads["chromedriver"], plat)
-            if not chromedriver_url:
-                raise RuntimeError(
-                    f"No ChromeDriver download found for platform: {plat}"
-                )
-            _download_and_extract(chromedriver_url, version_dir, "ChromeDriver")
-            _make_executable(chromedriver_path)
-            _remove_quarantine(chromedriver_path)
-
-        logger.info("Chrome and ChromeDriver are ready")
+        logger.info("Chrome is ready")
     else:
         logger.info(f"Using cached Chrome {version}")
 
-    # 清理已結束進程的 chromedriver 副本
-    running_dir = cache_dir / "running"
-    _cleanup_stale_drivers(running_dir)
-
-    # 建立 PID 專屬的 chromedriver 副本
-    chromedriver_copy = _create_chromedriver_copy(chromedriver_path, running_dir, plat)
-
     return ChromePaths(
         chrome=str(chrome_path),
-        chromedriver=str(chromedriver_copy),
         version=version,
     )

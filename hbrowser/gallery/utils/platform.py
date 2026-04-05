@@ -40,11 +40,3 @@ def get_chrome_executable_name(plat: str) -> str:
         return "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
     else:
         return "chrome"
-
-
-def get_chromedriver_executable_name(plat: str) -> str:
-    """取得 ChromeDriver 執行檔名稱"""
-    if plat.startswith("win"):
-        return "chromedriver.exe"
-    else:
-        return "chromedriver"

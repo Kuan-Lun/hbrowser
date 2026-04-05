@@ -1,22 +1,16 @@
 """E-Hentai Driver 實現"""
 
+import asyncio
 import os
 import re
-import time
-from functools import partial
 from random import random
-from typing import Any
 
 from h2h_galleryinfo_parser import GalleryURLParser
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 from ..exceptions import ClientOfflineException, InsufficientFundsException
 from .driver_base import Driver
 from .models import Tag
-from .utils import find_new_window, matchurl
+from .utils import matchurl, wait_for_new_tab
 
 
 class EHDriver(Driver):
@@ -25,26 +19,19 @@ class EHDriver(Driver):
     def _setname(self) -> str:
         return "E-Hentai"
 
-    def _setlogin(self) -> str:
-        return "My Home"
-
-    def checkh2h(self) -> bool:
+    async def checkh2h(self) -> bool:
         """檢查 H@H 客戶端是否在線"""
         self.logger.info("Checking H@H client status")
-        self.get("https://e-hentai.org/hentaiathome.php")
-        WebDriverWait(self.driver, 10).until(
-            EC.presence_of_element_located((By.ID, "hct"))
-        )
-        table = self.driver.find_element(By.ID, "hct")
-        headers = table.find_element(By.TAG_NAME, "tr").find_elements(By.TAG_NAME, "th")
+        await self.get("https://e-hentai.org/hentaiathome.php")
+        table = await self.page.select("#hct", timeout=10)
+        header_row = await table.query_selector("tr")
+        headers = await header_row.query_selector_all("th")
         status_index = [
             index for index, th in enumerate(headers) if th.text == "Status"
         ][0]
-        rows = table.find_elements(By.TAG_NAME, "tr")
+        rows = await table.query_selector_all("tr")
         for row in rows[1:]:
-            # 獲取每行的所有單元格
-            cells = row.find_elements(By.TAG_NAME, "td")
-            # 使用 'Status' 列的索引來檢查狀態
+            cells = await row.query_selector_all("td")
             status = cells[status_index].text
             if status.lower() == "online":
                 self.logger.info("H@H client is online")
@@ -52,23 +39,23 @@ class EHDriver(Driver):
         self.logger.warning("H@H client is offline")
         return False
 
-    def punchin(self) -> None:
+    async def punchin(self) -> None:
         """簽到"""
         self.logger.info("Starting daily check-in")
-        # 嘗試簽到
-        self.get("https://e-hentai.org/news.php")
+        await self.get("https://e-hentai.org/news.php")
 
         # 刷新以免沒簽到成功
-        self.wait(self.driver.refresh, ischangeurl=False)
+        await self.wait(self.page.reload, ischangeurl=False)
         self.logger.info("Check-in completed")
 
-    def search2gallery(self, url: str) -> list[GalleryURLParser]:
+    async def search2gallery(self, url: str) -> list[GalleryURLParser]:
         """從搜索結果頁面提取所有 gallery URLs"""
-        if not matchurl(self.driver.current_url, url):
-            self.get(url)
+        current_url = await self.page.evaluate("window.location.href")
+        if not matchurl(current_url, url):
+            await self.get(url)
 
-        input_element = self.driver.find_element(By.ID, "f_search")
-        input_value = input_element.get_attribute("value")
+        input_element = await self.page.select("#f_search")
+        input_value = input_element.attrs.get("value", "")
         if input_value == "":
             raise ValueError(
                 "The value in the search box is empty. "
@@ -77,17 +64,16 @@ class EHDriver(Driver):
 
         glist = list()
         while True:
-            html_content = self.driver.page_source
+            html_content = await self.page.get_content()
             pattern = r"https://exhentai.org/g/\d+/[A-Za-z0-9]+"
             glist += re.findall(pattern, html_content)
             try:
-                element = self.driver.find_element(By.ID, "unext")
-            except NoSuchElementException:
+                element = await self.page.select("#unext", timeout=2)
+            except TimeoutError:
                 break
             if element.tag_name == "a":
-                self.wait(element.click, ischangeurl=True)
-                element_present = EC.presence_of_element_located((By.ID, "unext"))
-                WebDriverWait(self.driver, 10).until(element_present)
+                await self.wait(element.click, ischangeurl=True)
+                await self.page.select("#unext", timeout=10)
             else:
                 break
         if len(glist) == 0:
@@ -96,95 +82,69 @@ class EHDriver(Driver):
                     "//*[contains(text(), 'No hits found')] | "
                     "//td[contains(text(), 'No unfiltered results found.')]"
                 )
-                self.driver.find_element(By.XPATH, xpath)
-            except NoSuchElementException:
+                results = await self.page.xpath(xpath, timeout=2)
+                if not results:
+                    raise ValueError(
+                        "找出 0 個 Gallery，但頁面沒有顯示 'No hits found'。"
+                    )
+            except TimeoutError:
                 raise ValueError("找出 0 個 Gallery，但頁面沒有顯示 'No hits found'。")
         glist = list(set(glist))
         glist = [GalleryURLParser(url) for url in glist]
         return glist
 
-    def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
+    async def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
         """搜索 galleries"""
 
-        def waitpage() -> None:
-            element_present: Any = EC.presence_of_element_located((By.ID, "f_search"))
-            WebDriverWait(self.driver, 10).until(element_present)
+        async def waitpage() -> None:
+            await self.page.select("#f_search", timeout=10)
 
         try:
-            input_element = self.driver.find_element(By.ID, "f_search")
-        except NoSuchElementException:
-            self.gohomepage()
-            waitpage()
-            input_element = self.driver.find_element(By.ID, "f_search")
+            input_element = await self.page.select("#f_search", timeout=2)
+        except TimeoutError:
+            await self.gohomepage()
+            await waitpage()
+            input_element = await self.page.select("#f_search")
         if isclear:
-            input_element.clear()
-            time.sleep(random())
+            await input_element.clear_input()
+            await asyncio.sleep(random())
             new_value = key
         else:
-            input_value = input_element.get_attribute("value")
+            input_value = input_element.attrs.get("value", "")
             if key == "":
                 new_value = input_value
             else:
                 new_value = " " + key
-        input_element.send_keys(new_value)
-        time.sleep(random())
+        await input_element.send_keys(new_value)
+        await asyncio.sleep(random())
 
         # 全總類搜尋
-        elements = self.driver.find_elements(
-            By.XPATH, "//div[contains(@id, 'cat_') and @data-disabled='1']"
+        elements = await self.page.xpath(
+            "//div[contains(@id, 'cat_') and @data-disabled='1']", timeout=2
         )
         for element in elements:
-            element.click()
-            time.sleep(random())
+            await element.click()
+            await asyncio.sleep(random())
 
-        button = self.driver.find_elements(By.XPATH, "//tr")
-        button = self.driver.find_element(
-            By.XPATH, '//input[@type="submit" and @value="Search"]'
-        )
-        button.click()
-        time.sleep(random())
-        waitpage()
+        button = await self.page.select('input[type="submit"][value="Search"]')
+        await button.click()
+        await asyncio.sleep(random())
+        await waitpage()
 
-        input_element = self.driver.find_element(By.ID, "f_search")
-        input_value = input_element.get_attribute("value")
+        input_element = await self.page.select("#f_search")
+        input_value = input_element.attrs.get("value", "")
         self.logger.info(f"Search keyword: {input_value}")
 
-        result = self.search2gallery(self.driver.current_url)
+        current_url = await self.page.evaluate("window.location.href")
+        result = await self.search2gallery(current_url)
         self.logger.info(f"Found {len(result)} galleries")
         return result
 
-    def download(self, gallery: GalleryURLParser) -> bool:
+    async def download(self, gallery: GalleryURLParser) -> bool:
         """下載 gallery"""
         self.logger.info(f"Starting download for gallery: {gallery.url}")
 
-        def _check_ekey(driver: Any, ekey: str) -> Any:
-            return EC.presence_of_element_located((By.XPATH, ekey))(
-                driver
-            ) or EC.visibility_of_element_located((By.XPATH, ekey))(driver)
-
-        def check_download_success_by_element(driver: Any) -> Any:
-            ekey = (
-                "//p[contains(text(), "
-                "'Downloads should start processing within a couple of minutes.'"
-                ")]"
-            )
-            return _check_ekey(driver, ekey)
-
-        def check_client_offline_by_element(driver: Any) -> Any:
-            ekey = "//p[contains(text(), 'Your H@H client appears to be offline.')]"
-            try:
-                return _check_ekey(driver, ekey)
-            except NoSuchElementException:
-                raise ClientOfflineException()
-
-        def check_insufficient_funds_by_element(driver: Any) -> Any:
-            ekey = "//p[contains(text(), 'Cannot start download: Insufficient funds')]"
-            try:
-                return _check_ekey(driver, ekey)
-            except NoSuchElementException:
-                raise InsufficientFundsException()
-
-        self.get(gallery.url)
+        await self.get(gallery.url)
         try:
             xpath_query_list = [
                 "//p[contains(text(), "
@@ -193,92 +153,112 @@ class EHDriver(Driver):
                 "//input[@id='f_search']",
             ]
             xpath_query = " | ".join(xpath_query_list)
-            self.driver.find_element(By.XPATH, xpath_query)
-            self.logger.warning(f"Gallery unavailable or deleted: {gallery.url}")
-            return False
-        except NoSuchElementException:
-            gallerywindow = self.driver.current_window_handle
-            existing_windows = set(self.driver.window_handles)
-            key = "//a[contains(text(), 'Archive Download')]"
-            try:
-                self.driver.find_element(By.XPATH, key).click()
-            except NoSuchElementException:
-                self.logger.warning(
-                    "Archive Download element not found, retrying download"
-                )
-                self.driver.close()
-                self.driver.switch_to.window(gallerywindow)
-                return self.download(gallery)
-            WebDriverWait(self.driver, 10).until(
-                partial(find_new_window, existing_windows)
-            )
+            results = await self.page.xpath(xpath_query, timeout=2)
+            if results:
+                self.logger.warning(f"Gallery unavailable or deleted: {gallery.url}")
+                return False
+        except TimeoutError:
+            pass
 
-            # 切換到新視窗
-            new_window = self.driver.window_handles[-1]
-            self.driver.switch_to.window(new_window)
+        # 記錄現有 tabs
+        existing_tabs = {t.target.target_id for t in self.browser.tabs}
+        gallery_tab = self.page
 
-            # 點擊 Original，開始下載。
-            key = "//a[contains(text(), 'Original')]"
-            element_present = EC.presence_of_element_located((By.XPATH, key))
-            WebDriverWait(self.driver, 10).until(element_present)
-            self.driver.find_element(By.XPATH, key).click()
-
-            # 確認是否連接 H@H
-            try:
-                try:
-                    WebDriverWait(self.driver, 10).until(
-                        lambda driver: check_download_success_by_element(driver)
-                        or check_client_offline_by_element(driver)
-                        or check_insufficient_funds_by_element(driver)
-                    )
-                except TimeoutException:
-                    if (
-                        "Cannot start download: Insufficient funds"
-                        in self.driver.page_source
-                    ):
-                        raise InsufficientFundsException()
-                    else:
-                        raise TimeoutException()
-            except TimeoutException:
-                error_file = os.path.join(".", "error.txt")
-                with open(error_file, "w", errors="ignore") as f:
-                    f.write(self.driver.page_source)
-                retrytime = 1 * 60  # 1 minute
-                self.logger.warning(
-                    f"Download timeout, error page saved to {error_file}, "
-                    f"retrying in {retrytime}s"
-                )
-                self.driver.close()
-                self.driver.switch_to.window(gallerywindow)
-                time.sleep(retrytime)
-                return self.download(gallery)
-            if len(self.driver.current_window_handle) > 1:
-                self.driver.close()
-                time.sleep(random())
-                self.driver.switch_to.window(gallerywindow)
-                time.sleep(random())
-            else:
-                self.logger.error(
-                    f"Window handle anomaly: {self.driver.current_window_handle}"
-                )
-            self.logger.info(f"Gallery downloaded successfully: {gallery.url}")
-            return True
-
-    def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:
-        """從 gallery 頁面提取指定 filter 的 tags"""
-        self.get(gallery.url)
+        key_xpath = "//a[contains(text(), 'Archive Download')]"
         try:
-            elements = self.driver.find_elements(
-                By.XPATH, f"//a[contains(@id, 'ta_{filter}')]"
+            archive_links = await self.page.xpath(key_xpath, timeout=2)
+            if archive_links:
+                await archive_links[0].click()
+            else:
+                raise Exception("Archive Download not found")
+        except Exception:
+            self.logger.warning("Archive Download element not found, retrying download")
+            await self.page.close()
+            self.page = gallery_tab
+            return await self.download(gallery)
+
+        # 等待新 tab ���啟
+        new_tab = await wait_for_new_tab(self.browser, existing_tabs)
+        if not new_tab:
+            self.logger.warning("No new tab opened, retrying download")
+            return await self.download(gallery)
+
+        # 切換到新 tab
+        await new_tab.activate()
+        self.page = new_tab
+
+        # 點擊 Original，開始下載
+        original_links = await self.page.xpath(
+            "//a[contains(text(), 'Original')]", timeout=10
+        )
+        if original_links:
+            await original_links[0].click()
+
+        # 確認是否連接 H@H
+        try:
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                html = await self.page.get_content()
+                if (
+                    "Downloads should start processing within a couple of minutes."
+                    in html
+                ):
+                    break
+                if "Your H@H client appears to be offline." in html:
+                    raise ClientOfflineException()
+                if "Cannot start download: Insufficient funds" in html:
+                    raise InsufficientFundsException()
+                await asyncio.sleep(0.5)
+            else:
+                html = await self.page.get_content()
+                if "Cannot start download: Insufficient funds" in html:
+                    raise InsufficientFundsException()
+                raise TimeoutError()
+        except TimeoutError:
+            error_file = os.path.join(".", "error.txt")
+            with open(error_file, "w", errors="ignore") as f:
+                f.write(await self.page.get_content())
+            retrytime = 1 * 60  # 1 minute
+            self.logger.warning(
+                f"Download timeout, error page saved to {error_file}, "
+                f"retrying in {retrytime}s"
             )
-        except NoSuchElementException:
+            await self.page.close()
+            self.page = gallery_tab
+            await asyncio.sleep(retrytime)
+            return await self.download(gallery)
+
+        # 關閉下載 tab，切回 gallery tab
+        if len(self.browser.tabs) > 1:
+            await self.page.close()
+            await asyncio.sleep(random())
+            self.page = gallery_tab
+            await gallery_tab.activate()
+            await asyncio.sleep(random())
+        else:
+            self.logger.error(
+                f"Tab anomaly: only {len(self.browser.tabs)} tab(s) remaining"
+            )
+        self.logger.info(f"Gallery downloaded successfully: {gallery.url}")
+        return True
+
+    async def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:
+        """從 gallery 頁面提取指定 filter 的 tags"""
+        await self.get(gallery.url)
+        try:
+            elements = await self.page.xpath(
+                f"//a[contains(@id, 'ta_{filter}')]", timeout=2
+            )
+        except TimeoutError:
             return list()
 
         tag = list()
         for element in elements:
             tag.append(
                 Tag(
-                    filter=filter, name=element.text, href=element.get_attribute("href")
+                    filter=filter,
+                    name=element.text,
+                    href=element.attrs.get("href", ""),
                 )
             )
         return tag

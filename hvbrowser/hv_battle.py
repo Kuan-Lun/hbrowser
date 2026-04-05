@@ -1,4 +1,4 @@
-import time
+import asyncio
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial, wraps
@@ -6,12 +6,7 @@ from random import random
 from typing import Any, TypeVar
 
 from ponychart_classifier import update as update_ponychart_classifier
-from selenium.common.exceptions import (
-    NoAlertPresentException,
-    TimeoutException,
-    UnexpectedAlertPresentException,
-)
-from selenium.webdriver.common.by import By
+from zendriver import cdp
 
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
@@ -52,8 +47,8 @@ def update_ponychart_on(expected: bool) -> Callable[[_F], _F]:
 
     def decorator(func: _F) -> _F:
         @wraps(func)
-        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            result = func(self, *args, **kwargs)
+        async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = await func(self, *args, **kwargs)
             if result is expected:
                 update_ponychart_classifier()
             return result
@@ -64,28 +59,29 @@ def update_ponychart_on(expected: bool) -> Callable[[_F], _F]:
 
 
 def retry_on_server_fail(func: _F) -> _F:
-    """在出現 Server communication failed alert 時，自動刷新頁面並重試一次"""
+    """在出現 Server communication failed alert ��，自動刷新頁面並重試一次"""
 
     @wraps(func)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
-            return func(self, *args, **kwargs)
-        except UnexpectedAlertPresentException:
-            try:
-                alert = self.hvdriver.driver.switch_to.alert
-                text = alert.text
-                alert.accept()
-                if "Server communication failed" in text:
+            return await func(self, *args, **kwargs)
+        except Exception as e:
+            # 檢查是否為 alert 相關錯誤
+            if "alert" in str(e).lower() or "dialog" in str(e).lower():
+                try:
+                    # 嘗試接受 alert via CDP
+                    await self.hvdriver.page.send(
+                        cdp.page.handle_javascript_dialog(accept=True)
+                    )
                     logger.warning(
                         "Server communication failed detected, "
                         "retrying after refresh..."
                     )
-                    time.sleep(5)
-                    self.hvdriver.driver.refresh()
-                    return func(self, *args, **kwargs)
-            except Exception as e:
-                logger.error(f"Failed to handle alert or refresh: {e}")
-            # 如果不是這種錯誤或重試也失敗，拋出原例外
+                    await asyncio.sleep(5)
+                    await self.hvdriver.page.reload()
+                    return await func(self, *args, **kwargs)
+                except Exception as inner_e:
+                    logger.error(f"Failed to handle alert or refresh: {inner_e}")
             raise
 
     return wrapper  # type: ignore[return-value]
@@ -102,13 +98,13 @@ class BattleDriver(HVDriver):
         super().__init__(*args, **kwargs)
 
         self.statthreshold = statthreshold or DEFAULT_STATTHRESHOLD
-        self.battle_dashboard = BattleDashboard(self)
-        self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
+        self.battle_dashboard: BattleDashboard = None  # type: ignore[assignment]
+        self.element_action_manager: ElementActionManager = None  # type: ignore[assignment]
 
-        self.with_ofc = not self.is_isekai
-        self._itemprovider = ItemProvider(self, self.battle_dashboard)
-        self._skillmanager = SkillManager(self, self.battle_dashboard)
-        self._buffmanager = BuffManager(self, self.battle_dashboard)
+        self.with_ofc: bool = True
+        self._itemprovider: ItemProvider = None  # type: ignore[assignment]
+        self._skillmanager: SkillManager = None  # type: ignore[assignment]
+        self._buffmanager: BuffManager = None  # type: ignore[assignment]
         self.control_panel = ControlPanel()
         self.control_panel.register_toggle("auto_next_battle")
 
@@ -134,14 +130,40 @@ class BattleDriver(HVDriver):
 
         update_ponychart_classifier()
 
+    async def _init_browser(self) -> None:
+        """Override: 初始化瀏覽器後也初始化戰鬥組件"""
+        await super()._init_browser()
+        await self._init_battle_components()
+
+    async def _init_battle_components(self) -> None:
+        """初始化戰鬥相關組件（需要 page 已就緒）"""
+        self.battle_dashboard = BattleDashboard(self)
+        await self.battle_dashboard.init()
+        self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
+
+        self.with_ofc = not await self.is_isekai
+        self._itemprovider = ItemProvider(self, self.battle_dashboard)
+        self._skillmanager = SkillManager(self, self.battle_dashboard)
+        self._buffmanager = BuffManager(self, self.battle_dashboard)
+
+    async def _setup_alert_handler(self) -> None:
+        """設置 JavaScript dialog 自動處理"""
+
+        async def dialog_handler(
+            event: cdp.page.JavascriptDialogOpening,
+        ) -> None:
+            await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
+
+        self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
+
     @property
     def auto_next_battle(self) -> bool:
         return self.control_panel.get_toggle("auto_next_battle")
 
-    def clear_cache(self) -> None:
+    async def clear_cache(self) -> None:
         # 重新解析戰鬥儀表板以獲取最新的怪物狀態
         self.round = self.battle_dashboard.log_entries.current_round
-        self.battle_dashboard.update()
+        await self.battle_dashboard.update()
 
     def reset_pround(self) -> None:
         self.pround = self.round
@@ -167,10 +189,10 @@ class BattleDriver(HVDriver):
     def forbidden_skills(self) -> list[str]:
         return self.control_panel.get_forbidden_skills()
 
-    def click_skill(self, key: str, iswait: bool = True) -> bool:
+    async def click_skill(self, key: str, iswait: bool = True) -> bool:
         if key in self.forbidden_skills:
             return False
-        result = self._skillmanager.cast(key, iswait=iswait)
+        result = await self._skillmanager.cast(key, iswait=iswait)
         return result
 
     def get_stat_percent(self, stat: str) -> float:
@@ -197,10 +219,10 @@ class BattleDriver(HVDriver):
         round_str = f"Round {current:>3} / {total:<3}"
         return [f"{turn_str} {round_str} {line}" for line in new_logs]
 
-    def use_item(self, key: str) -> bool:
-        return self._itemprovider.use(key)
+    async def use_item(self, key: str) -> bool:
+        return await self._itemprovider.use(key)
 
-    def apply_buff(self, key: str, force: bool = False) -> bool:
+    async def apply_buff(self, key: str, force: bool = False) -> bool:
         if key in self.forbidden_skills:
             return False
         apply_buff = partial(self._buffmanager.apply_buff, key=key, force=force)
@@ -208,22 +230,22 @@ class BattleDriver(HVDriver):
             match key:
                 case "health draught":
                     if self.get_stat_percent("hp") < 90:
-                        return apply_buff()
+                        return await apply_buff()
                     else:
                         return False
                 case "mana draught":
                     if self.get_stat_percent("mp") < 90:
-                        return apply_buff()
+                        return await apply_buff()
                     else:
                         return False
                 case "spirit draught":
                     if self.get_stat_percent("sp") < 90:
-                        return apply_buff()
+                        return await apply_buff()
                     else:
                         return False
-        return apply_buff()
+        return await apply_buff()
 
-    def check_hp(self) -> bool:
+    async def check_hp(self) -> bool:
         if self.get_stat_percent("hp") < self.statthreshold.hp_low:
             for fun in [
                 partial(self.use_item, "health gem"),
@@ -233,7 +255,7 @@ class BattleDriver(HVDriver):
                 partial(self.use_item, "last elixir"),
                 partial(self.click_skill, "cure"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         if self.get_stat_percent("hp") < self.statthreshold.hp_high:
@@ -242,12 +264,12 @@ class BattleDriver(HVDriver):
                 partial(self.click_skill, "cure"),
                 partial(self.use_item, "health potion"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         return False
 
-    def check_mp(self) -> bool:
+    async def check_mp(self) -> bool:
         if self.get_stat_percent("mp") < self.statthreshold.mp_low:
             for fun in [
                 partial(self.use_item, "mana gem"),
@@ -255,7 +277,7 @@ class BattleDriver(HVDriver):
                 partial(self.use_item, "mana elixir"),
                 partial(self.use_item, "last elixir"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         if self.get_stat_percent("mp") < self.statthreshold.mp_high:
@@ -263,12 +285,12 @@ class BattleDriver(HVDriver):
                 partial(self.use_item, "mana gem"),
                 partial(self.use_item, "mana potion"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         return False
 
-    def check_sp(self) -> bool:
+    async def check_sp(self) -> bool:
         if self.get_stat_percent("sp") < self.statthreshold.sp_low:
             for fun in [
                 partial(self.use_item, "spirit gem"),
@@ -276,7 +298,7 @@ class BattleDriver(HVDriver):
                 partial(self.use_item, "spirit elixir"),
                 partial(self.use_item, "last elixir"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         if self.get_stat_percent("sp") < self.statthreshold.sp_high:
@@ -284,15 +306,13 @@ class BattleDriver(HVDriver):
                 partial(self.use_item, "spirit gem"),
                 partial(self.use_item, "spirit potion"),
             ]:
-                if fun():
+                if await fun():
                     return True
 
         return False
 
-    def check_overcharge(self) -> bool:
+    async def check_overcharge(self) -> bool:
         if self._buffmanager.has_buff("spirit stance"):
-            # If Spirit Stance is active, check if Overcharge and SP
-            # are below thresholds
             if any(
                 [
                     self.get_stat_percent("overcharge")
@@ -300,7 +320,7 @@ class BattleDriver(HVDriver):
                     self.get_stat_percent("sp") < self.statthreshold.sp_low,
                 ]
             ):
-                return self.apply_buff("spirit stance", force=True)
+                return await self.apply_buff("spirit stance", force=True)
 
         if all(
             [
@@ -310,34 +330,39 @@ class BattleDriver(HVDriver):
                 not self._buffmanager.has_buff("spirit stance"),
             ]
         ):
-            return self.apply_buff("spirit stance")
+            return await self.apply_buff("spirit stance")
         return False
 
     @update_ponychart_on(True)
-    def go_next_floor(self) -> bool:
-        # Use locator-based click to avoid stale element caching
-        if self.driver.find_elements(By.ID, "btcp"):
-            self.element_action_manager.click_and_wait_log_locator(By.ID, "btcp")
+    async def go_next_floor(self) -> bool:
+        elements = await self.page.query_selector_all("#btcp")
+        if elements:
+            await self.element_action_manager.click_and_wait_log_locator("#btcp")
             self._create_last_debuff_monster_id()
             return True
         return False
 
     @update_ponychart_on(True)
-    def go_next_battle(self) -> bool:
-        arena_url = f'{self.url["HentaiVerse"]}{self.path_prefix}/?s=Battle&ss=ar'
-        if self.driver.current_url != arena_url:
+    async def go_next_battle(self) -> bool:
+        path_prefix = await self._get_path_prefix()
+        arena_url = f'{self.url["HentaiVerse"]}{path_prefix}/?s=Battle&ss=ar'
+        current_url = await self.page.evaluate("window.location.href")
+        if current_url != arena_url:
             return False
-        elements = self.driver.find_elements(
-            By.CSS_SELECTOR,
-            f'img[src="{self.path_prefix}/y/arena/startchallenge.png"]',
+        elements = await self.page.select_all(
+            f'img[src="{path_prefix}/y/arena/startchallenge.png"]', timeout=2
         )
         if elements:
-            elements[-1].click()
-            self.driver.switch_to.alert.accept()
+            await elements[-1].click()
+            # Accept the confirmation alert via CDP
+            try:
+                await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
+            except Exception:
+                pass
             return True
         return False
 
-    def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
+    async def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
         if debuff_skill in self.forbidden_skills:
             return False
@@ -349,33 +374,32 @@ class BattleDriver(HVDriver):
         ) + [self.last_debuff_monster_id[debuff]]
         for num in nums:
             if num not in monster_ids_with_debuff:
-                self.attack_monster_by_skill(
+                await self.attack_monster_by_skill(
                     num, MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
                 )
                 self.last_debuff_monster_id[debuff] = num
                 return True
         return False
 
-    def attack_monster(self, n: int) -> bool:
+    async def attack_monster(self, n: int) -> bool:
         element_id = f"mkey_{n}"
-        if not self.driver.find_elements(By.ID, element_id):
+        elements = await self.page.query_selector_all(f"#{element_id}")
+        if not elements:
             return False
-        self.element_action_manager.click_and_wait_log_locator(By.ID, element_id)
+        await self.element_action_manager.click_and_wait_log_locator(f"#{element_id}")
         return True
 
-    def attack_monster_by_skill(self, n: int, skill_name: str) -> bool:
-        self.click_skill(skill_name, iswait=False)
-        return self.attack_monster(n)
+    async def attack_monster_by_skill(self, n: int, skill_name: str) -> bool:
+        await self.click_skill(skill_name, iswait=False)
+        return await self.attack_monster(n)
 
-    def attack(self) -> bool:
+    async def attack(self) -> bool:
         base_monster_ids: list[int] = [1, 3, 5, 7, 9, 2, 4, 6, 8, 0]
 
         def monster_ids_starting_with(ids: list[int], n: int) -> list[int]:
-            """Returns a list of monster IDs starting with the given number."""
             return ids[ids.index(n) :] + ids[: ids.index(n)]
 
         def resort_monster_alive_ids(bmlist: list[int]) -> list[int]:
-            """Returns a list of monster IDs starting with the given number."""
             monster_alive_ids: list[int] = [
                 id
                 for id in bmlist
@@ -414,16 +438,14 @@ class BattleDriver(HVDriver):
                 "Orbital Friendship Cannon"
             ].available
         ):
-            self.attack_monster_by_skill(
+            await self.attack_monster_by_skill(
                 self.battle_dashboard.overview_monsters.alive_monster[0],
                 "Orbital Friendship Cannon",
             )
             return True
 
-        # Get the list of alive monster IDs
         monster_alive_ids: list[int] = resort_monster_alive_ids(base_monster_ids)
 
-        # Get the list of monster IDs that are not debuffed with the specified debuffs
         if (
             len(monster_alive_ids) > 3
             and self.get_stat_percent("mp") > self.statthreshold.mp_high
@@ -438,10 +460,9 @@ class BattleDriver(HVDriver):
                 )
                 if len(monster_alive_ids) - len(debuffed_monsters) < 3:
                     continue
-                if self.debuff_monster(debuff, monster_alive_ids):
+                if await self.debuff_monster(debuff, monster_alive_ids):
                     return True
 
-        # Get the list of monster IDs that are not debuffed with Imperil
         monster_with_imperil: list[int]
         if (
             "imperil" not in self.forbidden_skills
@@ -470,7 +491,7 @@ class BattleDriver(HVDriver):
                             "merciful blow"
                         ].available
                     ):
-                        self.attack_monster_by_skill(n, "merciful blow")
+                        await self.attack_monster_by_skill(n, "merciful blow")
                     elif (
                         monster_health > 5
                         and "vital strike"
@@ -479,20 +500,20 @@ class BattleDriver(HVDriver):
                             "vital strike"
                         ].available
                     ):
-                        self.attack_monster_by_skill(n, "vital strike")
+                        await self.attack_monster_by_skill(n, "vital strike")
                     else:
-                        self.attack_monster(n)
+                        await self.attack_monster(n)
                 else:
-                    self.attack_monster(n)
+                    await self.attack_monster(n)
                 self.last_debuff_monster_id["imperiled"] = -1
             else:
                 if n == self.last_debuff_monster_id["imperiled"]:
                     if random() < 0.5:
-                        self.attack_monster_by_skill(n, "imperil")
+                        await self.attack_monster_by_skill(n, "imperil")
                     else:
-                        self.attack_monster(n)
+                        await self.attack_monster(n)
                 else:
-                    self.attack_monster_by_skill(
+                    await self.attack_monster_by_skill(
                         n, MONSTER_DEBUFF_TO_CHARACTER_SKILL["imperiled"]
                     )
                     self.last_debuff_monster_id["imperiled"] = n
@@ -500,7 +521,7 @@ class BattleDriver(HVDriver):
         else:
             return False
 
-    def use_channeling(self) -> bool:
+    async def use_channeling(self) -> bool:
         if "channeling" in self.battle_dashboard.snap.player.buffs:
             skill_names = ["regen", "heartseeker"]
             skill2remaining: dict[str, float] = dict()
@@ -518,18 +539,19 @@ class BattleDriver(HVDriver):
 
             to_use_skill_name = max(skill2remaining, key=lambda k: skill2remaining[k])
 
-            self.apply_buff(to_use_skill_name, force=True)
+            await self.apply_buff(to_use_skill_name, force=True)
             return True
 
         return False
 
     @retry_on_server_fail
-    def battle_in_turn(self) -> bool:
+    async def battle_in_turn(self) -> bool:
         if self.turn == -1:
-            mode = "Isekai" if self.is_isekai else "Persistent"
+            is_isekai = await self.is_isekai
+            mode = "Isekai" if is_isekai else "Persistent"
             self.control_panel.set_title(f"Battle Control Panel ({mode})")
         self.turn += 1
-        self.clear_cache()
+        await self.clear_cache()
         # Log the current round logs
         if self.new_logs:
             for log_line in self.new_logs:
@@ -555,7 +577,7 @@ class BattleDriver(HVDriver):
             self.use_channeling,
             self.attack,
         ]:
-            if fun():
+            if await fun():
                 return True
 
         return False
@@ -563,62 +585,57 @@ class BattleDriver(HVDriver):
     def _create_last_debuff_monster_id(self) -> None:
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
-    def _is_in_battle(self) -> bool:
+    async def _is_in_battle(self) -> bool:
         try:
-            self.battle_dashboard.update()
+            await self.battle_dashboard.update()
             return (
                 bool(self.battle_dashboard.overview_monsters.alive_monster_name)
-                or PonyChart(self).check()
+                or await PonyChart(self).check()
             )
-        except UnexpectedAlertPresentException:
-            logger.info("Alert detected, accepting it.")
+        except Exception:
+            logger.info("Alert or error detected, attempting to handle it.")
             try:
-                self.driver.switch_to.alert.accept()
-            except NoAlertPresentException:
-                logger.debug("Alert already dismissed before we could accept it.")
+                await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
+            except Exception:
+                logger.debug("No dialog to accept or already dismissed.")
             return False
 
     def _wait_if_paused(self) -> None:
         self.control_panel.wait_if_paused()
 
-    def _wait_for_page_recovery(
+    async def _wait_for_page_recovery(
         self, timeout: int = 300, poll_interval: int = 5, log_interval: int = 30
     ) -> bool:
-        """Poll the page periodically to detect early recovery.
-
-        Refreshes every ``poll_interval`` seconds but only logs progress every
-        ``log_interval`` seconds.
-
-        Returns True if the page recovered within the timeout.
-        """
+        """Poll the page periodically to detect early recovery."""
         for i in range(timeout // poll_interval):
-            time.sleep(poll_interval)
+            await asyncio.sleep(poll_interval)
             elapsed = (i + 1) * poll_interval
             if elapsed % log_interval == 0:
                 logger.info(f"Waiting for recovery... ({elapsed}/{timeout}s)")
             try:
-                self.driver.get(self.driver.current_url)
-                if self._is_in_battle():
+                current_url = await self.page.evaluate("window.location.href")
+                await self.page.get(current_url)
+                if await self._is_in_battle():
                     logger.info(f"Page recovered after {elapsed}s")
                     return True
-            except TimeoutException:
+            except TimeoutError:
                 pass
         logger.warning(f"Page did not recover within {timeout}s")
         return False
 
-    def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
-        if self._is_in_battle():
+    async def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
+        if await self._is_in_battle():
             return True
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
         for _ in range(timeout // interval):
-            time.sleep(interval)
+            await asyncio.sleep(interval)
             self._wait_if_paused()
-            if self._is_in_battle():
+            if await self._is_in_battle():
                 return True
         return False
 
-    def battle(self) -> None:
-        if not self._wait_for_battle():
+    async def battle(self) -> None:
+        if not await self._wait_for_battle():
             logger.info("No battle detected after waiting, exiting.")
             return
 
@@ -629,25 +646,25 @@ class BattleDriver(HVDriver):
         while True:
             self._wait_if_paused()
             try:
-                if not self.battle_in_turn():
+                if not await self.battle_in_turn():
                     break
                 retry_count = 0
-            except TimeoutException:
+            except TimeoutError:
                 retry_count += 1
                 if retry_count >= max_retries:
                     logger.error(
-                        "TimeoutException caught, max retries reached "
+                        "TimeoutError caught, max retries reached "
                         f"({max_retries}/{max_retries})"
                     )
                     raise
                 logger.warning(
-                    "TimeoutException caught, reloading page "
+                    "TimeoutError caught, reloading page "
                     f"(attempt {retry_count}/{max_retries})"
                 )
-                if self._wait_for_page_recovery():
+                if await self._wait_for_page_recovery():
                     retry_count = 0
 
         notify("HBrowser", "Battle complete")
         logger.info("Battle complete, waiting 300s for user to start next battle...")
 
-        self.battle()
+        await self.battle()

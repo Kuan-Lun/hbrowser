@@ -14,13 +14,13 @@ class CaptchaSolver(ABC):
     """
 
     @abstractmethod
-    def solve(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
+    async def solve(self, challenge: ChallengeDetection, page: Any) -> SolveResult:
         """
         解決驗證碼
 
         Args:
             challenge: 檢測到的驗證信息
-            driver: Selenium WebDriver 實例（用於注入 token）
+            page: zendriver Tab 實例（用於注入 token）
 
         Returns:
             SolveResult: 解決結果（包含 token 或錯誤信息）

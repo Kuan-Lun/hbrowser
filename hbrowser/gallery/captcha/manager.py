@@ -20,26 +20,26 @@ class CaptchaManager:
         self.solver = solver
         self.detector = CaptchaDetector()
 
-    def detect(self, driver: Any, timeout: float = 2.0) -> ChallengeDetection:
+    async def detect(self, page: Any, timeout: float = 2.0) -> ChallengeDetection:
         """
         檢測驗證碼
 
         Args:
-            driver: Selenium WebDriver 實例
+            page: zendriver Tab 實例
             timeout: 檢測超時時間（秒）
 
         Returns:
             ChallengeDetection: 檢測結果
         """
-        return self.detector.detect(driver, timeout)
+        return await self.detector.detect(page, timeout)
 
-    def solve(self, challenge: ChallengeDetection, driver: Any) -> bool:
+    async def solve(self, challenge: ChallengeDetection, page: Any) -> bool:
         """
         解決驗證碼
 
         Args:
             challenge: 檢測到的驗證信息
-            driver: Selenium WebDriver 實例
+            page: zendriver Tab 實例
 
         Returns:
             bool: 是否成功解決
@@ -47,23 +47,23 @@ class CaptchaManager:
         if challenge.kind == "none":
             return True
 
-        result = self.solver.solve(challenge, driver)
+        result = await self.solver.solve(challenge, page)
         return result.success
 
-    def detect_and_solve(self, driver: Any, timeout: float = 2.0) -> bool:
+    async def detect_and_solve(self, page: Any, timeout: float = 2.0) -> bool:
         """
         檢測並解決驗證碼
 
         Args:
-            driver: Selenium WebDriver 實例
+            page: zendriver Tab 實例
             timeout: 檢測超時時間（秒）
 
         Returns:
             bool: 是否成功解決
         """
-        challenge = self.detect(driver, timeout)
+        challenge = await self.detect(page, timeout)
 
         if challenge.kind == "none":
             return True
 
-        return self.solve(challenge, driver)
+        return await self.solve(challenge, page)

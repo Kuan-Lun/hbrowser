@@ -1,9 +1,5 @@
 from typing import Any
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_observer_pattern import BattleDashboard
@@ -20,27 +16,27 @@ class ItemProvider:
         )
 
     @property
-    def driver(self) -> Any:  # WebDriver from EHDriver is untyped
-        return self.hvdriver.driver
+    def page(self) -> Any:
+        return self.hvdriver.page
 
-    @property
-    def items_menu_web_element(self) -> Any:  # WebElement from untyped driver
-        return self.hvdriver.driver.find_element(By.ID, "ckey_items")
+    async def _get_items_menu_element(self) -> Any:
+        return await self.hvdriver.page.select("#ckey_items")
 
-    def click_items_menu(self) -> None:
+    async def click_items_menu(self) -> None:
         # Resilient click to mitigate stale menu button
-        self.element_action_manager.click_resilient(
-            lambda: self.hvdriver.driver.find_element(By.ID, "ckey_items")
+        await self.element_action_manager.click_resilient(
+            lambda: self.hvdriver.page.select("#ckey_items")
         )
 
-    def is_open_items_menu(self) -> bool:
+    async def is_open_items_menu(self) -> bool:
         """
         Check if the items menu is open.
         """
-        items_menum = self.items_menu_web_element.get_attribute("src") or ""
-        return "items_s.png" in items_menum
+        items_menu = await self._get_items_menu_element()
+        items_src = items_menu.attrs.get("src", "")
+        return "items_s.png" in items_src
 
-    def use(self, item: str) -> bool:
+    async def use(self, item: str) -> bool:
         if item not in self.battle_dashboard.snap.items.items:
             return False
 
@@ -51,13 +47,12 @@ class ItemProvider:
         if not parsed_item.element_id:
             return False
 
-        if not self.is_open_items_menu():
-            self.click_items_menu()
-            WebDriverWait(self.driver, 2).until(
-                EC.visibility_of_element_located((By.ID, "pane_item"))
-            )
+        if not await self.is_open_items_menu():
+            await self.click_items_menu()
+            # Wait for items pane to become visible
+            await self.hvdriver.page.select("#pane_item", timeout=2)
 
-        self.element_action_manager.click_and_wait_log_locator(
-            By.ID, parsed_item.element_id
+        await self.element_action_manager.click_and_wait_log_locator(
+            f"#{parsed_item.element_id}"
         )
         return True

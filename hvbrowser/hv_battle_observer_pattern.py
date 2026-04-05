@@ -43,7 +43,12 @@ class BattleSubject:
     def __init__(self, driver: HVDriver):
         self._observers: list[Observer] = list()
         self._hvdriver = driver
-        self.snap = parse_snapshot(driver.driver.page_source)
+        self.snap: Any = None
+
+    async def init(self) -> None:
+        """非同步初始化 - 取得初始快照"""
+        html = await self._hvdriver.page.get_content()
+        self.snap = parse_snapshot(html)
 
     def attach(self, observer: Observer) -> None:
         self._observers.append(observer)
@@ -51,8 +56,9 @@ class BattleSubject:
     def detach(self, observer: Observer) -> None:
         self._observers.remove(observer)
 
-    def notify(self) -> None:
-        self.snap = parse_snapshot(self._hvdriver.driver.page_source)
+    async def notify(self) -> None:
+        html = await self._hvdriver.page.get_content()
+        self.snap = parse_snapshot(html)
         for observer in self._observers:
             observer.update(self.snap)
 
@@ -104,14 +110,19 @@ class BattleDashboard:
     def __init__(self, driver: HVDriver):
         self._hvdriver = driver
         self.battle_subject = BattleSubject(driver)
-        self.snap = self.battle_subject.snap
+        self.snap: Any = None
         self.overview_monsters = OverviewMonsters()
         self.log_entries: LogEntry = LogEntry()
         self.battle_subject.attach(self.log_entries)
-        self.update()
 
-    def update(self) -> None:
-        self.battle_subject.notify()
+    async def init(self) -> None:
+        """非同步初始化"""
+        await self.battle_subject.init()
+        self.snap = self.battle_subject.snap
+        await self.update()
+
+    async def update(self) -> None:
+        await self.battle_subject.notify()
         self.snap = self.battle_subject.snap
         self.update_overview_monsters()
 

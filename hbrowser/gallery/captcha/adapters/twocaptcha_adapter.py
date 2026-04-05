@@ -6,6 +6,7 @@ TwoCaptcha 適配器
 移除 TwoCaptcha 依賴時，刪除此文件即可
 """
 
+import asyncio
 import os
 import re
 import time
@@ -44,13 +45,13 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 被適配的對象
         self._twocaptcha = TwoCaptcha(self.api_key)
 
-    def solve(self, challenge: ChallengeDetection, driver: Any) -> SolveResult:
+    async def solve(self, challenge: ChallengeDetection, page: Any) -> SolveResult:
         """
         使用 TwoCaptcha 服務解決驗證碼
 
         Args:
             challenge: 檢測到的驗證信息
-            driver: Selenium WebDriver 實例
+            page: zendriver Tab 實例
 
         Returns:
             SolveResult: 解決結果
@@ -60,13 +61,13 @@ class TwoCaptchaAdapter(CaptchaSolver):
         try:
             match challenge.kind:
                 case "cf_managed_challenge":
-                    solveresult = self._solve_managed_challenge(
-                        challenge, driver, max_wait=self.max_wait
+                    solveresult = await self._solve_managed_challenge(
+                        challenge, page, max_wait=self.max_wait
                     )
                 case "turnstile_widget":
-                    solveresult = self._solve_turnstile_widget(challenge, driver)
+                    solveresult = await self._solve_turnstile_widget(challenge, page)
                 case "recaptcha_v2":
-                    solveresult = self._solve_recaptcha_v2(challenge, driver)
+                    solveresult = await self._solve_recaptcha_v2(challenge, page)
                 case _:
                     solveresult = SolveResult(
                         success=False,
@@ -81,15 +82,15 @@ class TwoCaptchaAdapter(CaptchaSolver):
             # 保存錯誤時的頁面狀態
             error_file = os.path.join(get_log_dir(), "challenge_error.html")
             with open(error_file, "w", errors="ignore") as f:
-                f.write(driver.page_source)
+                f.write(await page.get_content())
             logger.error(f"Failed to solve challenge, page saved to {error_file}")
 
             raise CaptchaSolveException(
                 f"Failed to solve Cloudflare challenge: {str(e)}"
             ) from e
 
-    def _solve_managed_challenge(
-        self, challenge: ChallengeDetection, driver: Any, max_wait: int
+    async def _solve_managed_challenge(
+        self, challenge: ChallengeDetection, page: Any, max_wait: int
     ) -> SolveResult:
         """解決 Cloudflare managed challenge"""
         # 保存當前頁面以供調試
@@ -98,7 +99,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             "w",
             errors="ignore",
         ) as f:
-            f.write(driver.page_source)
+            f.write(await page.get_content())
 
         logger.info(
             f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})"
@@ -110,7 +111,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
         iframe_loaded = False
         while time.time() - iframe_wait_start < 10:
             try:
-                iframes = driver.find_elements("tag name", "iframe")
+                iframes = await page.select_all("iframe", timeout=1)
                 if iframes:
                     wait_time = int(time.time() - iframe_wait_start)
                     logger.debug(f"Found {len(iframes)} iframe(s) after {wait_time}s")
@@ -118,13 +119,13 @@ class TwoCaptchaAdapter(CaptchaSolver):
                     break
             except Exception:
                 pass
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
         if not iframe_loaded:
             logger.warning("No iframes loaded after 10 seconds")
 
         # 嘗試多種方式提取 sitekey
-        html = driver.page_source
+        html = await page.get_content()
         sitekey = None
 
         # 方法 1: 從 sitekey 屬性提取
@@ -145,23 +146,25 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 方法 2: 從 JavaScript 變數提取
         if not sitekey:
             try:
-                sitekey = driver.execute_script(
+                sitekey = await page.evaluate(
                     """
-                    // 嘗試從各種可能的全域變數獲取 sitekey
-                    if (window.turnstile && window.turnstile.sitekey) {
-                        return window.turnstile.sitekey;
-                    }
-                    if (window._cf_chl_opt && window._cf_chl_opt.cKey) {
-                        return window._cf_chl_opt.cKey;
-                    }
-                    // 搜尋所有 iframe 的 src
-                    const iframes = document.querySelectorAll('iframe');
-                    for (let iframe of iframes) {
-                        const src = iframe.src || '';
-                        const match = src.match(/sitekey=([0-9a-zA-Z_-]+)/);
-                        if (match) return match[1];
-                    }
-                    return null;
+                    (() => {
+                        // 嘗試從各種可能的全域變數獲取 sitekey
+                        if (window.turnstile && window.turnstile.sitekey) {
+                            return window.turnstile.sitekey;
+                        }
+                        if (window._cf_chl_opt && window._cf_chl_opt.cKey) {
+                            return window._cf_chl_opt.cKey;
+                        }
+                        // 搜尋所有 iframe 的 src
+                        const iframes = document.querySelectorAll('iframe');
+                        for (let iframe of iframes) {
+                            const src = iframe.src || '';
+                            const match = src.match(/sitekey=([0-9a-zA-Z_-]+)/);
+                            if (match) return match[1];
+                        }
+                        return null;
+                    })()
                 """
                 )
                 if sitekey:
@@ -172,11 +175,11 @@ class TwoCaptchaAdapter(CaptchaSolver):
         # 方法 3: 檢查是否有 Turnstile iframe
         if not sitekey:
             try:
-                iframes = driver.find_elements(
-                    "css selector", "iframe[src*='challenges.cloudflare.com']"
+                iframes = await page.select_all(
+                    "iframe[src*='challenges.cloudflare.com']", timeout=1
                 )
                 if iframes:
-                    iframe_src = iframes[0].get_attribute("src")
+                    iframe_src = iframes[0].attrs.get("src", "")
                     logger.debug(f"Found Cloudflare challenge iframe: {iframe_src}")
                     match = re.search(r"sitekey=([0-9a-zA-Z_-]+)", iframe_src)
                     if match:
@@ -201,37 +204,38 @@ class TwoCaptchaAdapter(CaptchaSolver):
                     logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
                     # 嘗試注入 token
-                    driver.execute_script(
+                    await page.evaluate(
                         """
-                        // 方法1: 尋找並設置 turnstile response input
-                        var inputs = document.querySelectorAll(
-                            'input[name*="turnstile"], input[name*="cf-turnstile"]'
-                        );
-                        for (var i = 0; i < inputs.length; i++) {
-                            inputs[i].value = arguments[0];
-                        }
-
-                        // 方法2: 如果有 callback
-                        if (
-                            window.turnstile &&
-                            typeof window.turnstile.reset === 'function'
-                        ) {
-                            try {
-                                // 嘗試觸發驗證完成
-                                if (window.cfCallback) window.cfCallback(arguments[0]);
-                                if (window.tsCallback) window.tsCallback(arguments[0]);
-                            } catch(e) {
-                                console.log('Callback error:', e);
+                        (token) => {
+                            // 方法1: 尋找並設置 turnstile response input
+                            var inputs = document.querySelectorAll(
+                                'input[name*="turnstile"], input[name*="cf-turnstile"]'
+                            );
+                            for (var i = 0; i < inputs.length; i++) {
+                                inputs[i].value = token;
                             }
-                        }
 
-                        // 方法3: 提交表單（如果存在）
-                        var form = document.querySelector('form');
-                        if (form) {
-                            try {
-                                form.submit();
-                            } catch(e) {
-                                console.log('Form submit error:', e);
+                            // 方法2: 如果有 callback
+                            if (
+                                window.turnstile &&
+                                typeof window.turnstile.reset === 'function'
+                            ) {
+                                try {
+                                    if (window.cfCallback) window.cfCallback(token);
+                                    if (window.tsCallback) window.tsCallback(token);
+                                } catch(e) {
+                                    console.log('Callback error:', e);
+                                }
+                            }
+
+                            // 方法3: 提交表單（如果存在）
+                            var form = document.querySelector('form');
+                            if (form) {
+                                try {
+                                    form.submit();
+                                } catch(e) {
+                                    console.log('Form submit error:', e);
+                                }
                             }
                         }
                         """,
@@ -239,7 +243,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
                     )
 
                     logger.info("Token injected, waiting for page to respond...")
-                    time.sleep(5)
+                    await asyncio.sleep(5)
             except Exception as e:
                 logger.warning(f"2Captcha solve attempt failed: {str(e)}")
                 logger.info("Falling back to passive waiting...")
@@ -261,29 +265,31 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 screenshot_path = os.path.join(
                     get_log_dir(), "challenge_screenshot.png"
                 )
-                driver.save_screenshot(screenshot_path)
+                await page.save_screenshot(screenshot_path)
                 logger.debug(f"Screenshot saved to {screenshot_path}")
             except Exception as e:
                 logger.debug(f"Failed to save screenshot: {e}")
 
             # 打印當前 URL 和標題
-            logger.debug(f"Current URL: {driver.current_url}")
-            logger.debug(f"Page title: {driver.title}")
+            current_url = await page.evaluate("window.location.href")
+            current_title = await page.evaluate("document.title")
+            logger.debug(f"Current URL: {current_url}")
+            logger.debug(f"Page title: {current_title}")
 
             # 檢查頁面中的關鍵元素
             try:
-                cf_elements = driver.find_elements(
-                    "css selector", "[class*='cf'], [id*='cf']"
+                cf_elements = await page.select_all(
+                    "[class*='cf'], [id*='cf']", timeout=1
                 )
                 logger.debug(f"Found {len(cf_elements)} Cloudflare-related elements")
 
-                challenge_forms = driver.find_elements("css selector", "form")
+                challenge_forms = await page.select_all("form", timeout=1)
                 logger.debug(f"Found {len(challenge_forms)} forms on page")
 
-                all_iframes = driver.find_elements("tag name", "iframe")
+                all_iframes = await page.select_all("iframe", timeout=1)
                 logger.debug(f"Found {len(all_iframes)} iframes on page")
                 for idx, iframe in enumerate(all_iframes):
-                    src = iframe.get_attribute("src") or "(no src)"
+                    src = iframe.attrs.get("src", "(no src)")
                     logger.debug(f"  iframe {idx}: {src[:100]}")
             except Exception as e:
                 logger.debug(f"Failed to inspect page elements: {e}")
@@ -292,14 +298,14 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         start_time = time.time()
         check_interval = 5
-        last_url = driver.current_url
-        last_title = driver.title
+        last_url = await page.evaluate("window.location.href")
+        last_title = await page.evaluate("document.title")
 
         while time.time() - start_time < max_wait:
-            time.sleep(check_interval)
+            await asyncio.sleep(check_interval)
 
-            current_url = driver.current_url
-            current_title = driver.title
+            current_url = await page.evaluate("window.location.href")
+            current_title = await page.evaluate("document.title")
 
             # 檢查 URL 是否變化
             if current_url != last_url:
@@ -312,7 +318,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 last_title = current_title
 
             # 重新檢測是否還有驗證
-            current_det = detector.detect(driver, timeout=1.0)
+            current_det = await detector.detect(page, timeout=1.0)
             if current_det.kind == "none":
                 logger.info("Challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
@@ -335,8 +341,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
             f"\n4. Cloudflare may be blocking automated access to this site"
         )
 
-    def _solve_turnstile_widget(
-        self, challenge: ChallengeDetection, driver: Any
+    async def _solve_turnstile_widget(
+        self, challenge: ChallengeDetection, page: Any
     ) -> SolveResult:
         """解決 Turnstile widget"""
         if not challenge.sitekey:
@@ -360,37 +366,38 @@ class TwoCaptchaAdapter(CaptchaSolver):
         logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
         # 將 token 注入到頁面
-        success = driver.execute_script(
+        success = await page.evaluate(
             """
-            if (window.turnstile && window.turnstile.reset) {
-                // 如果有 callback，直接調用
-                if (window.cfCallback || window.tsCallback) {
-                    const callback = window.cfCallback || window.tsCallback;
-                    callback(arguments[0]);
+            (token) => {
+                if (window.turnstile && window.turnstile.reset) {
+                    if (window.cfCallback || window.tsCallback) {
+                        const callback = window.cfCallback || window.tsCallback;
+                        callback(token);
+                        return true;
+                    }
+                }
+
+                const input = document.querySelector(
+                    'input[name="cf-turnstile-response"]'
+                );
+                if (input) {
+                    input.value = token;
                     return true;
                 }
-            }
 
-            // 方法2: 設置到隱藏的表單欄位
-            const input = document.querySelector('input[name="cf-turnstile-response"]');
-            if (input) {
-                input.value = arguments[0];
-                return true;
+                return false;
             }
-
-            return false;
             """,
             token,
         )
 
         if success:
             logger.info("Token injected successfully, waiting for page to respond...")
-            time.sleep(3)
+            await asyncio.sleep(3)
 
             # 檢查是否通過驗證
-
             detector = CaptchaDetector()
-            current_det = detector.detect(driver, timeout=1.0)
+            current_det = await detector.detect(page, timeout=1.0)
             if current_det.kind == "none":
                 logger.info("Turnstile challenge resolved successfully!")
                 return SolveResult(success=True, solver_name="TwoCaptcha")
@@ -403,8 +410,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
             solver_name="TwoCaptcha",
         )
 
-    def _solve_recaptcha_v2(
-        self, challenge: ChallengeDetection, driver: Any
+    async def _solve_recaptcha_v2(
+        self, challenge: ChallengeDetection, page: Any
     ) -> SolveResult:
         """解決 reCAPTCHA v2"""
         if not challenge.sitekey:
@@ -426,28 +433,32 @@ class TwoCaptchaAdapter(CaptchaSolver):
         logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
         # 將 token 注入到頁面
-        success = driver.execute_script(
+        success = await page.evaluate(
             """
-            // 嘗試設置 g-recaptcha-response 欄位
-            var recaptchaResponse = document.getElementById('g-recaptcha-response');
-            if (recaptchaResponse) {
-                recaptchaResponse.style.display = '';
-                recaptchaResponse.value = arguments[0];
-                return true;
+            (token) => {
+                var recaptchaResponse = document.getElementById(
+                    'g-recaptcha-response'
+                );
+                if (recaptchaResponse) {
+                    recaptchaResponse.style.display = '';
+                    recaptchaResponse.value = token;
+                    return true;
+                }
+                return false;
             }
-            return false;
             """,
             token,
         )
         if success:
             logger.info("Token injected successfully, waiting for page to respond...")
-            time.sleep(3)
+            await asyncio.sleep(3)
 
             # 透過檢查 g-recaptcha-response 欄位值確認 token 是否注入成功
-            # （reCAPTCHA div 在 token 注入後不會消失，因此不能用 re-detect 判斷）
-            token_value = driver.execute_script(
+            token_value = await page.evaluate(
+                "(() => {"
                 "var el = document.getElementById('g-recaptcha-response');"
                 "return el ? el.value : '';"
+                "})()"
             )
             if token_value:
                 logger.info("reCAPTCHA v2 challenge resolved successfully!")

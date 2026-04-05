@@ -2,11 +2,6 @@
 
 from typing import Any
 
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-
 from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_IFRAME_CSS
 from .models import ChallengeDetection
 
@@ -14,20 +9,20 @@ from .models import ChallengeDetection
 class CaptchaDetector:
     """驗證碼檢測器 - 與解決方案無關"""
 
-    def detect(self, driver: Any, timeout: float = 2.0) -> ChallengeDetection:
+    async def detect(self, page: Any, timeout: float = 2.0) -> ChallengeDetection:
         """
         檢測當前頁面是否存在驗證碼挑戰
 
         Args:
-            driver: Selenium WebDriver 實例
+            page: zendriver Tab 實例
             timeout: 檢測超時時間（秒）
 
         Returns:
             ChallengeDetection: 檢測結果
         """
-        url = driver.current_url
-        title = (driver.title or "").strip()
-        html = driver.page_source or ""
+        url = await page.evaluate("window.location.href")
+        title = (await page.evaluate("document.title") or "").strip()
+        html = await page.get_content() or ""
 
         # 檢測 Cloudflare managed challenge
         if self._is_managed_challenge(title, html):
@@ -37,7 +32,7 @@ class CaptchaDetector:
             )
 
         # 檢測 Turnstile widget
-        iframe_data = self._find_turnstile_iframe(driver, timeout)
+        iframe_data = await self._find_turnstile_iframe(page, timeout)
         if iframe_data:
             return ChallengeDetection(
                 url=url,
@@ -47,7 +42,7 @@ class CaptchaDetector:
             )
 
         # 檢測 reCAPTCHA v2
-        recaptcha_data = self._find_recaptcha_div(driver, timeout)
+        recaptcha_data = await self._find_recaptcha_div(page, timeout)
         if recaptcha_data:
             return ChallengeDetection(
                 url=url,
@@ -71,31 +66,28 @@ class CaptchaDetector:
         m = RAY_RE.search(html)
         return m.group(1) if m else None
 
-    def _find_turnstile_iframe(
-        self, driver: Any, timeout: float
+    async def _find_turnstile_iframe(
+        self, page: Any, timeout: float
     ) -> dict[str, Any] | None:
         """查找 Turnstile iframe 並提取 sitekey"""
         try:
-            iframe = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, TURNSTILE_IFRAME_CSS))
-            )
-            iframe_src = iframe.get_attribute("src") or ""
+            iframe = await page.select(TURNSTILE_IFRAME_CSS, timeout=timeout)
+            iframe_src = iframe.attrs.get("src", "")
             m = SITEKEY_RE.search(iframe_src)
             sitekey = m.group(1) if m else None
             return {"src": iframe_src, "sitekey": sitekey}
-        except TimeoutException:
+        except (TimeoutError, Exception):
             return None
 
-    def _find_recaptcha_div(self, driver: Any, timeout: float) -> dict[str, Any] | None:
+    async def _find_recaptcha_div(
+        self, page: Any, timeout: float
+    ) -> dict[str, Any] | None:
         """查找 reCAPTCHA div 並提取 sitekey"""
         try:
-            recaptcha_div = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "div.g-recaptcha[data-sitekey]")
-                )
+            recaptcha_div = await page.select(
+                "div.g-recaptcha[data-sitekey]", timeout=timeout
             )
-
-            sitekey = recaptcha_div.get_attribute("data-sitekey")
+            sitekey = recaptcha_div.attrs.get("data-sitekey")
             return {"sitekey": sitekey}
-        except TimeoutException:
+        except (TimeoutError, Exception):
             return None

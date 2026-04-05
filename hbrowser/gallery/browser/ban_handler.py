@@ -1,8 +1,8 @@
 """IP ban 處理邏輯"""
 
+import asyncio
 import re
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -47,18 +47,20 @@ def parse_ban_time(page_source: str) -> int:
     )
 
 
-def handle_ban_decorator(driver: Any) -> Callable[..., None]:
+def handle_ban_decorator(
+    page: Any,
+) -> Callable[..., Coroutine[Any, Any, None]]:
     """
     處理 IP ban 的裝飾器
 
     Args:
-        driver: WebDriver 實例
+        page: zendriver Tab 實例
 
     Returns:
-        包裝後的 get 函數
+        包裝後的 async get 函數
     """
 
-    def banningcheck() -> None:
+    async def banningcheck() -> None:
         def banningmsg() -> str:
             a = timedelta(seconds=wait_seconds)
             wait_until_str = wait_until.strftime("%Y-%m-%d %H:%M:%S")
@@ -74,7 +76,7 @@ def handle_ban_decorator(driver: Any) -> Callable[..., None]:
         def whilechecknothing() -> bool:
             return bool(nothing == source)
 
-        source = driver.page_source
+        source = await page.get_content()
         nothing = "<html><head></head><body></body></html>"
         baningmsg = "Your IP address has been temporarily banned"
         onehour = 60 * 60
@@ -94,14 +96,14 @@ def handle_ban_decorator(driver: Any) -> Callable[..., None]:
                 logger.warning(banningmsg())
 
                 while wait_seconds > onehour:
-                    time.sleep(onehour)
+                    await asyncio.sleep(onehour)
                     wait_seconds -= onehour
                     logger.info(banningmsg())
-                time.sleep(wait_seconds + 15 * 60)
+                await asyncio.sleep(wait_seconds + 15 * 60)
                 wait_seconds = 0
                 logger.info("Retrying connection")
-                driver.refresh()
-                source = driver.page_source
+                await page.reload()
+                source = await page.get_content()
                 isfirst = False
                 if isnothing:
                     logger.error("Empty page, stopping retry")
@@ -110,8 +112,8 @@ def handle_ban_decorator(driver: Any) -> Callable[..., None]:
         else:
             return
 
-    def myget(*args: Any, **kwargs: Any) -> None:
-        driver.get(*args, **kwargs)
-        banningcheck()
+    async def myget(*args: Any, **kwargs: Any) -> None:
+        await page.get(*args, **kwargs)
+        await banningcheck()
 
     return myget

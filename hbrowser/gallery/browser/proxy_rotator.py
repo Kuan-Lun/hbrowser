@@ -3,8 +3,10 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
+import zendriver as zd
+
 from ..utils import setup_logger
-from .factory import create_driver
+from .factory import create_browser, stop_browser
 
 logger = setup_logger(__name__)
 
@@ -18,15 +20,17 @@ class ProxyRotator(ABC):
     """
 
     @abstractmethod
-    def rotate(self, current_driver: Any, headless: bool) -> Any:
-        """輪換代理並回傳新的（或同一個）driver
+    async def rotate(
+        self, current_browser: Any, headless: bool
+    ) -> tuple[zd.Browser, zd.Tab]:
+        """輪換代理並回傳新的 (browser, page) tuple
 
         Args:
-            current_driver: 目前的 WebDriver 實例
+            current_browser: 目前的 zendriver Browser 實例
             headless: 是否使用無頭模式
 
         Returns:
-            新的或重置過的 WebDriver 實例
+            新的 (browser, page) tuple
         """
         pass
 
@@ -34,13 +38,15 @@ class ProxyRotator(ABC):
 class DriverRestartRotator(ProxyRotator):
     """透過重啟瀏覽器來取得新的代理連線"""
 
-    def rotate(self, current_driver: Any, headless: bool) -> Any:
+    async def rotate(
+        self, current_browser: Any, headless: bool
+    ) -> tuple[zd.Browser, zd.Tab]:
         logger.warning("Rotating proxy by restarting browser...")
         try:
-            current_driver.quit()
+            await stop_browser(current_browser)
         except Exception:
-            logger.debug("Failed to quit current driver (non-fatal)")
+            logger.debug("Failed to stop current browser (non-fatal)")
 
-        new_driver = create_driver(headless=headless)
+        browser, page = await create_browser(headless=headless)
         logger.info("Browser restarted with new proxy connection")
-        return new_driver
+        return browser, page

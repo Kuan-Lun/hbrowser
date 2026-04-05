@@ -141,14 +141,15 @@ def find_available_port(start: int = 9150) -> int:
     raise RuntimeError(f"No available port found in range {start}-{start + 99}")
 
 
-def verify_proxy_ip(driver: Any) -> None:
+async def verify_proxy_ip(browser: Any, page: Any) -> None:
     """驗證代理連線的 IP 與本機 IP 不同"""
     try:
         with urlopen("https://api.ipify.org", timeout=10) as response:
             local_ip: str = response.read().decode("utf-8").strip()
 
-        driver.get("https://api.ipify.org")
-        proxy_ip: str = driver.find_element("tag name", "body").text.strip()
+        await page.get("https://api.ipify.org")
+        body = await page.select("body")
+        proxy_ip: str = body.text.strip()
 
         if local_ip == proxy_ip:
             raise RuntimeError(
