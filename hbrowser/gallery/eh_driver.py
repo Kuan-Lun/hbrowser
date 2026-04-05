@@ -106,16 +106,19 @@ class EHDriver(Driver):
             await waitpage()
             input_element = await self.page.select("#f_search")
         if isclear:
-            await input_element.clear_input()
-            await asyncio.sleep(random())
-            new_value = key
+            await input_element.apply(
+                "(el, k) => { el.value = k; el.dispatchEvent(new Event('input')); }",
+                key,
+            )
         else:
-            input_value = await input_element.apply("(el) => el.value || ''")
-            if key == "":
-                new_value = input_value
-            else:
-                new_value = " " + key
-        await input_element.send_keys(new_value)
+            if key != "":
+                await input_element.apply(
+                    "(el, k) => {"
+                    " el.value = el.value + ' ' + k;"
+                    " el.dispatchEvent(new Event('input'));"
+                    "}",
+                    key,
+                )
         await asyncio.sleep(random())
 
         # 全總類搜尋
