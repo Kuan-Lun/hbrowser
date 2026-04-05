@@ -55,7 +55,7 @@ class EHDriver(Driver):
             await self.get(url)
 
         input_element = await self.page.select("#f_search")
-        input_value = input_element.attrs.get("value", "")
+        input_value = await input_element.apply("(el) => el.value || ''")
         if input_value == "":
             raise ValueError(
                 "The value in the search box is empty. "
@@ -110,7 +110,7 @@ class EHDriver(Driver):
             await asyncio.sleep(random())
             new_value = key
         else:
-            input_value = input_element.attrs.get("value", "")
+            input_value = await input_element.apply("(el) => el.value || ''")
             if key == "":
                 new_value = input_value
             else:
@@ -132,7 +132,7 @@ class EHDriver(Driver):
         await waitpage()
 
         input_element = await self.page.select("#f_search")
-        input_value = input_element.attrs.get("value", "")
+        input_value = await input_element.apply("(el) => el.value || ''")
         self.logger.info(f"Search keyword: {input_value}")
 
         current_url = await self.page.evaluate("window.location.href")
