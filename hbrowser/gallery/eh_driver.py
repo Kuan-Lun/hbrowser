@@ -105,19 +105,18 @@ class EHDriver(Driver):
             await self.gohomepage()
             await waitpage()
             input_element = await self.page.select("#f_search")
+        # 用 JS 直接操作 value，避免 send_keys 空格被頁面攔截
+        escaped_key = key.replace("\\", "\\\\").replace("'", "\\'")
         if isclear:
             await input_element.apply(
-                "(el, k) => { el.value = k; el.dispatchEvent(new Event('input')); }",
-                key,
+                f"(el) => {{ el.value = '{escaped_key}';"
+                " el.dispatchEvent(new Event('input')); }"
             )
         else:
             if key != "":
                 await input_element.apply(
-                    "(el, k) => {"
-                    " el.value = el.value + ' ' + k;"
-                    " el.dispatchEvent(new Event('input'));"
-                    "}",
-                    key,
+                    f"(el) => {{ el.value = el.value + ' ' + '{escaped_key}';"
+                    " el.dispatchEvent(new Event('input')); }"
                 )
         await asyncio.sleep(random())
 
