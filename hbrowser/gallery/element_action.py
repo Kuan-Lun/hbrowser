@@ -21,9 +21,16 @@ class ElementAction:
         return self._page
 
     async def click(self, element: Any) -> None:
-        """使用 mouse_move + mouse_click 點擊元素"""
-        await element.mouse_move()
-        await element.mouse_click()
+        """點擊元素，先嘗試滾動到可見位置再模擬滑鼠點擊，失敗時用 JS click"""
+        try:
+            await element.scroll_into_view()
+            await element.mouse_move()
+            await element.mouse_click()
+        except Exception as e:
+            if "could not find position" in str(e):
+                await element.apply("(el) => el.click()")
+            else:
+                raise
 
     async def click_resilient(
         self,
