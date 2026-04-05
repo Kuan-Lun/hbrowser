@@ -41,12 +41,11 @@ class SkillManager:
         )
 
     async def _click_skill(self, element_id: str, iswait: bool) -> None:
+        selector = f'[id="{element_id}"]'
         if iswait:
-            await self.element_action_manager.click_and_wait_log_locator(
-                f"#{element_id}"
-            )
+            await self.element_action_manager.click_and_wait_log_locator(selector)
         else:
-            await self.element_action_manager.click_locator(f"#{element_id}")
+            await self.element_action_manager.click_locator(selector)
 
     async def cast(self, key: str, iswait: bool = True) -> bool:
         if key not in self.get_skills_and_spells():

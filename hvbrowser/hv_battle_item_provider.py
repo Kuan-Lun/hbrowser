@@ -53,6 +53,6 @@ class ItemProvider:
             await self.hvdriver.page.select("#pane_item", timeout=2)
 
         await self.element_action_manager.click_and_wait_log_locator(
-            f"#{parsed_item.element_id}"
+            f'[id="{parsed_item.element_id}"]'
         )
         return True

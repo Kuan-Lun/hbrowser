@@ -382,11 +382,11 @@ class BattleDriver(HVDriver):
         return False
 
     async def attack_monster(self, n: int) -> bool:
-        element_id = f"mkey_{n}"
-        elements = await self.page.query_selector_all(f"#{element_id}")
+        selector = f'[id="mkey_{n}"]'
+        elements = await self.page.query_selector_all(selector)
         if not elements:
             return False
-        await self.element_action_manager.click_and_wait_log_locator(f"#{element_id}")
+        await self.element_action_manager.click_and_wait_log_locator(selector)
         return True
 
     async def attack_monster_by_skill(self, n: int, skill_name: str) -> bool:
