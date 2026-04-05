@@ -7,13 +7,8 @@ from hbrowser.gallery.element_action import ElementAction
 from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard
 
-# 用輕量 JS 取得 log 區塊的 innerHTML，避免每次都抓整頁 HTML
-_LOG_SNIPPET_JS = (
-    "(() => {"
-    "const el = document.getElementById('battlelog');"
-    "return el ? el.innerHTML : '';"
-    "})()"
-)
+# 用輕量 JS 取得頁面 HTML 長度，偵測任何頁面變化（log 更新、HP 變化等）
+_PAGE_LENGTH_JS = "document.body.innerHTML.length"
 
 
 class ElementActionManager:
@@ -84,7 +79,7 @@ class ElementActionManager:
         避免頻繁呼叫 get_content() + parse_snapshot() 阻塞 CDP 連線。
         """
         # 用輕量 JS 取得 pre-click log 快照
-        pre_log = await self.hvdriver.page.evaluate(_LOG_SNIPPET_JS)
+        pre_log = await self.hvdriver.page.evaluate(_PAGE_LENGTH_JS)
 
         # 點擊
         await self._action.click_locator(
@@ -96,7 +91,7 @@ class ElementActionManager:
         while True:
             await asyncio.sleep(check_interval)
             waited += check_interval
-            current_log = await self.hvdriver.page.evaluate(_LOG_SNIPPET_JS)
+            current_log = await self.hvdriver.page.evaluate(_PAGE_LENGTH_JS)
             if current_log != pre_log:
                 break
             if waited >= timeout:
