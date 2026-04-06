@@ -349,8 +349,8 @@ class BattleDriver(HVDriver):
         current_url = await self.page.evaluate("window.location.href")
         if current_url != arena_url:
             return False
-        elements = await self.page.select_all(
-            f'img[src="{path_prefix}/y/arena/startchallenge.png"]', timeout=2
+        elements = await self.page.query_selector_all(
+            f'img[src="{path_prefix}/y/arena/startchallenge.png"]'
         )
         if elements:
             # 先覆寫 window.confirm 讓它自動回傳 true，避免確認對話框阻塞
