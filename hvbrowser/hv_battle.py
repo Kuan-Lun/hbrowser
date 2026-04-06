@@ -644,26 +644,6 @@ class BattleDriver(HVDriver):
     def _wait_if_paused(self) -> None:
         self.control_panel.wait_if_paused()
 
-    async def _wait_for_page_recovery(
-        self, timeout: int = 300, poll_interval: int = 5, log_interval: int = 30
-    ) -> bool:
-        """Poll the page periodically to detect early recovery."""
-        for i in range(timeout // poll_interval):
-            await asyncio.sleep(poll_interval)
-            elapsed = (i + 1) * poll_interval
-            if elapsed % log_interval == 0:
-                logger.info(f"Waiting for recovery... ({elapsed}/{timeout}s)")
-            try:
-                current_url = await self.page.evaluate("window.location.href")
-                await self.page.get(current_url)
-                if await self._is_in_battle():
-                    logger.info(f"Page recovered after {elapsed}s")
-                    return True
-            except TimeoutError:
-                pass
-        logger.warning(f"Page did not recover within {timeout}s")
-        return False
-
     async def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
         if await self._is_in_battle():
             return True
@@ -706,11 +686,11 @@ class BattleDriver(HVDriver):
                     )
                     raise
                 logger.warning(
-                    f"TimeoutError caught: {e!r}, reloading page "
+                    f"TimeoutError caught: {e!r}, retrying turn "
                     f"(attempt {retry_count}/{max_retries})"
                 )
-                if await self._wait_for_page_recovery():
-                    retry_count = 0
+                await asyncio.sleep(5)
+                continue
 
         notify("HBrowser", "Battle complete")
         logger.info("Battle complete, waiting 300s for user to start next battle...")
