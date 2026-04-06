@@ -8,7 +8,8 @@ from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard
 
 # 用輕量 JS 取得頁面 HTML 長度，偵測任何頁面變化（log 更新、HP 變化等）
-_PAGE_LENGTH_JS = "document.body.innerHTML.length"
+# 加上 null guard 避免在頁面 reload/navigation 過程中 document.body 暫時為 null
+_PAGE_LENGTH_JS = "(document.body && document.body.innerHTML.length) || 0"
 
 
 class ElementActionManager:
