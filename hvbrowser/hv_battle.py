@@ -353,12 +353,9 @@ class BattleDriver(HVDriver):
             f'img[src="{path_prefix}/y/arena/startchallenge.png"]', timeout=2
         )
         if elements:
+            # 先覆寫 window.confirm 讓它自動回傳 true，避免確認對話框阻塞
+            await self.page.evaluate("window.confirm = function() { return true; };")
             await elements[-1].click()
-            # Accept the confirmation alert via CDP
-            try:
-                await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
-            except Exception:
-                pass
             return True
         return False
 
