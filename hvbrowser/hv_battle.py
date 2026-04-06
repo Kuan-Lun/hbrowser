@@ -349,15 +349,36 @@ class BattleDriver(HVDriver):
         current_url = await self.page.evaluate("window.location.href")
         if current_url != arena_url:
             return False
-        elements = await self.page.query_selector_all(
-            f'img[src="{path_prefix}/y/arena/startchallenge.png"]'
+
+        # Arena 列表頁面的圖片 onclick 是 "init_battle(N, 0)"，
+        # 該函式內部會呼叫 confirm() 確認後 submit #initform。
+        # 直接繞過 confirm，從 onclick 字串解析 id 並 submit form：
+        # 1. 找出所有 onclick 帶 init_battle 的元素，取最後一個
+        # 2. 解析出 id
+        # 3. 設定 #initid 並 submit #initform
+        result = await self.page.evaluate(
+            """
+            (() => {
+                const imgs = document.querySelectorAll(
+                    'img[onclick*="init_battle"]'
+                );
+                if (imgs.length === 0) return null;
+                const target = imgs[imgs.length - 1];
+                const m = target.getAttribute('onclick').match(
+                    /init_battle\\((\\d+)\\s*,\\s*(\\d+)\\)/
+                );
+                if (!m) return null;
+                const id = m[1];
+                const initid = document.getElementById('initid');
+                const initform = document.getElementById('initform');
+                if (!initid || !initform) return null;
+                initid.value = id;
+                initform.submit();
+                return id;
+            })()
+            """
         )
-        if elements:
-            # 先覆寫 window.confirm 讓它自動回傳 true，避免確認對話框阻塞
-            await self.page.evaluate("window.confirm = function() { return true; };")
-            await elements[-1].click()
-            return True
-        return False
+        return result is not None
 
     async def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
