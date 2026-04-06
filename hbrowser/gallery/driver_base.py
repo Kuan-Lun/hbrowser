@@ -50,14 +50,11 @@ class Driver(ABC):
         self.proxy_rotator = proxy_rotator or DriverRestartRotator()
         self.max_captcha_retries = max_captcha_retries
 
-        # 初始化驗證碼管理器
-        # 使用 180 秒（3 分鐘）的等待時間，
-        # 以便在非 headless 模式下��足夠時間手動解決驗證碼
+        # 180 秒等待時間讓非 headless 模式有足夠時間手動解決驗證碼
         solver = TwoCaptchaAdapter(max_wait=180)
         self.captcha_manager = CaptchaManager(solver)
 
     async def _init_browser(self) -> None:
-        """非同步初始化瀏覽器"""
         self.browser, self.page = await create_browser(headless=self.headless)
         self.myget = handle_ban_decorator(self.page)
         await self.get(self.url["Forums"])
@@ -85,7 +82,6 @@ class Driver(ABC):
             pass
 
     async def gohomepage(self) -> None:
-        """前往主頁"""
         url = self.url[self.name]
         current_url = await self.page.evaluate("window.location.href")
         if not matchurl(current_url, url):
@@ -95,20 +91,17 @@ class Driver(ABC):
             self.logger.debug("Already on homepage, no navigation needed")
 
     async def find_element_chain(self, *selectors: str) -> Any:
-        """通過 CSS selector 鏈逐步查找元素"""
         element: Any = self.page
         for selector in selectors:
             element = await element.query_selector(selector)
         return element
 
     async def get(self, url: str) -> None:
-        """導航到指定 URL"""
         current_url = await self.page.evaluate("window.location.href")
         self.logger.debug(f"Navigate to URL: {url}")
         is_new_url = not matchurl(url, current_url)
         await self.myget(url)
         if is_new_url:
-            # 等待 URL 變化
             try:
                 deadline = asyncio.get_event_loop().time() + 10
                 while matchurl(
@@ -121,7 +114,6 @@ class Driver(ABC):
                 pass
         else:
             await self.page.wait(1)
-        # 隨機延遲
         await asyncio.sleep(3 * random())
 
     async def wait(
@@ -130,17 +122,15 @@ class Driver(ABC):
         ischangeurl: bool,
         sleeptime: int = -1,
     ) -> None:
-        """
-        執行 async 函數並等待頁面變化
+        """執行 async 函數並等待頁面變化。
 
         Args:
             fun: 要執行的 async callable
             ischangeurl: 是否等待 URL 變化
-            sleeptime: 等待��間（秒），-1 表示隨機等待
+            sleeptime: 等待時間（秒），-1 表示隨機等待
         """
         old_url = await self.page.evaluate("window.location.href")
 
-        # 重試機制
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -167,7 +157,6 @@ class Driver(ABC):
             await asyncio.sleep(sleeptime)
 
     async def _rotate_proxy(self) -> None:
-        """透過 ProxyRotator 輪換代理，替換當前 browser/page。"""
         self.browser, self.page = await self.proxy_rotator.rotate(
             self.browser, self.headless
         )
@@ -187,7 +176,6 @@ class Driver(ABC):
 
         self.logger.info("reCAPTCHA v2 detected on login form")
 
-        # 嘗試透過 2Captcha 自動解決
         try:
             result = await self.captcha_manager.solve(det, self.page)
             if result:
@@ -196,7 +184,6 @@ class Driver(ABC):
         except Exception:
             self.logger.debug("Auto-solve failed, will wait for manual completion")
 
-        # 檢查 token 是否已就緒
         token = await self.page.evaluate(
             "(() => {"
             "var el = document.getElementById('g-recaptcha-response');"
@@ -207,7 +194,6 @@ class Driver(ABC):
             self.logger.info("reCAPTCHA token already present")
             return
 
-        # 等待使用者手動完成 reCAPTCHA
         self.logger.info(
             "Please complete the reCAPTCHA manually in the browser. "
             f"Waiting up to {manual_timeout:.0f} seconds..."
@@ -236,10 +222,8 @@ class Driver(ABC):
     ) -> None:
         """檢測並解決 Cloudflare 驗證，失敗時自動輪換代理重試。
 
-        可在任何需要通過 Cloudflare 驗證的地方呼叫此方法。
-
         Args:
-            url: 要存取的 URL（輪換代理後��重新導航）
+            url: 要存取的 URL（輪換代理後需重新導航）
             detect_timeout: 驗證碼檢測超時時間（秒）
 
         Raises:
@@ -256,7 +240,6 @@ class Driver(ABC):
                 f"(attempt {attempt}/{self.max_captcha_retries})"
             )
 
-            # 儲存驗證頁面供除錯
             challenge_page_path = os.path.join(get_log_dir(), "challenge_page.html")
             with open(challenge_page_path, "w", errors="ignore") as f:
                 f.write(await self.page.get_content())
@@ -272,7 +255,6 @@ class Driver(ABC):
                 self.logger.info("Challenge solved successfully")
                 return
 
-            # 解決失敗，輪換代理重試
             self.logger.warning(
                 f"Failed to solve challenge "
                 f"(attempt {attempt}/{self.max_captcha_retries})"
@@ -287,38 +269,31 @@ class Driver(ABC):
         )
 
     async def login(self) -> None:
-        """
-        登入流程
+        """透過 Forums 頁面登入。
 
-        透過 Forums 頁面登入：
-        1. 進入 Forums 首頁（Cloudflare 驗��在此發生）
+        流程：
+        1. 進入 Forums 首頁（Cloudflare 驗證在此發生）
         2. 點擊 "Log In" 連結進入登入頁面
         3. 輸入帳號密碼並點擊 "Log me in"
         4. 驗證登入成功後前往主頁
         """
         self.logger.info("Starting login process")
 
-        # 進入 Forums 首頁
         await self.myget(self.url["Forums"])
-
-        # 檢測並解決 Cloudflare 驗證（失敗時自動輪換代理重試）
         await self.detect_and_solve_with_rotation(self.url["Forums"])
 
-        # 檢查是否已登入（已登入時不會出現 userlinksguest）
         guest_elements = await self.page.query_selector_all("#userlinksguest")
         if not guest_elements:
             self.logger.info("Already logged in, skipping login")
             await self.gohomepage()
             return
 
-        # 點擊 "Log In" 連結進入登入頁面
         self.logger.info("Clicking 'Log In' link on Forums page")
         login_link = await self.page.select(
             "#userlinksguest a[href*='act=Login&CODE=00']"
         )
         old_url = await self.page.evaluate("window.location.href")
         await login_link.click()
-        # 等待 URL 變化
         deadline = asyncio.get_event_loop().time() + 10
         while (
             await self.page.evaluate("window.location.href") == old_url
@@ -326,20 +301,16 @@ class Driver(ABC):
         ):
             await asyncio.sleep(0.1)
 
-        # 等待登入表單載入
         await self.page.select("[name='UserName']", timeout=10)
 
-        # 輸入帳號密碼
         username_input = await self.page.select("[name='UserName']")
         await username_input.send_keys(self.username)
 
         password_input = await self.page.select("[name='PassWord']")
         await password_input.send_keys(self.password)
 
-        # 處理登入表單上的 reCAPTCHA v2
         await self._handle_login_recaptcha()
 
-        # 點擊 "Log me in" 按鈕
         old_url = await self.page.evaluate("window.location.href")
         submit_button = await self.page.select(
             "input[type='submit'][value='Log me in']"
@@ -347,7 +318,6 @@ class Driver(ABC):
         await submit_button.click()
         self.logger.info("'Log me in' button clicked, waiting for redirect...")
 
-        # 等待登入完成（URL 變化）
         deadline = asyncio.get_event_loop().time() + 10
         while (
             await self.page.evaluate("window.location.href") == old_url

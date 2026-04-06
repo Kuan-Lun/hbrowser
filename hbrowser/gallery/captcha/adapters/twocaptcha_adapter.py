@@ -42,20 +42,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
             )
 
         self.max_wait = max_wait
-        # 被適配的對象
         self._twocaptcha = TwoCaptcha(self.api_key)
 
     async def solve(self, challenge: ChallengeDetection, page: Any) -> SolveResult:
-        """
-        使用 TwoCaptcha 服務解決驗證碼
-
-        Args:
-            challenge: 檢測到的驗證信息
-            page: zendriver Tab 實例
-
-        Returns:
-            SolveResult: 解決結果
-        """
+        """使用 TwoCaptcha 服務解決驗證碼。"""
         logger.info(f"Detected {challenge.kind} challenge, attempting to solve...")
 
         try:
@@ -79,7 +69,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
         except (CaptchaAPIKeyNotSetException, CaptchaSolveException):
             raise
         except Exception as e:
-            # 保存錯誤時的頁面狀態
             error_file = os.path.join(get_log_dir(), "challenge_error.html")
             with open(error_file, "w", errors="ignore") as f:
                 f.write(await page.get_content())
@@ -92,8 +81,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
     async def _solve_managed_challenge(
         self, challenge: ChallengeDetection, page: Any, max_wait: int
     ) -> SolveResult:
-        """解決 Cloudflare managed challenge"""
-        # 保存當前頁面以供調試
+        """解決 Cloudflare managed challenge."""
         with open(
             os.path.join(get_log_dir(), "challenge_page.html"),
             "w",
@@ -105,8 +93,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
             f"Cloudflare managed challenge detected (Ray ID: {challenge.ray_id})"
         )
 
-        # 等待 Turnstile iframe 載入（最多等待 10 秒）
-        logger.debug("Waiting for Cloudflare Turnstile to load...")
+        logger.debug("Waiting for Cloudflare Turnstile to load (up to 10s)...")
         iframe_wait_start = time.time()
         iframe_loaded = False
         while time.time() - iframe_wait_start < 10:
@@ -124,11 +111,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
         if not iframe_loaded:
             logger.warning("No iframes loaded after 10 seconds")
 
-        # 嘗試多種方式提取 sitekey
+        # Sitekey 來源：HTML pattern → JS 全域變數 → Turnstile iframe src
         html = await page.get_content()
         sitekey = None
 
-        # 方法 1: 從 sitekey 屬性提取
         patterns = [
             r'sitekey["\s:]+([0-9a-zA-Z_-]+)',
             r'data-sitekey["\s]*=["\s]*([0-9a-zA-Z_-]+)',
@@ -143,20 +129,17 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 logger.debug(f"Found sitekey using pattern '{pattern}': {sitekey}")
                 break
 
-        # 方法 2: 從 JavaScript 變數提取
         if not sitekey:
             try:
                 sitekey = await page.evaluate(
                     """
                     (() => {
-                        // 嘗試從各種可能的全域變數獲取 sitekey
                         if (window.turnstile && window.turnstile.sitekey) {
                             return window.turnstile.sitekey;
                         }
                         if (window._cf_chl_opt && window._cf_chl_opt.cKey) {
                             return window._cf_chl_opt.cKey;
                         }
-                        // 搜尋所有 iframe 的 src
                         const iframes = document.querySelectorAll('iframe');
                         for (let iframe of iframes) {
                             const src = iframe.src || '';
@@ -172,7 +155,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
             except Exception as e:
                 logger.warning(f"Failed to extract sitekey from JavaScript: {e}")
 
-        # 方法 3: 檢查是否有 Turnstile iframe
         if not sitekey:
             try:
                 iframes = await page.select_all(
@@ -191,7 +173,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
         if sitekey:
             logger.info(f"Final sitekey to use: {sitekey}")
 
-            # 嘗試使用 2Captcha 解決 Turnstile
             try:
                 logger.info("Attempting to solve with 2Captcha Turnstile API...")
                 result = self._twocaptcha.turnstile(
@@ -203,11 +184,9 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 if token:
                     logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
-                    # 嘗試注入 token
                     await page.evaluate(
                         """
                         (token) => {
-                            // 方法1: 尋找並設置 turnstile response input
                             var inputs = document.querySelectorAll(
                                 'input[name*="turnstile"], input[name*="cf-turnstile"]'
                             );
@@ -215,7 +194,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
                                 inputs[i].value = token;
                             }
 
-                            // 方法2: 如果有 callback
                             if (
                                 window.turnstile &&
                                 typeof window.turnstile.reset === 'function'
@@ -228,7 +206,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
                                 }
                             }
 
-                            // 方法3: 提交表單（如果存在）
                             var form = document.querySelector('form');
                             if (form) {
                                 try {
@@ -248,7 +225,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 logger.warning(f"2Captcha solve attempt failed: {str(e)}")
                 logger.info("Falling back to passive waiting...")
 
-        # 輪詢檢查頁面是否已經通過驗證
         logger.info("Monitoring page for challenge resolution...")
         if not sitekey:
             logger.warning(
@@ -260,7 +236,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
             )
             logger.debug("Saving additional debug information...")
 
-            # 保存頁面截圖（如果可能）
             try:
                 screenshot_path = os.path.join(
                     get_log_dir(), "challenge_screenshot.png"
@@ -270,13 +245,11 @@ class TwoCaptchaAdapter(CaptchaSolver):
             except Exception as e:
                 logger.debug(f"Failed to save screenshot: {e}")
 
-            # 打印當前 URL 和標題
             current_url = await page.evaluate("window.location.href")
             current_title = await page.evaluate("document.title")
             logger.debug(f"Current URL: {current_url}")
             logger.debug(f"Page title: {current_title}")
 
-            # 檢查頁面中的關鍵元素
             try:
                 cf_elements = await page.select_all(
                     "[class*='cf'], [id*='cf']", timeout=1
@@ -312,12 +285,10 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 logger.info(f"URL changed from {last_url} to {current_url}")
                 last_url = current_url
 
-            # 檢查標題是否變化（可能表示頁面狀態變更）
             if current_title != last_title:
                 logger.info(f"Page title changed: {last_title} -> {current_title}")
                 last_title = current_title
 
-            # 重新檢測是否還有驗證
             current_det = await detector.detect(page, timeout=1.0)
             if current_det.kind == "none":
                 logger.info("Challenge resolved successfully!")
@@ -330,7 +301,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
                 f"Current URL: {url_preview}..."
             )
 
-        # 超時仍未解決
         raise CaptchaSolveException(
             f"Cloudflare managed challenge not resolved after {max_wait} seconds. "
             f"Ray ID: {challenge.ray_id}. "
@@ -344,7 +314,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
     async def _solve_turnstile_widget(
         self, challenge: ChallengeDetection, page: Any
     ) -> SolveResult:
-        """解決 Turnstile widget"""
+        """解決 Turnstile widget."""
         if not challenge.sitekey:
             raise CaptchaSolveException(
                 "Turnstile widget detected but sitekey not found"
@@ -352,20 +322,17 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         logger.info(f"Solving Turnstile with sitekey: {challenge.sitekey}")
 
-        # 提交驗證任務到 2Captcha
         result = self._twocaptcha.turnstile(
             sitekey=challenge.sitekey,
             url=challenge.url,
         )
 
-        # 獲取解決的 token
         token = result.get("code")
         if not token:
             raise CaptchaSolveException("Failed to get token from 2Captcha response")
 
         logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
-        # 將 token 注入到頁面
         success = await page.evaluate(
             """
             (token) => {
@@ -395,7 +362,6 @@ class TwoCaptchaAdapter(CaptchaSolver):
             logger.info("Token injected successfully, waiting for page to respond...")
             await asyncio.sleep(3)
 
-            # 檢查是否通過驗證
             detector = CaptchaDetector()
             current_det = await detector.detect(page, timeout=1.0)
             if current_det.kind == "none":
@@ -413,26 +379,23 @@ class TwoCaptchaAdapter(CaptchaSolver):
     async def _solve_recaptcha_v2(
         self, challenge: ChallengeDetection, page: Any
     ) -> SolveResult:
-        """解決 reCAPTCHA v2"""
+        """解決 reCAPTCHA v2."""
         if not challenge.sitekey:
             raise CaptchaSolveException("reCAPTCHA v2 detected but sitekey not found")
 
         logger.info(f"Solving reCAPTCHA v2 with sitekey: {challenge.sitekey}")
 
-        # 提交驗證任務到 2Captcha
         result = self._twocaptcha.recaptcha(
             sitekey=challenge.sitekey,
             url=challenge.url,
         )
 
-        # 獲取解決的 token
         token = result.get("code")
         if not token:
             raise CaptchaSolveException("Failed to get token from 2Captcha response")
 
         logger.info(f"Got token from 2Captcha: {token[:50]}...")
 
-        # 將 token 注入到頁面
         success = await page.evaluate(
             """
             (token) => {
@@ -453,7 +416,8 @@ class TwoCaptchaAdapter(CaptchaSolver):
             logger.info("Token injected successfully, waiting for page to respond...")
             await asyncio.sleep(3)
 
-            # 透過檢查 g-recaptcha-response 欄位值確認 token 是否注入成功
+            # reCAPTCHA div 在 token 注入後不會消失，
+            # 因此用 g-recaptcha-response 欄位值來確認注入是否成功
             token_value = await page.evaluate(
                 "(() => {"
                 "var el = document.getElementById('g-recaptcha-response');"

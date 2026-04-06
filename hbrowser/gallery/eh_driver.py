@@ -14,8 +14,6 @@ from .utils import matchurl, wait_for_new_tab
 
 
 class EHDriver(Driver):
-    """E-Hentai Driver"""
-
     def _setname(self) -> str:
         return "E-Hentai"
 
@@ -94,8 +92,6 @@ class EHDriver(Driver):
         return glist
 
     async def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
-        """搜索 galleries"""
-
         async def waitpage() -> None:
             await self.page.select("#f_search", timeout=10)
 
@@ -105,7 +101,6 @@ class EHDriver(Driver):
             await self.gohomepage()
             await waitpage()
             input_element = await self.page.select("#f_search")
-        # 用 JS 直接操作 value，避免 send_keys 空格被頁面攔截
         escaped_key = key.replace("\\", "\\\\").replace("'", "\\'")
         if isclear:
             await input_element.apply(
@@ -120,7 +115,6 @@ class EHDriver(Driver):
                 )
         await asyncio.sleep(random())
 
-        # 全總類搜尋
         elements = await self.page.xpath(
             "//div[contains(@id, 'cat_') and @data-disabled='1']", timeout=2
         )
@@ -143,7 +137,6 @@ class EHDriver(Driver):
         return result
 
     async def download(self, gallery: GalleryURLParser) -> bool:
-        """下載 gallery"""
         self.logger.info(f"Starting download for gallery: {gallery.url}")
 
         await self.get(gallery.url)
@@ -162,7 +155,6 @@ class EHDriver(Driver):
         except TimeoutError:
             pass
 
-        # 記錄現有 tabs
         existing_tabs = {t.target.target_id for t in self.browser.tabs}
         gallery_tab = self.page
 
@@ -179,24 +171,20 @@ class EHDriver(Driver):
             self.page = gallery_tab
             return await self.download(gallery)
 
-        # 等待新 tab ���啟
         new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
             self.logger.warning("No new tab opened, retrying download")
             return await self.download(gallery)
 
-        # 切換到新 tab
         await new_tab.activate()
         self.page = new_tab
 
-        # 點擊 Original，開始下載
         original_links = await self.page.xpath(
             "//a[contains(text(), 'Original')]", timeout=10
         )
         if original_links:
             await original_links[0].click()
 
-        # 確認是否連接 H@H
         try:
             deadline = asyncio.get_event_loop().time() + 10
             while asyncio.get_event_loop().time() < deadline:
@@ -220,7 +208,7 @@ class EHDriver(Driver):
             error_file = os.path.join(".", "error.txt")
             with open(error_file, "w", errors="ignore") as f:
                 f.write(await self.page.get_content())
-            retrytime = 1 * 60  # 1 minute
+            retrytime = 60
             self.logger.warning(
                 f"Download timeout, error page saved to {error_file}, "
                 f"retrying in {retrytime}s"
@@ -230,7 +218,6 @@ class EHDriver(Driver):
             await asyncio.sleep(retrytime)
             return await self.download(gallery)
 
-        # 關閉下載 tab，切回 gallery tab
         if len(self.browser.tabs) > 1:
             await self.page.close()
             await asyncio.sleep(random())
@@ -245,7 +232,6 @@ class EHDriver(Driver):
         return True
 
     async def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:
-        """從 gallery 頁面提取指定 filter 的 tags"""
         await self.get(gallery.url)
         try:
             elements = await self.page.xpath(

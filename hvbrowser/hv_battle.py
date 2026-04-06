@@ -59,17 +59,15 @@ def update_ponychart_on(expected: bool) -> Callable[[_F], _F]:
 
 
 def retry_on_server_fail(func: _F) -> _F:
-    """在出現 Server communication failed alert ��，自動刷新頁面並重試一次"""
+    """在出現 Server communication failed alert 時，自動刷新頁面並重試一次。"""
 
     @wraps(func)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             return await func(self, *args, **kwargs)
         except Exception as e:
-            # 檢查是否為 alert 相關錯誤
             if "alert" in str(e).lower() or "dialog" in str(e).lower():
                 try:
-                    # 嘗試接受 alert via CDP
                     await self.hvdriver.page.send(
                         cdp.page.handle_javascript_dialog(accept=True)
                     )
@@ -131,12 +129,10 @@ class BattleDriver(HVDriver):
         update_ponychart_classifier()
 
     async def _init_browser(self) -> None:
-        """Override: 初始化瀏覽器後也初始化戰鬥組件"""
         await super()._init_browser()
         await self._init_battle_components()
 
     async def _init_battle_components(self) -> None:
-        """初始化戰鬥相關組件（需要 page 已就緒）"""
         self.battle_dashboard = BattleDashboard(self)
         await self.battle_dashboard.init()
         self.element_action_manager = ElementActionManager(self, self.battle_dashboard)
@@ -147,8 +143,6 @@ class BattleDriver(HVDriver):
         self._buffmanager = BuffManager(self, self.battle_dashboard)
 
     async def _setup_alert_handler(self) -> None:
-        """設置 JavaScript dialog 自動處理"""
-
         async def dialog_handler(
             event: cdp.page.JavascriptDialogOpening,
         ) -> None:
@@ -161,7 +155,6 @@ class BattleDriver(HVDriver):
         return self.control_panel.get_toggle("auto_next_battle")
 
     async def clear_cache(self) -> None:
-        # 重新解析戰鬥儀表板以獲取最新的怪物狀態
         self.round = self.battle_dashboard.log_entries.current_round
         await self.battle_dashboard.update()
 
@@ -212,7 +205,6 @@ class BattleDriver(HVDriver):
     @property
     def new_logs(self) -> list[str]:
         new_logs = self.battle_dashboard.log_entries.current_lines
-        # 固定寬度，假設最大 3 位數
         turn_str = f"Turn {self.turn:>5}"
         current = self.battle_dashboard.log_entries.current_round
         total = self.battle_dashboard.log_entries.total_round
@@ -350,29 +342,33 @@ class BattleDriver(HVDriver):
         if current_url != arena_url:
             return False
 
-        # Arena 列表頁面的圖片 onclick 是 "init_battle(N, 0)"，
-        # 該函式內部會呼叫 confirm() 確認後 submit #initform。
-        # 直接繞過 confirm，從 onclick 字串解析 id 並 submit form：
-        # 1. 找出所有 onclick 帶 init_battle 的元素，取最後一個
-        # 2. 解析出 id
-        # 3. 設定 #initid 並 submit #initform
+        # 從圖片 onclick 解析 init_battle 參數，繞過頁面 confirm() 直接 submit。
+        # 兩種頁面版本：
+        #   init_battle(id, entrycost)        - 對應 form: #initid + #postoken
+        #   init_battle(id, entrycost, token) - 對應 form: #initid + #inittoken
         result = await self.page.evaluate(
-            """
+            r"""
             (() => {
                 const imgs = document.querySelectorAll(
                     'img[onclick*="init_battle"]'
                 );
                 if (imgs.length === 0) return null;
                 const target = imgs[imgs.length - 1];
-                const m = target.getAttribute('onclick').match(
-                    /init_battle\\((\\d+)\\s*,\\s*(\\d+)\\)/
+                const onclick = target.getAttribute('onclick');
+                const m = onclick.match(
+                    /init_battle\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*['"]([^'"]*)['"]\s*)?\)/
                 );
                 if (!m) return null;
                 const id = m[1];
+                const token = m[3];
                 const initid = document.getElementById('initid');
                 const initform = document.getElementById('initform');
                 if (!initid || !initform) return null;
                 initid.value = id;
+                if (token !== undefined) {
+                    const inittoken = document.getElementById('inittoken');
+                    if (inittoken) inittoken.value = token;
+                }
                 initform.submit();
                 return id;
             })()
@@ -443,7 +439,6 @@ class BattleDriver(HVDriver):
                     )
             return monster_alive_ids
 
-        # Check if Orbital Friendship Cannon can be used
         if (
             self.with_ofc
             and self.get_stat_percent("overcharge") > 220
@@ -665,12 +660,11 @@ class BattleDriver(HVDriver):
             self._wait_if_paused()
             try:
                 if not await self.battle_in_turn():
-                    # 可能是樓層轉場時 HTML 還在載入導致解析不到狀態，
-                    # 多等一下再確認是否真的離開戰鬥
+                    # 樓層轉場時 HTML 可能尚未完整載入導致解析不到戰鬥狀態，
+                    # 等待後再次確認是否真的離開戰鬥
                     await asyncio.sleep(2)
                     if not await self._is_in_battle():
                         break
-                    # 仍在戰鬥中，繼續迴圈
                     continue
                 retry_count = 0
             except TimeoutError as e:

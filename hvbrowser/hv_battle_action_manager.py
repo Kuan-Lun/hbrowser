@@ -7,11 +7,8 @@ from hbrowser.gallery.element_action import ElementAction
 from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard
 
-# 用輕量 JS 計算頁面 HTML 的快速 hash（cyrb53 變體），偵測任何頁面變化
-# - 純長度比對會漏掉「字數相同但內容變化」的情況（例如 HP 50% → 60%）
-# - 完整 SHA hash 在大頁面上成本高
-# - cyrb53 是 53-bit 快速非加密 hash，碰撞率極低，計算成本接近 length
-# 加上 null guard 避免在頁面 reload/navigation 過程中 document.body 暫時為 null
+# cyrb53 hash of document.body.innerHTML，用於偵測頁面變化。
+# 回傳 0 表示 document.body 尚未就緒。
 _PAGE_HASH_JS = """
 (() => {
     if (!document.body) return 0;

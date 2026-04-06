@@ -74,10 +74,6 @@ class SkillManager:
         )
 
     def get_max_skill_mp_cost_by_name(self, skill_name: str) -> int:
-        """
-        根據技能名稱（如 'Haste' 或 'Weaken'���從 HTML 片段中找出對應的數值。
-        """
-
         if skill_name not in self.get_skills_and_spells():
             return -1  # Default cost if skill not found
 

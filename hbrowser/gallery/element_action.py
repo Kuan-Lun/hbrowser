@@ -21,11 +21,7 @@ class ElementAction:
         return self._page
 
     async def click(self, element: Any) -> None:
-        """使用 JS 直接觸發 DOM click event，比 mouse_click 更可靠
-
-        DOM click() 會觸發元素上的 onclick handler，
-        不依賴座標計算，避免 stale position 導致點擊到空白處的問題。
-        """
+        """捲動到可見範圍後觸發元素的 DOM click()。"""
         await element.apply(
             "(el) => { el.scrollIntoView({block: 'center'}); el.click(); }"
         )
