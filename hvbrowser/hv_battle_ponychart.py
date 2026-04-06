@@ -22,8 +22,58 @@ class PonyChart:
     def page(self) -> Any:
         return self.hvdriver.page
 
+    async def _wait_for_image_loaded(
+        self, timeout: float = 10.0, min_size: int = 50, stable_checks: int = 3
+    ) -> None:
+        """等待 PonyChart 圖片完全下載並穩定。
+
+        PonyChart 頁面會先載入小 placeholder 再換成真正的圖片，
+        所以光檢查 naturalWidth > 0 不夠，必須：
+        1. 尺寸超過 min_size（避開 4x4 之類的 placeholder）
+        2. src 連續 stable_checks 次都沒變（避開換圖瞬間）
+        """
+        get_state_js = (
+            "(() => {"
+            " const div = document.getElementById('riddleimage');"
+            " if (!div) return null;"
+            " const img = div.querySelector('img');"
+            " if (!img || !img.complete) return null;"
+            " return {"
+            "  src: img.currentSrc || img.src,"
+            "  w: img.naturalWidth,"
+            "  h: img.naturalHeight"
+            " };"
+            "})()"
+        )
+        deadline = asyncio.get_event_loop().time() + timeout
+        last_src: str | None = None
+        stable_count = 0
+        while asyncio.get_event_loop().time() < deadline:
+            state = await self.page.evaluate(get_state_js)
+            if (
+                state
+                and state.get("w", 0) >= min_size
+                and state.get("h", 0) >= min_size
+            ):
+                src = state.get("src")
+                if src == last_src:
+                    stable_count += 1
+                    if stable_count >= stable_checks:
+                        return
+                else:
+                    last_src = src
+                    stable_count = 1
+            else:
+                last_src = None
+                stable_count = 0
+            await asyncio.sleep(0.1)
+        raise TimeoutError("PonyChart image did not finish loading in time")
+
     async def _save_pony_chart_image(self) -> str:
         """保存 PonyChart 圖片到 pony_chart 資料夾，回傳檔案路徑"""
+        # 等待圖片完全載入再截圖
+        await self._wait_for_image_loaded()
+
         # 尋找 riddleimage 中的 img 元素
         riddleimage_div = await self.page.select("#riddleimage")
         img_element = await riddleimage_div.query_selector("img")
