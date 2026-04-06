@@ -31,9 +31,12 @@ class ItemProvider:
     async def is_open_items_menu(self) -> bool:
         """
         Check if the items menu is open.
+
+        必須用 JS 讀取當前 src（而非 element.attrs），因為 HentaiVerse
+        透過 JS 動態切換 img.src，attrs 只反映初始 HTML 屬性。
         """
         items_menu = await self._get_items_menu_element()
-        items_src = items_menu.attrs.get("src", "")
+        items_src = await items_menu.apply("(el) => el.src || ''")
         return "items_s.png" in items_src
 
     async def use(self, item: str) -> bool:

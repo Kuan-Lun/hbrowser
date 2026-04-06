@@ -77,7 +77,8 @@ class PonyChart:
         # 尋找 riddleimage 中的 img 元素
         riddleimage_div = await self.page.select("#riddleimage")
         img_element = await riddleimage_div.query_selector("img")
-        img_src = img_element.attrs.get("src", "")
+        # 用 JS 讀取當前 src（attrs 只反映初始 HTML 屬性）
+        img_src = await img_element.apply("(el) => el.src || ''")
 
         if not img_src:
             raise ValueError("無法獲取圖片 src")
