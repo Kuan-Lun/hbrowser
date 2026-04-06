@@ -643,6 +643,8 @@ class BattleDriver(HVDriver):
         for _ in range(timeout // interval):
             await asyncio.sleep(interval)
             self._wait_if_paused()
+            if self.auto_next_battle and await self.go_next_battle():
+                continue
             if await self._is_in_battle():
                 return True
         return False
