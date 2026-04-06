@@ -644,7 +644,13 @@ class BattleDriver(HVDriver):
             self._wait_if_paused()
             try:
                 if not await self.battle_in_turn():
-                    break
+                    # 可能是樓層轉場時 HTML 還在載入導致解析不到狀態，
+                    # 多等一下再確認是否真的離開戰鬥
+                    await asyncio.sleep(2)
+                    if not await self._is_in_battle():
+                        break
+                    # 仍在戰鬥中，繼續迴圈
+                    continue
                 retry_count = 0
             except TimeoutError as e:
                 retry_count += 1
