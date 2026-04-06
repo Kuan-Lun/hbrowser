@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial, wraps
@@ -342,39 +343,66 @@ class BattleDriver(HVDriver):
         if current_url != arena_url:
             return False
 
-        # 從圖片 onclick 解析 init_battle 參數，繞過頁面 confirm() 直接 submit。
-        # 兩種頁面版本：
-        #   init_battle(id, entrycost)        - 對應 form: #initid + #postoken
-        #   init_battle(id, entrycost, token) - 對應 form: #initid + #inittoken
-        result = await self.page.evaluate(
-            r"""
+        # init_battle 有兩種簽名：
+        #   init_battle(id, entrycost)        - form: postoken
+        #   init_battle(id, entrycost, token) - form: inittoken
+        onclick_list = await self.page.evaluate(
+            """
             (() => {
                 const imgs = document.querySelectorAll(
                     'img[onclick*="init_battle"]'
                 );
-                if (imgs.length === 0) return null;
-                const target = imgs[imgs.length - 1];
-                const onclick = target.getAttribute('onclick');
-                const m = onclick.match(
-                    /init_battle\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*['"]([^'"]*)['"]\s*)?\)/
+                return Array.from(imgs).map(
+                    (el) => el.getAttribute('onclick') || ''
                 );
-                if (!m) return null;
-                const id = m[1];
-                const token = m[3];
-                const initid = document.getElementById('initid');
-                const initform = document.getElementById('initform');
-                if (!initid || !initform) return null;
-                initid.value = id;
-                if (token !== undefined) {
-                    const inittoken = document.getElementById('inittoken');
-                    if (inittoken) inittoken.value = token;
-                }
-                initform.submit();
-                return id;
             })()
             """
         )
-        return result is not None
+        if not onclick_list:
+            return False
+
+        target_onclick = onclick_list[-1]
+        match = re.match(
+            r"init_battle\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*['\"]([^'\"]*)['\"]\s*)?\)",
+            target_onclick,
+        )
+        if not match:
+            logger.debug(
+                f"go_next_battle: onclick did not match pattern: {target_onclick}"
+            )
+            return False
+
+        battle_id = match.group(1)
+        token = match.group(3)
+        token_js = f"'{token}'" if token is not None else "null"
+
+        # form submit 觸發 navigation 會中斷 evaluate，需要忽略例外
+        try:
+            await self.page.evaluate(
+                f"""
+                (() => {{
+                    const initid = document.getElementById('initid');
+                    const initform = document.getElementById('initform');
+                    if (!initid || !initform) return false;
+                    initid.value = '{battle_id}';
+                    const tokenVal = {token_js};
+                    if (tokenVal !== null) {{
+                        const inittoken = document.getElementById('inittoken');
+                        if (inittoken) inittoken.value = tokenVal;
+                    }}
+                    initform.submit();
+                    return true;
+                }})()
+                """
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"go_next_battle: started battle id={battle_id} "
+            f"token={'<present>' if token else '<none>'}"
+        )
+        return True
 
     async def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
