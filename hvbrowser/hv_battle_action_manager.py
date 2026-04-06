@@ -87,42 +87,34 @@ class ElementActionManager:
     async def click_and_wait_log_locator(
         self,
         selector: str,
-        is_retry: bool = True,
         stale_retries: int = 3,
         timeout: float = 5.0,
         check_interval: float = 0.3,
     ) -> None:
         """
-        點擊元素並等待戰鬥 log 更新。
+        點擊元素並等待頁面變化。
 
-        使用輕量 JS 輪詢 battlelog innerHTML 偵測變化，
-        避免頻繁呼叫 get_content() + parse_snapshot() 阻塞 CDP 連線。
+        使用 cyrb53 hash 比對 document.body.innerHTML 偵測任何頁面變化。
+        timeout 後直接 raise，由外層 battle() 的 recovery 機制統一處理。
         """
-        # 用輕量 JS 取得 pre-click log 快照
-        pre_log = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
+        # 用輕量 JS 取得 pre-click hash 快照
+        pre_hash = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
 
         # 點擊
         await self._action.click_locator(
             selector, retries=stale_retries, wait_timeout=2.0, delay=0.1
         )
 
-        # 輪詢：用輕量 JS 偵測 log 變化
+        # 輪詢：用 hash 偵測頁面變化
         waited = 0.0
         while True:
             await asyncio.sleep(check_interval)
             waited += check_interval
-            current_log = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
-            if current_log != pre_log:
-                break
+            current_hash = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
+            if current_hash != pre_hash:
+                return
             if waited >= timeout:
-                if is_retry:
-                    await self.hvdriver.page.reload()
-                    return await self.click_and_wait_log_locator(
-                        selector,
-                        is_retry=False,
-                        stale_retries=stale_retries,
-                        timeout=timeout,
-                        check_interval=check_interval,
-                    )
-                else:
-                    raise TimeoutError("Battle action timeout waiting for log update")
+                raise TimeoutError(
+                    f"Battle action timeout waiting for page change "
+                    f"after clicking {selector}"
+                )

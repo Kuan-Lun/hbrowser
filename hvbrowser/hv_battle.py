@@ -646,7 +646,7 @@ class BattleDriver(HVDriver):
                 if not await self.battle_in_turn():
                     break
                 retry_count = 0
-            except TimeoutError:
+            except TimeoutError as e:
                 retry_count += 1
                 if retry_count >= max_retries:
                     logger.error(
@@ -655,7 +655,7 @@ class BattleDriver(HVDriver):
                     )
                     raise
                 logger.warning(
-                    "TimeoutError caught, reloading page "
+                    f"TimeoutError caught: {e!r}, reloading page "
                     f"(attempt {retry_count}/{max_retries})"
                 )
                 if await self._wait_for_page_recovery():
