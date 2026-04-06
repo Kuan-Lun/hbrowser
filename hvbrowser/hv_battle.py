@@ -104,7 +104,7 @@ class BattleDriver(HVDriver):
         self._skillmanager: SkillManager = None  # type: ignore[assignment]
         self._buffmanager: BuffManager = None  # type: ignore[assignment]
         self.control_panel = ControlPanel()
-        self.control_panel.register_toggle("auto_next_battle")
+        self.control_panel.register_toggle("auto_next_battle", default=True)
 
         forbidden_lower = [
             s.lower() for s in (forbidden_skills or DEFAULT_FORBIDDEN_SKILLS)
