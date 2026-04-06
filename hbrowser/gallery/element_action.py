@@ -21,16 +21,14 @@ class ElementAction:
         return self._page
 
     async def click(self, element: Any) -> None:
-        """點擊元素，先嘗試滾動到可見位置再模擬滑鼠點擊，失敗時用 JS click"""
-        try:
-            await element.scroll_into_view()
-            await element.mouse_move()
-            await element.mouse_click()
-        except Exception as e:
-            if "could not find position" in str(e):
-                await element.apply("(el) => el.click()")
-            else:
-                raise
+        """使用 JS 直接觸發 DOM click event，比 mouse_click 更可靠
+
+        DOM click() 會觸發元素上的 onclick handler，
+        不依賴座標計算，避免 stale position 導致點擊到空白處的問題。
+        """
+        await element.apply(
+            "(el) => { el.scrollIntoView({block: 'center'}); el.click(); }"
+        )
 
     async def click_resilient(
         self,

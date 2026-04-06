@@ -7,9 +7,28 @@ from hbrowser.gallery.element_action import ElementAction
 from .hv import HVDriver
 from .hv_battle_observer_pattern import BattleDashboard
 
-# 用輕量 JS 取得頁面 HTML 長度，偵測任何頁面變化（log 更新、HP 變化等）
+# 用輕量 JS 計算頁面 HTML 的快速 hash（cyrb53 變體），偵測任何頁面變化
+# - 純長度比對會漏掉「字數相同但內容變化」的情況（例如 HP 50% → 60%）
+# - 完整 SHA hash 在大頁面上成本高
+# - cyrb53 是 53-bit 快速非加密 hash，碰撞率極低，計算成本接近 length
 # 加上 null guard 避免在頁面 reload/navigation 過程中 document.body 暫時為 null
-_PAGE_LENGTH_JS = "(document.body && document.body.innerHTML.length) || 0"
+_PAGE_HASH_JS = """
+(() => {
+    if (!document.body) return 0;
+    const s = document.body.innerHTML;
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+    h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+    h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+})()
+"""
 
 
 class ElementActionManager:
@@ -80,7 +99,7 @@ class ElementActionManager:
         避免頻繁呼叫 get_content() + parse_snapshot() 阻塞 CDP 連線。
         """
         # 用輕量 JS 取得 pre-click log 快照
-        pre_log = await self.hvdriver.page.evaluate(_PAGE_LENGTH_JS)
+        pre_log = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
 
         # 點擊
         await self._action.click_locator(
@@ -92,7 +111,7 @@ class ElementActionManager:
         while True:
             await asyncio.sleep(check_interval)
             waited += check_interval
-            current_log = await self.hvdriver.page.evaluate(_PAGE_LENGTH_JS)
+            current_log = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
             if current_log != pre_log:
                 break
             if waited >= timeout:
