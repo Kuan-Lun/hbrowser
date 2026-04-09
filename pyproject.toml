@@ -43,3 +43,6 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+# Mirror flake8's Black-compatible ignore set (see .vscode/settings.json).
+# These pycodestyle rules conflict with Black's formatting choices.
+extend-ignore = ["E203", "E226", "E501"]
