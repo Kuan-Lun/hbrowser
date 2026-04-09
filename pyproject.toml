@@ -11,13 +11,13 @@ authors = [{ name = "Kuan-Lun Wang" }]
 license = { text = "GNU Affero General Public License v3" }
 requires-python = ">=3.11,<3.15"
 dependencies = [
-    "2captcha-python>=2.0.5",
+    "2captcha-python>=2.0.6",
     "beautifulsoup4>=4.14.3",
     "fake-useragent>=2.2.0",
     "h2h-galleryinfo-parser>=0.2.2",
     "hv-bie>=0.5.2",
-    "ponychart-classifier>=0.3.14",
-    "zendriver>=0.15.2",
+    "ponychart-classifier>=0.4.3",
+    "zendriver>=0.15.3",
 ]
 
 classifiers = [
