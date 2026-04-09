@@ -13,6 +13,8 @@ tmp
 !.github/**
 !/.vscode/
 !.vscode/**
+!.claude/
+!.claude/**
 
 uv.lock
 
