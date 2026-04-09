@@ -24,7 +24,7 @@
 set -eu
 trap 'exit 2' ERR
 
-PATHS=(src app tests scripts)
+PATHS=(hbrowser hvbrowser)
 
 uv run black "${PATHS[@]}" >&2
 uv run ruff check --fix "${PATHS[@]}" >&2
