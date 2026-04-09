@@ -22,6 +22,10 @@ uv run ruff check .
 uv run black .
 ```
 
+## Running Python
+
+- Always use `uv run python` to run scripts, tests, or ad-hoc snippets.
+
 ## Environment Variables
 
 - `APIKEY_2CAPTCHA` - Required for CAPTCHA solving via 2Captcha service
