@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**/*)",
+      "Write(**/*)",
+      "Edit(**/*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(uv:*)",
+      "Bash(grep:*)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/finalize-python.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/finalize-markdown.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
