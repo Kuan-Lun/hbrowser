@@ -346,8 +346,7 @@ class BattleDriver(HVDriver):
         # init_battle 有兩種簽名：
         #   init_battle(id, entrycost)        - form: postoken
         #   init_battle(id, entrycost, token) - form: inittoken
-        onclick_list = await self.page.evaluate(
-            """
+        onclick_list = await self.page.evaluate("""
             (() => {
                 const imgs = document.querySelectorAll(
                     'img[onclick*="init_battle"]'
@@ -356,8 +355,7 @@ class BattleDriver(HVDriver):
                     (el) => el.getAttribute('onclick') || ''
                 );
             })()
-            """
-        )
+            """)
         if not onclick_list:
             return False
 
@@ -378,8 +376,7 @@ class BattleDriver(HVDriver):
 
         # form submit 觸發 navigation 會中斷 evaluate，需要忽略例外
         try:
-            await self.page.evaluate(
-                f"""
+            await self.page.evaluate(f"""
                 (() => {{
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
@@ -393,8 +390,7 @@ class BattleDriver(HVDriver):
                     initform.submit();
                     return true;
                 }})()
-                """
-            )
+                """)
         except Exception:
             pass
 

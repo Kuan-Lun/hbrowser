@@ -131,8 +131,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
 
         if not sitekey:
             try:
-                sitekey = await page.evaluate(
-                    """
+                sitekey = await page.evaluate("""
                     (() => {
                         if (window.turnstile && window.turnstile.sitekey) {
                             return window.turnstile.sitekey;
@@ -148,8 +147,7 @@ class TwoCaptchaAdapter(CaptchaSolver):
                         }
                         return null;
                     })()
-                """
-                )
+                """)
                 if sitekey:
                     logger.debug(f"Found sitekey from JavaScript: {sitekey}")
             except Exception as e:
