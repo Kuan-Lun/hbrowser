@@ -29,6 +29,7 @@ HBrowser requires the following environment variables:
 Set the environment variables before running the script:
 
 **Bash/Zsh:**
+
 ```bash
 export EH_USERNAME=your_username
 export EH_PASSWORD=your_password
@@ -39,6 +40,7 @@ export TOR_BINARY_PATH=/path/to/tor     # Optional: custom tor path
 ```
 
 **Fish:**
+
 ```fish
 set -x EH_USERNAME your_username
 set -x EH_PASSWORD your_password
@@ -49,6 +51,7 @@ set -x TOR_BINARY_PATH /path/to/tor     # Optional: custom tor path
 ```
 
 **Windows Command Prompt:**
+
 ```cmd
 set EH_USERNAME=your_username
 set EH_PASSWORD=your_password
@@ -59,6 +62,7 @@ set TOR_BINARY_PATH=C:\path\to\tor.exe
 ```
 
 **Windows PowerShell:**
+
 ```powershell
 $env:EH_USERNAME="your_username"
 $env:EH_PASSWORD="your_password"
@@ -80,6 +84,7 @@ HBrowser uses Python's built-in `logging` module. You can control the log level 
 - **ERROR**: A serious problem that prevented a function from executing
 
 Example:
+
 ```bash
 # Set log level to DEBUG for detailed output
 export HBROWSER_LOG_LEVEL=DEBUG
