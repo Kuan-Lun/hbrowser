@@ -25,12 +25,14 @@ async def wait_for_new_tab(
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         await browser.update_targets()
-        current_tabs = {t.target.target_id for t in browser.tabs}
+        current_tabs = {
+            t.target.target_id for t in browser.tabs if t.target is not None
+        }
         new_tabs = current_tabs - existing_tabs
         if new_tabs:
             new_tab_id = next(iter(new_tabs))
             for tab in browser.tabs:
-                if tab.target.target_id == new_tab_id:
+                if tab.target is not None and tab.target.target_id == new_tab_id:
                     return tab
         await asyncio.sleep(0.2)
     return None

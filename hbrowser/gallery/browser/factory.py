@@ -109,10 +109,12 @@ async def _post_create_setup(
     await page.send(cdp.emulation.set_geolocation_override())
 
     ua = await page.evaluate("navigator.userAgent")
+    if not isinstance(ua, str):
+        raise RuntimeError(f"Unexpected userAgent evaluation result: {ua!r}")
     await page.send(cdp.network.set_user_agent_override(user_agent=ua))
 
     if tor_process is not None:
-        browser._tor_process = tor_process
+        browser._tor_process = tor_process  # type: ignore[attr-defined]
 
     if use_tor and not has_residential_proxy():
         await verify_proxy_ip(browser, page)
@@ -146,6 +148,8 @@ async def create_browser(
     logger.debug("Initializing browser...")
     browser = await zd.start(config=config)
     page = browser.main_tab
+    if page is None:
+        raise RuntimeError("Browser failed to expose a main tab")
     logger.info("Browser initialized successfully")
 
     await _post_create_setup(browser, page, tor_process, use_tor)

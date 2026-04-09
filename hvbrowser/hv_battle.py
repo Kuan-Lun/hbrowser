@@ -70,7 +70,7 @@ def retry_on_server_fail(func: _F) -> _F:
             if "alert" in str(e).lower() or "dialog" in str(e).lower():
                 try:
                     await self.hvdriver.page.send(
-                        cdp.page.handle_javascript_dialog(accept=True)
+                        cdp.page.handle_java_script_dialog(accept=True)
                     )
                     logger.warning(
                         "Server communication failed detected, "
@@ -147,7 +147,7 @@ class BattleDriver(HVDriver):
         async def dialog_handler(
             event: cdp.page.JavascriptDialogOpening,
         ) -> None:
-            await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
+            await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
 
         self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
 
@@ -636,7 +636,7 @@ class BattleDriver(HVDriver):
         except Exception:
             logger.info("Alert or error detected, attempting to handle it.")
             try:
-                await self.page.send(cdp.page.handle_javascript_dialog(accept=True))
+                await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
             except Exception:
                 logger.debug("No dialog to accept or already dismissed.")
             return False
