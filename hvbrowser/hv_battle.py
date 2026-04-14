@@ -654,41 +654,40 @@ class BattleDriver(HVDriver):
         return False
 
     async def battle(self) -> None:
-        if not await self._wait_for_battle():
-            logger.info("No battle detected after waiting, exiting.")
-            return
-
-        self._create_last_debuff_monster_id()
-
-        max_retries = 3
-        retry_count = 0
         while True:
-            self._wait_if_paused()
-            try:
-                if not await self.battle_in_turn():
-                    # 樓層轉場時 HTML 可能尚未完整載入導致解析不到戰鬥狀態，
-                    # 等待後再次確認是否真的離開戰鬥
-                    await asyncio.sleep(2)
-                    if not await self._is_in_battle():
-                        break
-                    continue
-                retry_count = 0
-            except TimeoutError as e:
-                retry_count += 1
-                if retry_count >= max_retries:
-                    logger.error(
-                        "TimeoutError caught, max retries reached "
-                        f"({max_retries}/{max_retries})"
+            if not await self._wait_for_battle():
+                logger.info("No battle detected after waiting, exiting.")
+                return
+
+            self._create_last_debuff_monster_id()
+
+            max_retries = 3
+            retry_count = 0
+            while True:
+                self._wait_if_paused()
+                try:
+                    if not await self.battle_in_turn():
+                        # 樓層轉場時 HTML 可能尚未完整載入導致解析不到戰鬥狀態，
+                        # 等待後再次確認是否真的離開戰鬥
+                        await asyncio.sleep(2)
+                        if not await self._is_in_battle():
+                            break
+                        continue
+                    retry_count = 0
+                except TimeoutError as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error(
+                            "TimeoutError caught, max retries reached "
+                            f"({max_retries}/{max_retries})"
+                        )
+                        raise
+                    logger.warning(
+                        f"TimeoutError caught: {e!r}, retrying turn "
+                        f"(attempt {retry_count}/{max_retries})"
                     )
-                    raise
-                logger.warning(
-                    f"TimeoutError caught: {e!r}, retrying turn "
-                    f"(attempt {retry_count}/{max_retries})"
-                )
-                await asyncio.sleep(5)
-                continue
+                    await asyncio.sleep(5)
+                    continue
 
-        notify("HBrowser", "Battle complete")
-        logger.info("Battle complete, waiting 300s for user to start next battle...")
-
-        await self.battle()
+            notify("HBrowser", "Battle complete")
+            logger.info("Battle complete.")
