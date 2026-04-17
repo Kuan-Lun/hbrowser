@@ -16,7 +16,7 @@ dependencies = [
     "fake-useragent>=2.2.0",
     "h2h-galleryinfo-parser>=0.2.2",
     "hv-bie>=0.5.2",
-    "ponychart-classifier>=0.5.0",
+    "ponychart-classifier>=0.6.0",
     "zendriver>=0.15.3",
 ]
 
