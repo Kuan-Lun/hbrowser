@@ -8,7 +8,7 @@ from typing import Any
 
 from .browser import DriverRestartRotator, ProxyRotator, create_browser, stop_browser
 from .browser.ban_handler import handle_ban_decorator
-from .captcha import CaptchaManager, TwoCaptchaAdapter
+from .captcha import CaptchaDetector
 from .utils import get_log_dir, matchurl, setup_logger
 
 
@@ -27,6 +27,7 @@ class Driver(ABC):
         headless: bool = True,
         proxy_rotator: ProxyRotator | None = None,
         max_captcha_retries: int = 3,
+        captcha_manual_timeout: int = 180,
     ) -> None:
         def seturl() -> dict[str, str]:
             url: dict[str, str] = dict()
@@ -49,10 +50,8 @@ class Driver(ABC):
         self.myget: Any = None
         self.proxy_rotator = proxy_rotator or DriverRestartRotator()
         self.max_captcha_retries = max_captcha_retries
-
-        # 180 秒等待時間讓非 headless 模式有足夠時間手動解決驗證碼
-        solver = TwoCaptchaAdapter(max_wait=180)
-        self.captcha_manager = CaptchaManager(solver)
+        self.captcha_manual_timeout = captcha_manual_timeout
+        self.captcha_detector = CaptchaDetector()
 
     async def _init_browser(self) -> None:
         self.browser, self.page = await create_browser(headless=self.headless)
@@ -163,26 +162,16 @@ class Driver(ABC):
         self.myget = handle_ban_decorator(self.page)
 
     async def _handle_login_recaptcha(self, manual_timeout: float = 300.0) -> None:
-        """處理登入表單上的 reCAPTCHA v2。
-
-        先嘗試透過 2Captcha 自動解決，若失敗則等待使用者手動完成。
+        """處理登入表單上的 reCAPTCHA v2，等待使用者手動完成。
 
         Args:
             manual_timeout: 等待手動完成的超時時間（秒），預設 300 秒
         """
-        det = await self.captcha_manager.detect(self.page, timeout=3.0)
+        det = await self.captcha_detector.detect(self.page, timeout=3.0)
         if det.kind != "recaptcha_v2":
             return
 
         self.logger.info("reCAPTCHA v2 detected on login form")
-
-        try:
-            result = await self.captcha_manager.solve(det, self.page)
-            if result:
-                self.logger.info("reCAPTCHA v2 solved automatically")
-                return
-        except Exception:
-            self.logger.debug("Auto-solve failed, will wait for manual completion")
 
         token = await self.page.evaluate(
             "(() => {"
@@ -220,7 +209,7 @@ class Driver(ABC):
         url: str,
         detect_timeout: float = 3.0,
     ) -> None:
-        """檢測並解決 Cloudflare 驗證，失敗時自動輪換代理重試。
+        """檢測 Cloudflare 驗證並等待使用者手動解決，失敗時自動輪換代理重試。
 
         Args:
             url: 要存取的 URL（輪換代理後需重新導航）
@@ -230,7 +219,7 @@ class Driver(ABC):
             Exception: 所有重試都失敗後拋出
         """
         for attempt in range(1, self.max_captcha_retries + 1):
-            det = await self.captcha_manager.detect(self.page, timeout=detect_timeout)
+            det = await self.captcha_detector.detect(self.page, timeout=detect_timeout)
             if det.kind == "none":
                 self.logger.info("No challenge detected")
                 return
@@ -245,18 +234,24 @@ class Driver(ABC):
                 f.write(await self.page.get_content())
             self.logger.debug(f"Challenge page saved to: {challenge_page_path}")
 
-            self.logger.info(f"Attempting to solve {det.kind} challenge...")
-            try:
-                success = await self.captcha_manager.solve(det, self.page)
-            except Exception:
-                success = False
+            self.logger.info(
+                "Please solve the challenge manually in the browser. "
+                f"Waiting up to {self.captcha_manual_timeout} seconds..."
+            )
 
-            if success:
-                self.logger.info("Challenge solved successfully")
-                return
+            start_time = asyncio.get_event_loop().time()
+            while (
+                asyncio.get_event_loop().time() - start_time
+                < self.captcha_manual_timeout
+            ):
+                current_det = await self.captcha_detector.detect(self.page, timeout=1.0)
+                if current_det.kind == "none":
+                    self.logger.info("Challenge resolved successfully")
+                    return
+                await asyncio.sleep(5)
 
             self.logger.warning(
-                f"Failed to solve challenge "
+                f"Challenge not resolved within {self.captcha_manual_timeout}s "
                 f"(attempt {attempt}/{self.max_captcha_retries})"
             )
             if attempt < self.max_captcha_retries:
@@ -264,7 +259,7 @@ class Driver(ABC):
                 await self.myget(url)
 
         raise Exception(
-            f"Failed to solve captcha after {self.max_captcha_retries} attempts "
+            f"Failed to resolve captcha after {self.max_captcha_retries} attempts "
             f"with proxy rotation"
         )
 

@@ -15,13 +15,3 @@ class ChallengeDetection:
     sitekey: str | None = None
     iframe_src: str | None = None
     ray_id: str | None = None
-
-
-@dataclass
-class SolveResult:
-    """驗證碼解決結果"""
-
-    success: bool
-    token: str | None = None
-    error_message: str | None = None
-    solver_name: str = "unknown"

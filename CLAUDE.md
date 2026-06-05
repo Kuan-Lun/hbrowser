@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses Selenium with undetected-chromedriver and integrates 2Captcha for solving Cloudflare challenges.
+HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses Selenium with undetected-chromedriver. Cloudflare and CAPTCHA challenges require manual user interaction.
 
 ## Build & Development Commands
 
@@ -28,7 +28,6 @@ uv run black .
 
 ## Environment Variables
 
-- `APIKEY_2CAPTCHA` - Required for CAPTCHA solving via 2Captcha service
 - `EH_USERNAME` / `EH_PASSWORD` - Login credentials for E-Hentai
 - `HBROWSER_LOG_LEVEL` - Optional: DEBUG, INFO, WARNING, ERROR (default: INFO)
 
@@ -40,7 +39,7 @@ uv run black .
   - `gallery/driver_base.py` - Abstract `Driver` base class with Selenium integration, login flow, and CAPTCHA handling
   - `gallery/eh_driver.py` - `EHDriver` for E-Hentai
   - `gallery/exh_driver.py` - `ExHDriver` for ExHentai
-  - `gallery/captcha/` - CAPTCHA detection and solving (supports Cloudflare Turnstile via 2Captcha)
+  - `gallery/captcha/` - CAPTCHA and Cloudflare challenge detection (manual user resolution)
   - `gallery/browser/` - Browser factory with undetected-chromedriver
 
 - **`hvbrowser`** - HentaiVerse game automation
@@ -62,7 +61,6 @@ uv run black .
 - `hv-bie` - Battle snapshot parsing library
 - `h2h-galleryinfo-parser` - Gallery metadata parsing
 - `undetected-chromedriver` - Evades bot detection
-- `2captcha-python` - CAPTCHA solving API client
 
 ## Coding Guidelines
 
