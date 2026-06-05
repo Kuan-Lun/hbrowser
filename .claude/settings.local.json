@@ -9,7 +9,8 @@
       "Bash(tree:*)",
       "Bash(find:*)",
       "Bash(uv:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(xargs cat)"
     ]
   },
   "hooks": {
