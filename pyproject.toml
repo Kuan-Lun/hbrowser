@@ -34,7 +34,7 @@ dev = [
     "black>=26.5.1",
     "ruff>=0.15.16",
     "mypy>=2.1.0",
-    "pymarkdownlnt>=0.9.36",
+    "pymarkdownlnt>=0.9.37",
 ]
 
 [project.urls]
