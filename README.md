@@ -6,7 +6,7 @@
 
 HBrowser can route all traffic through the Tor network for IP privacy. If Tor Browser is installed, HBrowser will automatically detect and use it. To install:
 
-1. Download and install from https://www.torproject.org/download/
+1. Download and install from <https://www.torproject.org/download/>
 2. HBrowser will automatically locate the `tor` binary from the default installation path:
    - **macOS**: `/Applications/Tor Browser.app/Contents/MacOS/Tor/tor`
    - **Linux**: `/usr/bin/tor`
