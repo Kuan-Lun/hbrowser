@@ -57,6 +57,10 @@ class BattleSubject:
         self._observers.remove(observer)
 
     async def notify(self) -> None:
+        mapper = self._hvdriver.page.mapper
+        for k in list(mapper):
+            if mapper[k].done():
+                del mapper[k]
         html = await self._hvdriver.page.get_content()
         self.snap = parse_snapshot(html)
         for observer in self._observers:
