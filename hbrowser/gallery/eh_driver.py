@@ -139,6 +139,11 @@ class EHDriver(Driver):
     async def download(self, gallery: GalleryURLParser) -> bool:
         self.logger.info(f"Starting download for gallery: {gallery.url}")
 
+        mapper = self.page.mapper
+        for k in list(mapper):
+            if mapper[k].done():
+                del mapper[k]
+
         await self.get(gallery.url)
         try:
             xpath_query_list = [
