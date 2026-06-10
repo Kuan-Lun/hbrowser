@@ -100,21 +100,12 @@ class ElementActionManager:
         timeout: float = 5.0,
         check_interval: float = 0.3,
     ) -> None:
-        """
-        點擊元素並等待頁面變化。
-
-        使用 cyrb53 hash 比對 document.body.innerHTML 偵測任何頁面變化。
-        timeout 後直接 raise，由外層 battle() 的 recovery 機制統一處理。
-        """
-        # 用輕量 JS 取得 pre-click hash 快照
         pre_hash = await self._page_hash()
 
-        # 點擊
         await self._action.click_locator(
             selector, retries=stale_retries, wait_timeout=2.0, delay=0.1
         )
 
-        # 輪詢：用 hash 偵測頁面變化
         waited = 0.0
         while True:
             await asyncio.sleep(check_interval)
