@@ -10,7 +10,9 @@
       "Bash(find:*)",
       "Bash(uv:*)",
       "Bash(grep:*)",
-      "Bash(xargs cat)"
+      "Bash(xargs cat)",
+      "Bash(git diff:*)",
+      "Bash(git -C * diff:*)"
     ]
   },
   "hooks": {
