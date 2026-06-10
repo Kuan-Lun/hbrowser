@@ -80,6 +80,18 @@ class ElementActionManager:
             selector, retries=retries, wait_timeout=wait_timeout, delay=delay
         )
 
+    async def _page_hash(self, timeout: float = 5.0) -> int:
+        """取得頁面內容 hash。
+
+        zendriver 的 CDP 呼叫沒有內建 timeout，若頁面在 evaluate 期間
+        發生 navigation 導致 execution context 被銷毀，回應可能永遠不會
+        送達，造成 await 永久卡死。這裡用 asyncio.wait_for 包一層，逾時
+        改丟 TimeoutError，交由外層 battle() 的 recovery 機制處理。
+        """
+        return await asyncio.wait_for(
+            self.hvdriver.page.evaluate(_PAGE_HASH_JS), timeout=timeout
+        )
+
     # --- Battle-specific methods ---
     async def click_and_wait_log_locator(
         self,
@@ -95,7 +107,7 @@ class ElementActionManager:
         timeout 後直接 raise，由外層 battle() 的 recovery 機制統一處理。
         """
         # 用輕量 JS 取得 pre-click hash 快照
-        pre_hash = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
+        pre_hash = await self._page_hash()
 
         # 點擊
         await self._action.click_locator(
@@ -107,7 +119,7 @@ class ElementActionManager:
         while True:
             await asyncio.sleep(check_interval)
             waited += check_interval
-            current_hash = await self.hvdriver.page.evaluate(_PAGE_HASH_JS)
+            current_hash = await self._page_hash()
             if current_hash != pre_hash:
                 return
             if waited >= timeout:

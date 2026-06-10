@@ -1,3 +1,4 @@
+import asyncio
 import re
 from abc import ABC, abstractmethod
 from collections import deque
@@ -45,9 +46,21 @@ class BattleSubject:
         self._hvdriver = driver
         self.snap: Any = None
 
+    async def _get_content(self, timeout: float = 10.0) -> str:
+        """取得頁面內容。
+
+        zendriver 的 CDP 呼叫沒有內建 timeout，若頁面在取得內容期間發生
+        navigation 導致 execution context 被銷毀，回應可能永遠不會送達，
+        造成 await 永久卡死。這裡用 asyncio.wait_for 包一層，逾時改丟
+        TimeoutError，交由外層 battle() 的 recovery 機制處理。
+        """
+        return await asyncio.wait_for(
+            self._hvdriver.page.get_content(), timeout=timeout
+        )
+
     async def init(self) -> None:
         """非同步初始化 - 取得初始快照"""
-        html = await self._hvdriver.page.get_content()
+        html = await self._get_content()
         self.snap = parse_snapshot(html)
 
     def attach(self, observer: Observer) -> None:
@@ -61,7 +74,7 @@ class BattleSubject:
         for k in list(mapper):
             if mapper[k].done():
                 del mapper[k]
-        html = await self._hvdriver.page.get_content()
+        html = await self._get_content()
         self.snap = parse_snapshot(html)
         for observer in self._observers:
             observer.update(self.snap)
