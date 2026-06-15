@@ -400,6 +400,48 @@ class BattleDriver(HVDriver):
         )
         return True
 
+    @update_ponychart_on(True)
+    async def go_grindfest(self) -> bool:
+        onclick_list = await self.page.evaluate("""
+            (() => {
+                const imgs = document.querySelectorAll(
+                    '#grindfest img[onclick*="init_battle"]'
+                );
+                return Array.from(imgs).map(
+                    (el) => el.getAttribute('onclick') || ''
+                );
+            })()
+            """)
+        if not onclick_list:
+            return False
+
+        match = re.match(r"init_battle\(\s*(\d+)\s*\)", onclick_list[0])
+        if not match:
+            logger.debug(
+                f"go_grindfest: onclick did not match pattern: {onclick_list[0]}"
+            )
+            return False
+
+        grindfest_id = match.group(1)
+
+        # form submit 觸發 navigation 會中斷 evaluate，需要忽略例外
+        try:
+            await self.page.evaluate(f"""
+                (() => {{
+                    const initid = document.getElementById('initid');
+                    const initform = document.getElementById('initform');
+                    if (!initid || !initform) return false;
+                    initid.value = '{grindfest_id}';
+                    initform.submit();
+                    return true;
+                }})()
+                """)
+        except Exception:
+            pass
+
+        logger.info(f"go_grindfest: started grindfest id={grindfest_id}")
+        return True
+
     async def debuff_monster(self, debuff: str, nums: list[int]) -> bool:
         debuff_skill = MONSTER_DEBUFF_TO_CHARACTER_SKILL[debuff]
         if debuff_skill in self.forbidden_skills:
@@ -596,6 +638,7 @@ class BattleDriver(HVDriver):
 
         for fun in [
             *([] if not self.auto_next_battle else [self.go_next_battle]),
+            *([] if not self.auto_next_battle else [self.go_grindfest]),
             self.go_next_floor,
             PonyChart(self).check,
             self.check_hp,
@@ -648,6 +691,8 @@ class BattleDriver(HVDriver):
             await asyncio.sleep(interval)
             self._wait_if_paused()
             if self.auto_next_battle and await self.go_next_battle():
+                continue
+            if self.auto_next_battle and await self.go_grindfest():
                 continue
             if await self._is_in_battle():
                 return True
