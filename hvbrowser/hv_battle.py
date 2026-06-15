@@ -638,7 +638,6 @@ class BattleDriver(HVDriver):
 
         for fun in [
             *([] if not self.auto_next_battle else [self.go_next_battle]),
-            *([] if not self.auto_next_battle else [self.go_grindfest]),
             self.go_next_floor,
             PonyChart(self).check,
             self.check_hp,
