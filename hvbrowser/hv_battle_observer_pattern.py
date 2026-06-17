@@ -7,6 +7,7 @@ from typing import Any, TypeVar, overload
 
 from hv_bie import parse_snapshot
 from hv_bie.types import BattleSnapshot
+from zendriver.core.connection import ProtocolException
 
 from .hv import HVDriver
 
@@ -53,10 +54,22 @@ class BattleSubject:
         navigation 導致 execution context 被銷毀，回應可能永遠不會送達，
         造成 await 永久卡死。這裡用 asyncio.wait_for 包一層，逾時改丟
         TimeoutError，交由外層 battle() 的 recovery 機制處理。
+
+        zendriver 的 Connection.send() 在 mapper 為空時重置 id counter，
+        該檢查沒有上鎖，若此時另一個 coroutine（例如 alert dialog handler）
+        也同時呼叫 send()，兩者可能搶到同一個 id 而觸發
+        `ProtocolException: Duplicate id`。這是暫時性的競態，重試一次即可。
         """
-        return await asyncio.wait_for(
-            self._hvdriver.page.get_content(), timeout=timeout
-        )
+        try:
+            return await asyncio.wait_for(
+                self._hvdriver.page.get_content(), timeout=timeout
+            )
+        except ProtocolException as e:
+            if "duplicate" not in str(e).lower():
+                raise
+            return await asyncio.wait_for(
+                self._hvdriver.page.get_content(), timeout=timeout
+            )
 
     async def init(self) -> None:
         """非同步初始化 - 取得初始快照"""
