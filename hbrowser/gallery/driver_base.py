@@ -171,6 +171,21 @@ class Driver(ABC):
         )
         self.myget = handle_ban_decorator(self.page)
 
+    @property
+    def can_auto_resolve_challenges(self) -> bool:
+        """是否能在無人值守的情況下自動解決登入時的 Cloudflare 驗證。
+
+        目前唯一的自動解法是 FlareSolverr；未來若加入其他解法，只需要改這裡。
+        """
+        return should_use_flaresolverr()
+
+    async def reconnect(self) -> None:
+        """重啟瀏覽器並重新登入，用於從連線中斷復原。"""
+        self.logger.warning("Reconnecting: restarting browser and re-logging in...")
+        await self._rotate_proxy()
+        await self.login()
+        await self.gohomepage()
+
     async def _handle_login_recaptcha(self, manual_timeout: float = 300.0) -> None:
         """處理登入表單上的 reCAPTCHA v2，等待使用者手動完成。
 

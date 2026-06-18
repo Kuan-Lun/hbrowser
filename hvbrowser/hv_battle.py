@@ -7,6 +7,7 @@ from random import random
 from typing import Any, TypeVar
 
 from ponychart_classifier import update as update_ponychart_classifier
+from websockets.exceptions import ConnectionClosed
 from zendriver import cdp
 
 from hbrowser.gallery.utils import setup_logger
@@ -707,6 +708,8 @@ class BattleDriver(HVDriver):
 
             max_retries = 3
             retry_count = 0
+            max_connection_retries = 3
+            connection_retry_count = 0
             while True:
                 self._wait_if_paused()
                 try:
@@ -731,6 +734,22 @@ class BattleDriver(HVDriver):
                         f"(attempt {retry_count}/{max_retries})"
                     )
                     await asyncio.sleep(5)
+                    continue
+                except ConnectionClosed as e:
+                    if not self.can_auto_resolve_challenges:
+                        raise
+                    connection_retry_count += 1
+                    if connection_retry_count >= max_connection_retries:
+                        logger.error(
+                            "ConnectionClosed caught, max retries reached "
+                            f"({max_connection_retries}/{max_connection_retries})"
+                        )
+                        raise
+                    logger.warning(
+                        f"ConnectionClosed caught: {e!r}, recovering "
+                        f"(attempt {connection_retry_count}/{max_connection_retries})"
+                    )
+                    await self.reconnect()
                     continue
 
             notify("HBrowser", "Battle complete")

@@ -17,6 +17,7 @@ dependencies = [
     "httpx>=0.28.1",
     "hv-bie>=0.5.3",
     "ponychart-classifier>=0.6.1",
+    "websockets>=16.0",
     "zendriver>=0.15.3",
 ]
 
