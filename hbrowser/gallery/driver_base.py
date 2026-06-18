@@ -6,7 +6,17 @@ from abc import ABC, abstractmethod
 from random import random
 from typing import Any
 
-from .browser import DriverRestartRotator, ProxyRotator, create_browser, stop_browser
+from zendriver import cdp
+
+from .browser import (
+    DriverRestartRotator,
+    ProxyRotator,
+    create_browser,
+    get_flaresolverr_url,
+    should_use_flaresolverr,
+    solve_with_flaresolverr,
+    stop_browser,
+)
 from .browser.ban_handler import handle_ban_decorator
 from .captcha import CaptchaDetector
 from .utils import get_log_dir, matchurl, setup_logger
@@ -204,6 +214,33 @@ class Driver(ABC):
             "proceeding with login attempt anyway"
         )
 
+    async def _try_flaresolverr(self, url: str, flaresolverr_url: str) -> bool:
+        """嘗試用 FlareSolverr 自動解決 Cloudflare managed challenge。
+
+        Returns:
+            是否成功解決（解出 cookie 並重新導航後挑戰已消失）
+        """
+        self.logger.info(f"Trying FlareSolverr ({flaresolverr_url}) to solve challenge")
+        try:
+            result = await solve_with_flaresolverr(url, flaresolverr_url)
+        except Exception as e:
+            self.logger.warning(f"FlareSolverr request failed: {e!r}")
+            return False
+
+        await self.page.send(cdp.network.set_cookies(result.to_cdp_cookie_params()))
+        if result.user_agent:
+            await self.page.send(
+                cdp.network.set_user_agent_override(user_agent=result.user_agent)
+            )
+
+        await self.myget(url)
+        det = await self.captcha_detector.detect(self.page, timeout=3.0)
+        if det.kind == "none":
+            self.logger.info("FlareSolverr resolved the challenge")
+            return True
+        self.logger.warning("FlareSolverr cookie did not clear the challenge")
+        return False
+
     async def detect_and_solve_with_rotation(
         self,
         url: str,
@@ -228,6 +265,15 @@ class Driver(ABC):
                 f"Challenge detected: {det.kind} "
                 f"(attempt {attempt}/{self.max_captcha_retries})"
             )
+
+            flaresolverr_url = get_flaresolverr_url()
+            if (
+                det.kind == "cf_managed_challenge"
+                and flaresolverr_url
+                and should_use_flaresolverr()
+            ):
+                if await self._try_flaresolverr(url, flaresolverr_url):
+                    return
 
             challenge_page_path = os.path.join(get_log_dir(), "challenge_page.html")
             with open(challenge_page_path, "w", errors="ignore") as f:

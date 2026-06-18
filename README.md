@@ -15,6 +15,18 @@ HBrowser can route all traffic through the Tor network for IP privacy. If Tor Br
 4. To force disable Tor even when installed, set `USE_TOR=0`.
 5. If your Tor Browser is installed in a non-standard location, set the `TOR_BINARY_PATH` environment variable.
 
+### FlareSolverr (Optional)
+
+HBrowser can use [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to automatically
+solve Cloudflare's "managed challenge" (the plain JS challenge, not the interactive Turnstile
+widget) without manual interaction. Set `FLARESOLVERR_URL` to your FlareSolverr instance's `/v1`
+endpoint to enable it, e.g. `http://127.0.0.1:8191/v1`.
+
+FlareSolverr's solved `cf_clearance` cookie is tied to the IP address it solved from, so it is
+only used when Tor is **not** active — if both `USE_TOR` (or auto-detected Tor) and
+`FLARESOLVERR_URL` are set, HBrowser ignores FlareSolverr and logs a warning, since the cookie
+would not match the Tor exit IP anyway.
+
 ### Environment Variables
 
 HBrowser requires the following environment variables:
@@ -24,6 +36,7 @@ HBrowser requires the following environment variables:
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
+- `FLARESOLVERR_URL` (optional): FlareSolverr `/v1` endpoint used to auto-solve Cloudflare managed challenges. Ignored when Tor is active
 
 Set the environment variables before running the script:
 
@@ -35,6 +48,7 @@ export EH_PASSWORD=your_password
 export HBROWSER_LOG_LEVEL=INFO          # Optional
 export USE_TOR=0                        # Optional: disable Tor proxy
 export TOR_BINARY_PATH=/path/to/tor     # Optional: custom tor path
+export FLARESOLVERR_URL=http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudflare
 ```
 
 **Fish:**
@@ -45,6 +59,7 @@ set -x EH_PASSWORD your_password
 set -x HBROWSER_LOG_LEVEL INFO          # Optional
 set -x USE_TOR 0                        # Optional: disable Tor proxy
 set -x TOR_BINARY_PATH /path/to/tor     # Optional: custom tor path
+set -x FLARESOLVERR_URL http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudflare
 ```
 
 **Windows Command Prompt:**
@@ -55,6 +70,7 @@ set EH_PASSWORD=your_password
 set HBROWSER_LOG_LEVEL=INFO
 set USE_TOR=0
 set TOR_BINARY_PATH=C:\path\to\tor.exe
+set FLARESOLVERR_URL=http://127.0.0.1:8191/v1
 ```
 
 **Windows PowerShell:**
@@ -65,9 +81,13 @@ $env:EH_PASSWORD="your_password"
 $env:HBROWSER_LOG_LEVEL="INFO"
 $env:USE_TOR="0"
 $env:TOR_BINARY_PATH="C:\path\to\tor.exe"
+$env:FLARESOLVERR_URL="http://127.0.0.1:8191/v1"
 ```
 
-When a Cloudflare or CAPTCHA challenge appears during login, HBrowser will detect it and wait for you to solve it manually in the browser window. Set `headless=False` when initialising the driver to see the browser window.
+When a Cloudflare or CAPTCHA challenge appears during login, HBrowser will first try
+FlareSolverr (if configured and applicable), then fall back to waiting for you to solve it
+manually in the browser window. Set `headless=False` when initialising the driver to see the
+browser window.
 
 ## Logging
 
