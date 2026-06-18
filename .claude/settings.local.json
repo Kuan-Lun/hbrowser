@@ -12,7 +12,11 @@
       "Bash(grep:*)",
       "Bash(xargs cat)",
       "Bash(git diff:*)",
-      "Bash(git -C * diff:*)"
+      "Bash(git -C * diff:*)",
+      "Bash(cat > *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   },
   "hooks": {
