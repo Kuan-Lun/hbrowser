@@ -4,6 +4,7 @@
       "Read(**/*)",
       "Write(**/*)",
       "Edit(**/*)",
+      "Bash(docker:*)",
       "Bash(ls:*)",
       "Bash(mkdir:*)",
       "Bash(tree:*)",
