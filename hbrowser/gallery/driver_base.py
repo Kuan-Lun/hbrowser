@@ -4,7 +4,7 @@ import asyncio
 import os
 from abc import ABC, abstractmethod
 from random import random
-from typing import Any
+from typing import Any, Self
 
 from zendriver import cdp
 
@@ -68,10 +68,16 @@ class Driver(ABC):
         self.myget = handle_ban_decorator(self.page)
         await self.get(self.url["Forums"])
 
-    async def __aenter__(self) -> "Driver":
-        await self._init_browser()
-        await self.login()
-        await self.gohomepage()
+    async def __aenter__(self) -> Self:
+        try:
+            await self._init_browser()
+            await self.login()
+            await self.gohomepage()
+        except BaseException as e:
+            # __aexit__ 不會在 __aenter__ 失敗時自動被呼叫，
+            # 這裡手動觸發以確保瀏覽器與子程序資源不會洩漏。
+            await self.__aexit__(type(e), e, e.__traceback__)
+            raise
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -170,21 +176,6 @@ class Driver(ABC):
             self.browser, self.headless
         )
         self.myget = handle_ban_decorator(self.page)
-
-    @property
-    def can_auto_resolve_challenges(self) -> bool:
-        """是否能在無人值守的情況下自動解決登入時的 Cloudflare 驗證。
-
-        目前唯一的自動解法是 FlareSolverr；未來若加入其他解法，只需要改這裡。
-        """
-        return should_use_flaresolverr()
-
-    async def reconnect(self) -> None:
-        """重啟瀏覽器並重新登入，用於從連線中斷復原。"""
-        self.logger.warning("Reconnecting: restarting browser and re-logging in...")
-        await self._rotate_proxy()
-        await self.login()
-        await self.gohomepage()
 
     async def _handle_login_recaptcha(self, manual_timeout: float = 300.0) -> None:
         """處理登入表單上的 reCAPTCHA v2，等待使用者手動完成。

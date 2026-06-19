@@ -10,6 +10,7 @@ from ponychart_classifier import update as update_ponychart_classifier
 from websockets.exceptions import ConnectionClosed
 from zendriver import cdp
 
+from hbrowser.gallery.browser import should_use_flaresolverr
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
 
@@ -143,6 +144,10 @@ class BattleDriver(HVDriver):
         self._itemprovider = ItemProvider(self, self.battle_dashboard)
         self._skillmanager = SkillManager(self, self.battle_dashboard)
         self._buffmanager = BuffManager(self, self.battle_dashboard)
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await super().__aexit__(exc_type, exc_val, exc_tb)
+        self.control_panel.destroy()
 
     async def _setup_alert_handler(self) -> None:
         async def dialog_handler(
@@ -672,6 +677,10 @@ class BattleDriver(HVDriver):
                 bool(self.battle_dashboard.overview_monsters.alive_monster_name)
                 or await PonyChart(self).check()
             )
+        except ConnectionClosed:
+            # 連線中斷不是「頁面上有 alert/dialog」這種可以原地處理的狀況，
+            # 必須往外傳交給 battle() 的重連/重建邏輯，不能被當成「不在戰鬥中」吞掉。
+            raise
         except Exception:
             logger.info("Alert or error detected, attempting to handle it.")
             try:
@@ -708,8 +717,6 @@ class BattleDriver(HVDriver):
 
             max_retries = 3
             retry_count = 0
-            max_connection_retries = 3
-            connection_retry_count = 0
             while True:
                 self._wait_if_paused()
                 try:
@@ -735,22 +742,43 @@ class BattleDriver(HVDriver):
                     )
                     await asyncio.sleep(5)
                     continue
-                except ConnectionClosed as e:
-                    if not self.can_auto_resolve_challenges:
-                        raise
-                    connection_retry_count += 1
-                    if connection_retry_count >= max_connection_retries:
-                        logger.error(
-                            "ConnectionClosed caught, max retries reached "
-                            f"({max_connection_retries}/{max_connection_retries})"
-                        )
-                        raise
-                    logger.warning(
-                        f"ConnectionClosed caught: {e!r}, recovering "
-                        f"(attempt {connection_retry_count}/{max_connection_retries})"
-                    )
-                    await self.reconnect()
-                    continue
 
             notify("HBrowser", "Battle complete")
             logger.info("Battle complete.")
+
+
+async def run_battle_with_restart(
+    *args: Any,
+    max_restarts: int = 3,
+    **kwargs: Any,
+) -> None:
+    """執行戰鬥迴圈；連線中斷時捨棄整個 BattleDriver、建立全新的一個重來。
+
+    比起在同一個 BattleDriver 內 reconnect，整個重建可以避免 battle_dashboard、
+    log 去重視窗、buff 冷卻追蹤等內部狀態半套復原而產生的錯誤。
+
+    Args:
+        *args: 轉傳給 BattleDriver 建構子
+        max_restarts: 因連線中斷重新建立 BattleDriver 的最大次數
+        **kwargs: 轉傳給 BattleDriver 建構子
+    """
+    restart_count = 0
+    while True:
+        try:
+            async with BattleDriver(*args, **kwargs) as driver:
+                await driver.battle()
+            return
+        except ConnectionClosed as e:
+            if not should_use_flaresolverr():
+                raise
+            restart_count += 1
+            if restart_count >= max_restarts:
+                logger.error(
+                    "ConnectionClosed caught, max restarts reached "
+                    f"({max_restarts}/{max_restarts})"
+                )
+                raise
+            logger.warning(
+                f"ConnectionClosed caught: {e!r}, restarting with a fresh session "
+                f"(attempt {restart_count}/{max_restarts})"
+            )
