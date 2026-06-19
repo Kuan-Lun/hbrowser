@@ -1,5 +1,6 @@
 """瀏覽器工廠"""
 
+import asyncio
 import os
 import platform
 import subprocess
@@ -20,6 +21,7 @@ from .tor import (
     TOR_SOCKS_PORT,
     should_use_tor,
     start_tor_with_retry,
+    terminate_tor_process,
 )
 
 logger = setup_logger(__name__)
@@ -98,10 +100,22 @@ def _build_config(
     return config
 
 
+def _attach_tor_process(
+    browser: zd.Browser, tor_process: subprocess.Popen[bytes] | None
+) -> None:
+    """把 Tor 子程序掛在 browser 物件上，讓 stop_browser 之後能找到它清理。
+
+    一拿到 browser 就立刻呼叫（在任何後續可能失敗的步驟之前），確保只要
+    browser 物件存在，stop_browser 就一定能找到並終止對應的 Tor 程序，
+    不會因為中途某一步驟拋例外而洩漏。
+    """
+    if tor_process is not None:
+        browser._tor_process = tor_process  # type: ignore[attr-defined]
+
+
 async def _post_create_setup(
     browser: zd.Browser,
     page: zd.Tab,
-    tor_process: subprocess.Popen[bytes] | None,
     use_tor: bool,
 ) -> None:
     from zendriver import cdp
@@ -112,9 +126,6 @@ async def _post_create_setup(
     if not isinstance(ua, str):
         raise RuntimeError(f"Unexpected userAgent evaluation result: {ua!r}")
     await page.send(cdp.network.set_user_agent_override(user_agent=ua))
-
-    if tor_process is not None:
-        browser._tor_process = tor_process  # type: ignore[attr-defined]
 
     if use_tor and not has_residential_proxy():
         await verify_proxy_ip(browser, page)
@@ -135,24 +146,33 @@ async def create_browser(
     socks_port: int | None = None
     if use_tor:
         socks_port = find_available_port(TOR_SOCKS_PORT)
-        tor_process = start_tor_with_retry(socks_port)
+        tor_process = await asyncio.to_thread(start_tor_with_retry, socks_port)
 
-    proxy_extension = configure_proxy()
+    try:
+        proxy_extension = configure_proxy()
+        chrome_paths = ensure_chrome_installed()
+        config = _build_config(
+            headless, proxy_extension, use_tor, socks_port, chrome_paths.chrome
+        )
 
-    chrome_paths = ensure_chrome_installed()
+        logger.debug("Initializing browser...")
+        browser = await zd.start(config=config)
+    except BaseException:
+        if tor_process is not None:
+            terminate_tor_process(tor_process)
+        raise
 
-    config = _build_config(
-        headless, proxy_extension, use_tor, socks_port, chrome_paths.chrome
-    )
+    _attach_tor_process(browser, tor_process)
+    try:
+        page = browser.main_tab
+        if page is None:
+            raise RuntimeError("Browser failed to expose a main tab")
+        logger.info("Browser initialized successfully")
 
-    logger.debug("Initializing browser...")
-    browser = await zd.start(config=config)
-    page = browser.main_tab
-    if page is None:
-        raise RuntimeError("Browser failed to expose a main tab")
-    logger.info("Browser initialized successfully")
-
-    await _post_create_setup(browser, page, tor_process, use_tor)
+        await _post_create_setup(browser, page, use_tor)
+    except BaseException:
+        await stop_browser(browser)
+        raise
 
     return browser, page
 
@@ -164,8 +184,4 @@ async def stop_browser(browser: Any) -> None:
         await browser.stop()
     finally:
         if tor_process is not None:
-            try:
-                tor_process.terminate()
-                tor_process.wait(timeout=5)
-            except Exception:
-                tor_process.kill()
+            terminate_tor_process(tor_process)

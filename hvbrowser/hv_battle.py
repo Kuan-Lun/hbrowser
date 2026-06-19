@@ -680,7 +680,7 @@ class BattleDriver(HVDriver):
             )
         except ConnectionClosed:
             # 連線中斷不是「頁面上有 alert/dialog」這種可以原地處理的狀況，
-            # 必須往外傳交給 battle() 的重連/重建邏輯，不能被當成「不在戰鬥中」吞掉。
+            # 必須往外傳給呼叫端，不能被當成「不在戰鬥中」吞掉。
             raise
         except Exception:
             logger.info("Alert or error detected, attempting to handle it.")

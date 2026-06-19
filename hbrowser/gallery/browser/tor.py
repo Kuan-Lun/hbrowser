@@ -39,6 +39,15 @@ _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyTyp
 )
 
 
+def terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
+    """終止 Tor 子程序，正常 terminate 逾時才強制 kill。"""
+    try:
+        tor_process.terminate()
+        tor_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        tor_process.kill()
+
+
 def _find_tor_binary() -> str:
     """找到系統上的 tor 執行檔
 
@@ -203,14 +212,5 @@ def start_tor_with_retry(
     assert tor_process is not None
 
     # 註冊 atexit 確保 Tor 進程被清理
-    _tor = tor_process
-
-    def _cleanup_tor() -> None:
-        try:
-            _tor.terminate()
-            _tor.wait(timeout=5)
-        except Exception:
-            _tor.kill()
-
-    atexit.register(_cleanup_tor)
+    atexit.register(terminate_tor_process, tor_process)
     return tor_process

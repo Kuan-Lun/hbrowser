@@ -5,7 +5,7 @@ from random import random
 from typing import Any
 
 from hbrowser.gallery import EHDriver
-from hbrowser.gallery.utils import setup_logger
+from hbrowser.gallery.utils import is_connection_error, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -17,19 +17,19 @@ def genxpath(imagepath: str) -> str:
 class BSItems(ABC):
     def __init__(
         self,
-        consumables: list[str] = list(),
-        materials: list[str] = list(),
-        trophies: list[str] = list(),
-        artifacts: list[str] = list(),
-        figures: list[str] = list(),
-        monster_items: list[str] = list(),
+        consumables: list[str] | None = None,
+        materials: list[str] | None = None,
+        trophies: list[str] | None = None,
+        artifacts: list[str] | None = None,
+        figures: list[str] | None = None,
+        monster_items: list[str] | None = None,
     ) -> None:
-        self.consumables = consumables
-        self.materials = materials
-        self.trophies = trophies
-        self.artifacts = artifacts
-        self.figures = figures
-        self.monster_items = monster_items
+        self.consumables = consumables or []
+        self.materials = materials or []
+        self.trophies = trophies or []
+        self.artifacts = artifacts or []
+        self.figures = figures or []
+        self.monster_items = monster_items or []
 
 
 class SellItems(BSItems):
@@ -171,7 +171,9 @@ class HVDriver(EHDriver):
                     iszero = quantity_text == ""
                 else:
                     iszero = True
-            except Exception:
+            except Exception as e:
+                if is_connection_error(e):
+                    raise
                 iszero = True
             return bool(iszero)
 
@@ -254,7 +256,7 @@ class HVDriver(EHDriver):
                     case "Monster Items":
                         thecheckitemlist = sellitems.monster_items
                     case _:
-                        raise KeyError()
+                        raise KeyError(f"Unknown market key: {marketkey!r}")
                 if itemname not in thecheckitemlist:
                     continue
                 if await itempage(tr_element):
@@ -282,7 +284,8 @@ class HVDriver(EHDriver):
                     if tr_results:
                         await self.wait(tr_results[0].click, ischangeurl=False)
                     await resell()
-            except Exception:
+            except Exception as e:
+                if is_connection_error(e):
+                    raise
                 logger.debug(f"No existing sell orders found in {marketkey}")
-                pass
         logger.info("Market check completed")

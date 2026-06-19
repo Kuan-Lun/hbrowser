@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from ..utils import is_connection_error
 from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_IFRAME_CSS
 from .models import ChallengeDetection
 
@@ -76,7 +77,9 @@ class CaptchaDetector:
             m = SITEKEY_RE.search(iframe_src)
             sitekey = m.group(1) if m else None
             return {"src": iframe_src, "sitekey": sitekey}
-        except (TimeoutError, Exception):
+        except Exception as e:
+            if is_connection_error(e):
+                raise
             return None
 
     async def _find_recaptcha_div(
@@ -89,5 +92,7 @@ class CaptchaDetector:
             )
             sitekey = recaptcha_div.attrs.get("data-sitekey")
             return {"sitekey": sitekey}
-        except (TimeoutError, Exception):
+        except Exception as e:
+            if is_connection_error(e):
+                raise
             return None

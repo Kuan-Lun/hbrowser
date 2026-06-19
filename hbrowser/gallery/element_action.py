@@ -6,19 +6,24 @@ from typing import Any
 
 import zendriver as zd
 
+from .utils import is_connection_error
+
 
 class ElementAction:
     """通用的元素操作類，提供帶重試和等待機制的點擊功能。
 
     只依賴 zendriver Tab，不綁定任何業務邏輯。
+
+    page 透過 callable 動態取得，而不是在建構時固定捕捉：呼叫端（例如瀏覽器
+    重啟後 driver.page 被換成新物件）不需要重新建立 ElementAction 實例。
     """
 
-    def __init__(self, page: zd.Tab) -> None:
-        self._page = page
+    def __init__(self, page_provider: Callable[[], zd.Tab]) -> None:
+        self._page_provider = page_provider
 
     @property
     def page(self) -> zd.Tab:
-        return self._page
+        return self._page_provider()
 
     async def click(self, element: Any) -> None:
         """捲動到可見範圍後觸發元素的 DOM click()。"""
@@ -40,6 +45,8 @@ class ElementAction:
                 await self.click(element)
                 return
             except Exception as e:
+                if is_connection_error(e):
+                    raise
                 last_err = e
                 await asyncio.sleep(delay)
                 continue
@@ -61,13 +68,15 @@ class ElementAction:
         for _ in range(max_attempts):
             if await condition():
                 return
-            old_source = await self._page.get_content()
+            old_source = await self.page.get_content()
             try:
                 await self.click_resilient(get_element, retries=3, delay=delay)
-            except Exception:
+            except Exception as e:
+                if is_connection_error(e):
+                    raise
                 continue
             deadline = asyncio.get_event_loop().time() + timeout
-            while await self._page.get_content() == old_source:
+            while await self.page.get_content() == old_source:
                 if asyncio.get_event_loop().time() >= deadline:
                     break
                 await asyncio.sleep(0.05)
@@ -82,10 +91,10 @@ class ElementAction:
         """透過 CSS selector 找到元素，等待後點擊，自動重試"""
         for attempt in range(retries):
             try:
-                element = await self._page.select(selector, timeout=wait_timeout)
+                element = await self.page.select(selector, timeout=wait_timeout)
                 await self.click(element)
                 return
-            except Exception:
-                if attempt == retries - 1:
+            except Exception as e:
+                if is_connection_error(e) or attempt == retries - 1:
                     raise
                 await asyncio.sleep(delay)

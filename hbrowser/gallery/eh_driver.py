@@ -10,12 +10,27 @@ from h2h_galleryinfo_parser import GalleryURLParser
 from ..exceptions import ClientOfflineException, InsufficientFundsException
 from .driver_base import Driver
 from .models import Tag
-from .utils import matchurl, wait_for_new_tab
+from .utils import is_connection_error, matchurl, wait_for_new_tab
+
+MAX_DOWNLOAD_RETRIES = 5
 
 
 class EHDriver(Driver):
     def _setname(self) -> str:
         return "E-Hentai"
+
+    @staticmethod
+    def _write_error_file(path: str, content: str) -> None:
+        with open(path, "w", errors="ignore") as f:
+            f.write(content)
+
+    async def _close_page_safely(self, page: object) -> None:
+        try:
+            await page.close()  # type: ignore[attr-defined]
+        except Exception as e:
+            if is_connection_error(e):
+                raise
+            self.logger.debug(f"Failed to close page (non-fatal): {e!r}")
 
     async def checkh2h(self) -> bool:
         """檢查 H@H 客戶端是否在線"""
@@ -137,7 +152,17 @@ class EHDriver(Driver):
         return result
 
     async def download(self, gallery: GalleryURLParser) -> bool:
-        self.logger.info(f"Starting download for gallery: {gallery.url}")
+        return await self._download(gallery, attempt=1)
+
+    async def _download(self, gallery: GalleryURLParser, attempt: int) -> bool:
+        if attempt > MAX_DOWNLOAD_RETRIES:
+            raise RuntimeError(
+                f"Failed to download gallery after {MAX_DOWNLOAD_RETRIES} "
+                f"attempts: {gallery.url}"
+            )
+        self.logger.info(
+            f"Starting download for gallery: {gallery.url} (attempt {attempt})"
+        )
 
         mapper = self.page.mapper
         for k in list(mapper):
@@ -169,17 +194,19 @@ class EHDriver(Driver):
             if archive_links:
                 await archive_links[0].click()
             else:
-                raise Exception("Archive Download not found")
-        except Exception:
+                raise RuntimeError("Archive Download not found")
+        except Exception as e:
+            if is_connection_error(e):
+                raise
             self.logger.warning("Archive Download element not found, retrying download")
-            await self.page.close()
+            await self._close_page_safely(self.page)
             self.page = gallery_tab
-            return await self.download(gallery)
+            return await self._download(gallery, attempt + 1)
 
         new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
             self.logger.warning("No new tab opened, retrying download")
-            return await self.download(gallery)
+            return await self._download(gallery, attempt + 1)
 
         await new_tab.activate()
         self.page = new_tab
@@ -211,20 +238,20 @@ class EHDriver(Driver):
                 raise TimeoutError()
         except TimeoutError:
             error_file = os.path.join(".", "error.txt")
-            with open(error_file, "w", errors="ignore") as f:
-                f.write(await self.page.get_content())
+            error_content = await self.page.get_content()
+            await asyncio.to_thread(self._write_error_file, error_file, error_content)
             retrytime = 60
             self.logger.warning(
                 f"Download timeout, error page saved to {error_file}, "
                 f"retrying in {retrytime}s"
             )
-            await self.page.close()
+            await self._close_page_safely(self.page)
             self.page = gallery_tab
             await asyncio.sleep(retrytime)
-            return await self.download(gallery)
+            return await self._download(gallery, attempt + 1)
 
         if len(self.browser.tabs) > 1:
-            await self.page.close()
+            await self._close_page_safely(self.page)
             await asyncio.sleep(random())
             self.page = gallery_tab
             await gallery_tab.activate()

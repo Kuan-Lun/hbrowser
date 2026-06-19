@@ -1,5 +1,6 @@
 """代理設定"""
 
+import asyncio
 import os
 import socket
 import tempfile
@@ -7,7 +8,7 @@ import zipfile
 from typing import Any
 from urllib.request import urlopen
 
-from ..utils import setup_logger
+from ..utils import is_connection_error, setup_logger
 
 logger = setup_logger(__name__)
 
@@ -143,9 +144,14 @@ def find_available_port(start: int = 9150) -> int:
 
 async def verify_proxy_ip(browser: Any, page: Any) -> None:
     """驗證代理連線的 IP 與本機 IP 不同"""
-    try:
+
+    def _get_local_ip() -> str:
         with urlopen("https://api.ipify.org", timeout=10) as response:
-            local_ip: str = response.read().decode("utf-8").strip()
+            body: bytes = response.read()
+            return body.decode("utf-8").strip()
+
+    try:
+        local_ip = await asyncio.to_thread(_get_local_ip)
 
         await page.get("https://api.ipify.org")
         body = await page.select("body")
@@ -161,4 +167,6 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
     except RuntimeError:
         raise
     except Exception as e:
+        if is_connection_error(e):
+            raise
         logger.warning(f"Could not verify proxy IP (non-fatal): {e}")

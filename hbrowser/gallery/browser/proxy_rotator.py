@@ -44,8 +44,10 @@ class DriverRestartRotator(ProxyRotator):
         logger.warning("Rotating proxy by restarting browser...")
         try:
             await stop_browser(current_browser)
-        except Exception:
-            logger.debug("Failed to stop current browser (non-fatal)")
+        except Exception as e:
+            # 這支瀏覽器反正要被丟棄，停止失敗不影響後續流程；但仍記錄
+            # warning 而非 debug，避免真的有資源洩漏卻完全沒人注意到。
+            logger.warning(f"Failed to stop current browser (non-fatal): {e!r}")
 
         browser, page = await create_browser(headless=headless)
         logger.info("Browser restarted with new proxy connection")

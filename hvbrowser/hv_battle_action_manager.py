@@ -32,7 +32,7 @@ class ElementActionManager:
     def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
         self.hvdriver = driver
         self.battle_dashboard = battle_dashboard
-        self._action = ElementAction(driver.page)
+        self._action = ElementAction(lambda: driver.page)
 
     @property
     def page(self) -> Any:

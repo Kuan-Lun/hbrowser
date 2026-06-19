@@ -6,7 +6,7 @@ from typing import Any
 
 from ponychart_classifier import predict
 
-from hbrowser.gallery.utils import setup_logger
+from hbrowser.gallery.utils import is_connection_error, setup_logger
 from hbrowser.notify import notify
 
 from .hv import HVDriver
@@ -119,8 +119,9 @@ class PonyChart:
             try:
                 await _lab.click()
                 clicked.append(name)
-            except Exception:
-                pass
+            except Exception as e:
+                if is_connection_error(e):
+                    raise
         logger.info(f"[PonyChart][ML] Prediction: {labels} -> Clicked text: {clicked}")
         return labels
 
@@ -140,6 +141,8 @@ class PonyChart:
         try:
             await self._auto_answer(img_path)
         except Exception as e:  # pragma: no cover
+            if is_connection_error(e):
+                raise
             logger.error(f"[PonyChart] Auto-check failed: {e}")
 
         waitlimit = 15
@@ -157,12 +160,15 @@ class PonyChart:
                 )
                 if submit_elements:
                     await submit_elements[0].click()
-            except Exception:
+            except Exception as e:
+                if is_connection_error(e):
+                    raise
                 try:
                     riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
                     await riddle_submit.click()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    if is_connection_error(e2):
+                        raise
 
         await asyncio.sleep(1)
 
