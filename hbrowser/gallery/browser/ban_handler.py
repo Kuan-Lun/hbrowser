@@ -3,12 +3,19 @@
 import asyncio
 import re
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from ..utils import setup_logger
 
 logger = setup_logger(__name__)
+
+_BAN_MESSAGE = "Your IP address has been temporarily banned"
+_BLANK_PAGE = "<html><head></head><body></body></html>"
+_EMPTY_PAGE_WAIT_SECONDS = 4 * 60 * 60
+_HOUR_SECONDS = 60 * 60
+_RETRY_BUFFER_SECONDS = 15 * 60
 
 
 def parse_ban_time(page_source: str) -> int:
@@ -47,6 +54,71 @@ def parse_ban_time(page_source: str) -> int:
     )
 
 
+@dataclass(frozen=True)
+class BanStatus:
+    is_banned: bool
+    is_blank_page: bool
+
+    @property
+    def should_wait(self) -> bool:
+        return self.is_banned or self.is_blank_page
+
+
+def check_ban_status(source: str) -> BanStatus:
+    """從頁面原始碼判斷目前是否處於 IP ban 或空白頁狀態。"""
+    return BanStatus(
+        is_banned=_BAN_MESSAGE in source,
+        is_blank_page=source == _BLANK_PAGE,
+    )
+
+
+def format_wait_message(wait_seconds: int, wait_until: datetime) -> str:
+    remaining = timedelta(seconds=wait_seconds)
+    wait_until_str = wait_until.strftime("%Y-%m-%d %H:%M:%S")
+    return f"IP banned, waiting {remaining} (until {wait_until_str}) to retry..."
+
+
+async def _wait_out_ban(wait_seconds: int) -> None:
+    """以一小時為單位睡眠等待，每小時記一次目前還剩多久。"""
+    while wait_seconds > _HOUR_SECONDS:
+        await asyncio.sleep(_HOUR_SECONDS)
+        wait_seconds -= _HOUR_SECONDS
+        wait_until = datetime.now() + timedelta(seconds=wait_seconds)
+        logger.info(format_wait_message(wait_seconds, wait_until))
+    await asyncio.sleep(wait_seconds + _RETRY_BUFFER_SECONDS)
+
+
+async def _retry_until_unbanned(page: Any, source: str) -> None:
+    status = check_ban_status(source)
+    is_first = True
+    while status.should_wait:
+        logger.debug(f"Page source: {source[:200]}...")
+        if not is_first:
+            logger.warning("Banned again")
+
+        wait_seconds = (
+            _EMPTY_PAGE_WAIT_SECONDS if status.is_blank_page else parse_ban_time(source)
+        )
+        wait_until = datetime.now() + timedelta(seconds=wait_seconds)
+        logger.warning(format_wait_message(wait_seconds, wait_until))
+
+        await _wait_out_ban(wait_seconds)
+
+        logger.info("Retrying connection")
+        await page.reload()
+        source = await page.get_content()
+        is_first = False
+        status = check_ban_status(source)
+
+        if status.is_blank_page:
+            raise RuntimeError(
+                "Page is still blank after reloading while waiting out an IP "
+                "ban; giving up instead of retrying forever."
+            )
+
+    logger.info("IP ban lifted")
+
+
 def handle_ban_decorator(
     page: Any,
 ) -> Callable[..., Coroutine[Any, Any, None]]:
@@ -60,60 +132,10 @@ def handle_ban_decorator(
         包裝後的 async get 函數
     """
 
-    async def banningcheck() -> None:
-        def banningmsg() -> str:
-            a = timedelta(seconds=wait_seconds)
-            wait_until_str = wait_until.strftime("%Y-%m-%d %H:%M:%S")
-            msg = f"IP banned, waiting {a} (until {wait_until_str}) to retry..."
-            return msg
-
-        def whilecheck() -> bool:
-            return whilecheckban() or whilechecknothing()
-
-        def whilecheckban() -> bool:
-            return baningmsg in source
-
-        def whilechecknothing() -> bool:
-            return bool(nothing == source)
-
-        source = await page.get_content()
-        nothing = "<html><head></head><body></body></html>"
-        baningmsg = "Your IP address has been temporarily banned"
-        onehour = 60 * 60
-
-        if whilecheck():
-            isfirst = True
-            isnothing = nothing == source
-            while whilecheck():
-                logger.debug(f"Page source: {source[:200]}...")
-                if not isfirst:
-                    logger.warning("Banned again")
-                if isnothing:
-                    wait_seconds = 4 * onehour
-                else:
-                    wait_seconds = parse_ban_time(source)
-                wait_until = datetime.now() + timedelta(seconds=wait_seconds)
-                logger.warning(banningmsg())
-
-                while wait_seconds > onehour:
-                    await asyncio.sleep(onehour)
-                    wait_seconds -= onehour
-                    logger.info(banningmsg())
-                await asyncio.sleep(wait_seconds + 15 * 60)
-                wait_seconds = 0
-                logger.info("Retrying connection")
-                await page.reload()
-                source = await page.get_content()
-                isfirst = False
-                if isnothing:
-                    logger.error("Empty page, stopping retry")
-                    raise RuntimeError()
-            logger.info("IP ban lifted")
-        else:
-            return
-
     async def myget(*args: Any, **kwargs: Any) -> None:
         await page.get(*args, **kwargs)
-        await banningcheck()
+        source = await page.get_content()
+        if check_ban_status(source).should_wait:
+            await _retry_until_unbanned(page, source)
 
     return myget
