@@ -13,7 +13,7 @@ from zendriver import cdp
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
 
-from .control_panel import ControlPanel
+from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
 from .hv import HVDriver
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
@@ -105,7 +105,9 @@ class BattleDriver(HVDriver):
         self._itemprovider: ItemProvider = None  # type: ignore[assignment]
         self._skillmanager: SkillManager = None  # type: ignore[assignment]
         self._buffmanager: BuffManager = None  # type: ignore[assignment]
-        self.control_panel = ControlPanel()
+        self.control_panel: BaseControlPanel = (
+            NullControlPanel() if self.headless else ControlPanel()
+        )
         self.control_panel.register_toggle("auto_next_battle", default=True)
 
         forbidden_lower = [
@@ -688,8 +690,8 @@ class BattleDriver(HVDriver):
                 logger.debug("No dialog to accept or already dismissed.")
             return False
 
-    def _wait_if_paused(self) -> None:
-        self.control_panel.wait_if_paused()
+    async def _wait_if_paused(self) -> None:
+        await self.control_panel.wait_if_paused()
 
     async def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
         if await self._is_in_battle():
@@ -697,7 +699,7 @@ class BattleDriver(HVDriver):
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
         for _ in range(timeout // interval):
             await asyncio.sleep(interval)
-            self._wait_if_paused()
+            await self._wait_if_paused()
             if self.auto_next_battle and await self.go_next_battle():
                 continue
             if self.auto_next_battle and await self.go_grindfest():
@@ -717,7 +719,7 @@ class BattleDriver(HVDriver):
             max_retries = 3
             retry_count = 0
             while True:
-                self._wait_if_paused()
+                await self._wait_if_paused()
                 try:
                     if not await self.battle_in_turn():
                         # 樓層轉場時 HTML 可能尚未完整載入導致解析不到戰鬥狀態，

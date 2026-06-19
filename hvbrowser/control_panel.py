@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
 import tkinter as tk
+from abc import ABC, abstractmethod
 from multiprocessing import Queue
-from time import sleep
 from typing import Any
 
 
@@ -91,7 +92,36 @@ def _run_gui(
     root.mainloop()
 
 
-class ControlPanel:
+class BaseControlPanel(ABC):
+    """戰鬥控制面板介面，讓 GUI 版（ControlPanel）跟無 GUI 版（NullControlPanel）
+    可以互相替換（Liskov substitution），呼叫端不需要關心目前是不是 headless。
+    """
+
+    @abstractmethod
+    def set_title(self, title: str) -> None: ...
+
+    @abstractmethod
+    def register_toggle(self, name: str, default: bool = False) -> None: ...
+
+    @abstractmethod
+    def get_toggle(self, name: str) -> bool: ...
+
+    @abstractmethod
+    def set_skills(
+        self, skill_groups: dict[str, list[str]], forbidden: list[str]
+    ) -> None: ...
+
+    @abstractmethod
+    def get_forbidden_skills(self) -> list[str]: ...
+
+    @abstractmethod
+    async def wait_if_paused(self) -> None: ...
+
+    @abstractmethod
+    def destroy(self) -> None: ...
+
+
+class ControlPanel(BaseControlPanel):
     def __init__(self) -> None:
         manager = multiprocessing.Manager()
         self._pause_flag = manager.Event()
@@ -135,10 +165,44 @@ class ControlPanel:
     def get_forbidden_skills(self) -> list[str]:
         return [name for name, val in self._skill_dict.items() if not val]
 
-    def wait_if_paused(self) -> None:
+    async def wait_if_paused(self) -> None:
+        # 用 asyncio.sleep 而非 time.sleep：暫停期間絕對不能擋住 event loop，
+        # 否則 CDP websocket 連線在暫停期間完全沒有機會處理任何背景事件，
+        # 恢復時很容易直接拿到 ConnectionClosed。
         while self._pause_flag.is_set():
-            sleep(0.5)
+            await asyncio.sleep(0.5)
 
     def destroy(self) -> None:
         self._cmd_queue.put(("destroy", None))
         self._process.join(timeout=3)
+
+
+class NullControlPanel(BaseControlPanel):
+    """headless 模式使用：不開 GUI 視窗，僅在記憶體中保存設定。"""
+
+    def __init__(self) -> None:
+        self._toggles: dict[str, bool] = {}
+        self._forbidden_skills: list[str] = []
+
+    def set_title(self, title: str) -> None:
+        pass
+
+    def register_toggle(self, name: str, default: bool = False) -> None:
+        self._toggles[name] = default
+
+    def get_toggle(self, name: str) -> bool:
+        return self._toggles.get(name, False)
+
+    def set_skills(
+        self, skill_groups: dict[str, list[str]], forbidden: list[str]
+    ) -> None:
+        self._forbidden_skills = list(forbidden)
+
+    def get_forbidden_skills(self) -> list[str]:
+        return list(self._forbidden_skills)
+
+    async def wait_if_paused(self) -> None:
+        return
+
+    def destroy(self) -> None:
+        pass
