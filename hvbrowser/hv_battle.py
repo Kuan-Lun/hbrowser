@@ -10,7 +10,6 @@ from ponychart_classifier import update as update_ponychart_classifier
 from websockets.exceptions import ConnectionClosed
 from zendriver import cdp
 
-from hbrowser.gallery.browser import should_use_flaresolverr
 from hbrowser.gallery.utils import setup_logger
 from hbrowser.notify import notify
 
@@ -745,40 +744,3 @@ class BattleDriver(HVDriver):
 
             notify("HBrowser", "Battle complete")
             logger.info("Battle complete.")
-
-
-async def run_battle_with_restart(
-    *args: Any,
-    max_restarts: int = 3,
-    **kwargs: Any,
-) -> None:
-    """執行戰鬥迴圈；連線中斷時捨棄整個 BattleDriver、建立全新的一個重來。
-
-    比起在同一個 BattleDriver 內 reconnect，整個重建可以避免 battle_dashboard、
-    log 去重視窗、buff 冷卻追蹤等內部狀態半套復原而產生的錯誤。
-
-    Args:
-        *args: 轉傳給 BattleDriver 建構子
-        max_restarts: 因連線中斷重新建立 BattleDriver 的最大次數
-        **kwargs: 轉傳給 BattleDriver 建構子
-    """
-    restart_count = 0
-    while True:
-        try:
-            async with BattleDriver(*args, **kwargs) as driver:
-                await driver.battle()
-            return
-        except ConnectionClosed as e:
-            if not should_use_flaresolverr():
-                raise
-            restart_count += 1
-            if restart_count >= max_restarts:
-                logger.error(
-                    "ConnectionClosed caught, max restarts reached "
-                    f"({max_restarts}/{max_restarts})"
-                )
-                raise
-            logger.warning(
-                f"ConnectionClosed caught: {e!r}, restarting with a fresh session "
-                f"(attempt {restart_count}/{max_restarts})"
-            )
