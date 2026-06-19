@@ -5,6 +5,7 @@ import platform
 import shutil
 import stat
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -68,31 +69,39 @@ def _download_and_extract(url: str, dest_dir: Path, desc: str) -> None:
     macOS 使用 ditto 解壓以正確保留 symlinks 和 .app bundle 結構，
     其他平台使用 Python zipfile。
 
+    下載/解壓在 dest_dir 旁邊的暫存目錄進行，只有完全成功才會把結果移進
+    dest_dir；中途失敗時暫存目錄會被整個丟棄，dest_dir 不會留下半成品，
+    避免 ensure_chrome_installed 之後把半成品誤判成「已安裝」。
+
     Args:
         url: 下載連結
         dest_dir: 目標目錄
         desc: 描述（用於日誌）
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = dest_dir / "temp.zip"
 
-    logger.info(f"Downloading {desc}...")
-    logger.debug(f"URL: {url}")
+    with tempfile.TemporaryDirectory(dir=dest_dir) as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        zip_path = tmp_dir / "temp.zip"
 
-    urlretrieve(url, zip_path)
+        logger.info(f"Downloading {desc}...")
+        logger.debug(f"URL: {url}")
+        urlretrieve(url, zip_path)
 
-    logger.info(f"Extracting {desc}...")
-    if platform.system() == "Darwin":
-        subprocess.run(
-            ["ditto", "-xk", str(zip_path), str(dest_dir)],
-            check=True,
-        )
-    else:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(dest_dir)
+        logger.info(f"Extracting {desc}...")
+        if platform.system() == "Darwin":
+            subprocess.run(
+                ["ditto", "-xk", str(zip_path), str(tmp_dir)],
+                check=True,
+            )
+        else:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp_dir)
+        zip_path.unlink()
 
-    # 刪除 zip 檔案
-    zip_path.unlink()
+        for extracted in tmp_dir.iterdir():
+            shutil.move(str(extracted), str(dest_dir / extracted.name))
+
     logger.debug(f"{desc} extracted to {dest_dir}")
 
 
@@ -111,12 +120,21 @@ def _remove_quarantine(path: Path) -> None:
     """
     if platform.system() != "Darwin":
         return
-    subprocess.run(
+    result = subprocess.run(
         ["xattr", "-dr", "com.apple.quarantine", str(path)],
         check=False,
         capture_output=True,
     )
-    logger.debug(f"Removed quarantine attribute: {path}")
+    if result.returncode != 0:
+        # 下載下來的檔案本來就常常沒有 quarantine attribute（urlretrieve 不會
+        # 像瀏覽器下載一樣加上它），xattr 在這種情況下回非 0 是預期內的，
+        # 所以記 debug 而非 warning，但仍保留訊息以便真的有問題時可以查。
+        logger.debug(
+            f"xattr -dr returned non-zero for {path}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    else:
+        logger.debug(f"Removed quarantine attribute: {path}")
 
 
 def _find_download_url(downloads: list[dict[str, str]], plat: str) -> str | None:
