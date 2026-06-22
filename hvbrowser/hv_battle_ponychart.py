@@ -145,14 +145,16 @@ class PonyChart:
                 raise
             logger.error(f"[PonyChart] Auto-check failed: {e}")
 
-        waitlimit = 10
+        wait_seconds = 10
+        waitlimit = wait_seconds
         while waitlimit > 0 and await self._check():
             await asyncio.sleep(1)
             waitlimit -= 1
 
         if waitlimit <= 1 and await self._check():
-            logger.warning(
-                "PonyChart check timeout, please check your network connection"
+            logger.info(
+                "[PonyChart] Auto-answer did not trigger submission within "
+                f"{wait_seconds}s, attempting fallback submit"
             )
             clicked = False
             try:
@@ -177,7 +179,7 @@ class PonyChart:
 
             await asyncio.sleep(1)
             if await self._check():
-                logger.error(
+                logger.warning(
                     f"[PonyChart] Fallback submit click did not dismiss riddle "
                     f"(clicked={clicked}); likely auto-failed by game timeout"
                 )
