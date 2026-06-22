@@ -145,7 +145,7 @@ class PonyChart:
                 raise
             logger.error(f"[PonyChart] Auto-check failed: {e}")
 
-        waitlimit = 15
+        waitlimit = 10
         while waitlimit > 0 and await self._check():
             await asyncio.sleep(1)
             waitlimit -= 1
@@ -154,21 +154,34 @@ class PonyChart:
             logger.warning(
                 "PonyChart check timeout, please check your network connection"
             )
+            clicked = False
             try:
                 submit_elements = await self.hvdriver.page.xpath(
                     "//input[@type='submit' and @value='Submit Answer']", timeout=2
                 )
                 if submit_elements:
                     await submit_elements[0].click()
+                    clicked = True
             except Exception as e:
                 if is_connection_error(e):
                     raise
+
+            if not clicked:
                 try:
                     riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
                     await riddle_submit.click()
+                    clicked = True
                 except Exception as e2:
                     if is_connection_error(e2):
                         raise
+
+            await asyncio.sleep(1)
+            if await self._check():
+                logger.error(
+                    f"[PonyChart] Fallback submit click did not dismiss riddle "
+                    f"(clicked={clicked}); likely auto-failed by game timeout"
+                )
+            return isponychart
 
         await asyncio.sleep(1)
 
