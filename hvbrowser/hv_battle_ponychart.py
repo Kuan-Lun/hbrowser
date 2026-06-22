@@ -181,6 +181,11 @@ class PonyChart:
                     f"[PonyChart] Fallback submit click did not dismiss riddle "
                     f"(clicked={clicked}); likely auto-failed by game timeout"
                 )
+            else:
+                logger.info(
+                    f"[PonyChart] Fallback submit click dismissed riddle "
+                    f"(clicked={clicked})"
+                )
             return isponychart
 
         await asyncio.sleep(1)
