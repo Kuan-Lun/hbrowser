@@ -112,6 +112,23 @@ def _make_executable(path: Path) -> None:
         path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _make_all_files_executable(directory: Path) -> None:
+    """將目錄底下所有檔案都設定為可執行
+
+    只用於 zipfile.extractall 解壓的平台：zipfile 不會保留 Unix 執行權限
+    位元，導致 chrome 主執行檔以外的輔助執行檔（例如
+    chrome_crashpad_handler）解壓後失去執行權限，在 spawn 該輔助程序時
+    直接 FATAL abort。對整個資料夾的檔案統一補上執行權限可以一次涵蓋所有
+    現有與未來新增的輔助執行檔，不需要逐一列名。
+
+    macOS 使用 ditto 解壓，會正確保留原始權限位元，不需要（也不應該）
+    呼叫此函式，否則會替原本沒有執行權限的資源檔案多加上 +x。
+    """
+    for path in directory.rglob("*"):
+        if path.is_file():
+            _make_executable(path)
+
+
 def _remove_quarantine(path: Path) -> None:
     """移除 macOS 的 quarantine 屬性（僅 macOS）
 
@@ -193,7 +210,10 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
         if not chrome_url:
             raise RuntimeError(f"No Chrome download found for platform: {plat}")
         _download_and_extract(chrome_url, version_dir, "Chrome")
-        _make_executable(chrome_path)
+        if platform.system() != "Darwin":
+            _make_all_files_executable(version_dir / chrome_folder)
+        else:
+            _make_executable(chrome_path)
         _remove_quarantine(version_dir / chrome_folder)
 
         logger.info("Chrome is ready")
