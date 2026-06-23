@@ -5,7 +5,6 @@ __pycache__
 *.egg-info
 build
 dist
-cProfile_result.txt
 tmp
 
 !/.gitignore
