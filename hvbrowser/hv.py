@@ -155,8 +155,59 @@ class HVDriver(EHDriver):
         logger.info("Used USR RESTORATIVE to recover stamina")
         return True
 
-    async def repairequipment(self) -> bool:
-        logger.info("Checking equipped gear for repairs")
+    async def _select_all_and_check_repair_submit(
+        self, equipcount_elements: list[Any]
+    ) -> tuple[bool | None, list[Any]]:
+        """全選裝備並回報 repair submit 按鈕狀態。
+
+        回傳 (is_disabled, submit_elements):
+        is_disabled 為 None 代表找不到 submit 按鈕，呼叫端應視為無需處理。
+        """
+        logger.debug(f"Before select_all click: {equipcount_elements[0].text!r}")
+        await self.wait(equipcount_elements[0].mouse_click, ischangeurl=False)
+
+        equipcount_after = await self.page.xpath("//label[@id='equipcount']", timeout=5)
+        if equipcount_after:
+            logger.debug(f"After select_all click: {equipcount_after[0].text!r}")
+
+        submit_elements = await self.page.xpath("//input[@id='equipsubmit']", timeout=5)
+        if not submit_elements:
+            logger.warning("Unable to find equipment repair submit button")
+            return None, []
+
+        is_disabled = await self.page.evaluate(
+            "document.getElementById('equipsubmit').disabled"
+        )
+        if is_disabled:
+            debug_state = await self.page.evaluate("""
+                JSON.stringify({
+                    selected_count: selected_count,
+                    selectable_count: selectable_count,
+                    block_submit: block_submit,
+                    materials: (() => {
+                        const totals = {};
+                        for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
+                            if (el.checked && eqitems[el.value]) {
+                                for (const m in eqitems[el.value].m) {
+                                    totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
+                                }
+                            }
+                        }
+                        return Object.entries(totals).map(([id, need]) => ({
+                            id,
+                            name: itemdata[id] ? itemdata[id].n : undefined,
+                            need,
+                            have: itemdata[id] ? itemdata[id].c : undefined,
+                        }));
+                    })(),
+                })
+                """)
+            logger.warning(f"Not enough materials to repair equipment: {debug_state}")
+
+        return bool(is_disabled), submit_elements
+
+    async def _goto_repair_tab(self) -> bool:
+        """導航到 Bazaar -> The Armory -> Repair 頁籤。成功回傳 True。"""
         await self.gohomepage()
 
         bazaar = await self.page.select("#parent_Bazaar")
@@ -165,7 +216,7 @@ class HVDriver(EHDriver):
         )
         if not armory_elements:
             logger.warning("Unable to find The Armory entry")
-            return True
+            return False
 
         await bazaar.mouse_move()
         await armory_elements[0].mouse_move()
@@ -177,8 +228,14 @@ class HVDriver(EHDriver):
         )
         if not repair_elements:
             logger.warning("Unable to find Repair tab")
-            return True
+            return False
         await self.wait(repair_elements[0].click, ischangeurl=True)
+        return True
+
+    async def repairequipment(self) -> bool:
+        logger.info("Checking equipped gear for repairs")
+        if not await self._goto_repair_tab():
+            return True
 
         equipcount_elements = await self.page.xpath(
             "//label[@id='equipcount']", timeout=5
@@ -194,21 +251,60 @@ class HVDriver(EHDriver):
             logger.debug("No equipment needs repair")
             return True
 
-        await self.wait(equipcount_elements[0].mouse_click, ischangeurl=False)
-
-        submit_elements = await self.page.xpath("//input[@id='equipsubmit']", timeout=5)
-        if not submit_elements:
-            logger.warning("Unable to find equipment repair submit button")
-            return True
-        is_disabled = await self.page.evaluate(
-            "document.getElementById('equipsubmit').disabled"
+        is_disabled, submit_elements = await self._select_all_and_check_repair_submit(
+            equipcount_elements
         )
+        if is_disabled is None:
+            return True
+
         if is_disabled:
-            logger.warning("Not enough materials to repair equipment")
-            return False
+            logger.debug("Re-entering Repair tab to verify against fresh server state")
+            if not await self._goto_repair_tab():
+                return True
+
+            equipcount_reentered = await self.page.xpath(
+                "//label[@id='equipcount']", timeout=5
+            )
+            if not equipcount_reentered:
+                logger.debug("No equipment needs repair after re-entering Repair tab")
+                return True
+
+            is_disabled, submit_elements = (
+                await self._select_all_and_check_repair_submit(equipcount_reentered)
+            )
+            if is_disabled is None:
+                return True
+            if is_disabled:
+                logger.error(
+                    "Still not enough materials to repair equipment "
+                    "after re-entering Repair tab"
+                )
+                return False
+            logger.info(
+                "Repair submit was enabled after re-entering Repair tab; "
+                "the earlier disabled check was stale"
+            )
 
         await submit_elements[0].mouse_click()
         await self.page.wait(2)
+
+        equipcount_after_submit = await self.page.xpath(
+            "//label[@id='equipcount']", timeout=5
+        )
+        remaining = 0
+        if equipcount_after_submit:
+            match_after_submit = re.search(
+                r"Selected \d+ of (\d+) matching", equipcount_after_submit[0].text
+            )
+            if match_after_submit:
+                remaining = int(match_after_submit.group(1))
+
+        if remaining:
+            logger.error(
+                f"Repair submitted but {remaining} pieces of equipment still need repair"
+            )
+            return False
+
         logger.info("Repaired equipment")
         return True
 
