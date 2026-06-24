@@ -724,13 +724,13 @@ class BattleDriver(HVDriver):
         for _ in range(timeout // interval):
             await asyncio.sleep(interval)
             await self._wait_if_paused()
+            if await self._is_in_battle():
+                return True
             if self.auto_next_battle:
                 if await self.goto_arena() and await self.go_next_battle():
                     continue
                 if await self.goto_grindfest() and await self.go_grindfest():
                     continue
-            if await self._is_in_battle():
-                return True
         return False
 
     async def battle(self) -> None:
