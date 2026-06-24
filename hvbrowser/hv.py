@@ -112,6 +112,36 @@ class HVDriver(EHDriver):
                     f"(tickets: {buy_number}, credits: {currently_number})"
                 )
 
+    async def recoverstamina(self) -> None:
+        logger.info("Checking USR RESTORATIVE availability for stamina recovery")
+        await self.gohomepage()
+
+        stamina_readout = await self.page.select("#stamina_readout")
+        await stamina_readout.mouse_move()
+
+        restorative_elements = await self.page.xpath(
+            "//img[@onclick=\"document.getElementById('recoverform').submit()\"]",
+            timeout=5,
+        )
+        if not restorative_elements:
+            logger.debug("USR RESTORATIVE is not available")
+            return
+
+        restorative_img = restorative_elements[0]
+        await restorative_img.mouse_move()
+        await restorative_img.mouse_click()
+        await self.page.wait(1)
+
+        error_elements = await self.page.xpath(
+            "//p[contains(@class, 'messagebox_error')]", timeout=2
+        )
+        if error_elements:
+            logger.warning(f"USR RESTORATIVE failed: {error_elements[0].text}")
+            await error_elements[0].click()
+            return
+
+        logger.info("Used USR RESTORATIVE to recover stamina")
+
     async def monstercheck(self) -> None:
         logger.info("Starting monster check")
         await self.gohomepage()
