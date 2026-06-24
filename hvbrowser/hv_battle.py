@@ -338,6 +338,26 @@ class BattleDriver(HVDriver):
             if not await self.recoverstamina():
                 break
 
+    async def _goto_via_battle_menu(self, label: str) -> bool:
+        battle_menu = await self.page.select("#parent_Battle")
+        target_elements = await self.page.xpath(
+            f"//div[contains(text(), '{label}')]", timeout=5
+        )
+        if not target_elements:
+            logger.warning(f"Unable to find '{label}' in the Battle menu")
+            return False
+
+        await battle_menu.mouse_move()
+        await target_elements[0].mouse_move()
+        await self.wait(target_elements[0].mouse_click, ischangeurl=True)
+        return True
+
+    async def goto_arena(self) -> bool:
+        return await self._goto_via_battle_menu("The Arena")
+
+    async def goto_grindfest(self) -> bool:
+        return await self._goto_via_battle_menu("GrindFest")
+
     @update_ponychart_on(True)
     async def go_next_floor(self) -> bool:
         elements = await self.page.query_selector_all("#btcp")
@@ -705,10 +725,11 @@ class BattleDriver(HVDriver):
         for _ in range(timeout // interval):
             await asyncio.sleep(interval)
             await self._wait_if_paused()
-            if self.auto_next_battle and await self.go_next_battle():
-                continue
-            if self.auto_next_battle and await self.go_grindfest():
-                continue
+            if self.auto_next_battle:
+                if await self.goto_arena() and await self.go_next_battle():
+                    continue
+                if await self.goto_grindfest() and await self.go_grindfest():
+                    continue
             if await self._is_in_battle():
                 return True
         return False
