@@ -8,6 +8,7 @@ from typing import Any, Self
 
 from zendriver import cdp
 
+from ..exceptions import LoginFailedException
 from .browser import (
     DriverRestartRotator,
     ProxyRotator,
@@ -371,6 +372,23 @@ class Driver(ABC):
             and asyncio.get_event_loop().time() < deadline
         ):
             await asyncio.sleep(0.1)
+
+        await self._verify_login_succeeded()
         self.logger.info("Login completed successfully")
 
         await self.gohomepage()
+
+    async def _verify_login_succeeded(self) -> None:
+        """確認登入是否成功：重新檢查 Forums 頁面的 guest 標記是否已消失。
+
+        提交登入表單後可能再次跳出 Cloudflare 驗證，因此這裡會再走一次
+        驗證碼偵測流程，而不是直接信任「URL 有變化」就代表登入成功。
+        """
+        await self.myget(self.url["Forums"])
+        await self.detect_and_solve_with_rotation(self.url["Forums"])
+
+        guest_elements = await self.page.query_selector_all("#userlinksguest")
+        if guest_elements:
+            raise LoginFailedException(
+                "Still showing as guest on Forums page after submitting login form"
+            )

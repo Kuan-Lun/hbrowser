@@ -16,3 +16,12 @@ class InsufficientFundsException(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+class LoginFailedException(Exception):
+    def __init__(self, message: str = "Login did not succeed.") -> None:
+        self.message = message
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
