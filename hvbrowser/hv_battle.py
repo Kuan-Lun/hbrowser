@@ -669,7 +669,6 @@ class BattleDriver(HVDriver):
                 logger.info(log_line)
 
         for fun in [
-            *([] if not self.auto_next_battle else [self.go_next_battle]),
             self.go_next_floor,
             PonyChart(self).check,
             self.check_hp,
