@@ -31,6 +31,8 @@ def _run_gui(
 
     local_toggles: dict[str, tk.BooleanVar] = {}
     local_skills: dict[str, tk.BooleanVar] = {}
+    toggle_frame: tk.LabelFrame | None = None
+    skill_group_count = 0
 
     def toggle_pause() -> None:
         if pause_flag.is_set():
@@ -52,20 +54,34 @@ def _run_gui(
 
     def poll_commands() -> None:
         """Process commands from the main process."""
+        nonlocal toggle_frame, skill_group_count
         while not cmd_queue.empty():
             cmd, args = cmd_queue.get_nowait()
             match cmd:
                 case "register_toggle":
-                    name, default = args
+                    name, label, default = args
+                    if toggle_frame is None:
+                        toggle_frame = tk.LabelFrame(
+                            skill_container, text="Auto Next Battle"
+                        )
+                        toggle_frame.grid(
+                            row=0,
+                            column=skill_group_count,
+                            padx=5,
+                            pady=3,
+                            sticky="nsew",
+                        )
+                        skill_container.columnconfigure(skill_group_count, weight=1)
                     var = tk.BooleanVar(value=default)
                     local_toggles[name] = var
                     toggle_dict[name] = default
-                    cb = tk.Checkbutton(root, text=name, variable=var)
-                    cb.pack(anchor="w", padx=10, pady=2)
+                    cb = tk.Checkbutton(toggle_frame, text=label, variable=var)
+                    cb.pack(anchor="w", padx=5, pady=1)
                 case "set_skills":
                     skill_groups, forbidden = args
                     for widget in skill_container.winfo_children():
-                        widget.destroy()
+                        if widget is not toggle_frame:
+                            widget.destroy()
                     local_skills.clear()
                     for col, (group_name, skills) in enumerate(skill_groups.items()):
                         frame = tk.LabelFrame(skill_container, text=group_name)
@@ -77,8 +93,12 @@ def _run_gui(
                             skill_dict[skill] = val
                             cb = tk.Checkbutton(frame, text=skill, variable=var)
                             cb.pack(anchor="w", padx=5, pady=1)
-                    for col in range(len(skill_groups)):
+                    skill_group_count = len(skill_groups)
+                    for col in range(skill_group_count):
                         skill_container.columnconfigure(col, weight=1)
+                    if toggle_frame is not None:
+                        toggle_frame.grid(row=0, column=skill_group_count)
+                        skill_container.columnconfigure(skill_group_count, weight=1)
                 case "set_title":
                     root.title(args)
                 case "destroy":
@@ -101,7 +121,7 @@ class BaseControlPanel(ABC):
     def set_title(self, title: str) -> None: ...
 
     @abstractmethod
-    def register_toggle(self, name: str, default: bool = False) -> None: ...
+    def register_toggle(self, name: str, label: str, default: bool = False) -> None: ...
 
     @abstractmethod
     def get_toggle(self, name: str) -> bool: ...
@@ -147,8 +167,8 @@ class ControlPanel(BaseControlPanel):
     def set_title(self, title: str) -> None:
         self._cmd_queue.put(("set_title", title))
 
-    def register_toggle(self, name: str, default: bool = False) -> None:
-        self._cmd_queue.put(("register_toggle", (name, default)))
+    def register_toggle(self, name: str, label: str, default: bool = False) -> None:
+        self._cmd_queue.put(("register_toggle", (name, label, default)))
 
     def get_toggle(self, name: str) -> bool:
         return bool(self._toggle_dict.get(name, False))
@@ -187,7 +207,7 @@ class NullControlPanel(BaseControlPanel):
     def set_title(self, title: str) -> None:
         pass
 
-    def register_toggle(self, name: str, default: bool = False) -> None:
+    def register_toggle(self, name: str, label: str, default: bool = False) -> None:
         self._toggles[name] = default
 
     def get_toggle(self, name: str) -> bool:

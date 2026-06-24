@@ -108,8 +108,6 @@ class BattleDriver(HVDriver):
         self.control_panel: BaseControlPanel = (
             NullControlPanel() if self.headless else ControlPanel()
         )
-        self.control_panel.register_toggle("auto_next_battle", default=True)
-
         forbidden_lower = [
             s.lower() for s in (forbidden_skills or DEFAULT_FORBIDDEN_SKILLS)
         ]
@@ -125,6 +123,12 @@ class BattleDriver(HVDriver):
                 set(skill_groups["Buff Skills"]) | set(extra_buff_skills)
             )
         self.control_panel.set_skills(skill_groups, forbidden_lower)
+        self.control_panel.register_toggle(
+            "auto_next_arena_battle", "Arena", default=True
+        )
+        self.control_panel.register_toggle(
+            "auto_next_grindfest_battle", "GrindFest", default=True
+        )
 
         self.turn = -1
         self.round = -1
@@ -159,8 +163,12 @@ class BattleDriver(HVDriver):
         self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
 
     @property
-    def auto_next_battle(self) -> bool:
-        return self.control_panel.get_toggle("auto_next_battle")
+    def auto_next_arena_battle(self) -> bool:
+        return self.control_panel.get_toggle("auto_next_arena_battle")
+
+    @property
+    def auto_next_grindfest_battle(self) -> bool:
+        return self.control_panel.get_toggle("auto_next_grindfest_battle")
 
     async def clear_cache(self) -> None:
         self.round = self.battle_dashboard.log_entries.current_round
@@ -726,9 +734,10 @@ class BattleDriver(HVDriver):
             await self._wait_if_paused()
             if await self._is_in_battle():
                 return True
-            if self.auto_next_battle:
+            if self.auto_next_arena_battle:
                 if await self.goto_arena() and await self.go_next_battle():
                     continue
+            if self.auto_next_grindfest_battle:
                 if await self.goto_grindfest() and await self.go_grindfest():
                     continue
         return False
