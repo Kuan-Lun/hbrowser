@@ -155,6 +155,63 @@ class HVDriver(EHDriver):
         logger.info("Used USR RESTORATIVE to recover stamina")
         return True
 
+    async def repairequipment(self) -> bool:
+        logger.info("Checking equipped gear for repairs")
+        await self.gohomepage()
+
+        bazaar = await self.page.select("#parent_Bazaar")
+        armory_elements = await self.page.xpath(
+            "//div[contains(text(), 'The Armory')]", timeout=5
+        )
+        if not armory_elements:
+            logger.warning("Unable to find The Armory entry")
+            return True
+
+        await bazaar.mouse_move()
+        await armory_elements[0].mouse_move()
+        await self.wait(armory_elements[0].mouse_click, ischangeurl=True)
+
+        repair_elements = await self.page.xpath(
+            "//div[contains(@class, 'armory_tab') and contains(text(), 'Repair')]",
+            timeout=5,
+        )
+        if not repair_elements:
+            logger.warning("Unable to find Repair tab")
+            return True
+        await self.wait(repair_elements[0].click, ischangeurl=True)
+
+        equipcount_elements = await self.page.xpath(
+            "//label[@id='equipcount']", timeout=5
+        )
+        if not equipcount_elements:
+            logger.debug("No equipment needs repair")
+            return True
+
+        match = re.search(
+            r"Selected \d+ of (\d+) matching", equipcount_elements[0].text
+        )
+        if not match or int(match.group(1)) == 0:
+            logger.debug("No equipment needs repair")
+            return True
+
+        await self.wait(equipcount_elements[0].mouse_click, ischangeurl=False)
+
+        submit_elements = await self.page.xpath("//input[@id='equipsubmit']", timeout=5)
+        if not submit_elements:
+            logger.warning("Unable to find equipment repair submit button")
+            return True
+        is_disabled = await self.page.evaluate(
+            "document.getElementById('equipsubmit').disabled"
+        )
+        if is_disabled:
+            logger.warning("Not enough materials to repair equipment")
+            return False
+
+        await submit_elements[0].mouse_click()
+        await self.page.wait(2)
+        logger.info("Repaired equipment")
+        return True
+
     async def monstercheck(self) -> None:
         logger.info("Starting monster check")
         await self.gohomepage()
