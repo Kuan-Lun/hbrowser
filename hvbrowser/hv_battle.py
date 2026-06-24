@@ -333,6 +333,11 @@ class BattleDriver(HVDriver):
             return await self.apply_buff("spirit stance")
         return False
 
+    async def _ensure_stamina(self) -> None:
+        while await self.get_stamina() < 89:
+            if not await self.recoverstamina():
+                break
+
     @update_ponychart_on(True)
     async def go_next_floor(self) -> bool:
         elements = await self.page.query_selector_all("#btcp")
@@ -710,6 +715,8 @@ class BattleDriver(HVDriver):
 
     async def battle(self) -> None:
         while True:
+            await self._wait_if_paused()
+            await self._ensure_stamina()
             if not await self._wait_for_battle():
                 logger.info("No battle detected after waiting, exiting.")
                 return
