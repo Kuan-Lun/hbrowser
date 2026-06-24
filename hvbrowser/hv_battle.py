@@ -737,15 +737,16 @@ class BattleDriver(HVDriver):
     async def battle(self) -> None:
         while True:
             await self._wait_if_paused()
-            if not await self.repairequipment():
-                logger.error(
-                    "Not enough materials to repair equipment, stopping battle."
-                )
-                return
-            await self._ensure_stamina()
-            if not await self._wait_for_battle():
-                logger.info("No battle detected after waiting, exiting.")
-                return
+            if not await self._is_in_battle():
+                if not await self.repairequipment():
+                    logger.error(
+                        "Not enough materials to repair equipment, stopping battle."
+                    )
+                    return
+                await self._ensure_stamina()
+                if not await self._wait_for_battle():
+                    logger.info("No battle detected after waiting, exiting.")
+                    return
 
             self._create_last_debuff_monster_id()
 
