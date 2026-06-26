@@ -704,23 +704,35 @@ class BattleDriver(HVDriver):
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
     async def _is_in_battle(self) -> bool:
-        try:
-            await self.battle_dashboard.update()
-            return (
-                bool(self.battle_dashboard.overview_monsters.alive_monster_name)
-                or await PonyChart(self).check()
-            )
-        except ConnectionClosed:
-            # 連線中斷不是「頁面上有 alert/dialog」這種可以原地處理的狀況，
-            # 必須往外傳給呼叫端，不能被當成「不在戰鬥中」吞掉。
-            raise
-        except Exception:
-            logger.info("Alert or error detected, attempting to handle it.")
+        for attempt in range(2):
             try:
-                await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
+                await self.battle_dashboard.update()
+                return (
+                    bool(self.battle_dashboard.overview_monsters.alive_monster_name)
+                    or await PonyChart(self).check()
+                )
+            except ConnectionClosed:
+                # 連線中斷不是「頁面上有 alert/dialog」這種可以原地處理的狀況，
+                # 必須往外傳給呼叫端，不能被當成「不在戰鬥中」吞掉。
+                raise
             except Exception:
-                logger.debug("No dialog to accept or already dismissed.")
-            return False
+                if attempt == 0:
+                    # 剛導航完頁面可能還沒渲染齊全，等事件迴圈空閒後重試一次，
+                    # 避免把「還沒載完」誤判成「不在戰鬥中」。
+                    logger.info(
+                        "Battle state parse failed, retrying once after idle wait."
+                    )
+                    await self.page.wait()
+                    continue
+                logger.info("Alert or error detected, attempting to handle it.")
+                try:
+                    await self.page.send(
+                        cdp.page.handle_java_script_dialog(accept=True)
+                    )
+                except Exception:
+                    logger.debug("No dialog to accept or already dismissed.")
+                return False
+        return False
 
     async def _wait_if_paused(self) -> None:
         await self.control_panel.wait_if_paused()
