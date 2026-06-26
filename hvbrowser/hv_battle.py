@@ -376,7 +376,7 @@ class BattleDriver(HVDriver):
         return False
 
     @update_ponychart_on(True)
-    async def go_next_battle(self) -> bool:
+    async def go_next_arena(self) -> bool:
         path_prefix = await self._get_path_prefix()
         arena_url = f'{self.url["HentaiVerse"]}{path_prefix}/?s=Battle&ss=ar'
         current_url = await self.page.evaluate("window.location.href")
@@ -406,7 +406,7 @@ class BattleDriver(HVDriver):
         )
         if not match:
             logger.debug(
-                f"go_next_battle: onclick did not match pattern: {target_onclick}"
+                f"go_next_arena: onclick did not match pattern: {target_onclick}"
             )
             return False
 
@@ -435,7 +435,7 @@ class BattleDriver(HVDriver):
             pass
 
         logger.info(
-            f"go_next_battle: started battle id={battle_id} "
+            f"go_next_arena: started battle id={battle_id} "
             f"token={'<present>' if token else '<none>'}"
         )
         return True
@@ -747,7 +747,7 @@ class BattleDriver(HVDriver):
             if await self._is_in_battle():
                 return True
             if self.auto_next_arena_battle:
-                if await self.goto_arena() and await self.go_next_battle():
+                if await self.goto_arena() and await self.go_next_arena():
                     continue
             if self.auto_next_grindfest_battle:
                 if await self.goto_grindfest() and await self.go_grindfest():
