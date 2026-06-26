@@ -747,7 +747,7 @@ class BattleDriver(HVDriver):
             if await self._is_in_battle():
                 return True
             if await self.get_stamina() <= 80:
-                break
+                continue
             if self.auto_next_arena_battle:
                 if await self.goto_arena() and await self.go_next_arena():
                     continue
