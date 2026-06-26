@@ -737,7 +737,7 @@ class BattleDriver(HVDriver):
     async def _wait_if_paused(self) -> None:
         await self.control_panel.wait_if_paused()
 
-    async def _wait_for_battle(self, timeout: int = 300, interval: int = 1) -> bool:
+    async def _wait_for_battle(self, timeout: int = 600, interval: int = 1) -> bool:
         if await self._is_in_battle():
             return True
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
