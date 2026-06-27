@@ -9,13 +9,13 @@ description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = { text = "GNU Affero General Public License v3" }
-requires-python = ">=3.13,<3.15"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "fake-useragent>=2.2.0",
     "h2h-galleryinfo-parser>=0.2.2",
     "httpx>=0.28.1",
-    "hv-bie>=0.6.0",
+    "hv-bie>=0.7.0",
     "ponychart-classifier>=0.7.0",
     "websockets>=16.0",
     "zendriver>=0.15.3",
@@ -26,7 +26,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
 
