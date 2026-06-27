@@ -25,7 +25,7 @@ _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyTyp
         "Darwin": ("/Applications/Tor Browser.app/Contents/MacOS/Tor/tor",),
         "Linux": (
             "/usr/bin/tor",
-            os.path.expanduser("~/tor-browser/Browser/TorBrowser/Tor/tor"),
+            str(Path("~/tor-browser/Browser/TorBrowser/Tor/tor").expanduser()),
         ),
         "Windows": (
             os.path.expandvars(
@@ -55,13 +55,13 @@ def _find_tor_binary() -> str:
     """
     # 優先使用環境變數
     env_path = os.getenv("TOR_BINARY_PATH")
-    if env_path and os.path.isfile(env_path):
+    if env_path and Path(env_path).is_file():
         return env_path
 
     plat = platform.system()
     candidates = _TOR_BINARY_CANDIDATES.get(plat, ())
     for path in candidates:
-        if os.path.isfile(path):
+        if Path(path).is_file():
             return path
 
     searched = (

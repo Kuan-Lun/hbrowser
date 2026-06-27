@@ -1,7 +1,7 @@
 import asyncio
-import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from ponychart_classifier import predict
@@ -84,22 +84,19 @@ class PonyChart:
             hasattr(sys.modules["__main__"], "__file__")
             and sys.modules["__main__"].__file__
         ):
-            main_script_dir = os.path.dirname(
-                os.path.abspath(sys.modules["__main__"].__file__)
-            )
+            main_script_dir = Path(sys.modules["__main__"].__file__).resolve().parent
         else:
             raise RuntimeError("無法獲取主執行檔案的目錄，請確保在正確的環境中運行。")
 
-        pony_chart_dir = os.path.join(main_script_dir, "pony_chart")
-        if not os.path.exists(pony_chart_dir):
-            os.makedirs(pony_chart_dir)
+        pony_chart_dir = main_script_dir / "pony_chart"
+        pony_chart_dir.mkdir(exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"pony_chart_{timestamp}.png"
-        filepath = os.path.join(pony_chart_dir, filename)
+        filepath = pony_chart_dir / filename
 
-        await img_element.save_screenshot(filepath)
-        return filepath
+        await img_element.save_screenshot(str(filepath))
+        return str(filepath)
 
     async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""

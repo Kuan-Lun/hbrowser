@@ -1,8 +1,8 @@
 """E-Hentai Driver 實現"""
 
 import asyncio
-import os
 import re
+from pathlib import Path
 from random import random
 
 from h2h_galleryinfo_parser import GalleryURLParser
@@ -20,9 +20,8 @@ class EHDriver(Driver):
         return "E-Hentai"
 
     @staticmethod
-    def _write_error_file(path: str, content: str) -> None:
-        with open(path, "w", errors="ignore") as f:
-            f.write(content)
+    def _write_error_file(path: Path, content: str) -> None:
+        path.write_text(content, errors="ignore")
 
     async def _close_page_safely(self, page: object) -> None:
         try:
@@ -237,7 +236,7 @@ class EHDriver(Driver):
                     raise InsufficientFundsException()
                 raise TimeoutError()
         except TimeoutError:
-            error_file = os.path.join(".", "error.txt")
+            error_file = Path("error.txt")
             error_content = await self.page.get_content()
             await asyncio.to_thread(self._write_error_file, error_file, error_content)
             retrytime = 60

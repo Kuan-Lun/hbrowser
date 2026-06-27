@@ -5,6 +5,7 @@ import os
 import socket
 import tempfile
 import zipfile
+from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
@@ -75,23 +76,23 @@ chrome.webRequest.onAuthRequired.addListener(
 """
 
     # 創建臨時目錄
-    plugin_dir = tempfile.mkdtemp()
+    plugin_dir = Path(tempfile.mkdtemp())
 
     # 寫入 manifest.json
-    with open(os.path.join(plugin_dir, "manifest.json"), "w") as f:
-        f.write(manifest_json)
+    manifest_path = plugin_dir / "manifest.json"
+    manifest_path.write_text(manifest_json)
 
     # 寫入 background.js
-    with open(os.path.join(plugin_dir, "background.js"), "w") as f:
-        f.write(background_js)
+    background_path = plugin_dir / "background.js"
+    background_path.write_text(background_js)
 
     # 創建 zip 檔案
-    plugin_file = os.path.join(tempfile.gettempdir(), "proxy_auth_plugin.zip")
+    plugin_file = Path(tempfile.gettempdir()) / "proxy_auth_plugin.zip"
     with zipfile.ZipFile(plugin_file, "w") as zp:
-        zp.write(os.path.join(plugin_dir, "manifest.json"), "manifest.json")
-        zp.write(os.path.join(plugin_dir, "background.js"), "background.js")
+        zp.write(manifest_path, "manifest.json")
+        zp.write(background_path, "background.js")
 
-    return plugin_file
+    return str(plugin_file)
 
 
 def configure_proxy() -> str | None:

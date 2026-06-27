@@ -85,9 +85,8 @@ class Driver(ABC):
         if exc_type:
             self.logger.error(f"Exception occurred: {exc_type.__name__}: {exc_val}")
             try:
-                error_file = os.path.join(get_log_dir(), "error.txt")
-                with open(error_file, "w", errors="ignore") as f:
-                    f.write(await self.page.get_content())
+                error_file = get_log_dir() / "error.txt"
+                error_file.write_text(await self.page.get_content(), errors="ignore")
                 self.logger.debug(f"Error page saved to: {error_file}")
             except Exception:
                 self.logger.error("Failed to save error page (browser session invalid)")
@@ -282,9 +281,10 @@ class Driver(ABC):
                 if await self._try_flaresolverr(url, flaresolverr_url):
                     return
 
-            challenge_page_path = os.path.join(get_log_dir(), "challenge_page.html")
-            with open(challenge_page_path, "w", errors="ignore") as f:
-                f.write(await self.page.get_content())
+            challenge_page_path = get_log_dir() / "challenge_page.html"
+            challenge_page_path.write_text(
+                await self.page.get_content(), errors="ignore"
+            )
             self.logger.debug(f"Challenge page saved to: {challenge_page_path}")
 
             self.logger.info(

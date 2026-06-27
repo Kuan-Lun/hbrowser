@@ -1,6 +1,6 @@
 __all__ = ["beep_os_independent"]
 
-import os
+import subprocess
 import sys
 
 
@@ -23,10 +23,12 @@ def beep_os_independent() -> None:
             return
 
         if sys.platform == "darwin":
-            # macOS: 使用 AppleScript 的系统蜂鸣，更稳定
-            # 若 osascript 不可用，则回退到 ASCII 铃声
-            exit_code = os.system('say -v Alex "Warning"')
-            if exit_code == 0:
+            # macOS: 使用 say 命令播放语音提示，更稳定
+            # 若 say 不可用，则回退到 ASCII 铃声
+            result = subprocess.run(
+                ["say", "-v", "Alex", "Warning"], capture_output=True
+            )
+            if result.returncode == 0:
                 return
             # 回退：继续走到通用分支
 
@@ -37,7 +39,11 @@ def beep_os_independent() -> None:
             sys.stdout.flush()
         except Exception:
             # 最后再退回到一个尽量简单的方式
-            os.system('printf "\a" >/dev/null 2>&1')
+            subprocess.run(
+                ["printf", "\a"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
     except Exception:
         # 忽略所有异常，避免因提示音影响主流程
         pass
