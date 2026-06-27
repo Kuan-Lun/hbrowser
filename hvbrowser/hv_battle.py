@@ -60,7 +60,7 @@ def update_ponychart_on(expected: bool) -> Callable[[_F], _F]:
     return decorator
 
 
-def retry_on_server_fail(func: _F) -> _F:
+def retry_on_server_fail[F: Callable[..., Any]](func: F) -> F:
     """在出現 Server communication failed alert 時，自動刷新頁面並重試一次。"""
 
     @wraps(func)
