@@ -738,22 +738,30 @@ class BattleDriver(HVDriver):
     async def _wait_if_paused(self) -> None:
         await self.control_panel.wait_if_paused()
 
-    async def _get_stamina_while_waiting(
-        self, interval: int, max_retries: int = 5
-    ) -> int | None:
-        for attempt in range(max_retries):
-            try:
-                return await self.get_stamina()
-            except ValueError:
-                logger.debug(
-                    "Stamina readout not found (page likely transitioning); "
-                    f"retry {attempt + 1}/{max_retries}."
-                )
-                await asyncio.sleep(interval)
-        logger.warning("Stamina readout still missing after retries; skipping check.")
-        return None
+    async def _try_auto_start_battle(self) -> None:
+        """嘗試自動跳轉到下一場 Arena/GrindFest 戰鬥，只試一次。
+        只在進入 _wait_for_battle 時呼叫一次，避免在等待使用者手動開戰期間
+        反覆跳轉頁面，跟使用者手動操作瀏覽器互搶導航。是否真的進入戰鬥
+        交給呼叫端用 _is_in_battle() 確認，因為表單送出後的導航是非同步的。
+        """
+        try:
+            stamina = await self.get_stamina()
+        except ValueError:
+            logger.debug("Stamina readout not found; skipping auto-start attempt.")
+            return
+        if stamina <= 80:
+            return
+        if self.auto_next_arena_battle:
+            if await self.goto_arena() and await self.go_next_arena():
+                return
+        if self.auto_next_grindfest_battle:
+            if await self.goto_grindfest() and await self.go_grindfest():
+                return
 
-    async def _wait_for_battle(self, timeout: int = 600, interval: int = 60) -> bool:
+    async def _wait_for_battle(self, timeout: int = 600, interval: int = 1) -> bool:
+        if await self._is_in_battle():
+            return True
+        await self._try_auto_start_battle()
         if await self._is_in_battle():
             return True
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
@@ -763,15 +771,6 @@ class BattleDriver(HVDriver):
             await self._wait_if_paused()
             if await self._is_in_battle():
                 return True
-            stamina = await self._get_stamina_while_waiting(interval)
-            if stamina is None or stamina <= 80:
-                continue
-            if self.auto_next_arena_battle:
-                if await self.goto_arena() and await self.go_next_arena():
-                    continue
-            if self.auto_next_grindfest_battle:
-                if await self.goto_grindfest() and await self.go_grindfest():
-                    continue
         return False
 
     async def battle(self) -> None:
