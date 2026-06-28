@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial, wraps
@@ -737,16 +738,33 @@ class BattleDriver(HVDriver):
     async def _wait_if_paused(self) -> None:
         await self.control_panel.wait_if_paused()
 
-    async def _wait_for_battle(self, timeout: int = 600, interval: int = 1) -> bool:
+    async def _get_stamina_while_waiting(
+        self, interval: int, max_retries: int = 5
+    ) -> int | None:
+        for attempt in range(max_retries):
+            try:
+                return await self.get_stamina()
+            except ValueError:
+                logger.debug(
+                    "Stamina readout not found (page likely transitioning); "
+                    f"retry {attempt + 1}/{max_retries}."
+                )
+                await asyncio.sleep(interval)
+        logger.warning("Stamina readout still missing after retries; skipping check.")
+        return None
+
+    async def _wait_for_battle(self, timeout: int = 600, interval: int = 60) -> bool:
         if await self._is_in_battle():
             return True
         logger.info(f"Waiting up to {timeout}s for user to start a battle...")
-        for _ in range(timeout // interval):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             await asyncio.sleep(interval)
             await self._wait_if_paused()
             if await self._is_in_battle():
                 return True
-            if await self.get_stamina() <= 80:
+            stamina = await self._get_stamina_while_waiting(interval)
+            if stamina is None or stamina <= 80:
                 continue
             if self.auto_next_arena_battle:
                 if await self.goto_arena() and await self.go_next_arena():
