@@ -343,7 +343,9 @@ class BattleDriver(HVDriver):
         return False
 
     async def _ensure_stamina(self) -> None:
-        while await self.get_stamina() < 79:
+        if await self.get_stamina() >= 79:
+            return
+        while await self.get_stamina() <= 88:
             if not await self.recoverstamina():
                 break
 
