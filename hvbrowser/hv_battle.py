@@ -343,7 +343,7 @@ class BattleDriver(HVDriver):
         return False
 
     async def _ensure_stamina(self) -> None:
-        while await self.get_stamina() < 89:
+        while await self.get_stamina() < 79:
             if not await self.recoverstamina():
                 break
 
@@ -749,7 +749,7 @@ class BattleDriver(HVDriver):
         except ValueError:
             logger.debug("Stamina readout not found; skipping auto-start attempt.")
             return
-        if stamina <= 80:
+        if stamina < 79:
             return
         if self.auto_next_arena_battle:
             if await self.goto_arena() and await self.go_next_arena():
