@@ -819,5 +819,6 @@ class BattleDriver(HVDriver):
                     await asyncio.sleep(5)
                     continue
 
-            notify("HBrowser", "Battle complete")
+            if not self.headless:
+                notify("HBrowser", "Battle complete")
             logger.info("Battle complete.")

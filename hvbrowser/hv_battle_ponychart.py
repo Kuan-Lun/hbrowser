@@ -133,7 +133,8 @@ class PonyChart:
 
         img_path = await self._save_pony_chart_image()
 
-        notify("PonyChart", "PonyChart detected")
+        if not self.hvdriver.headless:
+            notify("PonyChart", "PonyChart detected")
 
         try:
             await self._auto_answer(img_path)
