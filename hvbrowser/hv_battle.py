@@ -2,7 +2,7 @@ import asyncio
 import re
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from functools import partial, wraps
 from random import random
 from typing import Any, TypeVar
@@ -93,7 +93,7 @@ class BattleDriver(HVDriver):
         self,
         *args: Any,
         statthreshold: StatThreshold | None = None,
-        forbidden_skills: list[str] | None = None,
+        forbidden_skills: Iterable[str] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -109,9 +109,14 @@ class BattleDriver(HVDriver):
         self.control_panel: BaseControlPanel = (
             NullControlPanel() if self.headless else ControlPanel()
         )
-        forbidden_lower = [
-            s.lower() for s in (forbidden_skills or DEFAULT_FORBIDDEN_SKILLS)
-        ]
+        forbidden_lower = frozenset(
+            s.lower()
+            for s in (
+                forbidden_skills
+                if forbidden_skills is not None
+                else DEFAULT_FORBIDDEN_SKILLS
+            )
+        )
         skill_groups = self._build_skill_groups()
         extra_buff_skills = sorted(
             s
@@ -196,7 +201,7 @@ class BattleDriver(HVDriver):
         return {"Debuff Skills": debuff_skills, "Buff Skills": buff_skills}
 
     @property
-    def forbidden_skills(self) -> list[str]:
+    def forbidden_skills(self) -> frozenset[str]:
         return self.control_panel.get_forbidden_skills()
 
     async def click_skill(self, key: str, iswait: bool = True) -> bool:

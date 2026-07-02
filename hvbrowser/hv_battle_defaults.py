@@ -19,11 +19,13 @@ class StatThreshold:
 
 DEFAULT_STATTHRESHOLD = StatThreshold()
 
-DEFAULT_FORBIDDEN_SKILLS: list[str] = [
-    "blind",
-    "confuse",
-    "drain",
-    "magnet",
-    "silence",
-    "sleep",
-]
+DEFAULT_FORBIDDEN_SKILLS: frozenset[str] = frozenset(
+    {
+        "blind",
+        "confuse",
+        "drain",
+        "magnet",
+        "silence",
+        "sleep",
+    }
+)

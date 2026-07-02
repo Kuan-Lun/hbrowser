@@ -2,6 +2,7 @@ import asyncio
 import multiprocessing
 import tkinter as tk
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from multiprocessing import Queue
 from typing import Any
 
@@ -126,11 +127,11 @@ class BaseControlPanel(ABC):
 
     @abstractmethod
     def set_skills(
-        self, skill_groups: dict[str, list[str]], forbidden: list[str]
+        self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None: ...
 
     @abstractmethod
-    def get_forbidden_skills(self) -> list[str]: ...
+    def get_forbidden_skills(self) -> frozenset[str]: ...
 
     @abstractmethod
     async def wait_if_paused(self) -> None: ...
@@ -174,14 +175,14 @@ class ControlPanel(BaseControlPanel):
     def set_skills(
         self,
         skill_groups: dict[str, list[str]],
-        forbidden: list[str],
+        forbidden: Iterable[str],
     ) -> None:
         # Clear stale skill state before sending new layout
         self._skill_dict.clear()
-        self._cmd_queue.put(("set_skills", (skill_groups, forbidden)))
+        self._cmd_queue.put(("set_skills", (skill_groups, frozenset(forbidden))))
 
-    def get_forbidden_skills(self) -> list[str]:
-        return [name for name, val in self._skill_dict.items() if not val]
+    def get_forbidden_skills(self) -> frozenset[str]:
+        return frozenset(name for name, val in self._skill_dict.items() if not val)
 
     async def wait_if_paused(self) -> None:
         # 用 asyncio.sleep 而非 time.sleep：暫停期間絕對不能擋住 event loop，
@@ -200,7 +201,7 @@ class NullControlPanel(BaseControlPanel):
 
     def __init__(self) -> None:
         self._toggles: dict[str, bool] = {}
-        self._forbidden_skills: list[str] = []
+        self._forbidden_skills: frozenset[str] = frozenset()
 
     def set_title(self, title: str) -> None:
         pass
@@ -212,12 +213,12 @@ class NullControlPanel(BaseControlPanel):
         return self._toggles.get(name, False)
 
     def set_skills(
-        self, skill_groups: dict[str, list[str]], forbidden: list[str]
+        self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None:
-        self._forbidden_skills = list(forbidden)
+        self._forbidden_skills = frozenset(forbidden)
 
-    def get_forbidden_skills(self) -> list[str]:
-        return list(self._forbidden_skills)
+    def get_forbidden_skills(self) -> frozenset[str]:
+        return self._forbidden_skills
 
     async def wait_if_paused(self) -> None:
         return
