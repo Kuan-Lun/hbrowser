@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses `zendriver` (Chrome DevTools Protocol) for browser automation. Cloudflare managed challenges can be solved automatically via FlareSolverr; CAPTCHA challenges still require manual user interaction.
 
+## Communication
+
+- Claude 必須以繁體中文回答所有對話內容，不論使用者以何種語言提問；程式碼、指令、檔名、專有名詞等仍維持原文。
+
 ## Build & Development Commands
 
 ```bash
