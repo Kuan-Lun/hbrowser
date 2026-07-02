@@ -13,6 +13,8 @@ class StatThreshold:
     overcharge_high: int = 240
     countmonster_low: int = 0
     countmonster_high: int = 5
+    stamina_low: int = 75
+    stamina_high: int = 88
 
 
 DEFAULT_STATTHRESHOLD = StatThreshold()
