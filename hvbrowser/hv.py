@@ -208,7 +208,15 @@ class HVDriver(EHDriver):
 
     async def _goto_repair_tab(self) -> bool:
         """導航到 Bazaar -> The Armory -> Repair 頁籤。成功回傳 True。"""
-        bazaar = await self.page.select("#parent_Bazaar")
+        try:
+            bazaar = await self.page.select("#parent_Bazaar")
+        except TimeoutError:
+            logger.warning(
+                "Timed out waiting for #parent_Bazaar; homepage may not have "
+                "finished loading yet, reloading and retrying once"
+            )
+            await self.gohomepage(force=True)
+            bazaar = await self.page.select("#parent_Bazaar")
         armory_elements = await self.page.xpath(
             "//div[contains(text(), 'The Armory')]", timeout=5
         )

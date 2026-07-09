@@ -96,10 +96,10 @@ class Driver(ABC):
         except Exception:
             pass
 
-    async def gohomepage(self) -> None:
+    async def gohomepage(self, force: bool = False) -> None:
         url = self.url[self.name]
         current_url = await self.page.evaluate("window.location.href")
-        if not matchurl(current_url, url):
+        if force or not matchurl(current_url, url):
             self.logger.info(f"Navigate to homepage: {url}")
             await self.get(url)
         else:

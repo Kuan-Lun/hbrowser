@@ -8,10 +8,9 @@ from random import random
 from typing import Any, TypeVar
 
 from ponychart_classifier import update as update_ponychart_classifier
-from websockets.exceptions import ConnectionClosed
 from zendriver import cdp
 
-from hbrowser.gallery.utils import setup_logger
+from hbrowser.gallery.utils import is_connection_error, setup_logger
 from hbrowser.notify import notify
 
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
@@ -144,6 +143,7 @@ class BattleDriver(HVDriver):
 
     async def _init_browser(self) -> None:
         await super()._init_browser()
+        await self._setup_alert_handler()
         await self._init_battle_components()
 
     async def _init_battle_components(self) -> None:
@@ -712,6 +712,7 @@ class BattleDriver(HVDriver):
         self.last_debuff_monster_id: dict[str, int] = defaultdict(lambda: -1)
 
     async def _is_in_battle(self) -> bool:
+        last_error: Exception | None = None
         for attempt in range(2):
             try:
                 await self.battle_dashboard.update()
@@ -719,27 +720,41 @@ class BattleDriver(HVDriver):
                     bool(self.battle_dashboard.overview_monsters.alive_monster_name)
                     or await PonyChart(self).check()
                 )
-            except ConnectionClosed:
-                # 連線中斷不是「頁面上有 alert/dialog」這種可以原地處理的狀況，
-                # 必須往外傳給呼叫端，不能被當成「不在戰鬥中」吞掉。
+            except TimeoutError:
+                # _get_content() 逾時是設計上要交給外層 battle() 的 recovery
+                # 機制處理（例如 battle.zsh 重啟），不能被當成「不在戰鬥中」吞掉。
                 raise
-            except Exception:
+            except Exception as e:
+                if is_connection_error(e):
+                    # 連線中斷同理，不是「頁面上有 alert/dialog」這種可以
+                    # 原地處理的狀況，必須往外傳給呼叫端。
+                    raise
+                last_error = e
                 if attempt == 0:
                     # 剛導航完頁面可能還沒渲染齊全，等事件迴圈空閒後重試一次，
                     # 避免把「還沒載完」誤判成「不在戰鬥中」。
                     logger.info(
                         "Battle state parse failed, retrying once after idle wait."
                     )
-                    await self.page.wait()
-                    continue
-                logger.info("Alert or error detected, attempting to handle it.")
-                try:
-                    await self.page.send(
-                        cdp.page.handle_java_script_dialog(accept=True)
-                    )
-                except Exception:
-                    logger.debug("No dialog to accept or already dismissed.")
-                return False
+                    await self.page.wait(1)
+
+        # 兩次都解析失敗。用不依賴 hv-bie 的輕量 DOM 訊號確認頁面本身是不是
+        # 戰鬥畫面，避免把「hv-bie 解析失敗的戰鬥畫面」誤判成
+        # 「沒有戰鬥、只是彈窗擋住」。
+        battle_markers = await self.page.xpath("//*[@id='battle_main']", timeout=2)
+        if battle_markers:
+            logger.error(
+                "On battle page but failed to parse battle state twice; "
+                "refusing to report 'not in battle'."
+            )
+            assert last_error is not None
+            raise last_error
+
+        logger.info("Alert or error detected, attempting to handle it.")
+        try:
+            await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
+        except Exception:
+            logger.debug("No dialog to accept or already dismissed.")
         return False
 
     async def _wait_if_paused(self) -> None:
