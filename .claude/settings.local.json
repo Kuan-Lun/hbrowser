@@ -18,7 +18,10 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(uv run *)",
-      "Bash(uv run python -c ' *)"
+      "Bash(uv run python -c ' *)",
+      "Bash(python3 -)",
+      "Bash(python3 -c ' *)",
+      "Bash(echo \"exit: $?\")"
     ],
     "additionalDirectories": [
       "/tmp"
