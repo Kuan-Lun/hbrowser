@@ -46,9 +46,16 @@ class FlareSolverrResult:
 
 
 def get_flaresolverr_url() -> str | None:
-    """讀取 FLARESOLVERR_URL 環境變數（例如 http://127.0.0.1:8191/v1）"""
+    """讀取 FLARESOLVERR_URL 環境變數（例如 http://127.0.0.1:8191/v1）
+
+    部分平台（例如 Windows `set VAR="value"`）設定環境變數時不會剝除引號，
+    導致值變成 `"http://..."` 而非 `http://...`，讓 httpx 誤判為缺少 URL
+    scheme，因此這裡順手去除頭尾多餘的引號。
+    """
     url = os.getenv("FLARESOLVERR_URL")
-    return url.rstrip("/") if url else None
+    if not url:
+        return None
+    return url.strip().strip("\"'").rstrip("/")
 
 
 def should_use_flaresolverr() -> bool:
