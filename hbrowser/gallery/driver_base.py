@@ -287,26 +287,34 @@ class Driver(ABC):
             )
             self.logger.debug(f"Challenge page saved to: {challenge_page_path}")
 
-            self.logger.info(
-                "Please solve the challenge manually in the browser. "
-                f"Waiting up to {self.captcha_manual_timeout} seconds..."
-            )
+            if self.headless:
+                self.logger.warning(
+                    "Headless mode active; no browser window for manual solving. "
+                    f"Skipping manual wait (attempt {attempt}/{self.max_captcha_retries})"
+                )
+            else:
+                self.logger.info(
+                    "Please solve the challenge manually in the browser. "
+                    f"Waiting up to {self.captcha_manual_timeout} seconds..."
+                )
 
-            start_time = asyncio.get_event_loop().time()
-            while (
-                asyncio.get_event_loop().time() - start_time
-                < self.captcha_manual_timeout
-            ):
-                current_det = await self.captcha_detector.detect(self.page, timeout=1.0)
-                if current_det.kind == "none":
-                    self.logger.info("Challenge resolved successfully")
-                    return
-                await asyncio.sleep(5)
+                start_time = asyncio.get_event_loop().time()
+                while (
+                    asyncio.get_event_loop().time() - start_time
+                    < self.captcha_manual_timeout
+                ):
+                    current_det = await self.captcha_detector.detect(
+                        self.page, timeout=1.0
+                    )
+                    if current_det.kind == "none":
+                        self.logger.info("Challenge resolved successfully")
+                        return
+                    await asyncio.sleep(5)
 
-            self.logger.warning(
-                f"Challenge not resolved within {self.captcha_manual_timeout}s "
-                f"(attempt {attempt}/{self.max_captcha_retries})"
-            )
+                self.logger.warning(
+                    f"Challenge not resolved within {self.captcha_manual_timeout}s "
+                    f"(attempt {attempt}/{self.max_captcha_retries})"
+                )
             if attempt < self.max_captcha_retries:
                 await self._rotate_proxy()
                 await self.myget(url)
