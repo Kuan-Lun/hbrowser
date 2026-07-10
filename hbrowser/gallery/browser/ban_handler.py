@@ -16,6 +16,8 @@ _BLANK_PAGE = "<html><head></head><body></body></html>"
 _EMPTY_PAGE_WAIT_SECONDS = 4 * 60 * 60
 _HOUR_SECONDS = 60 * 60
 _RETRY_BUFFER_SECONDS = 15 * 60
+_BLANK_PAGE_QUICK_RETRIES = 3
+_BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS = 2.0
 
 
 def parse_ban_time(page_source: str) -> int:
@@ -119,6 +121,18 @@ async def _retry_until_unbanned(page: Any, source: str) -> None:
     logger.info("IP ban lifted")
 
 
+async def _resolve_transient_blank_page(page: Any, source: str) -> str:
+    """空白頁面通常只是頁面尚未載入完成（例如剛登入後的重新導向），
+    先快速重試幾次排除這種暫時性狀況，避免誤判為長時間 ban。"""
+    for _ in range(_BLANK_PAGE_QUICK_RETRIES):
+        if not check_ban_status(source).is_blank_page:
+            break
+        await asyncio.sleep(_BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS)
+        await page.reload()
+        source = await page.get_content()
+    return source
+
+
 def handle_ban_decorator(
     page: Any,
 ) -> Callable[..., Coroutine[Any, Any, None]]:
@@ -135,6 +149,8 @@ def handle_ban_decorator(
     async def myget(*args: Any, **kwargs: Any) -> None:
         await page.get(*args, **kwargs)
         source = await page.get_content()
+        if check_ban_status(source).is_blank_page:
+            source = await _resolve_transient_blank_page(page, source)
         if check_ban_status(source).should_wait:
             await _retry_until_unbanned(page, source)
 
