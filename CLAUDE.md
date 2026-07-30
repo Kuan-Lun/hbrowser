@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses `zendriver` (Chrome DevTools Protocol) for browser automation. Cloudflare managed challenges can be solved automatically via FlareSolverr; CAPTCHA challenges still require manual user interaction.
+HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses `zendriver` (Chrome DevTools Protocol) for browser automation. FlareSolverr can automatically solve Cloudflare managed challenges and the embedded Turnstile on the Forums login form; unsupported or failed interactive challenges fall back to manual interaction in GUI mode.
 
 ## Communication
 
@@ -34,7 +34,7 @@ uv run black .
 
 - `EH_USERNAME` / `EH_PASSWORD` - Login credentials for E-Hentai
 - `HBROWSER_LOG_LEVEL` - Optional: DEBUG, INFO, WARNING, ERROR (default: INFO)
-- `FLARESOLVERR_URL` - Optional: FlareSolverr endpoint (e.g. `http://127.0.0.1:8191/v1`) for automated Cloudflare challenge solving; unset disables it. For local testing, run `docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr` and set this to `http://127.0.0.1:8191/v1`
+- `FLARESOLVERR_URL` - Optional: FlareSolverr 3.5.0+ endpoint (e.g. `http://127.0.0.1:8191/v1`) for automated Cloudflare challenge solving; unset disables it. For local testing, run `docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr` and set this to `http://127.0.0.1:8191/v1`
 
 ## Architecture
 
@@ -44,8 +44,8 @@ uv run black .
   - `gallery/driver_base.py` - Abstract `Driver` base class with `zendriver` integration, login flow, and CAPTCHA handling
   - `gallery/eh_driver.py` - `EHDriver` for E-Hentai
   - `gallery/exh_driver.py` - `ExHDriver` for ExHentai
-  - `gallery/captcha/` - CAPTCHA detection (manual user resolution)
-  - `gallery/browser/` - Browser factory built on `zendriver`; also owns proxy/Tor rotation, FlareSolverr-based Cloudflare auto-solving, and ban detection. Use `find hbrowser/gallery/browser -name '*.py'` for the current file list rather than relying on this doc.
+  - `gallery/captcha/` - CAPTCHA detection plus automatic Turnstile and GUI-manual resolution policy
+  - `gallery/browser/` - Browser factory built on `zendriver`; also owns proxy/Tor rotation, persistent FlareSolverr sessions, and ban detection. Use `find hbrowser/gallery/browser -name '*.py'` for the current file list rather than relying on this doc.
 
 - **`hvbrowser`** - HentaiVerse game automation
   - `hv.py` - `HVDriver` extends `EHDriver` for HentaiVerse navigation (lottery, monster lab, market)
@@ -86,7 +86,7 @@ Follow SOLID principles when writing code:
 ## Code Style
 
 - **Sync obligation for tooling configuration:** the IDE save pipeline and the Stop hook pipeline are kept in lockstep across the locations below. Any change to one of them requires matching updates to the others in the same change.
-  - Python formatting/lint/type-check: [.vscode/settings.json](.vscode/settings.json) (`[python]` block), the `[tool.ruff]` section of [pyproject.toml](pyproject.toml), [mypy.ini](mypy.ini), and [.claude/hooks/finalize-python.sh](.claude/hooks/finalize-python.sh).
-  - Markdown formatting: [.vscode/settings.json](.vscode/settings.json) (`[markdown]` block) and [.claude/hooks/finalize-markdown.sh](.claude/hooks/finalize-markdown.sh).
+  - Python formatting/lint/type-check: [.vscode/settings.json](.vscode/settings.json) (`[python]` block), the `[tool.ruff]` section of [pyproject.toml](pyproject.toml), [mypy.ini](mypy.ini), and [scripts/hooks/finalize-python.sh](scripts/hooks/finalize-python.sh).
+  - Markdown formatting: [.vscode/settings.json](.vscode/settings.json) (`[markdown]` block) and [scripts/hooks/finalize-markdown.sh](scripts/hooks/finalize-markdown.sh).
   - Tool versions: the `dev` group of `[project.optional-dependencies]` in [pyproject.toml](pyproject.toml) pins `black`, `ruff`, `mypy`, and `pymarkdownlnt`. Both the IDE pipeline (when invoked via `uv run`) and the Stop hooks resolve to these venv-installed versions, so bumping any of them must be done here — not via Homebrew or any other system-wide install.
 - Python version range: refer to `requires-python` in [pyproject.toml](pyproject.toml)
