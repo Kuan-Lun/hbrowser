@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["black>=26.5.1", "ruff>=0.15.20", "mypy>=2.1.0", "pymarkdownlnt>=0.9.38"]
+dev = ["black>=26.5.1", "ruff>=0.15.20", "mypy>=2.1.0", "pymarkdownlnt>=0.9.38", "pytest>=9.1.1"]
 
 [project.urls]
 Homepage = "https://github.com/Kuan-Lun/hbrowser"
