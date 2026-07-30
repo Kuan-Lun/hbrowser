@@ -2,8 +2,10 @@
 
 from typing import Any
 
+from bs4 import BeautifulSoup
+
 from ..utils import is_connection_error
-from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_IFRAME_CSS
+from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_WIDGET_CSS
 from .models import ChallengeDetection
 
 
@@ -33,13 +35,13 @@ class CaptchaDetector:
             )
 
         # 檢測 Turnstile widget
-        iframe_data = await self._find_turnstile_iframe(page, timeout)
-        if iframe_data:
+        widget_data = await self._find_turnstile_widget(page, html, timeout)
+        if widget_data:
             return ChallengeDetection(
                 url=url,
                 kind="turnstile_widget",
-                sitekey=iframe_data["sitekey"],
-                iframe_src=iframe_data["src"],
+                sitekey=widget_data["sitekey"],
+                iframe_src=widget_data["src"],
             )
 
         # 檢測 reCAPTCHA v2
@@ -59,7 +61,9 @@ class CaptchaDetector:
             "請稍候" in title
             or "Just a moment" in title
             or "_cf_chl_opt" in html
-            or "/cdn-cgi/challenge-platform/" in html
+            or 'id="cf-challenge-running"' in html
+            or 'id="challenge-running"' in html
+            or 'id="challenge-stage"' in html
         )
 
     def _extract_ray_id(self, html: str) -> str | None:
@@ -67,20 +71,37 @@ class CaptchaDetector:
         m = RAY_RE.search(html)
         return m.group(1) if m else None
 
-    async def _find_turnstile_iframe(
-        self, page: Any, timeout: float
+    async def _find_turnstile_widget(
+        self,
+        page: Any,
+        html: str,
+        timeout: float,
     ) -> dict[str, Any] | None:
-        """查找 Turnstile iframe 並提取 sitekey"""
+        """Find either the static widget container, response field, or iframe."""
+        widget = BeautifulSoup(html, "html.parser").select_one(TURNSTILE_WIDGET_CSS)
+        if widget is not None:
+            return self._turnstile_data(dict(widget.attrs))
+
         try:
-            iframe = await page.select(TURNSTILE_IFRAME_CSS, timeout=timeout)
-            iframe_src = iframe.attrs.get("src", "")
-            m = SITEKEY_RE.search(iframe_src)
-            sitekey = m.group(1) if m else None
-            return {"src": iframe_src, "sitekey": sitekey}
+            widget = await page.select(TURNSTILE_WIDGET_CSS, timeout=timeout)
+            return self._turnstile_data(widget.attrs)
         except Exception as e:
             if is_connection_error(e):
                 raise
             return None
+
+    @staticmethod
+    def _turnstile_data(attrs: dict[str, Any]) -> dict[str, str | None]:
+        src_value = attrs.get("src")
+        src = src_value if isinstance(src_value, str) and src_value else None
+        sitekey_value = attrs.get("data-sitekey")
+        sitekey = (
+            sitekey_value if isinstance(sitekey_value, str) and sitekey_value else None
+        )
+        if sitekey is None and src is not None:
+            match = SITEKEY_RE.search(src)
+            sitekey = match.group(1) if match else None
+        return {"src": src, "sitekey": sitekey}
 
     async def _find_recaptcha_div(
         self, page: Any, timeout: float

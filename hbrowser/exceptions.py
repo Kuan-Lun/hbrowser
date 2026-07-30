@@ -25,3 +25,7 @@ class LoginFailedException(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+class BrowserIdentityApplyException(RuntimeError):
+    """Applying an external solver identity failed and cannot be rolled back."""

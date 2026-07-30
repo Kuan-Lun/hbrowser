@@ -7,7 +7,6 @@ import subprocess
 from typing import Any
 
 import zendriver as zd
-from fake_useragent import UserAgent
 
 from ..utils import setup_logger
 from .chrome_manager import ensure_chrome_installed
@@ -41,7 +40,6 @@ def _build_config(
 
     config.headless = headless
     config.disable_webrtc = True
-    config.user_agent = UserAgent()["google chrome"]
 
     if proxy_extension:
         logger.info("Using residential proxy extension")
@@ -121,11 +119,6 @@ async def _post_create_setup(
     from zendriver import cdp
 
     await page.send(cdp.emulation.set_geolocation_override())
-
-    ua = await page.evaluate("navigator.userAgent")
-    if not isinstance(ua, str):
-        raise RuntimeError(f"Unexpected userAgent evaluation result: {ua!r}")
-    await page.send(cdp.network.set_user_agent_override(user_agent=ua))
 
     if use_tor and not has_residential_proxy():
         await verify_proxy_ip(browser, page)
