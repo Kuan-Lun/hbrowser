@@ -134,7 +134,7 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistent_session_is_reused_for_turnstile(self) -> None:
         client = FlareSolverrClient("http://127.0.0.1:8191/v1")
-        http = _HTTP(_solution(), _solution("token"))
+        http = _HTTP(_solution(), _solution(), _solution("token"))
         client._http = http  # type: ignore[assignment]
         session = FlareSolverrSession(client, "same-session")
 
@@ -144,10 +144,27 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.turnstile_token, "token")
         self.assertEqual(
             [post["json"]["session"] for post in http.posts],
-            ["same-session", "same-session"],
+            ["same-session", "same-session", "same-session"],
         )
         self.assertNotIn("tabs_till_verify", http.posts[0]["json"])
-        self.assertEqual(http.posts[1]["json"]["tabs_till_verify"], 15)
+        self.assertNotIn("tabs_till_verify", http.posts[1]["json"])
+        self.assertEqual(http.posts[2]["json"]["tabs_till_verify"], 15)
+
+    async def test_missing_turnstile_token_is_retried_once(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _HTTP(_solution(), _solution(), _solution("token"))
+        client._http = http  # type: ignore[assignment]
+        session = FlareSolverrSession(client, "same-session")
+
+        result = await session.solve_turnstile(LOGIN_URL, tabs=15)
+
+        self.assertEqual(result.turnstile_token, "token")
+        self.assertEqual(len(http.posts), 3)
+        self.assertNotIn("tabs_till_verify", http.posts[0]["json"])
+        self.assertEqual(
+            [post["json"]["tabs_till_verify"] for post in http.posts[1:]],
+            [15, 15],
+        )
 
     async def test_persistent_session_rejects_user_agent_changes(self) -> None:
         client = FlareSolverrClient("http://127.0.0.1:8191/v1")

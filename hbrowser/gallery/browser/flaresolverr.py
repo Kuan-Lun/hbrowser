@@ -23,6 +23,7 @@ _SAME_SITE_MAP = {
     "None": cdp.network.CookieSameSite.NONE,
 }
 _CLOUDFLARE_COOKIE_PREFIXES = ("cf_", "__cf", "_cf")
+_TURNSTILE_DISCOVERY_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,6 @@ class FlareSolverrSession:
     def __init__(self, client: FlareSolverrClient, session_id: str) -> None:
         self._client = client
         self._session_id = session_id
-        self._has_navigated = False
         self._user_agent: str | None = None
 
     async def get(
@@ -101,7 +101,6 @@ class FlareSolverrSession:
             raise RuntimeError(
                 "FlareSolverr changed user agent within a persistent session"
             )
-        self._has_navigated = True
         return result
 
     async def solve_turnstile(
@@ -112,17 +111,24 @@ class FlareSolverrSession:
         timeout_ms: int = 30_000,
     ) -> FlareSolverrResult:
         """Solve an embedded Turnstile in the current persistent browser."""
-        if not self._has_navigated:
-            # The first navigation establishes Cloudflare clearance in this
-            # FlareSolverr browser. A second navigation is then able to target
-            # the embedded widget rather than the top-level managed challenge.
-            await self.get(url, timeout_ms=timeout_ms)
+        # Warm the exact login page before asking FlareSolverr to inspect it.
+        # Its Turnstile implementation checks for the hidden response field
+        # immediately after navigation, so a cold, asynchronously rendered
+        # widget can otherwise be reported as absent.
+        await self.get(url, timeout_ms=timeout_ms)
 
-        return await self.get(
-            url,
-            timeout_ms=timeout_ms,
-            turnstile_tabs=tabs,
-        )
+        result: FlareSolverrResult | None = None
+        for _ in range(_TURNSTILE_DISCOVERY_ATTEMPTS):
+            result = await self.get(
+                url,
+                timeout_ms=timeout_ms,
+                turnstile_tabs=tabs,
+            )
+            if result.turnstile_token:
+                return result
+
+        assert result is not None
+        return result
 
 
 class FlareSolverrClient:
