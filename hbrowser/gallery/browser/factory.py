@@ -25,6 +25,9 @@ from .tor import (
 
 logger = setup_logger(__name__)
 
+MAIN_TAB_WAIT_TIMEOUT = 5.0
+MAIN_TAB_POLL_INTERVAL = 0.1
+
 
 def _build_config(
     headless: bool,
@@ -124,6 +127,77 @@ async def _post_create_setup(
         await verify_proxy_ip(browser, page)
 
 
+def _select_main_tab(browser: zd.Browser) -> zd.Tab | None:
+    """取得可用的主分頁，並容忍 zendriver 啟動時的 target 同步競態。
+
+    zendriver 的 ``update_targets`` 可能先把初始 page 記成一般 Connection，
+    稍後的 TargetCreated 事件才會加入真正的 Tab。這時 ``main_tab`` 可能持續
+    回傳 None，即使 ``targets`` 裡已經有可用的 Tab，因此需要額外掃描一次。
+    """
+    page = browser.main_tab
+    if isinstance(page, zd.Tab) and page.type_ == "page":
+        return page
+    return next(
+        (
+            target
+            for target in browser.targets
+            if isinstance(target, zd.Tab) and target.type_ == "page"
+        ),
+        None,
+    )
+
+
+def _describe_browser_startup_state(browser: zd.Browser) -> str:
+    process = getattr(browser, "_process", None)
+    returncode = process.poll() if process is not None else None
+    targets = [
+        f"{type(target).__name__}(type={target.type_!r}, url={target.url!r})"
+        for target in browser.targets
+    ]
+    return (
+        f"stopped={browser.stopped}, "
+        f"process_returncode={returncode!r}, "
+        f"targets=[{', '.join(targets)}]"
+    )
+
+
+async def _wait_for_main_tab(
+    browser: zd.Browser,
+    *,
+    timeout: float = MAIN_TAB_WAIT_TIMEOUT,
+    poll_interval: float = MAIN_TAB_POLL_INTERVAL,
+) -> zd.Tab:
+    if not browser.stopped:
+        page = _select_main_tab(browser)
+        if page is not None and not browser.stopped:
+            return page
+
+        logger.warning(
+            "Browser did not expose a main tab immediately; "
+            f"waiting up to {timeout:.1f} seconds"
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        while not browser.stopped:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+            if browser.stopped:
+                break
+            page = _select_main_tab(browser)
+            if page is not None and not browser.stopped:
+                logger.info("Browser main tab became available after startup delay")
+                return page
+
+    state = _describe_browser_startup_state(browser)
+    raise RuntimeError(
+        f"Browser failed to expose a main tab within {timeout:.1f} seconds "
+        f"({state})"
+    )
+
+
 async def create_browser(
     headless: bool = True,
 ) -> tuple[zd.Browser, zd.Tab]:
@@ -157,9 +231,7 @@ async def create_browser(
 
     _attach_tor_process(browser, tor_process)
     try:
-        page = browser.main_tab
-        if page is None:
-            raise RuntimeError("Browser failed to expose a main tab")
+        page = await _wait_for_main_tab(browser)
         logger.info("Browser initialized successfully")
 
         await _post_create_setup(browser, page, use_tor)
