@@ -18,14 +18,16 @@ HBrowser can route all traffic through the Tor network for IP privacy. If Tor Br
 ### FlareSolverr (Optional)
 
 HBrowser can use [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to automatically
-solve Cloudflare's "managed challenge" (the plain JS challenge, not the interactive Turnstile
-widget) without manual interaction. Set `FLARESOLVERR_URL` to your FlareSolverr instance's `/v1`
-endpoint to enable it, e.g. `http://127.0.0.1:8191/v1`.
+solve both Cloudflare's page-level managed challenge and the Turnstile widget embedded in the
+Forums login form. Embedded Turnstile support requires FlareSolverr 3.5.0 or newer. Set
+`FLARESOLVERR_URL` to the instance's `/v1` endpoint, for example
+`http://127.0.0.1:8191/v1`.
 
-FlareSolverr's solved `cf_clearance` cookie is tied to the IP address it solved from, so it is
-only used when Tor is **not** active — if both `USE_TOR` (or auto-detected Tor) and
-`FLARESOLVERR_URL` are set, HBrowser ignores FlareSolverr and logs a warning, since the cookie
-would not match the Tor exit IP anyway.
+HBrowser keeps one persistent FlareSolverr browser across the managed challenge and login
+Turnstile so both steps use the same browser identity and clearance. That identity must also
+share the automated browser's public route. HBrowser therefore disables FlareSolverr when Tor
+or a residential proxy is active unless a future integration can configure the same sticky
+route on both browsers.
 
 ### Environment Variables
 
@@ -36,7 +38,7 @@ HBrowser requires the following environment variables:
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
-- `FLARESOLVERR_URL` (optional): FlareSolverr `/v1` endpoint used to auto-solve Cloudflare managed challenges. Ignored when Tor is active
+- `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used to auto-solve Cloudflare managed challenges and the Forums login Turnstile. Ignored when Tor or a residential proxy is active
 
 Set the environment variables before running the script:
 
