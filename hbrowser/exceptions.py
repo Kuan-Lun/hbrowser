@@ -42,10 +42,21 @@ class InvalidSearchRequestError(GallerySearchError, ValueError):
 class SearchNavigationError(GallerySearchError):
     """A trusted search URL could not be navigated to or read."""
 
-    def __init__(self, *, url: str, reason: str) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        reason: str,
+        diagnostic_path: str | None = None,
+    ) -> None:
         self.url = url
         self.reason = reason
-        super().__init__(f"Could not navigate gallery search URL {url!r}: {reason}")
+        self.diagnostic_path = diagnostic_path
+
+        message = f"Could not navigate gallery search URL {url!r}: {reason}"
+        if diagnostic_path is not None:
+            message += f"; diagnostic saved to {diagnostic_path}"
+        super().__init__(message)
 
 
 class SearchPageError(GallerySearchError):

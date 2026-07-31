@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import multiprocessing
+import os
 import unittest
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from zendriver.core.connection import ProtocolException
@@ -31,8 +34,11 @@ from hbrowser import (
     SearchRequest,
 )
 from hbrowser.gallery.eh_driver import (
+    _SEARCH_DIAGNOSTIC_FILE_LIMIT,
+    _SEARCH_DIAGNOSTIC_FILENAME_PATTERN,
     _SEARCH_PAGE_SNAPSHOT_SCRIPT,
     EHDriver,
+    _locked_search_diagnostic_directory,
     _NextPageState,
     _parse_search_page,
 )
@@ -48,6 +54,16 @@ _DEFAULT_QUERY = object()
 def _search_url(query: str, **extra: str) -> str:
     parameters = [("f_search", query), ("f_cats", "0"), *extra.items()]
     return f"{EXH_HOME}?{urlencode(parameters)}"
+
+
+def _managed_diagnostic_paths(log_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in log_dir.iterdir()
+        if _SEARCH_DIAGNOSTIC_FILENAME_PATTERN.fullmatch(path.name)
+        and path.is_file()
+        and not path.is_symlink()
+    )
 
 
 def _result_page(
@@ -459,6 +475,109 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.pages_visited, 1)
         self.assertEqual(driver.get_urls, [EXH_HOME, search_url])
 
+    async def test_stable_interactive_snapshot_is_dom_ready(self) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        driver.add_route(EXH_HOME, _scope_document())
+        driver.add_route(
+            search_url,
+            _Document(
+                url=search_url,
+                html_reads=(_result_page(query, GID_349189_GALLERY),),
+                ready_state_reads=("interactive",),
+            ),
+        )
+
+        result = await driver.search(SearchRequest(EXH_HOME, query))
+
+        self.assertEqual([gallery.gid for gallery in result.galleries], [349189])
+        self.assertEqual(driver.get_urls, [EXH_HOME, search_url])
+
+    async def test_loading_timeout_saves_the_last_snapshot(self) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        html = _result_page(query, GID_349189_GALLERY)
+        driver = _HarnessExHDriver()
+        driver.page.current_document = _Document(
+            url=search_url,
+            html_reads=(html,),
+            ready_state_reads=("loading",),
+        )
+        fake_loop = Mock()
+        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
+        diagnostic_path = Path("/tmp/search-error.html")
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
+                return_value=fake_loop,
+            ),
+            patch.object(
+                driver,
+                "_save_search_diagnostic",
+                new=AsyncMock(return_value=diagnostic_path),
+            ) as save_diagnostic,
+            self.assertRaises(SearchNavigationError) as raised,
+        ):
+            await driver._read_stable_search_page(search_url, query)
+
+        save_diagnostic.assert_awaited_once_with(html)
+        self.assertEqual(raised.exception.url, search_url)
+        self.assertEqual(
+            raised.exception.diagnostic_path,
+            str(diagnostic_path),
+        )
+        self.assertIn("last readyState='loading'", raised.exception.reason)
+        self.assertIn(
+            "stable main-frame loader=True",
+            raised.exception.reason,
+        )
+        self.assertIn(f"actual url={search_url!r}", raised.exception.reason)
+        self.assertIn("title='Search results'", raised.exception.reason)
+        self.assertIn(f"query={query!r}", raised.exception.reason)
+        self.assertIn("loader before='loader-0'", raised.exception.reason)
+        self.assertIn("loader after='loader-0'", raised.exception.reason)
+
+    async def test_loader_timeout_saves_the_actual_gallery_page(self) -> None:
+        target_url = _search_url("gid:349189")
+        gallery_html = "<html><head><title>Gallery</title></head></html>"
+        driver = _HarnessExHDriver()
+        driver.page.current_document = _Document(
+            url=GID_349189_GALLERY,
+            html_reads=(gallery_html,),
+            title="Gallery",
+            live_query=None,
+        )
+        fake_loop = Mock()
+        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
+        diagnostic_path = Path("/tmp/gallery-timeout.html")
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
+                return_value=fake_loop,
+            ),
+            patch.object(
+                driver,
+                "_save_search_diagnostic",
+                new=AsyncMock(return_value=diagnostic_path),
+            ) as save_diagnostic,
+            self.assertRaises(SearchNavigationError) as raised,
+        ):
+            await driver._wait_for_new_loader("loader-0", target_url)
+
+        save_diagnostic.assert_awaited_once_with(gallery_html)
+        self.assertEqual(raised.exception.diagnostic_path, str(diagnostic_path))
+        self.assertIn(
+            f"actual url={GID_349189_GALLERY!r}",
+            raised.exception.reason,
+        )
+        self.assertIn("title='Gallery'", raised.exception.reason)
+        self.assertIn("query=None", raised.exception.reason)
+        self.assertIn("capture loader before='loader-0'", raised.exception.reason)
+        self.assertIn("capture loader after='loader-0'", raised.exception.reason)
+
     async def test_snapshot_is_discarded_when_loader_changes_during_read(
         self,
     ) -> None:
@@ -581,6 +700,61 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([gallery.gid for gallery in result.galleries], [1, 2])
         self.assertEqual(result.galleries[0].url, first_gallery)
         self.assertEqual(driver.get_urls, [EXH_HOME, first_url, second_url])
+
+    async def test_pagination_accepts_omitted_default_f_cats(self) -> None:
+        query = "artist:test"
+        first_url = _search_url(query)
+        omitted_url = f"{EXH_HOME}?{urlencode({'f_search': query, 'next': '2'})}"
+        explicit_url = _search_url(query, next="2")
+
+        for second_request_url, second_document_url in (
+            (omitted_url, explicit_url),
+            (explicit_url, omitted_url),
+            (omitted_url, omitted_url),
+        ):
+            driver = _HarnessExHDriver()
+            driver.add_route(EXH_HOME, _scope_document())
+            driver.add_route(
+                first_url,
+                _Document(
+                    url=first_url,
+                    html_reads=(
+                        _result_page(
+                            query,
+                            "https://exhentai.org/g/1/deadbeef00/",
+                            next_href=second_request_url,
+                        ),
+                    ),
+                ),
+            )
+            driver.add_route(
+                second_request_url,
+                _Document(
+                    url=second_document_url,
+                    html_reads=(
+                        _result_page(
+                            query,
+                            "https://exhentai.org/g/2/cafebabe01/",
+                        ),
+                    ),
+                ),
+            )
+
+            with self.subTest(
+                request_url=second_request_url,
+                document_url=second_document_url,
+            ):
+                result = await driver.search(SearchRequest(EXH_HOME, query))
+
+                self.assertEqual(result.pages_visited, 2)
+                self.assertEqual(
+                    [gallery.gid for gallery in result.galleries],
+                    [1, 2],
+                )
+                self.assertEqual(
+                    driver.get_urls,
+                    [EXH_HOME, first_url, second_request_url],
+                )
 
     async def test_empty_query_after_scope_resolution_is_rejected(self) -> None:
         driver = _HarnessExHDriver()
@@ -737,6 +911,255 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             await failing_driver._navigate_search_url("gid:1", url)
 
 
+class SearchDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_diagnostics_keep_only_the_newest_files(self) -> None:
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            existing_paths = list[Path]()
+            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT + 2):
+                path = log_dir / f"search_error_{index:032x}.html"
+                path.write_text(f"old-{index}")
+                timestamp = index + 1
+                os.utime(path, ns=(timestamp, timestamp))
+                existing_paths.append(path)
+
+            manual_path = log_dir / "search_error_manual_notes.html"
+            manual_path.write_text("keep me")
+            ignored_directory = log_dir / f"search_error_{'e' * 32}.html"
+            ignored_directory.mkdir()
+            ignored_symlink = log_dir / f"search_error_{'f' * 32}.html"
+            ignored_symlink.symlink_to(manual_path)
+
+            with patch(
+                "hbrowser.gallery.eh_driver.get_log_dir",
+                return_value=log_dir,
+            ):
+                created_path = await driver._save_search_diagnostic("new")
+
+            self.assertIsNotNone(created_path)
+            assert created_path is not None
+            remaining_paths = _managed_diagnostic_paths(log_dir)
+            self.assertEqual(
+                len(remaining_paths),
+                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
+            )
+            self.assertIn(created_path, remaining_paths)
+            self.assertEqual(created_path.read_text(), "new")
+            for path in existing_paths[:3]:
+                self.assertFalse(path.exists())
+            self.assertTrue(manual_path.exists())
+            self.assertTrue(ignored_directory.is_dir())
+            self.assertTrue(ignored_symlink.is_symlink())
+            self.assertEqual(created_path.stat().st_mode & 0o777, 0o600)
+            lock_path = log_dir / ".hbrowser-search-diagnostics.lock"
+            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
+    async def test_concurrent_writers_keep_both_new_diagnostics(self) -> None:
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT - 1):
+                path = log_dir / f"search_error_{index:032x}.html"
+                path.write_text("old")
+                os.utime(path, ns=(10**18, 10**18))
+
+            with patch(
+                "hbrowser.gallery.eh_driver.get_log_dir",
+                return_value=log_dir,
+            ):
+                first_path, second_path = await asyncio.gather(
+                    driver._save_search_diagnostic("first"),
+                    driver._save_search_diagnostic("second"),
+                )
+
+            self.assertIsNotNone(first_path)
+            self.assertIsNotNone(second_path)
+            assert first_path is not None
+            assert second_path is not None
+            self.assertNotEqual(first_path, second_path)
+            self.assertTrue(first_path.exists())
+            self.assertTrue(second_path.exists())
+            self.assertEqual(
+                {first_path.read_text(), second_path.read_text()},
+                {"first", "second"},
+            )
+            self.assertEqual(
+                len(_managed_diagnostic_paths(log_dir)),
+                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
+            )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_fork_child_does_not_inherit_a_stuck_thread_lock(self) -> None:
+        context = multiprocessing.get_context("fork")
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            receive_connection, send_connection = context.Pipe(duplex=False)
+
+            def write_in_child() -> None:
+                receive_connection.close()
+                try:
+                    path = EHDriver._write_search_diagnostic(log_dir, "child")
+                except BaseException as error:
+                    send_connection.send((False, repr(error)))
+                else:
+                    send_connection.send((True, str(path)))
+                finally:
+                    send_connection.close()
+
+            with _locked_search_diagnostic_directory(log_dir):
+                process = context.Process(target=write_in_child)
+                process.start()
+
+            send_connection.close()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                self.fail("fork child remained blocked by the inherited lock")
+
+            self.assertEqual(process.exitcode, 0)
+            succeeded, detail = receive_connection.recv()
+            receive_connection.close()
+            process.close()
+            self.assertTrue(succeeded, detail)
+            self.assertTrue(Path(detail).exists())
+
+    async def test_search_diagnostics_obey_total_byte_budget(self) -> None:
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            existing_paths = list[Path]()
+            for index in range(3):
+                path = log_dir / f"search_error_{index:032x}.html"
+                path.write_bytes(b"old!")
+                os.utime(path, ns=(index + 1, index + 1))
+                existing_paths.append(path)
+
+            with (
+                patch(
+                    "hbrowser.gallery.eh_driver.get_log_dir",
+                    return_value=log_dir,
+                ),
+                patch(
+                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_TOTAL_BYTES",
+                    12,
+                ),
+                patch(
+                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_MAX_FILE_BYTES",
+                    12,
+                ),
+            ):
+                created_path = await driver._save_search_diagnostic("new!!")
+
+            self.assertIsNotNone(created_path)
+            assert created_path is not None
+            remaining_paths = _managed_diagnostic_paths(log_dir)
+            self.assertLessEqual(
+                sum(path.stat().st_size for path in remaining_paths),
+                12,
+            )
+            self.assertFalse(existing_paths[0].exists())
+            self.assertFalse(existing_paths[1].exists())
+            self.assertTrue(existing_paths[2].exists())
+
+    async def test_oversized_search_diagnostic_is_truncated(self) -> None:
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            with (
+                patch(
+                    "hbrowser.gallery.eh_driver.get_log_dir",
+                    return_value=log_dir,
+                ),
+                patch(
+                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_MAX_FILE_BYTES",
+                    256,
+                ),
+                patch(
+                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_TOTAL_BYTES",
+                    512,
+                ),
+            ):
+                created_path = await driver._save_search_diagnostic("x" * 1000)
+
+            self.assertIsNotNone(created_path)
+            assert created_path is not None
+            content = created_path.read_bytes()
+            self.assertLessEqual(len(content), 256)
+            self.assertIn(b"hbrowser search diagnostic truncated", content)
+
+    async def test_partial_write_is_removed(self) -> None:
+        class _FailingWriter:
+            def __init__(self, descriptor: int) -> None:
+                self.descriptor = descriptor
+
+            def __enter__(self) -> _FailingWriter:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+                os.close(self.descriptor)
+
+            def write(self, content: bytes) -> int:
+                os.write(self.descriptor, content[:1])
+                raise OSError("simulated partial write")
+
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+
+            with (
+                patch(
+                    "hbrowser.gallery.eh_driver.get_log_dir",
+                    return_value=log_dir,
+                ),
+                patch(
+                    "hbrowser.gallery.eh_driver.os.fdopen",
+                    side_effect=lambda descriptor, mode: _FailingWriter(descriptor),
+                ),
+            ):
+                created_path = await driver._save_search_diagnostic("content")
+
+            self.assertIsNone(created_path)
+            self.assertEqual(_managed_diagnostic_paths(log_dir), [])
+
+    async def test_prune_failure_does_not_add_another_file(self) -> None:
+        driver = _HarnessExHDriver()
+        with TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            existing_paths = list[Path]()
+            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT):
+                path = log_dir / f"search_error_{index:032x}.html"
+                path.write_text("old")
+                os.utime(path, ns=(index + 1, index + 1))
+                existing_paths.append(path)
+
+            original_unlink = Path.unlink
+
+            def fail_oldest_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path == existing_paths[0]:
+                    raise PermissionError("simulated retention failure")
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                patch(
+                    "hbrowser.gallery.eh_driver.get_log_dir",
+                    return_value=log_dir,
+                ),
+                patch.object(
+                    Path, "unlink", autospec=True, side_effect=fail_oldest_unlink
+                ),
+            ):
+                created_path = await driver._save_search_diagnostic("new")
+
+            self.assertIsNone(created_path)
+            self.assertEqual(
+                len(_managed_diagnostic_paths(log_dir)),
+                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
+            )
+
+
 class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.sleep_patch = patch(
@@ -867,7 +1290,9 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             "https://exhentai.org/gallery?f_search=artist%3Atest&next=2",
             "https://exhentai.org/?f_search=artist%3Aother&next=2",
             "https://exhentai.org/?f_search=artist%3Atest&f_cats=1&next=2",
-            "https://exhentai.org/?f_search=artist%3Atest&next=2",
+            "https://exhentai.org/?f_search=artist%3Atest&f_cats=&next=2",
+            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0" "&f_cats=0&next=2",
+            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0" "&f_cats=1&next=2",
             "https://exhentai.org/?foo=changed&f_search=artist%3Atest"
             "&f_cats=0&next=2",
             f"{first_url}#unexpected",

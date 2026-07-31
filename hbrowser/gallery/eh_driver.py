@@ -1,11 +1,16 @@
 """E-Hentai Driver 實現"""
 
 import asyncio
+import os
 import re
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from random import random
+from threading import Lock
 from typing import Never
 from urllib.parse import (
     parse_qs,
@@ -53,6 +58,16 @@ MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
 SEARCH_PAGE_POLL_SECONDS = 0.1
 SEARCH_NAVIGATION_RETRIES = 1
+_SEARCH_DIAGNOSTIC_FILE_LIMIT = 20
+_SEARCH_DIAGNOSTIC_MAX_FILE_BYTES = 2 * 1024 * 1024
+_SEARCH_DIAGNOSTIC_TOTAL_BYTES = 20 * 1024 * 1024
+_SEARCH_DIAGNOSTIC_FILENAME_PATTERN = re.compile(
+    r"search_error_(?:(?P<sequence>[0-9a-f]{16})_)?[0-9a-f]{32}\.html\Z"
+)
+_SEARCH_DIAGNOSTIC_LOCK_FILENAME = ".hbrowser-search-diagnostics.lock"
+_SEARCH_DIAGNOSTIC_THREAD_LOCK = Lock()
+_SEARCH_DIAGNOSTIC_MAX_SEQUENCE = (1 << 64) - 1
+_SEARCH_DOCUMENT_READY_STATES = frozenset({"interactive", "complete"})
 
 _GALLERY_PATH_PATTERN = re.compile(r"/g/\d+/[A-Za-z0-9]+/?")
 _GALLERY_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
@@ -100,6 +115,15 @@ class _NextPageState(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class _RawPageSnapshot:
+    url: str
+    title: str
+    ready_state: str
+    html: str
+    query_value: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _SearchPageSnapshot:
     url: str
     title: str
@@ -110,6 +134,128 @@ class _SearchPageSnapshot:
     query_value: str | None
     next_state: _NextPageState
     next_href: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchDiagnosticCandidate:
+    path: Path
+    size: int
+    order: tuple[int, int, str]
+
+
+def _reset_search_diagnostic_thread_lock_after_fork() -> None:
+    global _SEARCH_DIAGNOSTIC_THREAD_LOCK
+
+    _SEARCH_DIAGNOSTIC_THREAD_LOCK = Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_search_diagnostic_thread_lock_after_fork)
+
+
+def _lock_search_diagnostic_descriptor(descriptor: int) -> None:
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.lockf(descriptor, fcntl.LOCK_EX, 0, 0, os.SEEK_SET)
+    elif os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        getattr(msvcrt, "locking")(descriptor, getattr(msvcrt, "LK_LOCK"), 1)
+
+
+def _unlock_search_diagnostic_descriptor(descriptor: int) -> None:
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
+    elif os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        getattr(msvcrt, "locking")(
+            descriptor,
+            getattr(msvcrt, "LK_UNLCK"),
+            1,
+        )
+
+
+@contextmanager
+def _locked_search_diagnostic_directory(directory: Path) -> Iterator[None]:
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    lock_path = directory / _SEARCH_DIAGNOSTIC_LOCK_FILENAME
+
+    with _SEARCH_DIAGNOSTIC_THREAD_LOCK:
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            _lock_search_diagnostic_descriptor(descriptor)
+            try:
+                yield
+            finally:
+                _unlock_search_diagnostic_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _bounded_search_diagnostic_content(content: str) -> bytes:
+    maximum_bytes = min(
+        _SEARCH_DIAGNOSTIC_MAX_FILE_BYTES,
+        _SEARCH_DIAGNOSTIC_TOTAL_BYTES,
+    )
+    if maximum_bytes <= 0:
+        raise OSError("Search diagnostic byte limits must be positive")
+
+    content_bytes = content.encode("utf-8", errors="ignore")
+    if len(content_bytes) <= maximum_bytes:
+        return content_bytes
+
+    marker = (
+        "\n<!-- hbrowser search diagnostic truncated at " f"{maximum_bytes} bytes -->\n"
+    ).encode()
+    if len(marker) >= maximum_bytes:
+        return marker[:maximum_bytes]
+    prefix = content_bytes[: maximum_bytes - len(marker)]
+    return prefix.decode("utf-8", errors="ignore").encode("utf-8") + marker
+
+
+def _write_private_file(path: Path, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    created = False
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        created = True
+        file = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with file:
+            written = file.write(content)
+            if written != len(content):
+                raise OSError(
+                    f"Short search diagnostic write: {written}/{len(content)} bytes"
+                )
+    except BaseException as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                error.add_note(f"Could not close diagnostic file: {close_error!r}")
+        if created:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                error.add_note(
+                    f"Could not remove partial diagnostic file: {cleanup_error!r}"
+                )
+        raise
 
 
 def _normalize_gallery_url(href: str, page_url: str) -> GalleryURLParser | None:
@@ -252,14 +398,21 @@ def _query_values(url: str, key: str) -> list[str]:
     ).get(key, [])
 
 
+def _canonical_query_pairs(url: str) -> list[tuple[str, str]]:
+    pairs = parse_qsl(
+        urlsplit(url).query,
+        keep_blank_values=True,
+    )
+    if not any(key == "f_cats" for key, _ in pairs):
+        pairs.append(("f_cats", "0"))
+    return pairs
+
+
 def _search_context(url: str) -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
             (key, value)
-            for key, value in parse_qsl(
-                urlsplit(url).query,
-                keep_blank_values=True,
-            )
+            for key, value in _canonical_query_pairs(url)
             if key not in _PAGINATION_QUERY_KEYS
         )
     )
@@ -302,6 +455,86 @@ class EHDriver(Driver):
     def _write_error_file(path: Path, content: str) -> None:
         path.write_text(content, errors="ignore")
 
+    @staticmethod
+    def _write_search_diagnostic(directory: Path, content: str) -> Path:
+        content_bytes = _bounded_search_diagnostic_content(content)
+        if _SEARCH_DIAGNOSTIC_FILE_LIMIT <= 0:
+            raise OSError("Search diagnostic file limit must be positive")
+
+        with _locked_search_diagnostic_directory(directory):
+            candidates = list[_SearchDiagnosticCandidate]()
+            maximum_sequence = -1
+            for directory_entry in directory.iterdir():
+                match = _SEARCH_DIAGNOSTIC_FILENAME_PATTERN.fullmatch(
+                    directory_entry.name
+                )
+                if match is None:
+                    continue
+                try:
+                    candidate_stat = directory_entry.lstat()
+                except OSError as error:
+                    raise OSError(
+                        "Could not inspect search diagnostic "
+                        f"{directory_entry}: {error!r}"
+                    ) from error
+                if not stat.S_ISREG(candidate_stat.st_mode):
+                    continue
+
+                sequence_text = match.group("sequence")
+                if sequence_text is None:
+                    order = (
+                        0,
+                        candidate_stat.st_mtime_ns,
+                        directory_entry.name,
+                    )
+                else:
+                    sequence = int(sequence_text, 16)
+                    maximum_sequence = max(maximum_sequence, sequence)
+                    order = (1, sequence, directory_entry.name)
+                candidates.append(
+                    _SearchDiagnosticCandidate(
+                        path=directory_entry,
+                        size=candidate_stat.st_size,
+                        order=order,
+                    )
+                )
+
+            candidates.sort(key=lambda candidate: candidate.order)
+            allowed_count = _SEARCH_DIAGNOSTIC_FILE_LIMIT - 1
+            allowed_bytes = _SEARCH_DIAGNOSTIC_TOTAL_BYTES - len(content_bytes)
+            remaining_count = len(candidates)
+            remaining_bytes = sum(candidate.size for candidate in candidates)
+            for diagnostic_candidate in candidates:
+                if (
+                    remaining_count <= allowed_count
+                    and remaining_bytes <= allowed_bytes
+                ):
+                    break
+                try:
+                    diagnostic_candidate.path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise OSError(
+                        "Could not enforce search diagnostic retention while "
+                        f"removing {diagnostic_candidate.path}: {error!r}"
+                    ) from error
+                remaining_count -= 1
+                remaining_bytes -= diagnostic_candidate.size
+
+            if remaining_count > allowed_count or remaining_bytes > allowed_bytes:
+                raise OSError(
+                    "Could not make room within search diagnostic retention "
+                    f"bounds: files={remaining_count}, bytes={remaining_bytes}"
+                )
+            if maximum_sequence >= _SEARCH_DIAGNOSTIC_MAX_SEQUENCE:
+                raise OSError("Search diagnostic sequence is exhausted")
+
+            sequence = maximum_sequence + 1
+            path = directory / (f"search_error_{sequence:016x}_{uuid4().hex}.html")
+            _write_private_file(path, content_bytes)
+            return path
+
     async def _close_page_safely(self, page: object) -> None:
         try:
             await page.close()  # type: ignore[attr-defined]
@@ -314,7 +547,7 @@ class EHDriver(Driver):
         frame_tree = await self.page.send(cdp.page.get_frame_tree())
         return str(frame_tree.frame.loader_id)
 
-    async def _read_search_page(self) -> _SearchPageSnapshot:
+    async def _read_raw_page_snapshot(self) -> _RawPageSnapshot:
         page_data = await self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT)
         if not isinstance(page_data, dict):
             raise TypeError("Search-page snapshot was not an object")
@@ -333,22 +566,35 @@ class EHDriver(Driver):
         ):
             raise TypeError("Search-page snapshot contained non-string fields")
 
+        return _RawPageSnapshot(
+            url=url,
+            title=title.strip(),
+            ready_state=ready_state,
+            html=html_content,
+            query_value=query_value,
+        )
+
+    async def _read_search_page(self) -> _SearchPageSnapshot:
+        raw_snapshot = await self._read_raw_page_snapshot()
+
         (
             galleries,
             has_no_results,
             serialized_query,
             next_state,
             next_href,
-        ) = _parse_search_page(html_content, url)
+        ) = _parse_search_page(raw_snapshot.html, raw_snapshot.url)
         return _SearchPageSnapshot(
-            url=url,
-            title=title.strip(),
-            ready_state=ready_state,
-            html=html_content,
+            url=raw_snapshot.url,
+            title=raw_snapshot.title,
+            ready_state=raw_snapshot.ready_state,
+            html=raw_snapshot.html,
             galleries=galleries,
             has_no_results=has_no_results,
             query_value=(
-                query_value if isinstance(query_value, str) else serialized_query
+                raw_snapshot.query_value
+                if raw_snapshot.query_value is not None
+                else serialized_query
             ),
             next_state=next_state,
             next_href=next_href,
@@ -356,8 +602,11 @@ class EHDriver(Driver):
 
     async def _save_search_diagnostic(self, html_content: str) -> Path | None:
         try:
-            path = get_log_dir() / f"search_error_{uuid4().hex}.html"
-            await asyncio.to_thread(self._write_error_file, path, html_content)
+            path = await asyncio.to_thread(
+                self._write_search_diagnostic,
+                get_log_dir(),
+                html_content,
+            )
         except OSError as error:
             self.logger.warning(f"Failed to save search diagnostic: {error!r}")
             return None
@@ -390,6 +639,7 @@ class EHDriver(Driver):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
         last_error: Exception | None = None
+        last_loader_id: str | None = None
 
         while loop.time() < deadline:
             try:
@@ -405,16 +655,46 @@ class EHDriver(Driver):
                 last_error = error
                 await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
                 continue
+            last_loader_id = current_loader_id
             if current_loader_id != old_loader_id:
                 return
             await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
 
-        reason = "the trusted GET did not replace the main-frame loader"
+        reason = (
+            "the trusted GET did not replace the main-frame loader"
+            f"; old loader={old_loader_id!r}"
+            f"; last observed loader={last_loader_id!r}"
+        )
+        diagnostic_path: Path | None = None
+        try:
+            loader_before = await self._current_loader_id()
+            if loader_before != old_loader_id:
+                return
+            snapshot = await self._read_raw_page_snapshot()
+            loader_after = await self._current_loader_id()
+            if loader_after != old_loader_id:
+                return
+            reason += (
+                f"; actual url={snapshot.url!r}"
+                f"; title={snapshot.title!r}"
+                f"; query={snapshot.query_value!r}"
+                f"; readyState={snapshot.ready_state!r}"
+                f"; capture loader before={loader_before!r}"
+                f"; capture loader after={loader_after!r}"
+            )
+            diagnostic_path = await self._save_search_diagnostic(snapshot.html)
+        except Exception as error:
+            if is_connection_error(error):
+                raise
+            reason += f"; could not capture timeout diagnostic: {error!r}"
         if last_error is not None:
             reason += f"; last transient context error: {last_error!r}"
         raise SearchNavigationError(
             url=target_url,
             reason=reason,
+            diagnostic_path=(
+                str(diagnostic_path) if diagnostic_path is not None else None
+            ),
         )
 
     async def _read_stable_search_page(
@@ -425,6 +705,10 @@ class EHDriver(Driver):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
         last_transient_error: Exception | None = None
+        last_snapshot: _SearchPageSnapshot | None = None
+        last_loader_stable: bool | None = None
+        last_loader_before: str | None = None
+        last_loader_after: str | None = None
 
         while loop.time() < deadline:
             try:
@@ -450,17 +734,44 @@ class EHDriver(Driver):
                     reason=f"could not read the navigated document: {error!r}",
                 ) from error
 
-            if loader_before == loader_after and snapshot.ready_state == "complete":
+            last_snapshot = snapshot
+            last_loader_before = loader_before
+            last_loader_after = loader_after
+            last_loader_stable = loader_before == loader_after
+            if (
+                last_loader_stable
+                and snapshot.ready_state in _SEARCH_DOCUMENT_READY_STATES
+            ):
                 return snapshot
             await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
 
         reason = (
-            "the page did not expose a stable complete snapshot from one "
+            "the page did not expose a stable DOM-ready snapshot from one "
             "main-frame loader"
         )
+        diagnostic_path: Path | None = None
+        if last_snapshot is None:
+            reason += "; no readable snapshot was captured"
+        else:
+            reason += (
+                f"; actual url={last_snapshot.url!r}"
+                f"; title={last_snapshot.title!r}"
+                f"; query={last_snapshot.query_value!r}"
+                f"; last readyState={last_snapshot.ready_state!r}"
+                f"; stable main-frame loader={last_loader_stable}"
+                f"; loader before={last_loader_before!r}"
+                f"; loader after={last_loader_after!r}"
+            )
+            diagnostic_path = await self._save_search_diagnostic(last_snapshot.html)
         if last_transient_error is not None:
             reason += f"; last transient context error: {last_transient_error!r}"
-        raise SearchNavigationError(url=target_url, reason=reason)
+        raise SearchNavigationError(
+            url=target_url,
+            reason=reason,
+            diagnostic_path=(
+                str(diagnostic_path) if diagnostic_path is not None else None
+            ),
+        )
 
     async def _navigate_search_url(
         self,
@@ -788,7 +1099,7 @@ class EHDriver(Driver):
         return (
             parsed_url.hostname or "",
             parsed_url.path,
-            tuple(sorted(parse_qsl(parsed_url.query, keep_blank_values=True))),
+            tuple(sorted(_canonical_query_pairs(url))),
         )
 
     async def checkh2h(self) -> bool:
