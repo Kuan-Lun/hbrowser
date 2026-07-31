@@ -2,17 +2,295 @@
 
 import asyncio
 import re
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from random import random
+from typing import Never
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
+from uuid import uuid4
 
+from bs4 import BeautifulSoup
 from h2h_galleryinfo_parser import GalleryURLParser
+from zendriver import cdp
+from zendriver.core.connection import ProtocolException
 
-from ..exceptions import ClientOfflineException, InsufficientFundsException
+from ..exceptions import (
+    ClientOfflineException,
+    GalleryLookupError,
+    InsufficientFundsException,
+    InvalidSearchRequestError,
+    MalformedSearchPageError,
+    SearchAuthenticationError,
+    SearchChallengeError,
+    SearchLimitExceededError,
+    SearchNavigationError,
+    SearchPageError,
+    SearchPaginationError,
+    SearchRateLimitError,
+)
+from .browser.ban_handler import check_ban_status
 from .driver_base import Driver
 from .models import Tag
-from .utils import is_connection_error, matchurl, wait_for_new_tab
+from .search_models import (
+    MINIMUM_MISSING_CONFIRMATIONS,
+    ConfirmedGalleryMissing,
+    GalleryFound,
+    GalleryLookupResult,
+    GallerySearchResult,
+    SearchRequest,
+)
+from .utils import get_log_dir, is_connection_error, wait_for_new_tab
 
 MAX_DOWNLOAD_RETRIES = 5
+SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
+SEARCH_PAGE_POLL_SECONDS = 0.1
+SEARCH_NAVIGATION_RETRIES = 1
+
+_GALLERY_PATH_PATTERN = re.compile(r"/g/\d+/[A-Za-z0-9]+/?")
+_GALLERY_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
+_NO_RESULTS_MARKERS = (
+    "no hits found",
+    "no unfiltered results found",
+)
+_NO_RESULTS_SELECTORS = (
+    ".searchtext",
+    "table.itg > tbody > tr > td:only-child",
+)
+_PAGINATION_QUERY_KEYS = frozenset(
+    {
+        "next",
+        "prev",
+        "seek",
+        "page",
+        "range",
+    }
+)
+_TRANSIENT_CONTEXT_ERRORS = (
+    "cannot find context with specified id",
+    "cannot find default execution context",
+    "execution context was destroyed",
+    "inspected target navigated",
+)
+_SEARCH_PAGE_SNAPSHOT_SCRIPT = """(() => {
+    const root = document.documentElement;
+    return {
+        url: window.location.href,
+        title: document.title || "",
+        readyState: document.readyState || "",
+        html: root ? root.outerHTML : "",
+        query: document.querySelector("#f_search")?.value ?? null,
+    };
+})()"""
+
+
+class _NextPageState(Enum):
+    NEXT = "next"
+    END = "end"
+    MISSING = "missing"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchPageSnapshot:
+    url: str
+    title: str
+    ready_state: str
+    html: str
+    galleries: tuple[GalleryURLParser, ...]
+    has_no_results: bool
+    query_value: str | None
+    next_state: _NextPageState
+    next_href: str | None
+
+
+def _normalize_gallery_url(href: str, page_url: str) -> GalleryURLParser | None:
+    try:
+        absolute_url = urljoin(page_url, href)
+        parsed_url = urlsplit(absolute_url)
+        hostname = parsed_url.hostname
+        username = parsed_url.username
+        password = parsed_url.password
+        port = parsed_url.port
+    except ValueError:
+        return None
+    if (
+        parsed_url.scheme != "https"
+        or hostname not in _GALLERY_HOSTS
+        or username is not None
+        or password is not None
+        or port is not None
+        or _GALLERY_PATH_PATTERN.fullmatch(parsed_url.path) is None
+    ):
+        return None
+
+    gallery_path = f"{parsed_url.path.rstrip('/')}/"
+    gallery_url = urlunsplit(("https", hostname, gallery_path, "", ""))
+    try:
+        return GalleryURLParser(gallery_url)
+    except ValueError:
+        return None
+
+
+def _parse_search_page(
+    html_content: str,
+    page_url: str,
+) -> tuple[
+    tuple[GalleryURLParser, ...],
+    bool,
+    str | None,
+    _NextPageState,
+    str | None,
+]:
+    soup = BeautifulSoup(html_content, "html.parser")
+    galleries = list[GalleryURLParser]()
+    seen_galleries = set[tuple[int, str]]()
+
+    for anchor in soup.select(".itg a[href]"):
+        href = anchor.get("href")
+        if not isinstance(href, str):
+            continue
+        gallery = _normalize_gallery_url(href, page_url)
+        if gallery is None:
+            continue
+        identity = (gallery.gid, gallery.url_key)
+        if identity not in seen_galleries:
+            galleries.append(gallery)
+            seen_galleries.add(identity)
+
+    empty_state_texts = {
+        " ".join(node.get_text(" ", strip=True).split()).casefold().rstrip(".")
+        for selector in _NO_RESULTS_SELECTORS
+        for node in soup.select(selector)
+    }
+    has_no_results = bool(empty_state_texts.intersection(_NO_RESULTS_MARKERS))
+
+    input_element = soup.select_one("#f_search")
+    input_value = input_element.get("value") if input_element is not None else None
+    query_value = input_value if isinstance(input_value, str) else None
+
+    next_elements = soup.select("#unext")
+    if not next_elements:
+        next_state = _NextPageState.MISSING
+        next_href = None
+    elif len(next_elements) != 1:
+        next_state = _NextPageState.INVALID
+        next_href = None
+    else:
+        next_element = next_elements[0]
+        if (
+            next_element.name == "span"
+            and next_element.get("href") is None
+            and next_element.select_one("a[href]") is None
+        ):
+            next_state = _NextPageState.END
+            next_href = None
+        elif next_element.name == "a":
+            href = next_element.get("href")
+            if isinstance(href, str) and href.strip():
+                next_state = _NextPageState.NEXT
+                next_href = href
+            else:
+                next_state = _NextPageState.INVALID
+                next_href = None
+        else:
+            next_state = _NextPageState.INVALID
+            next_href = None
+
+    return (
+        tuple(galleries),
+        has_no_results,
+        query_value,
+        next_state,
+        next_href,
+    )
+
+
+def _is_transient_context_error(error: BaseException) -> bool:
+    if not isinstance(error, ProtocolException):
+        return False
+    message = str(error).casefold()
+    return any(marker in message for marker in _TRANSIENT_CONTEXT_ERRORS)
+
+
+def _trusted_origin(url: str) -> tuple[str, str]:
+    try:
+        parsed_url = urlsplit(url)
+        hostname = parsed_url.hostname
+        username = parsed_url.username
+        password = parsed_url.password
+        port = parsed_url.port
+    except ValueError as error:
+        raise InvalidSearchRequestError(f"Invalid search scope URL: {url!r}") from error
+    if (
+        parsed_url.scheme != "https"
+        or hostname not in _GALLERY_HOSTS
+        or username is not None
+        or password is not None
+        or port is not None
+    ):
+        raise InvalidSearchRequestError(
+            "Search scope must be an HTTPS e-hentai.org or exhentai.org URL "
+            "without credentials or an explicit port"
+        )
+    assert hostname is not None
+    return parsed_url.scheme, hostname
+
+
+def _query_values(url: str, key: str) -> list[str]:
+    return parse_qs(
+        urlsplit(url).query,
+        keep_blank_values=True,
+    ).get(key, [])
+
+
+def _search_context(url: str) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (key, value)
+            for key, value in parse_qsl(
+                urlsplit(url).query,
+                keep_blank_values=True,
+            )
+            if key not in _PAGINATION_QUERY_KEYS
+        )
+    )
+
+
+def _combine_search_query(base_query: str, additional_query: str) -> str:
+    values = [value.strip() for value in (base_query, additional_query)]
+    return " ".join(value for value in values if value)
+
+
+def _build_search_url(
+    scope_url: str,
+    *,
+    origin: tuple[str, str],
+    query: str,
+) -> str:
+    parsed_scope = urlsplit(scope_url)
+    preserved_params = [
+        (key, value)
+        for key, value in parse_qsl(parsed_scope.query, keep_blank_values=True)
+        if key not in _PAGINATION_QUERY_KEYS and key not in {"f_search", "f_cats"}
+    ]
+    preserved_params.extend((("f_search", query), ("f_cats", "0")))
+    return urlunsplit(
+        (
+            origin[0],
+            origin[1],
+            "/",
+            urlencode(preserved_params),
+            "",
+        )
+    )
 
 
 class EHDriver(Driver):
@@ -30,6 +308,487 @@ class EHDriver(Driver):
             if is_connection_error(e):
                 raise
             self.logger.debug(f"Failed to close page (non-fatal): {e!r}")
+
+    async def _current_loader_id(self) -> str:
+        frame_tree = await self.page.send(cdp.page.get_frame_tree())
+        return str(frame_tree.frame.loader_id)
+
+    async def _read_search_page(self) -> _SearchPageSnapshot:
+        page_data = await self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT)
+        if not isinstance(page_data, dict):
+            raise TypeError("Search-page snapshot was not an object")
+
+        url = page_data.get("url")
+        title = page_data.get("title")
+        ready_state = page_data.get("readyState")
+        html_content = page_data.get("html")
+        query_value = page_data.get("query")
+        if (
+            not isinstance(url, str)
+            or not isinstance(title, str)
+            or not isinstance(ready_state, str)
+            or not isinstance(html_content, str)
+            or (query_value is not None and not isinstance(query_value, str))
+        ):
+            raise TypeError("Search-page snapshot contained non-string fields")
+
+        (
+            galleries,
+            has_no_results,
+            serialized_query,
+            next_state,
+            next_href,
+        ) = _parse_search_page(html_content, url)
+        return _SearchPageSnapshot(
+            url=url,
+            title=title.strip(),
+            ready_state=ready_state,
+            html=html_content,
+            galleries=galleries,
+            has_no_results=has_no_results,
+            query_value=(
+                query_value if isinstance(query_value, str) else serialized_query
+            ),
+            next_state=next_state,
+            next_href=next_href,
+        )
+
+    async def _save_search_diagnostic(self, html_content: str) -> Path | None:
+        try:
+            path = get_log_dir() / f"search_error_{uuid4().hex}.html"
+            await asyncio.to_thread(self._write_error_file, path, html_content)
+        except OSError as error:
+            self.logger.warning(f"Failed to save search diagnostic: {error!r}")
+            return None
+        self.logger.warning(f"Search diagnostic saved to: {path}")
+        return path
+
+    async def _raise_search_page_error(
+        self,
+        error_type: type[SearchPageError],
+        query: str,
+        reason: str,
+        snapshot: _SearchPageSnapshot,
+    ) -> Never:
+        diagnostic_path = await self._save_search_diagnostic(snapshot.html)
+        raise error_type(
+            query=query,
+            url=snapshot.url,
+            title=snapshot.title,
+            reason=reason,
+            diagnostic_path=(
+                str(diagnostic_path) if diagnostic_path is not None else None
+            ),
+        )
+
+    async def _wait_for_new_loader(
+        self,
+        old_loader_id: str,
+        target_url: str,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
+        last_error: Exception | None = None
+
+        while loop.time() < deadline:
+            try:
+                current_loader_id = await self._current_loader_id()
+            except Exception as error:
+                if is_connection_error(error):
+                    raise
+                if not _is_transient_context_error(error):
+                    raise SearchNavigationError(
+                        url=target_url,
+                        reason=f"could not read the main-frame loader: {error!r}",
+                    ) from error
+                last_error = error
+                await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+                continue
+            if current_loader_id != old_loader_id:
+                return
+            await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+
+        reason = "the trusted GET did not replace the main-frame loader"
+        if last_error is not None:
+            reason += f"; last transient context error: {last_error!r}"
+        raise SearchNavigationError(
+            url=target_url,
+            reason=reason,
+        )
+
+    async def _read_stable_search_page(
+        self,
+        target_url: str,
+        diagnostic_query: str,
+    ) -> _SearchPageSnapshot:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
+        last_transient_error: Exception | None = None
+
+        while loop.time() < deadline:
+            try:
+                loader_before = await self._current_loader_id()
+                snapshot = await self._read_search_page()
+                loader_after = await self._current_loader_id()
+            except Exception as error:
+                if is_connection_error(error):
+                    raise
+                if _is_transient_context_error(error):
+                    last_transient_error = error
+                    await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+                    continue
+                if isinstance(error, (TypeError, ValueError)):
+                    raise MalformedSearchPageError(
+                        query=diagnostic_query,
+                        url=target_url,
+                        title="",
+                        reason=f"the atomic page snapshot was malformed: {error}",
+                    ) from error
+                raise SearchNavigationError(
+                    url=target_url,
+                    reason=f"could not read the navigated document: {error!r}",
+                ) from error
+
+            if loader_before == loader_after and snapshot.ready_state == "complete":
+                return snapshot
+            await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+
+        reason = (
+            "the page did not expose a stable complete snapshot from one "
+            "main-frame loader"
+        )
+        if last_transient_error is not None:
+            reason += f"; last transient context error: {last_transient_error!r}"
+        raise SearchNavigationError(url=target_url, reason=reason)
+
+    async def _navigate_search_url(
+        self,
+        diagnostic_query: str,
+        url: str,
+    ) -> _SearchPageSnapshot:
+        old_loader_id: str | None = None
+        for attempt in range(SEARCH_NAVIGATION_RETRIES + 1):
+            try:
+                old_loader_id = await self._current_loader_id()
+                break
+            except Exception as error:
+                if is_connection_error(error):
+                    raise
+                if (
+                    not _is_transient_context_error(error)
+                    or attempt == SEARCH_NAVIGATION_RETRIES
+                ):
+                    raise SearchNavigationError(
+                        url=url,
+                        reason=(
+                            "could not capture the pre-navigation main-frame "
+                            f"loader: {error!r}"
+                        ),
+                    ) from error
+                await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+        assert old_loader_id is not None
+
+        for attempt in range(SEARCH_NAVIGATION_RETRIES + 1):
+            try:
+                await self.get(url)
+                break
+            except Exception as error:
+                if is_connection_error(error):
+                    raise
+                if (
+                    not _is_transient_context_error(error)
+                    or attempt == SEARCH_NAVIGATION_RETRIES
+                ):
+                    raise SearchNavigationError(
+                        url=url,
+                        reason=f"trusted GET failed: {error!r}",
+                    ) from error
+                self.logger.warning(
+                    f"Transient browser context loss while navigating to {url!r}; "
+                    "retrying the trusted GET once"
+                )
+        await self._wait_for_new_loader(old_loader_id, url)
+        return await self._read_stable_search_page(
+            url,
+            diagnostic_query,
+        )
+
+    @staticmethod
+    def _is_challenge_page(snapshot: _SearchPageSnapshot) -> bool:
+        title = snapshot.title.casefold()
+        html = snapshot.html.casefold()
+        return (
+            "just a moment" in title
+            or "請稍候" in title
+            or "_cf_chl_opt" in html
+            or "cf-chl-widget" in html
+            or "cf-turnstile" in html
+            or "g-recaptcha" in html
+            or 'id="challenge-form"' in html
+            or 'id="cf-challenge-running"' in html
+            or 'id="challenge-running"' in html
+            or 'id="challenge-stage"' in html
+        )
+
+    @staticmethod
+    def _is_authentication_page(snapshot: _SearchPageSnapshot) -> bool:
+        try:
+            hostname = urlsplit(snapshot.url).hostname
+        except ValueError:
+            hostname = None
+        title = snapshot.title.casefold()
+        html = snapshot.html.casefold()
+        return (
+            hostname == "forums.e-hentai.org"
+            or title in {"log in", "login"}
+            or "you are not logged in" in html
+            or "kokomade.jpg" in html
+            or (
+                ('name="username"' in html or "name='username'" in html)
+                and ('name="password"' in html or "name='password'" in html)
+            )
+        )
+
+    async def _validate_search_page(
+        self,
+        snapshot: _SearchPageSnapshot,
+        *,
+        expected_origin: tuple[str, str],
+        expected_query: str | None,
+        expected_context: tuple[tuple[str, str], ...] | None = None,
+        diagnostic_query: str,
+    ) -> None:
+        if check_ban_status(snapshot.html).should_wait:
+            await self._raise_search_page_error(
+                SearchRateLimitError,
+                diagnostic_query,
+                "the shared ban handler returned a still-banned or blank page",
+                snapshot,
+            )
+        if self._is_challenge_page(snapshot):
+            await self._raise_search_page_error(
+                SearchChallengeError,
+                diagnostic_query,
+                "the trusted navigation reached a managed challenge",
+                snapshot,
+            )
+        if self._is_authentication_page(snapshot):
+            await self._raise_search_page_error(
+                SearchAuthenticationError,
+                diagnostic_query,
+                "the trusted navigation lost the authenticated gallery session",
+                snapshot,
+            )
+
+        try:
+            actual_origin = _trusted_origin(snapshot.url)
+        except InvalidSearchRequestError:
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                diagnostic_query,
+                "the result page URL was not a trusted gallery origin",
+                snapshot,
+            )
+        if actual_origin != expected_origin:
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                diagnostic_query,
+                "the result page changed gallery origin",
+                snapshot,
+            )
+
+        if snapshot.query_value is None:
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                diagnostic_query,
+                "the result page did not contain #f_search",
+                snapshot,
+            )
+        if expected_query is not None:
+            if snapshot.query_value != expected_query:
+                await self._raise_search_page_error(
+                    MalformedSearchPageError,
+                    diagnostic_query,
+                    "the live search query did not match the requested query "
+                    f"({snapshot.query_value!r} != {expected_query!r})",
+                    snapshot,
+                )
+            url_queries = _query_values(snapshot.url, "f_search")
+            if url_queries != [expected_query]:
+                await self._raise_search_page_error(
+                    MalformedSearchPageError,
+                    diagnostic_query,
+                    "the result URL did not contain exactly one matching "
+                    "f_search value",
+                    snapshot,
+                )
+        if expected_context is not None:
+            try:
+                parsed_result_url = urlsplit(snapshot.url)
+                actual_context = _search_context(snapshot.url)
+            except ValueError:
+                await self._raise_search_page_error(
+                    MalformedSearchPageError,
+                    diagnostic_query,
+                    "the result URL query could not be parsed",
+                    snapshot,
+                )
+            if (
+                parsed_result_url.path != "/"
+                or parsed_result_url.fragment
+                or actual_context != expected_context
+            ):
+                await self._raise_search_page_error(
+                    MalformedSearchPageError,
+                    diagnostic_query,
+                    "the result URL changed path, fragment, or non-pagination "
+                    "search parameters",
+                    snapshot,
+                )
+
+        if bool(snapshot.galleries) == snapshot.has_no_results:
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                diagnostic_query,
+                "the page contained either contradictory result markers or "
+                "neither galleries nor an explicit no-results marker",
+                snapshot,
+            )
+        if snapshot.next_state is _NextPageState.MISSING:
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                diagnostic_query,
+                "the result page did not contain an explicit #unext control",
+                snapshot,
+            )
+        if snapshot.next_state is _NextPageState.INVALID:
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                diagnostic_query,
+                "the #unext control was malformed",
+                snapshot,
+            )
+        if snapshot.has_no_results and snapshot.next_state is not _NextPageState.END:
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                diagnostic_query,
+                "an explicit no-results page unexpectedly advertised a next page",
+                snapshot,
+            )
+
+    async def _resolve_search_request(
+        self,
+        request: SearchRequest,
+    ) -> tuple[tuple[str, str], str, str]:
+        request_origin = _trusted_origin(request.scope_url)
+        driver_origin = _trusted_origin(self.url[self.name])
+        if request_origin != driver_origin:
+            raise InvalidSearchRequestError(
+                f"{self.name} searches cannot cross to {request_origin[1]!r}"
+            )
+        if urlsplit(request.scope_url).fragment:
+            raise InvalidSearchRequestError(
+                "Search scope URLs must not contain a fragment"
+            )
+
+        scope_snapshot = await self._navigate_search_url(
+            f"<scope {request.scope_url}>",
+            request.scope_url,
+        )
+        await self._validate_search_page(
+            scope_snapshot,
+            expected_origin=request_origin,
+            expected_query=None,
+            diagnostic_query=f"<scope {request.scope_url}>",
+        )
+        if self._page_identity(scope_snapshot.url) != self._page_identity(
+            request.scope_url
+        ):
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                f"<scope {request.scope_url}>",
+                "the navigated scope URL did not match the trusted GET target",
+                scope_snapshot,
+            )
+        assert scope_snapshot.query_value is not None
+        scope_url_queries = _query_values(scope_snapshot.url, "f_search")
+        if scope_url_queries and scope_url_queries != [scope_snapshot.query_value]:
+            await self._raise_search_page_error(
+                MalformedSearchPageError,
+                f"<scope {request.scope_url}>",
+                "the scope URL contained ambiguous or mismatched f_search values",
+                scope_snapshot,
+            )
+        query = _combine_search_query(scope_snapshot.query_value, request.query)
+        if not query:
+            raise InvalidSearchRequestError(
+                "The resolved search query must not be empty"
+            )
+        search_url = _build_search_url(
+            scope_snapshot.url,
+            origin=request_origin,
+            query=query,
+        )
+        return request_origin, query, search_url
+
+    async def _validated_next_url(
+        self,
+        snapshot: _SearchPageSnapshot,
+        *,
+        expected_origin: tuple[str, str],
+        expected_query: str,
+        expected_context: tuple[tuple[str, str], ...],
+    ) -> str:
+        if snapshot.next_state is not _NextPageState.NEXT or snapshot.next_href is None:
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                expected_query,
+                "the result page did not provide a usable next-page URL",
+                snapshot,
+            )
+
+        next_url = urljoin(snapshot.url, snapshot.next_href)
+        try:
+            next_origin = _trusted_origin(next_url)
+            parsed_next = urlsplit(next_url)
+        except InvalidSearchRequestError, ValueError:
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                expected_query,
+                "the next-page URL was malformed or untrusted",
+                snapshot,
+            )
+        if (
+            next_origin != expected_origin
+            or parsed_next.path != "/"
+            or parsed_next.fragment
+            or _query_values(next_url, "f_search") != [expected_query]
+            or _search_context(next_url) != expected_context
+        ):
+            await self._raise_search_page_error(
+                SearchPaginationError,
+                expected_query,
+                "the next-page URL changed origin, path, fragment, or query",
+                snapshot,
+            )
+        return urlunsplit(
+            (
+                parsed_next.scheme,
+                parsed_next.netloc,
+                parsed_next.path,
+                parsed_next.query,
+                "",
+            )
+        )
+
+    @staticmethod
+    def _page_identity(url: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+        parsed_url = urlsplit(url)
+        return (
+            parsed_url.hostname or "",
+            parsed_url.path,
+            tuple(sorted(parse_qsl(parsed_url.query, keep_blank_values=True))),
+        )
 
     async def checkh2h(self) -> bool:
         """檢查 H@H 客戶端是否在線"""
@@ -60,95 +819,132 @@ class EHDriver(Driver):
         await self.wait(self.page.reload, ischangeurl=False)
         self.logger.info("Check-in completed")
 
-    async def search2gallery(self, url: str) -> list[GalleryURLParser]:
-        """從搜索結果頁面提取所有 gallery URLs"""
-        current_url = await self.page.evaluate("window.location.href")
-        if not matchurl(current_url, url):
-            await self.get(url)
-
-        input_element = await self.page.select("#f_search")
-        input_value = await input_element.apply("(el) => el.value || ''")
-        if input_value == "":
-            raise ValueError(
-                "The value in the search box is empty. "
-                "I think there are TOO MANY GALLERIES."
+    async def search(self, request: SearchRequest) -> GallerySearchResult:
+        """Execute one bounded gallery search using trusted URL navigations."""
+        if not isinstance(request, SearchRequest):
+            raise InvalidSearchRequestError(
+                "search() requires a SearchRequest instance"
             )
 
-        glist = list()
+        origin, query, initial_url = await self._resolve_search_request(request)
+        self.logger.info(f"Search keyword: {query}")
+        expected_context = _search_context(initial_url)
+
+        galleries = list[GalleryURLParser]()
+        seen_galleries = set[tuple[int, str]]()
+        seen_pages = set[tuple[str, str, tuple[tuple[str, str], ...]]]()
+        current_url = initial_url
+        pages_visited = 0
+
         while True:
-            html_content = await self.page.get_content()
-            pattern = r"https://exhentai.org/g/\d+/[A-Za-z0-9]+"
-            glist += re.findall(pattern, html_content)
-            try:
-                element = await self.page.select("#unext", timeout=2)
-            except TimeoutError:
-                break
-            if element.tag_name == "a":
-                await self.wait(element.click, ischangeurl=True)
-                await self.page.select("#unext", timeout=10)
-            else:
-                break
-        if len(glist) == 0:
-            try:
-                xpath = (
-                    "//*[contains(text(), 'No hits found')] | "
-                    "//td[contains(text(), 'No unfiltered results found.')]"
-                )
-                results = await self.page.xpath(xpath, timeout=2)
-                if not results:
-                    raise ValueError(
-                        "找出 0 個 Gallery，但頁面沒有顯示 'No hits found'。"
-                    )
-            except TimeoutError:
-                raise ValueError("找出 0 個 Gallery，但頁面沒有顯示 'No hits found'。")
-        glist = list(set(glist))
-        glist = [GalleryURLParser(url) for url in glist]
-        return glist
-
-    async def search(self, key: str, isclear: bool) -> list[GalleryURLParser]:
-        async def waitpage() -> None:
-            await self.page.select("#f_search", timeout=10)
-
-        try:
-            input_element = await self.page.select("#f_search", timeout=2)
-        except TimeoutError:
-            await self.gohomepage()
-            await waitpage()
-            input_element = await self.page.select("#f_search")
-        escaped_key = key.replace("\\", "\\\\").replace("'", "\\'")
-        if isclear:
-            await input_element.apply(
-                f"(el) => {{ el.value = '{escaped_key}';"
-                " el.dispatchEvent(new Event('input')); }"
+            snapshot = await self._navigate_search_url(query, current_url)
+            await self._validate_search_page(
+                snapshot,
+                expected_origin=origin,
+                expected_query=query,
+                expected_context=expected_context,
+                diagnostic_query=query,
             )
-        else:
-            if key != "":
-                await input_element.apply(
-                    f"(el) => {{ el.value = el.value + ' ' + '{escaped_key}';"
-                    " el.dispatchEvent(new Event('input')); }"
+            page_identity = self._page_identity(snapshot.url)
+            if page_identity != self._page_identity(current_url):
+                await self._raise_search_page_error(
+                    (
+                        MalformedSearchPageError
+                        if pages_visited == 0
+                        else SearchPaginationError
+                    ),
+                    query,
+                    "the navigated result URL did not match the trusted GET target",
+                    snapshot,
                 )
-        await asyncio.sleep(random())
+            if page_identity in seen_pages:
+                await self._raise_search_page_error(
+                    SearchPaginationError,
+                    query,
+                    "pagination returned a previously processed result URL",
+                    snapshot,
+                )
+            seen_pages.add(page_identity)
+            pages_visited += 1
 
-        elements = await self.page.xpath(
-            "//div[contains(@id, 'cat_') and @data-disabled='1']", timeout=2
+            for gallery in snapshot.galleries:
+                identity = (gallery.gid, gallery.url_key)
+                if identity in seen_galleries:
+                    continue
+                if len(galleries) == request.max_results:
+                    raise SearchLimitExceededError(
+                        query=query,
+                        max_pages=request.max_pages,
+                        max_results=request.max_results,
+                        pages_visited=pages_visited,
+                        results_found=len(galleries) + 1,
+                    )
+                seen_galleries.add(identity)
+                galleries.append(gallery)
+
+            if snapshot.next_state is _NextPageState.END:
+                result = GallerySearchResult(
+                    request=request,
+                    galleries=tuple(galleries),
+                    pages_visited=pages_visited,
+                )
+                self.logger.info(f"Found {len(result.galleries)} galleries")
+                return result
+
+            if pages_visited == request.max_pages:
+                raise SearchLimitExceededError(
+                    query=query,
+                    max_pages=request.max_pages,
+                    max_results=request.max_results,
+                    pages_visited=pages_visited,
+                    results_found=len(galleries),
+                )
+            next_url = await self._validated_next_url(
+                snapshot,
+                expected_origin=origin,
+                expected_query=query,
+                expected_context=expected_context,
+            )
+            if self._page_identity(next_url) in seen_pages:
+                await self._raise_search_page_error(
+                    SearchPaginationError,
+                    query,
+                    "the next-page URL creates a pagination cycle",
+                    snapshot,
+                )
+            current_url = next_url
+
+    async def lookup_gid(self, gid: int) -> GalleryLookupResult:
+        """Resolve an exact GID or confirm its absence with two fresh searches."""
+        if not isinstance(gid, int) or isinstance(gid, bool) or gid < 1:
+            raise InvalidSearchRequestError("gid must be a positive integer")
+
+        request = SearchRequest(
+            scope_url=self.url[self.name],
+            query=f"gid:{gid}",
+            max_pages=1,
         )
-        for element in elements:
-            await element.click()
-            await asyncio.sleep(random())
+        for confirmation in range(1, MINIMUM_MISSING_CONFIRMATIONS + 1):
+            result = await self.search(request)
+            if len(result.galleries) > 1:
+                raise GalleryLookupError(
+                    f"Exact lookup for GID {gid} returned "
+                    f"{len(result.galleries)} logical galleries"
+                )
+            if result.galleries:
+                return GalleryFound(
+                    requested_gid=gid,
+                    gallery=result.galleries[0],
+                )
+            self.logger.warning(
+                f"Exact lookup for GID {gid} was empty "
+                f"({confirmation}/{MINIMUM_MISSING_CONFIRMATIONS})"
+            )
 
-        button = await self.page.select('input[type="submit"][value="Search"]')
-        await button.click()
-        await asyncio.sleep(random())
-        await waitpage()
-
-        input_element = await self.page.select("#f_search")
-        input_value = await input_element.apply("(el) => el.value || ''")
-        self.logger.info(f"Search keyword: {input_value}")
-
-        current_url = await self.page.evaluate("window.location.href")
-        result = await self.search2gallery(current_url)
-        self.logger.info(f"Found {len(result)} galleries")
-        return result
+        return ConfirmedGalleryMissing(
+            gid=gid,
+            confirmations=MINIMUM_MISSING_CONFIRMATIONS,
+        )
 
     async def download(self, gallery: GalleryURLParser) -> bool:
         return await self._download(gallery, attempt=1)

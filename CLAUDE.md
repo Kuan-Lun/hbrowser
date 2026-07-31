@@ -44,6 +44,7 @@ uv run black .
   - `gallery/driver_base.py` - Abstract `Driver` base class with `zendriver` integration, login flow, and CAPTCHA handling
   - `gallery/eh_driver.py` - `EHDriver` for E-Hentai
   - `gallery/exh_driver.py` - `ExHDriver` for ExHentai
+  - `gallery/search_models.py` - Public bounded-search and exact-GID lookup request/result models
   - `gallery/captcha/` - CAPTCHA detection plus automatic Turnstile and GUI-manual resolution policy
   - `gallery/browser/` - Browser factory built on `zendriver`; also owns proxy/Tor rotation, persistent FlareSolverr sessions, and ban detection. Use `find hbrowser/gallery/browser -name '*.py'` for the current file list rather than relying on this doc.
 
@@ -59,7 +60,12 @@ uv run black .
 
 **Observer Pattern**: `BattleSubject` notifies `Observer` instances (like `LogEntry`) when battle state updates. `BattleDashboard` coordinates parsing of page source via `hv-bie.parse_snapshot()`.
 
-**Context Manager**: All drivers support `with` statement for automatic login and cleanup.
+**Context Manager**: All drivers support `async with` for automatic login and cleanup.
+
+**Gallery Search**: `EHDriver` and `ExHDriver` accept `SearchRequest` objects.
+Initial results and pagination use trusted URL GETs with a main-frame loader
+barrier; missing/invalid pagination fails closed. `lookup_gid()` requires two
+independent explicit empty searches before returning `ConfirmedGalleryMissing`.
 
 ### External Dependencies
 

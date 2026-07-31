@@ -114,15 +114,40 @@ python your_script.py
 
 ## Usage
 
-Here's a quick example of how to use HBrowser:
+Gallery searches use an explicit request and return a bounded, ordered result.
+An exact GID lookup only reports a missing gallery after two independent empty
+searches:
 
 ```python
-from hbrowser import EHDriver
+import asyncio
+
+from hbrowser import (
+    ConfirmedGalleryMissing,
+    ExHDriver,
+    GalleryFound,
+    SearchRequest,
+)
+
+
+async def main() -> None:
+    async with ExHDriver() as driver:
+        result = await driver.search(
+            SearchRequest(
+                scope_url="https://exhentai.org/",
+                query="artist:test",
+            )
+        )
+        print(result.galleries, result.pages_visited)
+
+        match await driver.lookup_gid(349189):
+            case GalleryFound(gallery=gallery):
+                print(gallery.url)
+            case ConfirmedGalleryMissing(confirmations=confirmations):
+                print(f"Missing after {confirmations} confirmations")
 
 
 if __name__ == "__main__":
-    with EHDriver() as driver:
-        driver.punchin()
+    asyncio.run(main())
 ```
 
 Here's a quick example of how to use HVBrowser:
