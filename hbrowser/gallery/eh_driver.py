@@ -63,6 +63,7 @@ _NO_RESULTS_MARKERS = (
 _NO_RESULTS_SELECTORS = (
     ".searchtext",
     "table.itg > tbody > tr > td:only-child",
+    "#toppane + div > p:only-child",
 )
 _PAGINATION_QUERY_KEYS = frozenset(
     {
@@ -178,7 +179,7 @@ def _parse_search_page(
 
     next_elements = soup.select("#unext")
     if not next_elements:
-        next_state = _NextPageState.MISSING
+        next_state = _NextPageState.END if has_no_results else _NextPageState.MISSING
         next_href = None
     elif len(next_elements) != 1:
         next_state = _NextPageState.INVALID

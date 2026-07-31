@@ -274,6 +274,24 @@ class SearchPageParserTests(unittest.TestCase):
         self.assertIs(next_state, _NextPageState.END)
         self.assertIsNone(next_href)
 
+    def test_user_speechless_log_fixture_is_explicit_empty_result(self) -> None:
+        fixture = FIXTURE_DIR / "exhentai_speechless_no_hits_snapshot.html"
+        html = fixture.read_text()
+
+        galleries, no_results, query, next_state, next_href = _parse_search_page(
+            html,
+            _search_url('artist:"naruko hanaharu$" language:speechless$'),
+        )
+
+        self.assertEqual(galleries, ())
+        self.assertTrue(no_results)
+        self.assertEqual(
+            query,
+            'artist:"naruko hanaharu$" language:speechless$',
+        )
+        self.assertIs(next_state, _NextPageState.END)
+        self.assertIsNone(next_href)
+
     def test_parser_normalizes_safe_links_and_deduplicates_logically(self) -> None:
         html = _result_page(
             "test",
@@ -322,7 +340,7 @@ class SearchPageParserTests(unittest.TestCase):
         missing = no_results.replace('<span id="unext">Next</span>', "")
         self.assertIs(
             _parse_search_page(missing, EXH_HOME)[3],
-            _NextPageState.MISSING,
+            _NextPageState.END,
         )
         invalid = no_results.replace(
             '<span id="unext">Next</span>',
@@ -353,6 +371,17 @@ class SearchPageParserTests(unittest.TestCase):
         html = _result_page("test", GID_349189_GALLERY).replace(
             "</body>",
             "<table><tr><td>No hits found</td></tr></table></body>",
+        )
+
+        galleries, no_results, _, _, _ = _parse_search_page(html, EXH_HOME)
+
+        self.assertEqual([gallery.gid for gallery in galleries], [349189])
+        self.assertFalse(no_results)
+
+    def test_ordinary_paragraph_cannot_manufacture_an_empty_result(self) -> None:
+        html = _result_page("test", GID_349189_GALLERY).replace(
+            "</body>",
+            "<div><p>No hits found</p></div></body>",
         )
 
         galleries, no_results, _, _, _ = _parse_search_page(html, EXH_HOME)
@@ -410,6 +439,25 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
         self.assertEqual(driver.page.completed_navigation_loaders[-1], "loader-2")
+
+    async def test_real_empty_result_without_unext_completes_search(self) -> None:
+        query = 'artist:"naruko hanaharu$" language:speechless$'
+        search_url = _search_url(query)
+        fixture = (
+            FIXTURE_DIR / "exhentai_speechless_no_hits_snapshot.html"
+        ).read_text()
+        driver = _HarnessExHDriver()
+        driver.add_route(EXH_HOME, _scope_document())
+        driver.add_route(
+            search_url,
+            _Document(url=search_url, html_reads=(fixture,)),
+        )
+
+        result = await driver.search(SearchRequest(EXH_HOME, query))
+
+        self.assertEqual(result.galleries, ())
+        self.assertEqual(result.pages_visited, 1)
+        self.assertEqual(driver.get_urls, [EXH_HOME, search_url])
 
     async def test_snapshot_is_discarded_when_loader_changes_during_read(
         self,
