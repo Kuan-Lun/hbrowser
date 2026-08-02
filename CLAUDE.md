@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-HBrowser is a Python library for browser automation on E-Hentai/ExHentai websites and HentaiVerse game. It uses `zendriver` (Chrome DevTools Protocol) for browser automation. FlareSolverr can automatically solve Cloudflare managed challenges and the embedded Turnstile on the Forums login form; unsupported or failed interactive challenges fall back to manual interaction in GUI mode.
+HBrowser is a Python library for browser automation on E-Hentai/ExHentai
+websites. It uses `zendriver` (Chrome DevTools Protocol) for browser
+automation. FlareSolverr can automatically solve Cloudflare managed challenges
+and the embedded Turnstile on the Forums login form; unsupported or failed
+interactive challenges fall back to manual interaction in GUI mode.
 
 ## Communication
 
@@ -17,7 +21,7 @@ HBrowser is a Python library for browser automation on E-Hentai/ExHentai website
 uv pip install -e .
 
 # Type checking (strict mode configured in mypy.ini)
-uv run mypy hbrowser hvbrowser
+uv run mypy hbrowser
 
 # Linting with ruff (rules in pyproject.toml: E, F, I, UP)
 uv run ruff check .
@@ -48,17 +52,9 @@ uv run black .
   - `gallery/captcha/` - CAPTCHA detection plus automatic Turnstile and GUI-manual resolution policy
   - `gallery/browser/` - Browser factory built on `zendriver`; also owns proxy/Tor rotation, persistent FlareSolverr sessions, and ban detection. Use `find hbrowser/gallery/browser -name '*.py'` for the current file list rather than relying on this doc.
 
-- **`hvbrowser`** - HentaiVerse game automation
-  - `hv.py` - `HVDriver` extends `EHDriver` for HentaiVerse navigation (lottery, monster lab, market)
-  - `hv_battle.py` - `BattleDriver` extends `HVDriver` for combat automation
-  - `hv_battle_observer_pattern.py` - Observer pattern with `BattleDashboard` and `BattleSubject` for parsing battle state via `hv-bie` library
-  - `hv_battle_*_manager.py` / `hv_battle_*_provider.py` - Managers for actions, buffs, skills, items
-
 ### Key Patterns
 
-**Driver Inheritance**: `Driver` (ABC) → `EHDriver` → `HVDriver` → `BattleDriver`
-
-**Observer Pattern**: `BattleSubject` notifies `Observer` instances (like `LogEntry`) when battle state updates. `BattleDashboard` coordinates parsing of page source via `hv-bie.parse_snapshot()`.
+**Driver Inheritance**: `Driver` (ABC) → `EHDriver` → `ExHDriver`
 
 **Context Manager**: All drivers support `async with` for automatic login and cleanup.
 
@@ -69,7 +65,6 @@ independent explicit empty searches before returning `ConfirmedGalleryMissing`.
 
 ### External Dependencies
 
-- `hv-bie` - Battle snapshot parsing library
 - `h2h-galleryinfo-parser` - Gallery metadata parsing
 - `zendriver` - CDP-based browser automation
 

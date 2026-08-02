@@ -150,13 +150,5 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Here's a quick example of how to use HVBrowser:
-
-```python
-from hvbrowser import HVDriver
-
-
-if __name__ == "__main__":
-    with HVDriver() as driver:
-        driver.monstercheck()
-```
+HentaiVerse automation is provided separately by
+[HVBrowser](https://github.com/Kuan-Lun/hvbrowser).

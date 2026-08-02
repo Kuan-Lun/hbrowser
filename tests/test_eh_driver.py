@@ -51,6 +51,14 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _DEFAULT_QUERY = object()
 
 
+class DriverDomainBoundaryTests(unittest.TestCase):
+    def test_generic_driver_does_not_own_hentaiverse_urls(self) -> None:
+        driver = EHDriver(headless=True)
+
+        self.assertNotIn("HentaiVerse", driver.url)
+        self.assertNotIn("HentaiVerse isekai", driver.url)
+
+
 def _search_url(query: str, **extra: str) -> str:
     parameters = [("f_search", query), ("f_cats", "0"), *extra.items()]
     return f"{EXH_HOME}?{urlencode(parameters)}"

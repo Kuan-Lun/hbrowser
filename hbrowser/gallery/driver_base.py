@@ -81,8 +81,6 @@ class Driver(ABC):
             url["My Home"] = "https://e-hentai.org/home.php"
             url["E-Hentai"] = "https://e-hentai.org/"
             url["ExHentai"] = "https://exhentai.org/"
-            url["HentaiVerse"] = "https://hentaiverse.org"
-            url["HentaiVerse isekai"] = "https://hentaiverse.org/isekai/"
             url["Forums"] = "https://forums.e-hentai.org/"
             return url
 

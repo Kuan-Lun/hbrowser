@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
-version = "0.34.2"
+version = "0.35.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -14,8 +14,6 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "h2h-galleryinfo-parser>=0.2.2",
     "httpx>=0.28.1",
-    "hv-bie>=0.7.0",
-    "ponychart-classifier>=0.7.0",
     "websockets>=16.0",
     "zendriver>=0.15.5,<0.16",
 ]
@@ -42,7 +40,7 @@ Homepage = "https://github.com/Kuan-Lun/hbrowser"
 Tracker = "https://github.com/Kuan-Lun/hbrowser/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["hbrowser", "hvbrowser"]
+packages = ["hbrowser"]
 
 [tool.ruff]
 line-length = 88

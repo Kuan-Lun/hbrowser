@@ -18,8 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-FORMAT_PATHS=(hbrowser hvbrowser tests)
-TYPE_PATHS=(hbrowser hvbrowser)
+FORMAT_PATHS=(hbrowser tests)
+TYPE_PATHS=(hbrowser)
 
 uv run black "${FORMAT_PATHS[@]}" >&2
 uv run ruff check --fix "${FORMAT_PATHS[@]}" >&2
