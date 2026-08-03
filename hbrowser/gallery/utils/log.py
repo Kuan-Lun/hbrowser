@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+_LOG_DIR_ENVIRONMENT_VARIABLE = "HBROWSER_LOG_DIR"
+
 
 def setup_logger(name: str) -> logging.Logger:
     """
@@ -61,23 +63,28 @@ def setup_logger(name: str) -> logging.Logger:
 
 def get_log_dir() -> Path:
     """
-    獲取主腳本所在目錄下的 log 資料夾路徑，如果不存在則建立
+    獲取並建立診斷資料夾。
+
+    ``HBROWSER_LOG_DIR`` 可指定整合應用的共同日誌目錄。未指定時，維持
+    原有行為，使用主腳本所在目錄下的 ``log`` 資料夾；若沒有可用的主腳本
+    路徑則使用目前工作目錄。
 
     Returns:
         log 資料夾的絕對路徑
     """
-    # 獲取主腳本的路徑
-    if hasattr(sys, "argv") and len(sys.argv) > 0 and sys.argv[0]:
-        # 獲取主腳本所在的目錄
-        script_dir = Path(sys.argv[0]).resolve().parent
+    configured_directory = os.getenv(_LOG_DIR_ENVIRONMENT_VARIABLE)
+    if configured_directory:
+        log_dir = Path(configured_directory).expanduser()
+        if not log_dir.is_absolute():
+            log_dir = Path.cwd() / log_dir
+        log_dir = log_dir.resolve()
     else:
-        # 如果無法獲取主腳本路徑，使用當前工作目錄
-        script_dir = Path.cwd()
+        script_name = sys.argv[0] if sys.argv and sys.argv[0] else ""
+        if script_name and not script_name.startswith("-"):
+            script_dir = Path(script_name).expanduser().resolve().parent
+        else:
+            script_dir = Path.cwd().resolve()
+        log_dir = script_dir / "log"
 
-    # 建立 log 資料夾路徑
-    log_dir = script_dir / "log"
-
-    # 如果 log 資料夾不存在，則建立
-    log_dir.mkdir(exist_ok=True)
-
+    log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     return log_dir

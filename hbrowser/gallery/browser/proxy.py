@@ -114,7 +114,11 @@ def configure_proxy() -> str | None:
         proxy_host = rp_dns
         proxy_port = "8080"
 
-    logger.info(f"Using residential proxy: {rp_username}@{proxy_host}:{proxy_port}")
+    logger.info(
+        "Using authenticated residential proxy: %s:%s",
+        proxy_host,
+        proxy_port,
+    )
 
     proxy_extension = _create_proxy_extension(
         proxy_host=proxy_host,

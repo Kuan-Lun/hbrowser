@@ -36,6 +36,8 @@ HBrowser requires the following environment variables:
 - `EH_USERNAME`: Your E-Hentai account username
 - `EH_PASSWORD`: Your E-Hentai account password
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
+- `HBROWSER_LOG_DIR` (optional): Store HTML failure diagnostics in this
+  directory. Default: a `log` directory next to the main script
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
 - `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used to auto-solve Cloudflare managed challenges and the Forums login Turnstile. Ignored when Tor or a residential proxy is active
@@ -48,6 +50,7 @@ Set the environment variables before running the script:
 export EH_USERNAME=your_username
 export EH_PASSWORD=your_password
 export HBROWSER_LOG_LEVEL=INFO          # Optional
+export HBROWSER_LOG_DIR=/path/to/log    # Optional: shared diagnostic directory
 export USE_TOR=0                        # Optional: disable Tor proxy
 export TOR_BINARY_PATH=/path/to/tor     # Optional: custom tor path
 export FLARESOLVERR_URL=http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudflare
@@ -111,6 +114,13 @@ python your_script.py
 export HBROWSER_LOG_LEVEL=WARNING
 python your_script.py
 ```
+
+On browser failures, HBrowser saves uniquely named HTML diagnostics instead of
+overwriting a single `error.txt`. Page diagnostics and search diagnostics each
+retain at most 20 files and 20 MiB total, with each file capped at 2 MiB. On
+POSIX systems these files are created with owner-only permissions. Because page
+HTML can still contain account-specific data, keep `HBROWSER_LOG_DIR` in a
+private location.
 
 ## Usage
 

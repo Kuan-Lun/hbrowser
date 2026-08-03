@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from random import random
 from typing import Any, Self
 
@@ -25,7 +26,9 @@ from .browser import (
 from .browser.ban_handler import handle_ban_decorator
 from .captcha import CaptchaDetector, LoginChallengeHandler
 from .forums_auth import ForumsAuthState, detect_forums_auth_state
-from .utils import get_log_dir, matchurl, setup_logger
+from .utils import get_log_dir, matchurl, setup_logger, write_page_diagnostic
+
+_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
 
 
 class _DriverTurnstileSolver:
@@ -117,19 +120,69 @@ class Driver(ABC):
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if exc_type:
-            self.logger.error(f"Exception occurred: {exc_type.__name__}: {exc_val}")
-            try:
-                error_file = get_log_dir() / "error.txt"
-                error_file.write_text(await self.page.get_content(), errors="ignore")
-                self.logger.debug(f"Error page saved to: {error_file}")
-            except Exception:
-                self.logger.error("Failed to save error page (browser session invalid)")
+        if exc_type is not None:
+            self.logger.error(
+                "Exception occurred: %s: %s",
+                exc_type.__name__,
+                exc_val,
+                exc_info=(exc_type, exc_val, exc_tb),
+            )
+            await self._save_page_diagnostic("driver_error")
         self.logger.info("Closing browser")
         try:
             await stop_browser(self.browser)
-        except Exception:
-            pass
+        except Exception as error:
+            self.logger.warning(
+                "Failed to close browser cleanly: %r",
+                error,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _write_page_diagnostic(kind: str, content: str) -> Path:
+        return write_page_diagnostic(get_log_dir(), kind, content)
+
+    async def _save_page_diagnostic(
+        self,
+        kind: str,
+        content: str | None = None,
+    ) -> Path | None:
+        if content is None:
+            try:
+                if self.page is None:
+                    raise RuntimeError("browser page is not available")
+                async with asyncio.timeout(_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS):
+                    content = await self.page.get_content()
+            except Exception as error:
+                self.logger.warning(
+                    "Failed to capture %s page diagnostic: %r",
+                    kind,
+                    error,
+                    exc_info=True,
+                )
+                return None
+
+        try:
+            path = await asyncio.to_thread(
+                self._write_page_diagnostic,
+                kind,
+                content,
+            )
+        except Exception as error:
+            self.logger.warning(
+                "Failed to save %s page diagnostic: %r",
+                kind,
+                error,
+                exc_info=True,
+            )
+            return None
+
+        self.logger.warning(
+            "Page diagnostic saved: kind=%s path=%s",
+            kind,
+            path,
+        )
+        return path
 
     async def gohomepage(self, force: bool = False) -> None:
         url = self.url[self.name]
@@ -322,11 +375,7 @@ class Driver(ABC):
                 if await self._try_flaresolverr(url, flaresolverr_session):
                     return
 
-            challenge_page_path = get_log_dir() / "challenge_page.html"
-            challenge_page_path.write_text(
-                await self.page.get_content(), errors="ignore"
-            )
-            self.logger.debug(f"Challenge page saved to: {challenge_page_path}")
+            await self._save_page_diagnostic("challenge_page")
 
             if self.headless:
                 self.logger.warning(

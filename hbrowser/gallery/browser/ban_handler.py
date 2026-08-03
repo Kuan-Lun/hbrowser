@@ -94,7 +94,12 @@ async def _retry_until_unbanned(page: Any, source: str) -> None:
     status = check_ban_status(source)
     is_first = True
     while status.should_wait:
-        logger.debug(f"Page source: {source[:200]}...")
+        logger.debug(
+            "Ban page inspected: bytes=%d banned=%s blank=%s",
+            len(source.encode("utf-8", errors="ignore")),
+            status.is_banned,
+            status.is_blank_page,
+        )
         if not is_first:
             logger.warning("Banned again")
 

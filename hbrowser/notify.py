@@ -5,6 +5,8 @@ import sys
 
 from .beep import beep_os_independent
 
+_NOTIFICATION_TIMEOUT_SECONDS = 5.0
+
 
 def notify(title: str, message: str) -> None:
     """跨平台系統通知。
@@ -17,21 +19,13 @@ def notify(title: str, message: str) -> None:
     try:
         match sys.platform:
             case "darwin":
-                subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        f'display notification "{message}" with title "{title}"',
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
+                command = [
+                    "osascript",
+                    "-e",
+                    f'display notification "{message}" with title "{title}"',
+                ]
             case "linux":
-                subprocess.run(
-                    ["notify-send", title, message],
-                    check=True,
-                    capture_output=True,
-                )
+                command = ["notify-send", title, message]
             case "win32":
                 ps_script = (
                     "[Windows.UI.Notifications.ToastNotificationManager,"
@@ -53,11 +47,17 @@ def notify(title: str, message: str) -> None:
                     "[Windows.UI.Notifications.ToastNotification]"
                     "::new($t))"
                 )
-                subprocess.run(
-                    ["powershell", "-Command", ps_script],
-                    check=True,
-                    capture_output=True,
-                )
+                command = ["powershell", "-Command", ps_script]
+            case _:
+                beep_os_independent()
+                return
+
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            timeout=_NOTIFICATION_TIMEOUT_SECONDS,
+        )
         return
     except Exception:
         pass

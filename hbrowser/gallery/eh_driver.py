@@ -452,10 +452,6 @@ class EHDriver(Driver):
         return "E-Hentai"
 
     @staticmethod
-    def _write_error_file(path: Path, content: str) -> None:
-        path.write_text(content, errors="ignore")
-
-    @staticmethod
     def _write_search_diagnostic(directory: Path, content: str) -> Path:
         content_bytes = _bounded_search_diagnostic_content(content)
         if _SEARCH_DIAGNOSTIC_FILE_LIMIT <= 0:
@@ -1344,14 +1340,18 @@ class EHDriver(Driver):
                     raise InsufficientFundsException()
                 raise TimeoutError()
         except TimeoutError:
-            error_file = Path("error.txt")
-            error_content = await self.page.get_content()
-            await asyncio.to_thread(self._write_error_file, error_file, error_content)
+            error_file = await self._save_page_diagnostic("download_timeout")
             retrytime = 60
-            self.logger.warning(
-                f"Download timeout, error page saved to {error_file}, "
-                f"retrying in {retrytime}s"
-            )
+            if error_file is None:
+                self.logger.warning(
+                    f"Download timeout; error page could not be saved; "
+                    f"retrying in {retrytime}s"
+                )
+            else:
+                self.logger.warning(
+                    f"Download timeout, error page saved to {error_file}, "
+                    f"retrying in {retrytime}s"
+                )
             await self._close_page_safely(self.page)
             self.page = gallery_tab
             await asyncio.sleep(retrytime)
