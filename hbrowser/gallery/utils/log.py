@@ -1,11 +1,156 @@
 """日誌相關工具函數"""
 
 import logging
+import logging.handlers
 import os
+import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 
 _LOG_DIR_ENVIRONMENT_VARIABLE = "HBROWSER_LOG_DIR"
+_PROCESS_LOG_FILE_ENVIRONMENT_VARIABLE = "HBROWSER_PROCESS_LOG_FILE"
+_PROCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
+_PROCESS_LOG_BACKUP_COUNT = 5
+_PROCESS_LOG_HANDLER_LOCK = Lock()
+_PROCESS_LOG_HANDLERS: dict[Path, logging.Handler] = {}
+
+
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Keep the process log private and surface sink failures to the caller."""
+
+    @staticmethod
+    def _validate_open_descriptor(descriptor: int, path: Path) -> None:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise OSError(f"Process log target must be a regular file: {path}")
+        if descriptor_stat.st_nlink != 1:
+            raise OSError(f"Process log target must have exactly one link: {path}")
+
+        try:
+            path_stat = path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise OSError(
+                f"Process log target is no longer addressable: {path}"
+            ) from error
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise OSError(f"Process log target must be a regular file: {path}")
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+            path_stat.st_dev,
+            path_stat.st_ino,
+        ):
+            raise OSError(f"Process log path no longer names the opened file: {path}")
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        path = Path(self.baseFilename)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            self._validate_open_descriptor(descriptor, path)
+            if os.name == "posix":
+                os.fchmod(descriptor, 0o600)
+            stream = os.fdopen(
+                descriptor,
+                self.mode,
+                encoding=self.encoding,
+                errors=self.errors,
+            )
+            descriptor = None
+            return stream
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _validate_stream_path_identity(self) -> None:
+        if self.stream is None:
+            return
+        self._validate_open_descriptor(
+            self.stream.fileno(),
+            Path(self.baseFilename),
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._validate_stream_path_identity()
+        super().emit(record)
+        self._validate_stream_path_identity()
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
+        """Never let a configured process-log failure remain best effort."""
+        del record
+        error = sys.exception()
+        if error is None:
+            raise RuntimeError("Process log handler failed without an exception")
+        raise error
+
+
+def _configured_process_log_path() -> Path | None:
+    configured = os.getenv(_PROCESS_LOG_FILE_ENVIRONMENT_VARIABLE, "").strip()
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return Path(os.path.abspath(path))
+
+
+def _validate_process_log_target(path: Path) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        target_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+        raise OSError(f"Process log target must be a regular file: {path}")
+
+
+def _process_log_handler() -> logging.Handler | None:
+    path = _configured_process_log_path()
+    if path is None:
+        return None
+
+    with _PROCESS_LOG_HANDLER_LOCK:
+        handler = _PROCESS_LOG_HANDLERS.get(path)
+        if handler is not None:
+            return handler
+        _validate_process_log_target(path)
+        handler = _PrivateRotatingFileHandler(
+            path,
+            maxBytes=_PROCESS_LOG_MAX_BYTES,
+            backupCount=_PROCESS_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        _PROCESS_LOG_HANDLERS[path] = handler
+        return handler
+
+
+@contextmanager
+def _isolated_process_log_handlers_for_testing() -> Iterator[None]:
+    """Close shared process-log handlers after one isolated unit test."""
+    try:
+        yield
+    finally:
+        with _PROCESS_LOG_HANDLER_LOCK:
+            handlers = tuple(_PROCESS_LOG_HANDLERS.values())
+            _PROCESS_LOG_HANDLERS.clear()
+        for handler in handlers:
+            for logger_object in logging.Logger.manager.loggerDict.values():
+                if isinstance(logger_object, logging.Logger):
+                    logger_object.removeHandler(handler)
+            handler.close()
+
+
+def _formatter() -> logging.Formatter:
+    return logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def setup_logger(name: str) -> logging.Logger:
@@ -32,28 +177,22 @@ def setup_logger(name: str) -> logging.Logger:
     """
     logger = logging.getLogger(name)
 
-    # 避免重複配置
-    if logger.handlers:
-        return logger
-
     # 從環境變量獲取日誌級別
     level_str = os.getenv("HBROWSER_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_str, logging.INFO)
     logger.setLevel(level)
 
-    # 創建控制台處理器
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        handler.setFormatter(_formatter())
+        logger.addHandler(handler)
 
-    # 設置格式化器
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-
-    # 添加處理器到 logger
-    logger.addHandler(handler)
+    process_handler = _process_log_handler()
+    if process_handler is not None and process_handler not in logger.handlers:
+        process_handler.setLevel(logging.NOTSET)
+        process_handler.setFormatter(_formatter())
+        logger.addHandler(process_handler)
 
     # 防止日誌向上傳播到 root logger（避免重複輸出）
     logger.propagate = False

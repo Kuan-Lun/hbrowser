@@ -38,6 +38,10 @@ HBrowser requires the following environment variables:
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 - `HBROWSER_LOG_DIR` (optional): Store HTML failure diagnostics in this
   directory. Default: a `log` directory next to the main script
+- `HBROWSER_PROCESS_LOG_FILE` (optional): Mirror all HBrowser-family logger
+  records to this UTF-8 file. The file rotates at 10 MiB with five backups;
+  applications should leave it unset when an external supervisor already
+  captures stdout/stderr
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
 - `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used to auto-solve Cloudflare managed challenges and the Forums login Turnstile. Ignored when Tor or a residential proxy is active
@@ -114,6 +118,29 @@ python your_script.py
 export HBROWSER_LOG_LEVEL=WARNING
 python your_script.py
 ```
+
+Applications without an external process-log supervisor can also request a
+rotating text file for HBrowser-family logger records:
+
+```bash
+export HBROWSER_PROCESS_LOG_FILE=/private/path/battle.log
+```
+
+One file handler is shared by all HBrowser, HVBrowser, and HVBattle loggers in
+the process, so each record is written once. Existing targets must be regular,
+single-link files rather than symbolic links. The handler verifies that the
+configured path still names its open file before and after each record. Where
+the platform provides them, opening also uses `O_NOFOLLOW` and `O_CLOEXEC`; on
+POSIX, active and rotated files use owner-only permissions. Open, write, path
+replacement, and rollover failures are raised to the logging caller instead of
+being silently ignored.
+
+This optional handler records logger output only. It does not capture arbitrary
+stdout/stderr, subprocess output, or exceptions raised before logging is
+configured, and it does not provide an `fsync`-based process transcript. Use an
+external checked supervisor when those guarantees or terminal fail-closed
+behavior are required. The parent directory remains part of the application's
+trust boundary, and Windows file confidentiality depends on its inherited ACLs.
 
 On browser failures, HBrowser saves uniquely named HTML diagnostics instead of
 overwriting a single `error.txt`. Page diagnostics and search diagnostics each
