@@ -7,7 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from random import random
-from typing import Any, Self
+from typing import Any, Self, cast
 
 from zendriver import cdp
 
@@ -26,7 +26,13 @@ from .browser import (
 from .browser.ban_handler import handle_ban_decorator
 from .captcha import CaptchaDetector, LoginChallengeHandler
 from .forums_auth import ForumsAuthState, detect_forums_auth_state
-from .utils import get_log_dir, matchurl, setup_logger, write_page_diagnostic
+from .utils import (
+    get_log_dir,
+    matchurl,
+    setup_logger,
+    wait_for_zendriver,
+    write_page_diagnostic,
+)
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
 
@@ -151,8 +157,13 @@ class Driver(ABC):
             try:
                 if self.page is None:
                     raise RuntimeError("browser page is not available")
-                async with asyncio.timeout(_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS):
-                    content = await self.page.get_content()
+                content = cast(
+                    str,
+                    await wait_for_zendriver(
+                        self.page.get_content(),
+                        timeout=_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS,
+                    ),
+                )
             except Exception as error:
                 self.logger.warning(
                     "Failed to capture %s page diagnostic: %r",

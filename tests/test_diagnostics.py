@@ -224,18 +224,33 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_page_capture_has_a_timeout(self) -> None:
-        async def never_returns() -> str:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        cancelled = False
 
-        self.driver.page.get_content.side_effect = never_returns
+        async def returns_late() -> str:
+            nonlocal cancelled
+            started.set()
+            try:
+                await release.wait()
+                return "<html>late</html>"
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                finished.set()
+
+        self.driver.page.get_content.side_effect = returns_late
         with patch(
             "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
             0.001,
         ):
             path = await self.driver._save_page_diagnostic("driver_error")
 
+        self.assertTrue(started.is_set())
         self.assertIsNone(path)
+        self.assertFalse(cancelled)
         warning_args = self.driver.logger.warning.call_args.args
         self.assertEqual(
             warning_args[:2],
@@ -245,6 +260,43 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertIsInstance(warning_args[2], TimeoutError)
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertFalse(cancelled)
+
+    async def test_late_capture_exception_is_observed(self) -> None:
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        loop_errors: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+
+        async def fails_late() -> str:
+            try:
+                await release.wait()
+                raise RuntimeError("late protocol failure")
+            finally:
+                finished.set()
+
+        self.driver.page.get_content.side_effect = fails_late
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            with patch(
+                "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                path = await self.driver._save_page_diagnostic("driver_error")
+
+            self.assertIsNone(path)
+            release.set()
+            await asyncio.wait_for(finished.wait(), timeout=1)
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        self.assertEqual(loop_errors, [])
 
     async def test_browser_close_failure_is_visible(self) -> None:
         close_error = RuntimeError("process did not exit")
