@@ -4,7 +4,7 @@
 #
 # `pymarkdown fix` is best-effort because not every Markdown rule can be
 # auto-fixed. Ruff's preview formatter then validates and formats Python code
-# blocks embedded in Markdown.
+# blocks embedded in Markdown, and `pymarkdown scan` is the final lint gate.
 
 set -uo pipefail
 
@@ -13,23 +13,29 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 MD_FILES=()
-while IFS= read -r file; do
-    MD_FILES+=("$file")
+while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]]; then
+        MD_FILES+=("$file")
+    fi
 done < <(
-    find . -maxdepth 2 -type f -name "*.md" \
-        -not -path "./.venv/*" \
-        -not -path "./node_modules/*" \
-        -not -path "./.pytest_cache/*" \
-        -not -path "./.*" \
-        | sort
+    git ls-files --cached --others --exclude-standard -z -- '*.md'
 )
 
-if [ ${#MD_FILES[@]} -eq 0 ]; then
+if [[ ${#MD_FILES[@]} -eq 0 ]]; then
     exit 0
 fi
 
-uv run pymarkdown fix "${MD_FILES[@]}" >/dev/null 2>&1 || true
+# Keep these exclusions aligned with `markdownlint.config` in VS Code. MD013
+# would force hard-wrapped prose, while MD014 misreads PowerShell's `$env:`
+# syntax as a shell prompt.
+PYMARKDOWN_DISABLED_RULES="MD013,MD014"
+uv run pymarkdown -d "$PYMARKDOWN_DISABLED_RULES" fix "${MD_FILES[@]}" \
+    >/dev/null 2>&1 || true
 
 if ! uv run ruff format --preview "${MD_FILES[@]}" >&2; then
+    exit 2
+fi
+
+if ! uv run pymarkdown -d "$PYMARKDOWN_DISABLED_RULES" scan "${MD_FILES[@]}" >&2; then
     exit 2
 fi

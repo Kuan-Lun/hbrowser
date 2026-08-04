@@ -49,9 +49,8 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(proxy, "logger", logger),
-            patch.object(
-                proxy.asyncio,
-                "to_thread",
+            patch(
+                "hbrowser.gallery.browser.proxy.asyncio.to_thread",
                 new=AsyncMock(return_value="192.0.2.10"),
             ),
         ):

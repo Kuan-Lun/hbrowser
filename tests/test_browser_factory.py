@@ -1,4 +1,5 @@
 import unittest
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import zendriver as zd
@@ -62,7 +63,7 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
             "hbrowser.gallery.browser.factory.asyncio.sleep",
             new=AsyncMock(),
         ) as sleep:
-            result = await factory._wait_for_main_tab(browser)  # type: ignore[arg-type]
+            result = await factory._wait_for_main_tab(cast(zd.Browser, browser))
 
         self.assertIs(result, page)
         sleep.assert_not_awaited()
@@ -82,7 +83,7 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
             ) as sleep,
             patch.object(factory, "logger", logger),
         ):
-            result = await factory._wait_for_main_tab(browser)  # type: ignore[arg-type]
+            result = await factory._wait_for_main_tab(cast(zd.Browser, browser))
 
         self.assertIs(result, page)
         sleep.assert_awaited_once()
@@ -96,7 +97,7 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
         page = _tab()
         browser = _Browser(None, tabs=[_Target(), page])
 
-        result = await factory._wait_for_main_tab(browser)  # type: ignore[arg-type]
+        result = await factory._wait_for_main_tab(cast(zd.Browser, browser))
 
         self.assertIs(result, page)
 
@@ -104,8 +105,8 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
         browser = _Browser(None, tabs=[_Target()])
 
         with self.assertRaises(RuntimeError) as raised:
-            await factory._wait_for_main_tab(  # type: ignore[arg-type]
-                browser,
+            await factory._wait_for_main_tab(
+                cast(zd.Browser, browser),
                 timeout=0,
             )
 
@@ -129,7 +130,7 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
                 "stopped=True, process_returncode=17",
             ),
         ):
-            await factory._wait_for_main_tab(browser)  # type: ignore[arg-type]
+            await factory._wait_for_main_tab(cast(zd.Browser, browser))
 
         sleep.assert_not_awaited()
 
@@ -138,8 +139,8 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
         browser = _Browser(worker, tabs=[worker])
 
         with self.assertRaises(RuntimeError):
-            await factory._wait_for_main_tab(  # type: ignore[arg-type]
-                browser,
+            await factory._wait_for_main_tab(
+                cast(zd.Browser, browser),
                 timeout=0,
             )
 
@@ -155,7 +156,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
             patch.object(
-                factory.zd,
+                zd,
                 "start",
                 new=AsyncMock(return_value=browser),
             ),

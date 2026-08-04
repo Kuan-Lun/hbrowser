@@ -20,8 +20,11 @@ interactive challenges fall back to manual interaction in GUI mode.
 # Install dependencies
 uv pip install -e .
 
-# Type checking (strict mode configured in mypy.ini)
-uv run mypy hbrowser
+# Run the full Python finalizer over all project Python files
+bash scripts/hooks/finalize-python.sh
+
+# Run the full Markdown finalizer over all project Markdown files
+bash scripts/hooks/finalize-markdown.sh
 
 # Linting with ruff (rules in pyproject.toml: E, F, I, UP)
 uv run ruff check .

@@ -18,10 +18,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-FORMAT_PATHS=(hbrowser tests)
-TYPE_PATHS=(hbrowser)
+PY_FILES=()
+while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]]; then
+        PY_FILES+=("$file")
+    fi
+done < <(
+    git ls-files --cached --others --exclude-standard -z -- '*.py' '*.pyi'
+)
 
-uv run black "${FORMAT_PATHS[@]}" >&2
-uv run ruff check --fix "${FORMAT_PATHS[@]}" >&2
-uv run black "${FORMAT_PATHS[@]}" >&2
-uv run mypy "${TYPE_PATHS[@]}" >&2
+if [[ ${#PY_FILES[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+uv run black "${PY_FILES[@]}" >&2
+uv run ruff check --fix "${PY_FILES[@]}" >&2
+uv run black "${PY_FILES[@]}" >&2
+uv run mypy "${PY_FILES[@]}" >&2

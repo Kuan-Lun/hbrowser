@@ -1162,10 +1162,10 @@ class SearchDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
             original_unlink = Path.unlink
 
-            def fail_oldest_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            def fail_oldest_unlink(path: Path, missing_ok: bool = False) -> None:
                 if path == existing_paths[0]:
                     raise PermissionError("simulated retention failure")
-                original_unlink(path, *args, **kwargs)
+                original_unlink(path, missing_ok=missing_ok)
 
             with (
                 patch(
