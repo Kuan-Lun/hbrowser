@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import zendriver as zd
 from zendriver import cdp
@@ -74,14 +74,23 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
         async def expose_tab(_: float) -> None:
             browser.targets.append(page)
 
-        with patch(
-            "hbrowser.gallery.browser.factory.asyncio.sleep",
-            new=AsyncMock(side_effect=expose_tab),
-        ) as sleep:
+        logger = Mock()
+        with (
+            patch(
+                "hbrowser.gallery.browser.factory.asyncio.sleep",
+                new=AsyncMock(side_effect=expose_tab),
+            ) as sleep,
+            patch.object(factory, "logger", logger),
+        ):
             result = await factory._wait_for_main_tab(browser)  # type: ignore[arg-type]
 
         self.assertIs(result, page)
         sleep.assert_awaited_once()
+        logger.warning.assert_called_once()
+        logger.debug.assert_called_once_with(
+            "Browser main tab became available after startup delay"
+        )
+        logger.info.assert_not_called()
 
     async def test_recovers_tab_when_main_tab_is_blocked_by_connection(self) -> None:
         page = _tab()

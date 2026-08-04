@@ -114,8 +114,9 @@ def configure_proxy() -> str | None:
         proxy_host = rp_dns
         proxy_port = "8080"
 
-    logger.info(
-        "Using authenticated residential proxy: %s:%s",
+    logger.info("Using authenticated residential proxy")
+    logger.debug(
+        "Residential proxy endpoint: host=%s port=%s",
         proxy_host,
         proxy_port,
     )
@@ -168,10 +169,18 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
                 f"as local IP ({local_ip}). Proxy may not be working properly."
             )
 
-        logger.info(f"Proxy IP verified: {proxy_ip} (local: {local_ip})")
+        logger.info("Proxy IP verification succeeded")
+        logger.debug(
+            "Proxy IP verification context: proxy=%s local=%s",
+            proxy_ip,
+            local_ip,
+        )
     except RuntimeError:
         raise
-    except Exception as e:
-        if is_connection_error(e):
+    except Exception as error:
+        if is_connection_error(error):
             raise
-        logger.warning(f"Could not verify proxy IP (non-fatal): {e}")
+        logger.warning(
+            "Could not verify proxy IP (non-fatal): error_type=%s",
+            type(error).__name__,
+        )

@@ -12,9 +12,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from h2h_galleryinfo_parser import GalleryURLParser
 from zendriver.core.connection import ProtocolException
 
 import hbrowser
@@ -37,6 +38,7 @@ from hbrowser.gallery.eh_driver import (
     _SEARCH_DIAGNOSTIC_FILE_LIMIT,
     _SEARCH_DIAGNOSTIC_FILENAME_PATTERN,
     _SEARCH_PAGE_SNAPSHOT_SCRIPT,
+    MAX_DOWNLOAD_RETRIES,
     EHDriver,
     _locked_search_diagnostic_directory,
     _NextPageState,
@@ -841,15 +843,18 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.get_urls, [scope_url])
 
     async def test_only_explicit_context_loss_retries_a_get(self) -> None:
-        url = _search_url("gid:1")
+        sentinel = "SENSITIVESEARCHTOKEN987654"
+        query = f"gid:1 {sentinel}"
+        url = _search_url(query)
         transient_driver = _HarnessExHDriver()
+        transient_driver.logger = Mock()
         transient_driver.add_route(
             url,
             _Document(
                 url=url,
                 html_reads=(
                     _result_page(
-                        "gid:1",
+                        query,
                         "https://exhentai.org/g/1/deadbeef00/",
                     ),
                 ),
@@ -859,10 +864,20 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             ProtocolException({"message": "Execution context was destroyed."})
         )
 
-        snapshot = await transient_driver._navigate_search_url("gid:1", url)
+        snapshot = await transient_driver._navigate_search_url(query, url)
 
         self.assertEqual([gallery.gid for gallery in snapshot.galleries], [1])
         self.assertEqual(transient_driver.get_urls, [url, url])
+        transient_driver.logger.warning.assert_called_once_with(
+            "Transient browser context loss during search navigation; "
+            "retrying the trusted GET once: query_length=%d error_type=%s",
+            len(query),
+            "ProtocolException",
+        )
+        self.assertNotIn(
+            sentinel,
+            repr(transient_driver.logger.warning.call_args_list),
+        )
 
         for error in (
             RuntimeError("unknown navigation failure"),
@@ -874,7 +889,7 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
                 self.subTest(error=error),
                 self.assertRaises(SearchNavigationError),
             ):
-                await driver._navigate_search_url("gid:1", url)
+                await driver._navigate_search_url(query, url)
             self.assertEqual(driver.get_urls, [url])
 
     async def test_cancellation_is_never_reclassified_or_retried(self) -> None:
@@ -1475,6 +1490,7 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
         query = f"gid:{gid}"
         search_url = _search_url(query)
         driver = _HarnessExHDriver()
+        driver.logger = Mock()
         driver.add_route(EXH_HOME, _scope_document(), _scope_document())
         driver.add_route(
             search_url,
@@ -1495,6 +1511,38 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
         result_loader_ids = driver.page.completed_navigation_loaders[1::2]
         self.assertEqual(len(result_loader_ids), 2)
         self.assertEqual(len(set(result_loader_ids)), 2)
+        exact_lookup_calls = [
+            logged_call
+            for logged_call in driver.logger.debug.call_args_list
+            if logged_call.args
+            and logged_call.args[0].startswith("Exact gallery lookup")
+        ]
+        self.assertEqual(
+            exact_lookup_calls,
+            [
+                call(
+                    "Exact gallery lookup was empty: gid=%d confirmation=%d/%d",
+                    gid,
+                    1,
+                    2,
+                ),
+                call(
+                    "Exact gallery lookup was empty: gid=%d confirmation=%d/%d",
+                    gid,
+                    2,
+                    2,
+                ),
+            ],
+        )
+        driver.logger.info.assert_called_once_with(
+            "Gallery absence confirmed: gid=%d confirmations=%d",
+            gid,
+            2,
+        )
+        info_text = repr(driver.logger.info.call_args_list)
+        self.assertNotIn("Gallery search started", info_text)
+        self.assertNotIn("Gallery search completed", info_text)
+        driver.logger.warning.assert_not_called()
 
     async def test_empty_then_found_is_not_misclassified_as_missing(self) -> None:
         gid = 349189
@@ -1582,3 +1630,48 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await driver.lookup_gid(gid)  # type: ignore[arg-type]
             self.assertEqual(driver.get_urls, [])
+
+
+class GalleryDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gallery_token_never_reaches_logs_or_terminal_retry_error(
+        self,
+    ) -> None:
+        sentinel = "SENSITIVEGALLERYTOKEN987654"
+        gallery = GalleryURLParser(f"https://exhentai.org/g/7654321/{sentinel}/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        page = SimpleNamespace(
+            mapper={},
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(return_value=[]),
+            close=AsyncMock(),
+        )
+        driver.page = page
+        driver.browser = SimpleNamespace(tabs=[])
+        driver.myget = AsyncMock()
+
+        with self.assertRaises(RuntimeError) as raised:
+            await driver.download(gallery)
+
+        self.assertIn(f"after {MAX_DOWNLOAD_RETRIES} attempts", str(raised.exception))
+        self.assertIn("gid=7654321", str(raised.exception))
+        driver.logger.warning.assert_any_call(
+            "Archive Download control unavailable; retrying: "
+            "gid=%d attempt=%d/%d error_type=%s",
+            gallery.gid,
+            1,
+            MAX_DOWNLOAD_RETRIES,
+            "RuntimeError",
+        )
+        self.assertNotIn(sentinel, repr(driver.logger.method_calls))
+        self.assertNotIn(sentinel, str(raised.exception))

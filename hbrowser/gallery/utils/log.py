@@ -16,6 +16,7 @@ _PROCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
 _PROCESS_LOG_BACKUP_COUNT = 5
 _PROCESS_LOG_HANDLER_LOCK = Lock()
 _PROCESS_LOG_HANDLERS: dict[Path, logging.Handler] = {}
+_MANAGED_STDOUT_HANDLER_ATTRIBUTE = "_hbrowser_managed_stdout_handler"
 
 
 class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -182,11 +183,20 @@ def setup_logger(name: str) -> logging.Logger:
     level = getattr(logging, level_str, logging.INFO)
     logger.setLevel(level)
 
+    managed_stdout_handlers = [
+        handler
+        for handler in logger.handlers
+        if getattr(handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, False)
+    ]
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(level)
-        handler.setFormatter(_formatter())
-        logger.addHandler(handler)
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        setattr(stdout_handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, True)
+        stdout_handler.setLevel(level)
+        stdout_handler.setFormatter(_formatter())
+        logger.addHandler(stdout_handler)
+    else:
+        for managed_handler in managed_stdout_handlers:
+            managed_handler.setLevel(level)
 
     process_handler = _process_log_handler()
     if process_handler is not None and process_handler not in logger.handlers:

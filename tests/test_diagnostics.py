@@ -124,11 +124,10 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.driver.page.get_content = AsyncMock(return_value="<html>failure</html>")
         self.driver.browser = Mock()
 
-    async def test_exit_keeps_each_error_page_and_logs_traceback(self) -> None:
+    async def test_exit_keeps_each_error_page_and_logs_safe_error_types(self) -> None:
         try:
             raise ValueError("broken")
         except ValueError as error:
-            caught_error = error
             traceback = error.__traceback__
 
             with (
@@ -153,12 +152,30 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             ["<html>failure</html>", "<html>failure</html>"],
         )
         self.driver.logger.error.assert_any_call(
-            "Exception occurred: %s: %s",
+            "Browser session exiting after error: error_type=%s cause_type=%s",
             "ValueError",
-            caught_error,
-            exc_info=(ValueError, caught_error, traceback),
+            "none",
         )
         self.assertEqual(stop_browser.await_count, 2)
+
+    async def test_exit_log_does_not_render_chained_exception_detail(self) -> None:
+        sentinel = "SENSITIVE-BROWSER-CAUSE\nSECOND-LINE"
+        cause = RuntimeError(sentinel)
+        error = ValueError("safe outer error")
+        error.__cause__ = cause
+
+        with patch(
+            "hbrowser.gallery.driver_base.stop_browser",
+            new=AsyncMock(),
+        ):
+            await self.driver.__aexit__(ValueError, error, error.__traceback__)
+
+        self.driver.logger.error.assert_called_once_with(
+            "Browser session exiting after error: error_type=%s cause_type=%s",
+            "ValueError",
+            "RuntimeError",
+        )
+        self.assertNotIn(sentinel, repr(self.driver.logger.method_calls))
 
     async def test_page_write_runs_outside_the_event_loop_thread(self) -> None:
         event_loop_thread = threading.get_ident()
@@ -202,14 +219,13 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             await self.driver.__aexit__(RuntimeError, RuntimeError("battle"), None)
 
         self.driver.logger.warning.assert_any_call(
-            "Failed to save %s page diagnostic: %r",
+            "Failed to save %s page diagnostic: error_type=%s",
             "driver_error",
-            write_error,
-            exc_info=True,
+            "OSError",
         )
         stop_browser.assert_awaited_once_with(self.driver.browser)
 
-    async def test_capture_failure_reports_the_concrete_reason(self) -> None:
+    async def test_capture_failure_reports_only_the_safe_error_type(self) -> None:
         capture_error = RuntimeError("session detached")
         self.driver.page.get_content.side_effect = capture_error
 
@@ -217,10 +233,9 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(path)
         self.driver.logger.warning.assert_called_once_with(
-            "Failed to capture %s page diagnostic: %r",
+            "Failed to capture %s page diagnostic: error_type=%s",
             "driver_error",
-            capture_error,
-            exc_info=True,
+            "RuntimeError",
         )
 
     async def test_page_capture_has_a_timeout(self) -> None:
@@ -251,15 +266,11 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(started.is_set())
         self.assertIsNone(path)
         self.assertFalse(cancelled)
-        warning_args = self.driver.logger.warning.call_args.args
-        self.assertEqual(
-            warning_args[:2],
-            (
-                "Failed to capture %s page diagnostic: %r",
-                "driver_error",
-            ),
+        self.driver.logger.warning.assert_called_once_with(
+            "Failed to capture %s page diagnostic: error_type=%s",
+            "driver_error",
+            "TimeoutError",
         )
-        self.assertIsInstance(warning_args[2], TimeoutError)
 
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=1)
@@ -307,7 +318,6 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             await self.driver.__aexit__(None, None, None)
 
         self.driver.logger.warning.assert_called_once_with(
-            "Failed to close browser cleanly: %r",
-            close_error,
-            exc_info=True,
+            "Failed to close browser cleanly: error_type=%s",
+            "RuntimeError",
         )

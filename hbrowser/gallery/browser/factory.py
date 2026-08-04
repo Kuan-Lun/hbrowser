@@ -49,7 +49,8 @@ def _build_config(
         config.add_extension(proxy_extension)
     elif use_tor and socks_port is not None:
         config.add_argument(f"--proxy-server=socks5://127.0.0.1:{socks_port}")
-        logger.info(f"Using Tor SOCKS proxy on port {socks_port}")
+        logger.info("Using Tor SOCKS proxy")
+        logger.debug("Tor SOCKS proxy endpoint: host=127.0.0.1 port=%d", socks_port)
     else:
         logger.info("No proxy configured (direct connection)")
 
@@ -76,10 +77,7 @@ def _build_config(
     if is_xvfb_env and not headless:
         # Xvfb 環境讓 Chrome 使用 SwiftShader 軟體渲染，刻意不加 --disable-gpu，
         # 明確禁用 GPU 反而容易被 Cloudflare 偵測。
-        logger.info(
-            "Detected Xvfb environment, "
-            "using default GPU settings for better fingerprint"
-        )
+        logger.debug("Detected Xvfb environment; retaining default GPU settings")
 
     config.add_argument("--disable-blink-features=AutomationControlled")
     config.add_argument("--disable-infobars")
@@ -188,7 +186,7 @@ async def _wait_for_main_tab(
                 break
             page = _select_main_tab(browser)
             if page is not None and not browser.stopped:
-                logger.info("Browser main tab became available after startup delay")
+                logger.debug("Browser main tab became available after startup delay")
                 return page
 
     state = _describe_browser_startup_state(browser)

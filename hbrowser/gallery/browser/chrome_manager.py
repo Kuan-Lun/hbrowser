@@ -54,7 +54,7 @@ def _fetch_stable_version_info() -> dict[str, Any]:
     Returns:
         包含版本和下載連結的字典
     """
-    logger.info("Fetching Chrome for Testing stable version info...")
+    logger.debug("Fetching Chrome for Testing stable version info")
     with urlopen(CHROME_FOR_TESTING_API, timeout=30) as response:
         data: dict[str, Any] = json.loads(response.read().decode("utf-8"))
 
@@ -85,7 +85,7 @@ def _download_and_extract(url: str, dest_dir: Path, desc: str) -> None:
         zip_path = tmp_dir / "temp.zip"
 
         logger.info(f"Downloading {desc}...")
-        logger.debug(f"URL: {url}")
+        logger.debug("Download request started: artifact=%s", desc)
         urlretrieve(url, zip_path)
 
         logger.info(f"Extracting {desc}...")
@@ -178,13 +178,13 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
     plat = get_platform()
     cache_dir = _get_cache_dir()
 
-    logger.info(f"Platform: {plat}")
+    logger.debug(f"Platform: {plat}")
     logger.debug(f"Cache directory: {cache_dir}")
 
     # 獲取最新版本資訊
     version_info = _fetch_stable_version_info()
     version = version_info["version"]
-    logger.info(f"Latest stable version: {version}")
+    logger.debug(f"Latest stable version: {version}")
 
     version_dir = cache_dir / version
 
@@ -218,7 +218,7 @@ def ensure_chrome_installed(force_download: bool = False) -> ChromePaths:
 
         logger.info("Chrome is ready")
     else:
-        logger.info(f"Using cached Chrome {version}")
+        logger.debug(f"Using cached Chrome {version}")
 
     return ChromePaths(
         chrome=str(chrome_path),

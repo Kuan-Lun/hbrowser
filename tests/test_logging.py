@@ -78,6 +78,54 @@ class LoggerSetupTests(unittest.TestCase):
         self.assertIs(second, first)
         self.assertEqual(configured_handlers, [handler])
 
+    def test_repeated_setup_refreshes_only_managed_stdout_level(self) -> None:
+        logger_name = f"hbrowser.tests.level_refresh.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        output = io.StringIO()
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+                patch("hbrowser.gallery.utils.log.sys.stdout", output),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_LOG_LEVEL": "INFO",
+                        "HBROWSER_PROCESS_LOG_FILE": str(
+                            Path(directory_name) / "process.log"
+                        ),
+                    },
+                    clear=False,
+                ),
+            ):
+                first = setup_logger(logger_name)
+                stdout_handler = next(
+                    handler
+                    for handler in first.handlers
+                    if not isinstance(handler, logging.FileHandler)
+                )
+                process_handler = next(
+                    handler
+                    for handler in first.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+
+                os.environ["HBROWSER_LOG_LEVEL"] = "DEBUG"
+                second = setup_logger(logger_name)
+                second.debug("refreshed debug record")
+
+                self.assertIs(second, first)
+                self.assertEqual(second.level, logging.DEBUG)
+                self.assertEqual(stdout_handler.level, logging.DEBUG)
+                self.assertEqual(process_handler.level, logging.NOTSET)
+                self.assertIn("refreshed debug record", output.getvalue())
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+
     def test_configured_process_log_is_shared_and_written_once(self) -> None:
         first_name = f"hbrowser.tests.process.first.{id(self)}"
         second_name = f"hbrowser.tests.process.second.{id(self)}"

@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from random import random
 from typing import Any, Self, cast
+from urllib.parse import urlsplit
 
 from zendriver import cdp
 
@@ -35,6 +36,35 @@ from .utils import (
 )
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
+_SAFE_NAVIGATION_ROUTES = {
+    "favorites.php": "favorites",
+    "g": "gallery",
+    "hentaiathome.php": "hath",
+    "home.php": "home",
+    "news.php": "news",
+    "popular": "popular",
+    "tag": "tag",
+    "toplist.php": "toplist",
+    "uploader": "uploader",
+    "watched": "watched",
+}
+
+
+def _redacted_url_context(url: str) -> tuple[str, str, str, bool]:
+    """Return useful navigation context without path values or query contents."""
+    try:
+        parsed_url = urlsplit(url)
+        scheme = parsed_url.scheme or "relative"
+        hostname = parsed_url.hostname or "unknown"
+    except ValueError:
+        return "invalid", "invalid", "invalid", False
+
+    path_parts = [part for part in parsed_url.path.split("/") if part]
+    if not path_parts:
+        route = "root"
+    else:
+        route = _SAFE_NAVIGATION_ROUTES.get(path_parts[0].casefold(), "other")
+    return scheme, hostname, route, bool(parsed_url.query)
 
 
 class _DriverTurnstileSolver:
@@ -126,12 +156,18 @@ class Driver(ABC):
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        del exc_tb
         if exc_type is not None:
-            self.logger.error(
-                "Exception occurred: %s: %s",
-                exc_type.__name__,
+            error_type = getattr(exc_type, "__name__", type(exc_val).__name__)
+            cause = getattr(exc_val, "__cause__", None) or getattr(
                 exc_val,
-                exc_info=(exc_type, exc_val, exc_tb),
+                "__context__",
+                None,
+            )
+            self.logger.error(
+                "Browser session exiting after error: error_type=%s cause_type=%s",
+                error_type,
+                type(cause).__name__ if cause is not None else "none",
             )
             await self._save_page_diagnostic("driver_error")
         self.logger.info("Closing browser")
@@ -139,9 +175,8 @@ class Driver(ABC):
             await stop_browser(self.browser)
         except Exception as error:
             self.logger.warning(
-                "Failed to close browser cleanly: %r",
-                error,
-                exc_info=True,
+                "Failed to close browser cleanly: error_type=%s",
+                type(error).__name__,
             )
 
     @staticmethod
@@ -166,10 +201,9 @@ class Driver(ABC):
                 )
             except Exception as error:
                 self.logger.warning(
-                    "Failed to capture %s page diagnostic: %r",
+                    "Failed to capture %s page diagnostic: error_type=%s",
                     kind,
-                    error,
-                    exc_info=True,
+                    type(error).__name__,
                 )
                 return None
 
@@ -181,10 +215,9 @@ class Driver(ABC):
             )
         except Exception as error:
             self.logger.warning(
-                "Failed to save %s page diagnostic: %r",
+                "Failed to save %s page diagnostic: error_type=%s",
                 kind,
-                error,
-                exc_info=True,
+                type(error).__name__,
             )
             return None
 
@@ -198,11 +231,41 @@ class Driver(ABC):
     async def gohomepage(self, force: bool = False) -> None:
         url = self.url[self.name]
         current_url = await self.page.evaluate("window.location.href")
+        source_scheme, source_host, source_route, source_has_query = (
+            _redacted_url_context(current_url)
+        )
+        target_scheme, target_host, target_route, target_has_query = (
+            _redacted_url_context(url)
+        )
         if force or not matchurl(current_url, url):
-            self.logger.info(f"Navigate to homepage: {url}")
+            self.logger.debug(
+                "Navigate to homepage: source=%s://%s route=%s has_query=%s "
+                "target=%s://%s route=%s has_query=%s forced=%s",
+                source_scheme,
+                source_host,
+                source_route,
+                source_has_query,
+                target_scheme,
+                target_host,
+                target_route,
+                target_has_query,
+                force,
+            )
             await self.get(url)
         else:
-            self.logger.debug("Already on homepage, no navigation needed")
+            self.logger.debug(
+                "Already on homepage: source=%s://%s route=%s has_query=%s "
+                "target=%s://%s route=%s has_query=%s forced=%s",
+                source_scheme,
+                source_host,
+                source_route,
+                source_has_query,
+                target_scheme,
+                target_host,
+                target_route,
+                target_has_query,
+                force,
+            )
 
     async def find_element_chain(self, *selectors: str) -> Any:
         element: Any = self.page
@@ -212,7 +275,14 @@ class Driver(ABC):
 
     async def get(self, url: str) -> None:
         current_url = await self.page.evaluate("window.location.href")
-        self.logger.debug(f"Navigate to URL: {url}")
+        scheme, hostname, route, has_query = _redacted_url_context(url)
+        self.logger.debug(
+            "Navigate to URL: scheme=%s host=%s route=%s has_query=%s",
+            scheme,
+            hostname,
+            route,
+            has_query,
+        )
         is_new_url = not matchurl(url, current_url)
         await self.myget(url)
         if is_new_url:
@@ -374,7 +444,7 @@ class Driver(ABC):
         for attempt in range(1, self.max_captcha_retries + 1):
             det = await self.captcha_detector.detect(self.page, timeout=detect_timeout)
             if det.kind == "none":
-                self.logger.info("No challenge detected")
+                self.logger.debug("No challenge detected")
                 return
 
             self.logger.warning(
@@ -479,7 +549,7 @@ class Driver(ABC):
                 "Forums page has no trustworthy guest or member login state"
             )
 
-        self.logger.info("Clicking 'Log In' link on Forums page")
+        self.logger.debug("Clicking 'Log In' link on Forums page")
         login_link = await self.page.select(
             "#userlinksguest a[href*='act=Login&CODE=00']"
         )
@@ -507,7 +577,7 @@ class Driver(ABC):
             "input[type='submit'][value='Log me in']"
         )
         await submit_button.click()
-        self.logger.info("'Log me in' button clicked, waiting for redirect...")
+        self.logger.debug("'Log me in' button clicked, waiting for redirect...")
 
         deadline = asyncio.get_event_loop().time() + 10
         while (

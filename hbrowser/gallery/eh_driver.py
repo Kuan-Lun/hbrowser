@@ -534,10 +534,13 @@ class EHDriver(Driver):
     async def _close_page_safely(self, page: object) -> None:
         try:
             await page.close()  # type: ignore[attr-defined]
-        except Exception as e:
-            if is_connection_error(e):
+        except Exception as error:
+            if is_connection_error(error):
                 raise
-            self.logger.debug(f"Failed to close page (non-fatal): {e!r}")
+            self.logger.debug(
+                "Failed to close page (non-fatal): error_type=%s",
+                type(error).__name__,
+            )
 
     async def _current_loader_id(self) -> str:
         frame_tree = await self.page.send(cdp.page.get_frame_tree())
@@ -604,9 +607,12 @@ class EHDriver(Driver):
                 html_content,
             )
         except OSError as error:
-            self.logger.warning(f"Failed to save search diagnostic: {error!r}")
+            self.logger.warning(
+                "Failed to save search diagnostic: error_type=%s",
+                type(error).__name__,
+            )
             return None
-        self.logger.warning(f"Search diagnostic saved to: {path}")
+        self.logger.warning("Search diagnostic saved to: %s", path)
         return path
 
     async def _raise_search_page_error(
@@ -812,8 +818,10 @@ class EHDriver(Driver):
                         reason=f"trusted GET failed: {error!r}",
                     ) from error
                 self.logger.warning(
-                    f"Transient browser context loss while navigating to {url!r}; "
-                    "retrying the trusted GET once"
+                    "Transient browser context loss during search navigation; "
+                    "retrying the trusted GET once: query_length=%d error_type=%s",
+                    len(diagnostic_query),
+                    type(error).__name__,
                 )
         await self._wait_for_new_loader(old_loader_id, url)
         return await self._read_stable_search_page(
@@ -1125,7 +1133,7 @@ class EHDriver(Driver):
 
         # 刷新以免沒簽到成功
         await self.wait(self.page.reload, ischangeurl=False)
-        self.logger.info("Check-in completed")
+        self.logger.info("Daily check-in page refresh completed")
 
     async def search(self, request: SearchRequest) -> GallerySearchResult:
         """Execute one bounded gallery search using trusted URL navigations."""
@@ -1135,7 +1143,12 @@ class EHDriver(Driver):
             )
 
         origin, query, initial_url = await self._resolve_search_request(request)
-        self.logger.info(f"Search keyword: {query}")
+        self.logger.debug(
+            "Gallery search started: query=%r max_pages=%d max_results=%d",
+            query,
+            request.max_pages,
+            request.max_results,
+        )
         expected_context = _search_context(initial_url)
 
         galleries = list[GalleryURLParser]()
@@ -1196,7 +1209,12 @@ class EHDriver(Driver):
                     galleries=tuple(galleries),
                     pages_visited=pages_visited,
                 )
-                self.logger.info(f"Found {len(result.galleries)} galleries")
+                self.logger.debug(
+                    "Gallery search completed: query=%r galleries=%d pages=%d",
+                    query,
+                    len(result.galleries),
+                    result.pages_visited,
+                )
                 return result
 
             if pages_visited == request.max_pages:
@@ -1244,11 +1262,18 @@ class EHDriver(Driver):
                     requested_gid=gid,
                     gallery=result.galleries[0],
                 )
-            self.logger.warning(
-                f"Exact lookup for GID {gid} was empty "
-                f"({confirmation}/{MINIMUM_MISSING_CONFIRMATIONS})"
+            self.logger.debug(
+                "Exact gallery lookup was empty: gid=%d confirmation=%d/%d",
+                gid,
+                confirmation,
+                MINIMUM_MISSING_CONFIRMATIONS,
             )
 
+        self.logger.info(
+            "Gallery absence confirmed: gid=%d confirmations=%d",
+            gid,
+            MINIMUM_MISSING_CONFIRMATIONS,
+        )
         return ConfirmedGalleryMissing(
             gid=gid,
             confirmations=MINIMUM_MISSING_CONFIRMATIONS,
@@ -1261,11 +1286,21 @@ class EHDriver(Driver):
         if attempt > MAX_DOWNLOAD_RETRIES:
             raise RuntimeError(
                 f"Failed to download gallery after {MAX_DOWNLOAD_RETRIES} "
-                f"attempts: {gallery.url}"
+                f"attempts: gid={gallery.gid}"
             )
-        self.logger.info(
-            f"Starting download for gallery: {gallery.url} (attempt {attempt})"
-        )
+        if attempt == 1:
+            self.logger.info(
+                "Gallery archive download started: gid=%d max_attempts=%d",
+                gallery.gid,
+                MAX_DOWNLOAD_RETRIES,
+            )
+        else:
+            self.logger.debug(
+                "Gallery archive download retry started: gid=%d attempt=%d/%d",
+                gallery.gid,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+            )
 
         mapper = self.page.mapper
         for k in list(mapper):
@@ -1283,7 +1318,10 @@ class EHDriver(Driver):
             xpath_query = " | ".join(xpath_query_list)
             results = await self.page.xpath(xpath_query, timeout=2)
             if results:
-                self.logger.warning(f"Gallery unavailable or deleted: {gallery.url}")
+                self.logger.warning(
+                    "Gallery unavailable or deleted: gid=%d",
+                    gallery.gid,
+                )
                 return False
         except TimeoutError:
             pass
@@ -1298,17 +1336,29 @@ class EHDriver(Driver):
                 await archive_links[0].click()
             else:
                 raise RuntimeError("Archive Download not found")
-        except Exception as e:
-            if is_connection_error(e):
+        except Exception as error:
+            if is_connection_error(error):
                 raise
-            self.logger.warning("Archive Download element not found, retrying download")
+            self.logger.warning(
+                "Archive Download control unavailable; retrying: "
+                "gid=%d attempt=%d/%d error_type=%s",
+                gallery.gid,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+                type(error).__name__,
+            )
             await self._close_page_safely(self.page)
             self.page = gallery_tab
             return await self._download(gallery, attempt + 1)
 
         new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
-            self.logger.warning("No new tab opened, retrying download")
+            self.logger.warning(
+                "Archive download tab did not open; retrying: " "gid=%d attempt=%d/%d",
+                gallery.gid,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+            )
             return await self._download(gallery, attempt + 1)
 
         await new_tab.activate()
@@ -1344,13 +1394,22 @@ class EHDriver(Driver):
             retrytime = 60
             if error_file is None:
                 self.logger.warning(
-                    f"Download timeout; error page could not be saved; "
-                    f"retrying in {retrytime}s"
+                    "Archive download timed out; diagnostic unavailable; "
+                    "retrying: gid=%d attempt=%d/%d delay=%ds",
+                    gallery.gid,
+                    attempt,
+                    MAX_DOWNLOAD_RETRIES,
+                    retrytime,
                 )
             else:
                 self.logger.warning(
-                    f"Download timeout, error page saved to {error_file}, "
-                    f"retrying in {retrytime}s"
+                    "Archive download timed out; diagnostic=%s; retrying: "
+                    "gid=%d attempt=%d/%d delay=%ds",
+                    error_file,
+                    gallery.gid,
+                    attempt,
+                    MAX_DOWNLOAD_RETRIES,
+                    retrytime,
                 )
             await self._close_page_safely(self.page)
             self.page = gallery_tab
@@ -1364,10 +1423,13 @@ class EHDriver(Driver):
             await gallery_tab.activate()
             await asyncio.sleep(random())
         else:
-            self.logger.error(
-                f"Tab anomaly: only {len(self.browser.tabs)} tab(s) remaining"
+            self.logger.warning(
+                "Archive download tab closed before cleanup: gid=%d "
+                "remaining_tabs=%d",
+                gallery.gid,
+                len(self.browser.tabs),
             )
-        self.logger.info(f"Gallery downloaded successfully: {gallery.url}")
+        self.logger.info("Gallery archive download queued: gid=%d", gallery.gid)
         return True
 
     async def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:
