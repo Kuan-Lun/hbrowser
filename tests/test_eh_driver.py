@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from h2h_galleryinfo_parser import GalleryURLParser
+from websockets.exceptions import ConnectionClosedError
 from zendriver.core.connection import ProtocolException
 
 import hbrowser
@@ -34,6 +35,7 @@ from hbrowser import (
     SearchRateLimitError,
     SearchRequest,
 )
+from hbrowser.exceptions import ClientOfflineException
 from hbrowser.gallery.eh_driver import (
     _SEARCH_DIAGNOSTIC_FILE_LIMIT,
     _SEARCH_DIAGNOSTIC_FILENAME_PATTERN,
@@ -1632,6 +1634,234 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(driver.get_urls, [])
 
 
+class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_archive_control_reuses_live_gallery_tab(self) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+        gallery_closed = False
+
+        async def navigation_url(_: str) -> str:
+            if gallery_closed:
+                raise ConnectionClosedError(None, None)
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        async def close_gallery() -> None:
+            nonlocal gallery_closed
+            gallery_closed = True
+
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [], [], [archive_link]]),
+            close=AsyncMock(side_effect=close_gallery),
+            activate=AsyncMock(),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(
+                return_value=(
+                    "Downloads should start processing within a couple of minutes."
+                )
+            ),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            tabs=[gallery_page],
+            update_targets=AsyncMock(),
+        )
+
+        async def open_archive_tab() -> None:
+            browser.tabs.append(archive_page)
+
+        archive_link.click.side_effect = open_archive_tab
+        driver.page = gallery_page
+        driver.browser = browser
+        driver.myget = AsyncMock()
+
+        with patch(
+            "hbrowser.gallery.eh_driver.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            downloaded = await driver.download(gallery)
+
+        self.assertTrue(downloaded)
+        self.assertEqual(driver.myget.await_count, 2)
+        self.assertEqual(gallery_page.xpath.await_count, 4)
+        gallery_page.close.assert_not_awaited()
+        archive_link.click.assert_awaited_once()
+        archive_page.close.assert_awaited_once()
+        gallery_page.activate.assert_awaited_once()
+        self.assertIs(driver.page, gallery_page)
+
+    async def test_archive_timeout_closes_child_before_clicking_fresh_link(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        first_link = SimpleNamespace(click=AsyncMock())
+        second_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [first_link], [], [second_link]]),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        first_archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive-1"),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(side_effect=TimeoutError),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        second_archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive-2"),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(
+                return_value=(
+                    "Downloads should start processing within a couple of minutes."
+                )
+            ),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page])
+
+        async def open_archive_page(page: object) -> None:
+            browser.tabs.append(page)
+
+        async def close_archive_page(page: object) -> None:
+            browser.tabs.remove(page)
+
+        async def open_first_archive_page() -> None:
+            await open_archive_page(first_archive_page)
+
+        async def open_second_archive_page() -> None:
+            await open_archive_page(second_archive_page)
+
+        async def close_first_archive_page() -> None:
+            await close_archive_page(first_archive_page)
+
+        async def close_second_archive_page() -> None:
+            await close_archive_page(second_archive_page)
+
+        first_link.click.side_effect = open_first_archive_page
+        second_link.click.side_effect = open_second_archive_page
+        first_archive_page.close.side_effect = close_first_archive_page
+        second_archive_page.close.side_effect = close_second_archive_page
+        driver.page = gallery_page
+        driver.browser = browser
+        driver.myget = AsyncMock()
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(side_effect=[first_archive_page, second_archive_page]),
+            ),
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+            patch.object(
+                driver,
+                "_save_page_diagnostic",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            downloaded = await driver.download(gallery)
+
+        self.assertTrue(downloaded)
+        gallery_page.close.assert_not_awaited()
+        first_link.click.assert_awaited_once()
+        second_link.click.assert_awaited_once()
+        first_archive_page.close.assert_awaited_once()
+        second_archive_page.close.assert_awaited_once()
+        self.assertEqual(gallery_page.activate.await_count, 2)
+        self.assertIs(driver.page, gallery_page)
+
+    async def test_client_offline_restores_gallery_before_propagating(self) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            close=AsyncMock(),
+            activate=AsyncMock(side_effect=RuntimeError("activation failed")),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(
+                return_value="Your H@H client appears to be offline."
+            ),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.page = gallery_page
+        driver.browser = browser
+        driver.myget = AsyncMock()
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(return_value=archive_page),
+            ),
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+        ):
+            with self.assertRaises(ClientOfflineException) as raised:
+                await driver.download(gallery)
+
+        gallery_page.close.assert_not_awaited()
+        archive_page.close.assert_awaited_once()
+        gallery_page.activate.assert_awaited_once()
+        self.assertIs(driver.page, gallery_page)
+        self.assertEqual(
+            raised.exception.__notes__,
+            ["Archive cleanup also failed: RuntimeError"],
+        )
+
+
 class GalleryDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_gallery_token_never_reaches_logs_or_terminal_retry_error(
         self,
@@ -1675,3 +1905,4 @@ class GalleryDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(sentinel, repr(driver.logger.method_calls))
         self.assertNotIn(sentinel, str(raised.exception))
+        page.close.assert_not_awaited()

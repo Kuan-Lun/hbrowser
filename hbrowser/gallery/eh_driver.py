@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from random import random
 from threading import Lock
-from typing import Never
+from typing import Any, Never
 from urllib.parse import (
     parse_qs,
     parse_qsl,
@@ -541,6 +541,45 @@ class EHDriver(Driver):
                 "Failed to close page (non-fatal): error_type=%s",
                 type(error).__name__,
             )
+
+    def _browser_has_tab(self, page: object) -> bool:
+        page_target = getattr(page, "target", None)
+        page_target_id = getattr(page_target, "target_id", None)
+        for tab in self.browser.tabs:
+            if tab is page:
+                return True
+            tab_target = getattr(tab, "target", None)
+            tab_target_id = getattr(tab_target, "target_id", None)
+            if page_target_id is not None and tab_target_id == page_target_id:
+                return True
+        return False
+
+    async def _close_archive_tab_and_restore(
+        self,
+        gallery_tab: Any,
+        archive_tab: Any,
+    ) -> None:
+        cleanup_error: BaseException | None = None
+        if self._browser_has_tab(archive_tab):
+            try:
+                await self._close_page_safely(archive_tab)
+            except BaseException as error:
+                cleanup_error = error
+
+        self.page = gallery_tab
+        try:
+            await gallery_tab.activate()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            else:
+                cleanup_error.add_note(
+                    "Gallery activation also failed during archive cleanup: "
+                    f"{type(error).__name__}"
+                )
+
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def _current_loader_id(self) -> str:
         frame_tree = await self.page.send(cdp.page.get_frame_tree())
@@ -1280,28 +1319,29 @@ class EHDriver(Driver):
         )
 
     async def download(self, gallery: GalleryURLParser) -> bool:
-        return await self._download(gallery, attempt=1)
+        self.logger.info(
+            "Gallery archive download started: gid=%d max_attempts=%d",
+            gallery.gid,
+            MAX_DOWNLOAD_RETRIES,
+        )
+        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+            if attempt > 1:
+                self.logger.debug(
+                    "Gallery archive download retry started: gid=%d attempt=%d/%d",
+                    gallery.gid,
+                    attempt,
+                    MAX_DOWNLOAD_RETRIES,
+                )
+            downloaded = await self._download(gallery, attempt)
+            if downloaded is not None:
+                return downloaded
 
-    async def _download(self, gallery: GalleryURLParser, attempt: int) -> bool:
-        if attempt > MAX_DOWNLOAD_RETRIES:
-            raise RuntimeError(
-                f"Failed to download gallery after {MAX_DOWNLOAD_RETRIES} "
-                f"attempts: gid={gallery.gid}"
-            )
-        if attempt == 1:
-            self.logger.info(
-                "Gallery archive download started: gid=%d max_attempts=%d",
-                gallery.gid,
-                MAX_DOWNLOAD_RETRIES,
-            )
-        else:
-            self.logger.debug(
-                "Gallery archive download retry started: gid=%d attempt=%d/%d",
-                gallery.gid,
-                attempt,
-                MAX_DOWNLOAD_RETRIES,
-            )
+        raise RuntimeError(
+            f"Failed to download gallery after {MAX_DOWNLOAD_RETRIES} "
+            f"attempts: gid={gallery.gid}"
+        )
 
+    async def _download(self, gallery: GalleryURLParser, attempt: int) -> bool | None:
         mapper = self.page.mapper
         for k in list(mapper):
             if mapper[k].done():
@@ -1347,9 +1387,7 @@ class EHDriver(Driver):
                 MAX_DOWNLOAD_RETRIES,
                 type(error).__name__,
             )
-            await self._close_page_safely(self.page)
-            self.page = gallery_tab
-            return await self._download(gallery, attempt + 1)
+            return None
 
         new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
@@ -1359,76 +1397,76 @@ class EHDriver(Driver):
                 attempt,
                 MAX_DOWNLOAD_RETRIES,
             )
-            return await self._download(gallery, attempt + 1)
+            return None
 
-        await new_tab.activate()
         self.page = new_tab
-
-        original_links = await self.page.xpath(
-            "//a[contains(text(), 'Original')]", timeout=10
-        )
-        if original_links:
-            await original_links[0].click()
-
+        retrytime: int | None = None
         try:
-            deadline = asyncio.get_event_loop().time() + 10
-            while asyncio.get_event_loop().time() < deadline:
-                html = await self.page.get_content()
-                if (
-                    "Downloads should start processing within a couple of minutes."
-                    in html
-                ):
-                    break
-                if "Your H@H client appears to be offline." in html:
-                    raise ClientOfflineException()
-                if "Cannot start download: Insufficient funds" in html:
-                    raise InsufficientFundsException()
-                await asyncio.sleep(0.5)
-            else:
-                html = await self.page.get_content()
-                if "Cannot start download: Insufficient funds" in html:
-                    raise InsufficientFundsException()
-                raise TimeoutError()
-        except TimeoutError:
-            error_file = await self._save_page_diagnostic("download_timeout")
-            retrytime = 60
-            if error_file is None:
-                self.logger.warning(
-                    "Archive download timed out; diagnostic unavailable; "
-                    "retrying: gid=%d attempt=%d/%d delay=%ds",
-                    gallery.gid,
-                    attempt,
-                    MAX_DOWNLOAD_RETRIES,
-                    retrytime,
-                )
-            else:
-                self.logger.warning(
-                    "Archive download timed out; diagnostic=%s; retrying: "
-                    "gid=%d attempt=%d/%d delay=%ds",
-                    error_file,
-                    gallery.gid,
-                    attempt,
-                    MAX_DOWNLOAD_RETRIES,
-                    retrytime,
-                )
-            await self._close_page_safely(self.page)
-            self.page = gallery_tab
-            await asyncio.sleep(retrytime)
-            return await self._download(gallery, attempt + 1)
-
-        if len(self.browser.tabs) > 1:
-            await self._close_page_safely(self.page)
-            await asyncio.sleep(random())
-            self.page = gallery_tab
-            await gallery_tab.activate()
-            await asyncio.sleep(random())
-        else:
-            self.logger.warning(
-                "Archive download tab closed before cleanup: gid=%d "
-                "remaining_tabs=%d",
-                gallery.gid,
-                len(self.browser.tabs),
+            await new_tab.activate()
+            original_links = await self.page.xpath(
+                "//a[contains(text(), 'Original')]", timeout=10
             )
+            if original_links:
+                await original_links[0].click()
+
+            try:
+                deadline = asyncio.get_event_loop().time() + 10
+                while asyncio.get_event_loop().time() < deadline:
+                    html = await self.page.get_content()
+                    if (
+                        "Downloads should start processing within a couple of minutes."
+                        in html
+                    ):
+                        break
+                    if "Your H@H client appears to be offline." in html:
+                        raise ClientOfflineException()
+                    if "Cannot start download: Insufficient funds" in html:
+                        raise InsufficientFundsException()
+                    await asyncio.sleep(0.5)
+                else:
+                    html = await self.page.get_content()
+                    if "Cannot start download: Insufficient funds" in html:
+                        raise InsufficientFundsException()
+                    raise TimeoutError()
+            except TimeoutError:
+                error_file = await self._save_page_diagnostic("download_timeout")
+                retrytime = 60
+                if error_file is None:
+                    self.logger.warning(
+                        "Archive download timed out; diagnostic unavailable; "
+                        "retrying: gid=%d attempt=%d/%d delay=%ds",
+                        gallery.gid,
+                        attempt,
+                        MAX_DOWNLOAD_RETRIES,
+                        retrytime,
+                    )
+                else:
+                    self.logger.warning(
+                        "Archive download timed out; diagnostic=%s; retrying: "
+                        "gid=%d attempt=%d/%d delay=%ds",
+                        error_file,
+                        gallery.gid,
+                        attempt,
+                        MAX_DOWNLOAD_RETRIES,
+                        retrytime,
+                    )
+        except BaseException as operation_error:
+            try:
+                await self._close_archive_tab_and_restore(gallery_tab, new_tab)
+            except BaseException as cleanup_error:
+                operation_error.add_note(
+                    "Archive cleanup also failed: " f"{type(cleanup_error).__name__}"
+                )
+            raise
+        else:
+            await self._close_archive_tab_and_restore(gallery_tab, new_tab)
+
+        if retrytime is not None:
+            await asyncio.sleep(retrytime)
+            return None
+
+        await asyncio.sleep(random())
+        await asyncio.sleep(random())
         self.logger.info("Gallery archive download queued: gid=%d", gallery.gid)
         return True
 
