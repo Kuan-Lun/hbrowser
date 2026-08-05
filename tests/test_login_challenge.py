@@ -7,6 +7,7 @@ from hbrowser.exceptions import (
     BrowserIdentityApplyException,
     LoginFailedException,
 )
+from hbrowser.gallery.browser.flaresolverr import FlareSolverrSessionUnavailable
 from hbrowser.gallery.captcha import (
     CaptchaDetector,
     ChallengeDetection,
@@ -97,7 +98,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_solver_failure_falls_back_to_manual_in_gui(self) -> None:
         page = _Page("", "", "manual-token")
-        solver = _Solver(error=RuntimeError("solver failed"))
+        solver = _Solver(error=FlareSolverrSessionUnavailable("solver unavailable"))
 
         with patch(
             "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
@@ -107,6 +108,23 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(solver.calls), 1)
         sleep.assert_awaited_once_with(1)
+
+    async def test_unexpected_solver_bug_propagates_without_manual_fallback(
+        self,
+    ) -> None:
+        page = _Page("")
+        solver = _Solver(error=RuntimeError("programming bug"))
+
+        with (
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaisesRegex(RuntimeError, "programming bug"),
+        ):
+            await _handler("turnstile_widget", solver=solver).resolve(page)
+
+        sleep.assert_not_awaited()
 
     async def test_identity_apply_failure_never_falls_back_to_manual(self) -> None:
         page = _Page("")

@@ -4,19 +4,30 @@ from .ban_handler import handle_ban_decorator, parse_ban_time
 from .factory import create_browser, stop_browser
 from .flaresolverr import (
     FlareSolverrClient,
+    FlareSolverrConfigurationError,
+    FlareSolverrError,
+    FlareSolverrProtocolError,
+    FlareSolverrRequestError,
     FlareSolverrResult,
     FlareSolverrSession,
+    FlareSolverrSessionScope,
+    FlareSolverrSessionUnavailable,
+    FlareSolverrSolveReceipt,
     get_flaresolverr_url,
     should_use_flaresolverr,
 )
-from .proxy_rotator import DriverRestartRotator, ProxyRotator
 
 __all__ = [
-    "DriverRestartRotator",
     "FlareSolverrClient",
+    "FlareSolverrConfigurationError",
+    "FlareSolverrError",
+    "FlareSolverrProtocolError",
+    "FlareSolverrRequestError",
     "FlareSolverrResult",
     "FlareSolverrSession",
-    "ProxyRotator",
+    "FlareSolverrSessionScope",
+    "FlareSolverrSessionUnavailable",
+    "FlareSolverrSolveReceipt",
     "create_browser",
     "stop_browser",
     "get_flaresolverr_url",

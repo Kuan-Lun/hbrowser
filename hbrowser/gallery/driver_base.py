@@ -14,18 +14,17 @@ from zendriver import cdp
 
 from ..exceptions import BrowserIdentityApplyException, LoginFailedException
 from .browser import (
-    DriverRestartRotator,
     FlareSolverrClient,
     FlareSolverrResult,
-    FlareSolverrSession,
-    ProxyRotator,
+    FlareSolverrSessionScope,
+    FlareSolverrSolveReceipt,
     create_browser,
     get_flaresolverr_url,
     should_use_flaresolverr,
     stop_browser,
 )
 from .browser.ban_handler import handle_ban_decorator
-from .captcha import CaptchaDetector, LoginChallengeHandler
+from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandler
 from .forums_auth import ForumsAuthState, detect_forums_auth_state
 from .utils import (
     get_log_dir,
@@ -70,7 +69,7 @@ def _redacted_url_context(url: str) -> tuple[str, str, str, bool]:
 class _DriverTurnstileSolver:
     """Adapt a FlareSolverr session to the login challenge handler."""
 
-    def __init__(self, driver: Driver, session: FlareSolverrSession) -> None:
+    def __init__(self, driver: Driver, session: FlareSolverrSessionScope) -> None:
         self._driver = driver
         self._session = session
 
@@ -81,13 +80,14 @@ class _DriverTurnstileSolver:
         tabs: int,
         timeout_ms: int = 30_000,
     ) -> str | None:
-        result = await self._session.solve_turnstile(
+        receipt = await self._session.solve_turnstile(
             url,
             tabs=tabs,
             timeout_ms=timeout_ms,
         )
-        await self._driver._apply_flaresolverr_result(result)
-        return result.turnstile_token
+        await self._driver._apply_flaresolverr_receipt(receipt)
+        self._session.mark_identity_applied(receipt)
+        return receipt.result.turnstile_token
 
 
 class Driver(ABC):
@@ -103,13 +103,15 @@ class Driver(ABC):
     def __init__(
         self,
         headless: bool = True,
-        proxy_rotator: ProxyRotator | None = None,
-        max_captcha_retries: int = 3,
+        flaresolverr_session_attempts: int = 3,
         captcha_manual_timeout: int = 180,
         turnstile_tabs: int = 15,
     ) -> None:
-        if max_captcha_retries < 1:
-            raise ValueError("max_captcha_retries must be at least 1")
+        if (
+            type(flaresolverr_session_attempts) is not int
+            or flaresolverr_session_attempts < 1
+        ):
+            raise ValueError("flaresolverr_session_attempts must be a positive integer")
         if captcha_manual_timeout <= 0:
             raise ValueError("captcha_manual_timeout must be greater than zero")
         if turnstile_tabs < 1:
@@ -132,8 +134,7 @@ class Driver(ABC):
         self.browser: Any = None
         self.page: Any = None
         self.myget: Any = None
-        self.proxy_rotator = proxy_rotator or DriverRestartRotator()
-        self.max_captcha_retries = max_captcha_retries
+        self.flaresolverr_session_attempts = flaresolverr_session_attempts
         self.captcha_manual_timeout = captcha_manual_timeout
         self.turnstile_tabs = turnstile_tabs
         self.captcha_detector = CaptchaDetector()
@@ -340,15 +341,9 @@ class Driver(ABC):
         else:
             await asyncio.sleep(sleeptime)
 
-    async def _rotate_proxy(self) -> None:
-        self.browser, self.page = await self.proxy_rotator.rotate(
-            self.browser, self.headless
-        )
-        self.myget = handle_ban_decorator(self.page)
-
     async def _handle_login_challenge(
         self,
-        flaresolverr_session: FlareSolverrSession | None,
+        flaresolverr_session: FlareSolverrSessionScope | None,
     ) -> None:
         automatic_solver = (
             _DriverTurnstileSolver(self, flaresolverr_session)
@@ -364,6 +359,32 @@ class Driver(ABC):
             automatic_solver=automatic_solver,
         )
         await handler.resolve(self.page)
+
+    async def _handle_page_challenge(
+        self,
+        url: str,
+        flaresolverr_session: FlareSolverrSessionScope | None,
+        *,
+        detect_timeout: float = 3.0,
+    ) -> None:
+        """Resolve a page-level challenge without replacing browser or route."""
+        handler = PageChallengeHandler(
+            detector=self.captcha_detector,
+            logger=self.logger,
+            headless=self.headless,
+            manual_timeout=self.captcha_manual_timeout,
+            automatic_solver=flaresolverr_session,
+            apply_identity=self._apply_flaresolverr_receipt,
+            navigate=self.myget,
+            save_diagnostic=self._save_page_diagnostic,
+        )
+        await handler.resolve(self.page, url, detect_timeout=detect_timeout)
+
+    async def _apply_flaresolverr_receipt(
+        self,
+        receipt: FlareSolverrSolveReceipt,
+    ) -> None:
+        await self._apply_flaresolverr_result(receipt.result)
 
     async def _apply_flaresolverr_result(
         self,
@@ -389,112 +410,6 @@ class Driver(ABC):
                 "Could not apply the FlareSolverr Cloudflare cookies"
             ) from None
 
-    async def _try_flaresolverr(
-        self,
-        url: str,
-        flaresolverr_session: FlareSolverrSession,
-    ) -> bool:
-        """嘗試用 FlareSolverr 自動解決 Cloudflare managed challenge。
-
-        Returns:
-            是否成功解決（解出 cookie 並重新導航後挑戰已消失）
-        """
-        self.logger.info("Trying FlareSolverr to solve managed challenge")
-        try:
-            result = await flaresolverr_session.get(url)
-        except Exception as error:
-            self.logger.warning(
-                "FlareSolverr managed-challenge request failed (%s)",
-                type(error).__name__,
-            )
-            return False
-
-        # Treat the identity transition as fail-closed. Continuing after only
-        # the UA or only the cookies were applied would create a fingerprint
-        # that cannot match the clearance FlareSolverr obtained.
-        await self._apply_flaresolverr_result(result)
-
-        await self.myget(url)
-        det = await self.captcha_detector.detect(self.page, timeout=3.0)
-        if det.kind == "none":
-            self.logger.info("FlareSolverr resolved the challenge")
-            return True
-
-        self.logger.warning(
-            "FlareSolverr identity did not clear the challenge; "
-            "keeping that identity for manual resolution"
-        )
-        return False
-
-    async def detect_and_solve_with_rotation(
-        self,
-        url: str,
-        detect_timeout: float = 3.0,
-        flaresolverr_session: FlareSolverrSession | None = None,
-    ) -> None:
-        """檢測 Cloudflare 驗證並等待使用者手動解決，失敗時自動輪換代理重試。
-
-        Args:
-            url: 要存取的 URL（輪換代理後需重新導航）
-            detect_timeout: 驗證碼檢測超時時間（秒）
-
-        Raises:
-            Exception: 所有重試都失敗後拋出
-        """
-        for attempt in range(1, self.max_captcha_retries + 1):
-            det = await self.captcha_detector.detect(self.page, timeout=detect_timeout)
-            if det.kind == "none":
-                self.logger.debug("No challenge detected")
-                return
-
-            self.logger.warning(
-                f"Challenge detected: {det.kind} "
-                f"(attempt {attempt}/{self.max_captcha_retries})"
-            )
-
-            if det.kind == "cf_managed_challenge" and flaresolverr_session is not None:
-                if await self._try_flaresolverr(url, flaresolverr_session):
-                    return
-
-            await self._save_page_diagnostic("challenge_page")
-
-            if self.headless:
-                self.logger.warning(
-                    "Headless mode active; no browser window for manual solving. "
-                    f"Skipping manual wait (attempt {attempt}/{self.max_captcha_retries})"
-                )
-            else:
-                self.logger.info(
-                    "Please solve the challenge manually in the browser. "
-                    f"Waiting up to {self.captcha_manual_timeout} seconds..."
-                )
-
-                start_time = asyncio.get_event_loop().time()
-                while (
-                    asyncio.get_event_loop().time() - start_time
-                    < self.captcha_manual_timeout
-                ):
-                    current_det = await self.captcha_detector.detect(
-                        self.page, timeout=1.0
-                    )
-                    if current_det.kind == "none":
-                        self.logger.info("Challenge resolved successfully")
-                        return
-                    await asyncio.sleep(5)
-
-                self.logger.warning(
-                    f"Challenge not resolved within {self.captcha_manual_timeout}s "
-                    f"(attempt {attempt}/{self.max_captcha_retries})"
-                )
-            if attempt < self.max_captcha_retries:
-                await self._rotate_proxy()
-                await self.myget(url)
-
-        raise Exception(
-            f"Failed to resolve captcha after {self.max_captcha_retries} attempts "
-            f"with proxy rotation"
-        )
-
     async def login(self) -> None:
         """Log in, sharing one FlareSolverr browser across both challenges."""
         flaresolverr_url = get_flaresolverr_url()
@@ -503,25 +418,14 @@ class Driver(ABC):
             return
 
         async with FlareSolverrClient(flaresolverr_url) as client:
-            try:
-                session = await client.create_session()
-            except Exception as error:
-                self.logger.warning(
-                    "Could not create FlareSolverr session; "
-                    "falling back to browser interaction (%s)",
-                    type(error).__name__,
-                )
-                await self._login(None)
-                return
-
-            try:
+            async with client.session(
+                max_attempts=self.flaresolverr_session_attempts
+            ) as session:
                 await self._login(session)
-            finally:
-                await client.destroy_session(session)
 
     async def _login(
         self,
-        flaresolverr_session: FlareSolverrSession | None,
+        flaresolverr_session: FlareSolverrSessionScope | None,
     ) -> None:
         """透過 Forums 頁面登入。
 
@@ -534,9 +438,9 @@ class Driver(ABC):
         self.logger.info("Starting login process")
 
         await self.myget(self.url["Forums"])
-        await self.detect_and_solve_with_rotation(
+        await self._handle_page_challenge(
             self.url["Forums"],
-            flaresolverr_session=flaresolverr_session,
+            flaresolverr_session,
         )
 
         auth_state = await detect_forums_auth_state(self.page)
@@ -593,7 +497,7 @@ class Driver(ABC):
 
     async def _verify_login_succeeded(
         self,
-        flaresolverr_session: FlareSolverrSession | None,
+        flaresolverr_session: FlareSolverrSessionScope | None,
     ) -> None:
         """確認登入是否成功：重新檢查 Forums 頁面的 guest 標記是否已消失。
 
@@ -601,9 +505,9 @@ class Driver(ABC):
         驗證碼偵測流程，而不是直接信任「URL 有變化」就代表登入成功。
         """
         await self.myget(self.url["Forums"])
-        await self.detect_and_solve_with_rotation(
+        await self._handle_page_challenge(
             self.url["Forums"],
-            flaresolverr_session=flaresolverr_session,
+            flaresolverr_session,
         )
 
         auth_state = await detect_forums_auth_state(self.page)

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ...exceptions import BrowserIdentityApplyException, LoginFailedException
+from ..browser.flaresolverr import FlareSolverrError
 from .detector import CaptchaDetector
 from .models import Kind
 
@@ -109,7 +110,7 @@ class LoginChallengeHandler:
             # with. Let the driver close this browser instead of falling back
             # to manual interaction on a mixed identity.
             raise
-        except Exception as error:
+        except FlareSolverrError as error:
             self._logger.warning(
                 "FlareSolverr could not solve login Turnstile (%s)",
                 type(error).__name__,

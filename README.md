@@ -21,13 +21,31 @@ HBrowser can use [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to
 solve both Cloudflare's page-level managed challenge and the Turnstile widget embedded in the
 Forums login form. Embedded Turnstile support requires FlareSolverr 3.5.0 or newer. Set
 `FLARESOLVERR_URL` to the instance's `/v1` endpoint, for example
-`http://127.0.0.1:8191/v1`.
+`http://127.0.0.1:8191/v1`. The endpoint must be a valid HTTP or HTTPS URL;
+invalid configuration fails immediately with a sanitized configuration error.
 
 HBrowser keeps one persistent FlareSolverr browser across the managed challenge and login
-Turnstile so both steps use the same browser identity and clearance. That identity must also
-share the automated browser's public route. HBrowser therefore disables FlareSolverr when Tor
-or a residential proxy is active unless a future integration can configure the same sticky
-route on both browsers.
+Turnstile so both steps use the same browser identity and clearance. Before that identity is
+applied to the main browser, a failed FlareSolverr request causes the failed FlareSolverr
+session to be discarded and a fresh session to be tried. The default budget is three session
+attempts and can be changed with the `flaresolverr_session_attempts` driver argument.
+
+Once a FlareSolverr identity has been applied, HBrowser does not silently replace its solver
+session: a new session would no longer match the identity already installed in the main
+browser. In a visible browser, a runtime solver failure falls back to manual resolution in that
+same browser window. In headless mode, it fails immediately with a login error because no
+manual interaction is possible.
+
+Restarting Chrome is not a proxy or IP rotation, so challenge recovery never restarts the main
+browser and never reports a route change. A direct connection has no route-rotation capability.
+The FlareSolverr identity must share the main browser's public route, so HBrowser disables
+FlareSolverr when Tor or a residential proxy is active; those configurations currently have no
+shared sticky-route integration.
+
+HBrowser 0.36 removes the `proxy_rotator` and `max_captcha_retries` driver
+arguments. They coupled challenge handling to a Chrome restart that could not
+verify any route change. Use `flaresolverr_session_attempts` to configure the
+independent solver-session retry budget instead.
 
 ### Environment Variables
 
@@ -93,10 +111,11 @@ $env:TOR_BINARY_PATH="C:\path\to\tor.exe"
 $env:FLARESOLVERR_URL="http://127.0.0.1:8191/v1"
 ```
 
-When a Cloudflare or CAPTCHA challenge appears during login, HBrowser will first try
-FlareSolverr (if configured and applicable), then fall back to waiting for you to solve it
-manually in the browser window. Set `headless=False` when initialising the driver to see the
-browser window.
+When a challenge appears during login, HBrowser tries FlareSolverr for supported managed
+challenges and Turnstile widgets when it is configured and route-compatible. With
+`headless=False`, any unresolved challenge is left in the current browser window for manual
+completion. With `headless=True`, an unresolved challenge raises a login error immediately;
+HBrowser does not restart Chrome or claim that a proxy was rotated.
 
 ## Logging
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from hbrowser.gallery.browser import proxy, proxy_rotator
+from hbrowser.gallery.browser import proxy
 
 
 class ProxyLoggingTests(unittest.TestCase):
@@ -59,38 +59,5 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
         logger.warning.assert_called_once_with(
             "Could not verify proxy IP (non-fatal): error_type=%s",
             "ValueError",
-        )
-        self.assertNotIn(sentinel, repr(logger.method_calls))
-
-
-class ProxyRotatorLoggingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_failure_warning_does_not_include_exception_text(self) -> None:
-        sentinel = "SENSITIVE-STOP-FAILURE\nSECOND-LINE"
-        logger = Mock()
-        replacement_browser = Mock()
-        replacement_page = Mock()
-
-        with (
-            patch.object(proxy_rotator, "logger", logger),
-            patch.object(
-                proxy_rotator,
-                "stop_browser",
-                new=AsyncMock(side_effect=RuntimeError(sentinel)),
-            ),
-            patch.object(
-                proxy_rotator,
-                "create_browser",
-                new=AsyncMock(return_value=(replacement_browser, replacement_page)),
-            ),
-        ):
-            result = await proxy_rotator.DriverRestartRotator().rotate(
-                Mock(),
-                headless=True,
-            )
-
-        self.assertEqual(result, (replacement_browser, replacement_page))
-        logger.warning.assert_any_call(
-            "Failed to stop current browser (non-fatal): error_type=%s",
-            "RuntimeError",
         )
         self.assertNotIn(sentinel, repr(logger.method_calls))
