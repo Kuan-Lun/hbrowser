@@ -19,6 +19,15 @@ _PAGE_DIAGNOSTIC_KIND_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _PAGE_DIAGNOSTIC_FILENAME_PATTERN = re.compile(
     r"[a-z][a-z0-9_]{0,63}_(?P<sequence>[0-9a-f]{16})_[0-9a-f]{32}\.html\Z"
 )
+_ENCOUNTER_QUERY_SECRET_PATTERN = re.compile(
+    r"(?P<prefix>"
+    r"(?:\?|&(?:amp;|#0*38;|#x0*26;)?)"
+    r"encounter="
+    r")"
+    r"[^&#\s\"'<>]*",
+    flags=re.IGNORECASE,
+)
+_REDACTED_QUERY_VALUE = "REDACTED"
 _PAGE_DIAGNOSTIC_LOCK_FILENAME = ".hbrowser-page-diagnostics.lock"
 _PAGE_DIAGNOSTIC_MAX_SEQUENCE = (1 << 64) - 1
 _PAGE_DIAGNOSTIC_THREAD_LOCK = Lock()
@@ -86,6 +95,14 @@ def _locked_page_diagnostic_directory(directory: Path) -> Iterator[None]:
             os.close(descriptor)
 
 
+def _redact_page_diagnostic_secrets(content: str) -> str:
+    """Hide short-lived encounter query values while retaining HTML context."""
+    return _ENCOUNTER_QUERY_SECRET_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{_REDACTED_QUERY_VALUE}",
+        content,
+    )
+
+
 def _bounded_page_diagnostic_content(content: str) -> bytes:
     maximum_bytes = min(
         _PAGE_DIAGNOSTIC_MAX_FILE_BYTES,
@@ -94,7 +111,8 @@ def _bounded_page_diagnostic_content(content: str) -> bytes:
     if maximum_bytes <= 0:
         raise OSError("Page diagnostic byte limits must be positive")
 
-    content_bytes = content.encode("utf-8", errors="ignore")
+    redacted_content = _redact_page_diagnostic_secrets(content)
+    content_bytes = redacted_content.encode("utf-8", errors="ignore")
     if len(content_bytes) <= maximum_bytes:
         return content_bytes
 

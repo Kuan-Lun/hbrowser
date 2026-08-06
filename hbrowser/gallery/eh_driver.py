@@ -44,6 +44,7 @@ from ..exceptions import (
 from .browser.ban_handler import check_ban_status
 from .driver_base import Driver
 from .models import Tag
+from .punchin_models import PunchInComplete, PunchInResult, RandomEncounterFound
 from .search_models import (
     MINIMUM_MISSING_CONFIRMATIONS,
     ConfirmedGalleryMissing,
@@ -71,6 +72,8 @@ _SEARCH_DOCUMENT_READY_STATES = frozenset({"interactive", "complete"})
 
 _GALLERY_PATH_PATTERN = re.compile(r"/g/\d+/[A-Za-z0-9]+/?")
 _GALLERY_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
+_HENTAIVERSE_HOST = "hentaiverse.org"
+_RANDOM_ENCOUNTER_QUERY_KEYS = frozenset({"s", "ss", "encounter"})
 _NO_RESULTS_MARKERS = (
     "no hits found",
     "no unfiltered results found",
@@ -284,6 +287,116 @@ def _normalize_gallery_url(href: str, page_url: str) -> GalleryURLParser | None:
         return GalleryURLParser(gallery_url)
     except ValueError:
         return None
+
+
+def _normalize_random_encounter_url(href: str) -> str | None:
+    """Return a canonical URL for one trusted random encounter anchor."""
+    try:
+        parsed_url = urlsplit(href)
+        hostname = parsed_url.hostname
+        username = parsed_url.username
+        password = parsed_url.password
+        port = parsed_url.port
+        query_pairs = parse_qsl(
+            parsed_url.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=len(_RANDOM_ENCOUNTER_QUERY_KEYS),
+        )
+    except ValueError:
+        return None
+
+    if (
+        parsed_url.scheme != "https"
+        or hostname != _HENTAIVERSE_HOST
+        or username is not None
+        or password is not None
+        or port is not None
+        or parsed_url.path != "/"
+        or parsed_url.fragment
+        or len(query_pairs) != len(_RANDOM_ENCOUNTER_QUERY_KEYS)
+    ):
+        return None
+
+    query = dict(query_pairs)
+    if len(query) != len(query_pairs) or query.keys() != _RANDOM_ENCOUNTER_QUERY_KEYS:
+        return None
+    if query["s"] != "Battle" or query["ss"] != "ba":
+        return None
+
+    encounter = query["encounter"]
+    if not encounter.strip():
+        return None
+
+    return urlunsplit(
+        (
+            "https",
+            _HENTAIVERSE_HOST,
+            "/",
+            urlencode(
+                (
+                    ("s", "Battle"),
+                    ("ss", "ba"),
+                    ("encounter", encounter),
+                )
+            ),
+            "",
+        )
+    )
+
+
+def _looks_like_random_encounter_url(href: str) -> bool:
+    """Identify encounter-like markup that must not be silently ignored."""
+    try:
+        parsed_url = urlsplit(href)
+        query_pairs = parse_qsl(
+            parsed_url.query,
+            keep_blank_values=True,
+            max_num_fields=16,
+        )
+    except ValueError:
+        lowered = href.casefold()
+        return "encounter" in lowered and ("battle" in lowered or "ss=ba" in lowered)
+
+    query: dict[str, list[str]] = {}
+    for key, value in query_pairs:
+        query.setdefault(key, []).append(value)
+    return "encounter" in query or (
+        "Battle" in query.get("s", []) and "ba" in query.get("ss", [])
+    )
+
+
+def _parse_punch_in_result(html_content: str) -> PunchInResult:
+    """Classify the random-encounter state of one check-in document."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    event_panes = soup.select("#eventpane")
+    if not event_panes:
+        return PunchInComplete()
+    if len(event_panes) != 1:
+        raise RuntimeError(
+            "Daily check-in page contained ambiguous random encounter markup"
+        )
+
+    encounter_urls = list[str]()
+    for anchor in event_panes[0].select("a[href]"):
+        href = anchor.get("href")
+        if not isinstance(href, str):
+            continue
+        encounter_url = _normalize_random_encounter_url(href)
+        if encounter_url is not None:
+            encounter_urls.append(encounter_url)
+        elif _looks_like_random_encounter_url(href):
+            raise RuntimeError(
+                "Daily check-in page contained untrusted random encounter markup"
+            )
+
+    if not encounter_urls:
+        return PunchInComplete()
+    if len(encounter_urls) != 1:
+        raise RuntimeError(
+            "Daily check-in page contained ambiguous random encounter markup"
+        )
+    return RandomEncounterFound(url=encounter_urls[0])
 
 
 def _parse_search_page(
@@ -1165,14 +1278,24 @@ class EHDriver(Driver):
         self.logger.warning("H@H client is offline")
         return False
 
-    async def punchin(self) -> None:
-        """簽到"""
+    async def punchin(self) -> PunchInResult:
+        """Check in and return any trusted HentaiVerse random encounter."""
         self.logger.info("Starting daily check-in")
         await self.get("https://e-hentai.org/news.php")
 
         # 刷新以免沒簽到成功
         await self.wait(self.page.reload, ischangeurl=False)
         self.logger.info("Daily check-in page refresh completed")
+
+        html_content = await self.page.get_content()
+        if not isinstance(html_content, str):
+            raise TypeError("Daily check-in page content was not a string")
+        result = _parse_punch_in_result(html_content)
+        if isinstance(result, RandomEncounterFound):
+            self.logger.info("Daily check-in found a HentaiVerse random encounter")
+        else:
+            self.logger.info("Daily check-in found no HentaiVerse random encounter")
+        return result
 
     async def search(self, request: SearchRequest) -> GallerySearchResult:
         """Execute one bounded gallery search using trusted URL navigations."""

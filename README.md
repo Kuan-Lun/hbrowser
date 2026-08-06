@@ -170,6 +170,28 @@ private location.
 
 ## Usage
 
+Daily check-in returns an explicit outcome. A random encounter URL is accepted
+only when it is the unique trusted HentaiVerse battle link in the E-Hentai
+event pane:
+
+```python
+from hbrowser import PunchInComplete, RandomEncounterFound
+
+result = await driver.punchin()
+match result:
+    case RandomEncounterFound(url=url):
+        # The caller decides whether and when to navigate to this encounter.
+        await driver.get(url)
+    case PunchInComplete():
+        pass
+```
+
+The returned encounter URL is sensitive, short-lived navigation state. Avoid
+logging or persisting it. `hbrowser` never writes the raw value to its logs and
+redacts the `encounter` query value from page diagnostics. If an event pane has
+multiple encounter links or encounter-like markup that is not a trusted URL,
+`punchin()` raises instead of reporting a completed check-in.
+
 Gallery searches use an explicit request and return a bounded, ordered result.
 An exact GID lookup only reports a missing gallery after two independent empty
 searches:

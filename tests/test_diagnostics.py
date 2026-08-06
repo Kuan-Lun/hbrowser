@@ -108,6 +108,34 @@ class PageDiagnosticTests(unittest.TestCase):
                 10,
             )
 
+    def test_random_encounter_query_values_are_redacted_from_html(self) -> None:
+        first_secret = "FIRST-SHORT-LIVED-SECRET="
+        second_secret = "SECOND-SHORT-LIVED-SECRET"
+        html = (
+            '<html><body><div id="eventpane">'
+            '<a class="trusted" href="https://hentaiverse.org/?s=Battle&amp;'
+            f'ss=ba&amp;encounter={first_secret}">Fight</a>'
+            '<script>const retry = "https://hentaiverse.org/?encounter='
+            f'{second_secret}&ss=ba&s=Battle";</script>'
+            '<a href="https://example.org/?notencounter=VISIBLE">Context</a>'
+            "</div></body></html>"
+        )
+
+        with TemporaryDirectory() as directory_name:
+            path = write_page_diagnostic(
+                Path(directory_name),
+                "driver_error",
+                html,
+            )
+            diagnostic = path.read_text()
+
+        self.assertNotIn(first_secret, diagnostic)
+        self.assertNotIn(second_secret, diagnostic)
+        self.assertIn("s=Battle&amp;ss=ba&amp;encounter=REDACTED", diagnostic)
+        self.assertIn("?encounter=REDACTED&ss=ba&s=Battle", diagnostic)
+        self.assertIn('id="eventpane"', diagnostic)
+        self.assertIn("?notencounter=VISIBLE", diagnostic)
+
     def test_kind_cannot_escape_the_diagnostic_directory(self) -> None:
         with TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
@@ -158,6 +186,34 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             "none",
         )
         self.assertEqual(stop_browser.await_count, 2)
+
+    async def test_exit_diagnostic_never_persists_encounter_secret(self) -> None:
+        secret = "EXIT-DIAGNOSTIC-ENCOUNTER-SECRET="
+        self.driver.page.get_content.return_value = (
+            '<html><div id="eventpane"><a href="https://hentaiverse.org/'
+            f'?s=Battle&amp;ss=ba&amp;encounter={secret}">Fight</a></div></html>'
+        )
+        error = RuntimeError("campaign interrupted")
+
+        with (
+            TemporaryDirectory() as directory_name,
+            patch(
+                "hbrowser.gallery.driver_base.get_log_dir",
+                return_value=Path(directory_name),
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.stop_browser",
+                new=AsyncMock(),
+            ),
+        ):
+            await self.driver.__aexit__(RuntimeError, error, error.__traceback__)
+            diagnostics = list(Path(directory_name).glob("driver_error_*.html"))
+            self.assertEqual(len(diagnostics), 1)
+            diagnostic = diagnostics[0].read_text()
+
+        self.assertNotIn(secret, diagnostic)
+        self.assertIn("encounter=REDACTED", diagnostic)
+        self.assertIn('id="eventpane"', diagnostic)
 
     async def test_exit_log_does_not_render_chained_exception_detail(self) -> None:
         sentinel = "SENSITIVE-BROWSER-CAUSE\nSECOND-LINE"
