@@ -59,6 +59,8 @@ MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
 SEARCH_PAGE_POLL_SECONDS = 0.1
 SEARCH_NAVIGATION_RETRIES = 1
+PUNCHIN_PAGE_TIMEOUT_SECONDS = 10.0
+PUNCHIN_PAGE_POLL_SECONDS = 0.1
 _SEARCH_DIAGNOSTIC_FILE_LIMIT = 20
 _SEARCH_DIAGNOSTIC_MAX_FILE_BYTES = 2 * 1024 * 1024
 _SEARCH_DIAGNOSTIC_TOTAL_BYTES = 20 * 1024 * 1024
@@ -74,6 +76,7 @@ _GALLERY_PATH_PATTERN = re.compile(r"/g/\d+/[A-Za-z0-9]+/?")
 _GALLERY_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
 _HENTAIVERSE_HOST = "hentaiverse.org"
 _RANDOM_ENCOUNTER_QUERY_KEYS = frozenset({"s", "ss", "encounter"})
+_PUNCHIN_PAGE_CAPTURE_ENVIRONMENT_VARIABLE = "HBROWSER_CAPTURE_PUNCHIN_PAGES"
 _NO_RESULTS_MARKERS = (
     "no hits found",
     "no unfiltered results found",
@@ -399,6 +402,13 @@ def _parse_punch_in_result(html_content: str) -> PunchInResult:
     return RandomEncounterFound(url=encounter_urls[0])
 
 
+def _punchin_page_capture_enabled() -> bool:
+    return os.getenv(
+        _PUNCHIN_PAGE_CAPTURE_ENVIRONMENT_VARIABLE,
+        "",
+    ).strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def _parse_search_page(
     html_content: str,
     page_url: str,
@@ -697,6 +707,46 @@ class EHDriver(Driver):
     async def _current_loader_id(self) -> str:
         frame_tree = await self.page.send(cdp.page.get_frame_tree())
         return str(frame_tree.frame.loader_id)
+
+    async def _read_stable_punchin_document(
+        self,
+        *,
+        previous_loader_id: str | None = None,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PUNCHIN_PAGE_TIMEOUT_SECONDS
+
+        while loop.time() < deadline:
+            try:
+                loader_before = await self._current_loader_id()
+                if (
+                    previous_loader_id is not None
+                    and loader_before == previous_loader_id
+                ):
+                    await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
+                    continue
+                snapshot = await self._read_raw_page_snapshot()
+                loader_after = await self._current_loader_id()
+            except Exception as error:
+                if is_connection_error(error):
+                    raise
+                if _is_transient_context_error(error):
+                    await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
+                    continue
+                raise RuntimeError(
+                    "Unable to read a stable daily check-in document"
+                ) from error
+
+            if (
+                loader_before == loader_after
+                and snapshot.ready_state in _SEARCH_DOCUMENT_READY_STATES
+            ):
+                return snapshot.html
+            await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
+
+        raise RuntimeError(
+            "Daily check-in page did not expose a stable DOM-ready document"
+        )
 
     async def _read_raw_page_snapshot(self) -> _RawPageSnapshot:
         page_data = await self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT)
@@ -1283,18 +1333,47 @@ class EHDriver(Driver):
         self.logger.info("Starting daily check-in")
         await self.get("https://e-hentai.org/news.php")
 
+        capture_pages = _punchin_page_capture_enabled()
+        initial_html_content = await self._read_stable_punchin_document()
+        if not isinstance(initial_html_content, str):
+            raise TypeError("Initial daily check-in page content was not a string")
+        if capture_pages:
+            await self._save_page_diagnostic(
+                "punchin_initial",
+                initial_html_content,
+            )
+        initial_result = _parse_punch_in_result(initial_html_content)
+        if isinstance(initial_result, RandomEncounterFound):
+            self.logger.info(
+                "Daily check-in found a HentaiVerse random encounter: phase=initial"
+            )
+            return initial_result
+
         # 刷新以免沒簽到成功
+        initial_loader_id = await self._current_loader_id()
         await self.wait(self.page.reload, ischangeurl=False)
         self.logger.info("Daily check-in page refresh completed")
 
-        html_content = await self.page.get_content()
+        html_content = await self._read_stable_punchin_document(
+            previous_loader_id=initial_loader_id,
+        )
         if not isinstance(html_content, str):
             raise TypeError("Daily check-in page content was not a string")
+        if capture_pages:
+            await self._save_page_diagnostic(
+                "punchin_reloaded",
+                html_content,
+            )
         result = _parse_punch_in_result(html_content)
         if isinstance(result, RandomEncounterFound):
-            self.logger.info("Daily check-in found a HentaiVerse random encounter")
+            self.logger.info(
+                "Daily check-in found a HentaiVerse random encounter: phase=reloaded"
+            )
         else:
-            self.logger.info("Daily check-in found no HentaiVerse random encounter")
+            self.logger.info(
+                "Daily check-in found no HentaiVerse random encounter after "
+                "initial and reloaded page checks"
+            )
         return result
 
     async def search(self, request: SearchRequest) -> GallerySearchResult:

@@ -56,6 +56,10 @@ HBrowser requires the following environment variables:
 - `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 - `HBROWSER_LOG_DIR` (optional): Store HTML failure diagnostics in this
   directory. Default: a `log` directory next to the main script
+- `HBROWSER_CAPTURE_PUNCHIN_PAGES` (optional): Set to `1`, `true`, `yes`, or
+  `on` to save the initial and, when needed, reloaded daily check-in documents
+  in `HBROWSER_LOG_DIR`. Encounter query values are redacted, but the remaining
+  HTML is account-specific and must be kept private
 - `HBROWSER_PROCESS_LOG_FILE` (optional): Mirror all HBrowser-family logger
   records to this UTF-8 file. The file rotates at 10 MiB with five backups;
   applications should leave it unset when an external supervisor already
@@ -191,6 +195,11 @@ logging or persisting it. `hbrowser` never writes the raw value to its logs and
 redacts the `encounter` query value from page diagnostics. If an event pane has
 multiple encounter links or encounter-like markup that is not a trusted URL,
 `punchin()` raises instead of reporting a completed check-in.
+
+`punchin()` checks the initial news document before reloading it. A trusted
+encounter is returned immediately so a second navigation cannot discard it.
+When the initial document has no encounter, the historical reload fallback is
+retained and the reloaded document is checked independently.
 
 Gallery searches use an explicit request and return a bounded, ordered result.
 An exact GID lookup only reports a missing gallery after two independent empty
