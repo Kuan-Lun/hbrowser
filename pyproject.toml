@@ -12,7 +12,7 @@ license = { text = "GNU Affero General Public License v3" }
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "beautifulsoup4>=4.15.0",
-    "h2h-galleryinfo-parser>=0.5.0",
+    "h2h-galleryinfo-parser>=0.5.1",
     "httpx>=0.28.1",
     "websockets>=17.0.1",
     "zendriver>=0.15.5,<0.16",
