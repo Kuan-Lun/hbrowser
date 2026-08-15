@@ -114,7 +114,7 @@ def configure_proxy() -> str | None:
         proxy_host = rp_dns
         proxy_port = "8080"
 
-    logger.info("Using authenticated residential proxy")
+    logger.debug("Using authenticated residential proxy")
     logger.debug(
         "Residential proxy endpoint: host=%s port=%s",
         proxy_host,

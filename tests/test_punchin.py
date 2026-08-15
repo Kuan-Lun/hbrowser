@@ -191,6 +191,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, RandomEncounterFound)
         self.assertEqual(events, ["get", "content"])
         driver.wait.assert_not_awaited()
+        driver.logger.info.assert_any_call("Daily check-in found a random encounter")
         self.assertNotIn(ENCOUNTER, str(driver.logger.mock_calls))
 
     async def test_reload_is_checked_when_initial_page_has_no_encounter(self) -> None:
@@ -238,6 +239,9 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(),
                 unittest.mock.call(previous_loader_id="initial-loader"),
             ],
+        )
+        driver.logger.info.assert_any_call(
+            "Daily check-in found a random encounter after refresh"
         )
         self.assertNotIn(ENCOUNTER, str(driver.logger.mock_calls))
 

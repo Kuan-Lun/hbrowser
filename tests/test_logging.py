@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -13,8 +14,141 @@ from hbrowser.gallery.utils import log as log_module
 from hbrowser.gallery.utils.log import (
     _isolated_process_log_handlers_for_testing,
     get_log_dir,
+    log_context,
     setup_logger,
 )
+
+
+def _log_record(
+    message: str,
+    *,
+    name: str = "hbrowser.tests.semantic",
+    extra: dict[str, object] | None = None,
+) -> logging.LogRecord:
+    logger = logging.getLogger(name)
+    return logger.makeRecord(
+        name,
+        logging.INFO,
+        __file__,
+        1,
+        message,
+        (),
+        None,
+        extra=extra,
+    )
+
+
+class SemanticLogContextTests(unittest.TestCase):
+    def test_default_and_nested_context_labels_restore_safely(self) -> None:
+        formatter = log_module._formatter()
+        rendered = [formatter.format(_log_record("outside"))]
+
+        with log_context(account="main", realm="persistent", tab_role="persistent"):
+            rendered.append(formatter.format(_log_record("realm")))
+            with log_context(activity="Check-in"):
+                rendered.append(formatter.format(_log_record("nested")))
+                with log_context(scope="Browser"):
+                    rendered.append(formatter.format(_log_record("scoped")))
+            rendered.append(formatter.format(_log_record("restored realm")))
+
+        rendered.append(formatter.format(_log_record("restored system")))
+
+        self.assertIn(" - INFO - [System] outside", rendered[0])
+        self.assertIn(" - INFO - [Persistent] realm", rendered[1])
+        self.assertIn(" - INFO - [Persistent · Check-in] nested", rendered[2])
+        self.assertIn(" - INFO - [Browser] scoped", rendered[3])
+        self.assertIn(" - INFO - [Persistent] restored realm", rendered[4])
+        self.assertIn(" - INFO - [System] restored system", rendered[5])
+
+    def test_context_fields_are_injected_without_changing_record_name(self) -> None:
+        record = _log_record("diagnostic", name="diagnostic.module")
+
+        with log_context(
+            account="main",
+            realm="isekai",
+            tab_role="isekai",
+            activity="Battle",
+        ):
+            self.assertTrue(log_module._LOG_CONTEXT_FILTER.filter(record))
+
+        rendered = log_module._formatter().format(record)
+
+        self.assertEqual(record.name, "diagnostic.module")
+        self.assertEqual(record.__dict__["account"], "main")
+        self.assertEqual(record.__dict__["realm"], "isekai")
+        self.assertEqual(record.__dict__["tab_role"], "isekai")
+        self.assertEqual(record.__dict__["activity"], "Battle")
+        self.assertIsNone(record.__dict__["scope"])
+        self.assertIn("[Isekai · Battle] diagnostic", rendered)
+        self.assertNotIn("diagnostic.module", rendered)
+
+    def test_record_activity_and_scope_override_inherited_context(self) -> None:
+        formatter = log_module._formatter()
+        with log_context(realm="persistent", activity="Battle"):
+            activity_record = _log_record(
+                "activity override",
+                extra={"activity": "Maintenance"},
+            )
+            scope_record = _log_record(
+                "scope override",
+                extra={"scope": "Browser", "activity": "Maintenance"},
+            )
+            invalid_override = _log_record(
+                "invalid override",
+                extra={"activity": "   ", "scope": 42},
+            )
+            activity_rendered = formatter.format(activity_record)
+            scope_rendered = formatter.format(scope_record)
+            invalid_rendered = formatter.format(invalid_override)
+
+        self.assertIn("[Persistent · Maintenance] activity override", activity_rendered)
+        self.assertIn("[Browser] scope override", scope_rendered)
+        self.assertIn("[Persistent · Battle] invalid override", invalid_rendered)
+
+    def test_tab_role_is_used_when_realm_is_unspecified(self) -> None:
+        with log_context(tab_role="persistent", activity="Login"):
+            rendered = log_module._formatter().format(_log_record("role fallback"))
+
+        self.assertIn("[Persistent · Login] role fallback", rendered)
+
+    def test_invalid_context_values_are_rejected_without_leaking_context(self) -> None:
+        for field, value, error_type in (
+            ("realm", "", ValueError),
+            ("activity", "   ", ValueError),
+            ("scope", 5, TypeError),
+        ):
+            with self.subTest(field=field), self.assertRaises(error_type):
+                with log_context(**{field: value}):  # type: ignore[arg-type]
+                    self.fail("invalid context unexpectedly entered")
+
+        rendered = log_module._formatter().format(_log_record("after errors"))
+        self.assertIn("[System] after errors", rendered)
+
+
+class AsyncSemanticLogContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context_is_isolated_between_concurrent_tasks(self) -> None:
+        formatter = log_module._formatter()
+        release = asyncio.Event()
+        ready = [asyncio.Event(), asyncio.Event()]
+
+        async def render(index: int, realm: str) -> str:
+            with log_context(realm=realm, activity="Battle"):
+                ready[index].set()
+                await release.wait()
+                return formatter.format(_log_record(f"task {index}"))
+
+        tasks = [
+            asyncio.create_task(render(0, "isekai")),
+            asyncio.create_task(render(1, "persistent")),
+        ]
+        await asyncio.gather(*(event.wait() for event in ready))
+        release.set()
+        rendered = await asyncio.gather(*tasks)
+
+        self.assertIn("[Isekai · Battle] task 0", rendered[0])
+        self.assertIn("[Persistent · Battle] task 1", rendered[1])
+        parent = formatter.format(_log_record("parent"))
+        self.assertIn("[System] parent", parent)
 
 
 class LoggerSetupTests(unittest.TestCase):

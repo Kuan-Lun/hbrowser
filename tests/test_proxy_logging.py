@@ -29,7 +29,7 @@ class ProxyLoggingTests(unittest.TestCase):
             result = proxy.configure_proxy()
 
         self.assertEqual(result, "proxy-extension.zip")
-        logger.info.assert_called_once_with("Using authenticated residential proxy")
+        logger.debug.assert_any_call("Using authenticated residential proxy")
         logger.debug.assert_any_call(
             "Residential proxy endpoint: host=%s port=%s",
             "proxy.example",

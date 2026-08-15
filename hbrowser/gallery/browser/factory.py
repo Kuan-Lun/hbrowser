@@ -8,7 +8,7 @@ from typing import Any
 
 import zendriver as zd
 
-from ..utils import setup_logger
+from ..utils import log_context, setup_logger
 from .chrome_manager import ensure_chrome_installed
 from .proxy import (
     configure_proxy,
@@ -45,14 +45,14 @@ def _build_config(
     config.disable_webrtc = True
 
     if proxy_extension:
-        logger.info("Using residential proxy extension")
+        logger.debug("Using residential proxy extension")
         config.add_extension(proxy_extension)
     elif use_tor and socks_port is not None:
         config.add_argument(f"--proxy-server=socks5://127.0.0.1:{socks_port}")
-        logger.info("Using Tor SOCKS proxy")
+        logger.debug("Using Tor SOCKS proxy")
         logger.debug("Tor SOCKS proxy endpoint: host=127.0.0.1 port=%d", socks_port)
     else:
-        logger.info("No proxy configured (direct connection)")
+        logger.debug("Using a direct connection")
 
     is_xvfb_env = (
         platform.system() == "Linux"
@@ -204,7 +204,13 @@ async def create_browser(
     Returns:
         (browser, page) tuple
     """
-    logger.info(f"Creating browser (headless: {headless})")
+    with log_context(scope="Browser"):
+        return await _create_browser(headless)
+
+
+async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
+    mode = "headless" if headless else "windowed"
+    logger.info("Starting browser")
 
     use_tor = should_use_tor()
     tor_process: subprocess.Popen[bytes] | None = None
@@ -215,12 +221,18 @@ async def create_browser(
 
     try:
         proxy_extension = configure_proxy()
+        if proxy_extension is not None:
+            connection = "residential proxy"
+        elif use_tor:
+            connection = "Tor"
+        else:
+            connection = "direct"
         chrome_paths = ensure_chrome_installed()
         config = _build_config(
             headless, proxy_extension, use_tor, socks_port, chrome_paths.chrome
         )
 
-        logger.debug("Initializing browser...")
+        logger.debug("Initializing browser")
         browser = await zd.start(config=config)
     except BaseException:
         if tor_process is not None:
@@ -230,9 +242,8 @@ async def create_browser(
     _attach_tor_process(browser, tor_process)
     try:
         page = await _wait_for_main_tab(browser)
-        logger.info("Browser initialized successfully")
-
         await _post_create_setup(browser, page, use_tor)
+        logger.info("Browser ready (%s, %s)", mode, connection)
     except BaseException:
         await stop_browser(browser)
         raise

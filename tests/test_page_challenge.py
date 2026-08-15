@@ -183,7 +183,7 @@ class PageChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         navigate.assert_not_awaited()
         sleep.assert_not_awaited()
         rendered_log = "\n".join(captured.output)
-        self.assertIn("recovery is unavailable", rendered_log)
+        self.assertIn("Automatic Cloudflare verification failed", rendered_log)
         self.assertNotIn("request failed", rendered_log)
 
     async def test_solver_is_retired_before_manual_fallback_after_identity_fails(

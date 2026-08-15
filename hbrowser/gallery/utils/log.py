@@ -7,6 +7,8 @@ import stat
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
@@ -17,6 +19,154 @@ _PROCESS_LOG_BACKUP_COUNT = 5
 _PROCESS_LOG_HANDLER_LOCK = Lock()
 _PROCESS_LOG_HANDLERS: dict[Path, logging.Handler] = {}
 _MANAGED_STDOUT_HANDLER_ATTRIBUTE = "_hbrowser_managed_stdout_handler"
+_LOG_CONTEXT_FIELDS = ("account", "realm", "tab_role", "activity", "scope")
+
+
+@dataclass(frozen=True, slots=True)
+class _LogContext:
+    account: str | None = None
+    realm: str | None = None
+    tab_role: str | None = None
+    activity: str | None = None
+    scope: str | None = None
+
+
+_CURRENT_LOG_CONTEXT: ContextVar[_LogContext] = ContextVar(
+    "hbrowser_log_context",
+    default=_LogContext(),
+)
+
+
+def _normalize_context_value(field: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string or None")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field} must not be empty")
+    return normalized
+
+
+@contextmanager
+def log_context(
+    *,
+    account: str | None = None,
+    realm: str | None = None,
+    tab_role: str | None = None,
+    activity: str | None = None,
+    scope: str | None = None,
+) -> Iterator[None]:
+    """Add semantic fields to log records within one synchronous scope.
+
+    Unspecified fields inherit their current values. Context variables make the
+    scope safe to nest and keep concurrent asyncio tasks isolated from one
+    another, even when the context remains active across ``await`` expressions.
+    """
+    current = _CURRENT_LOG_CONTEXT.get()
+    supplied = {
+        "account": _normalize_context_value("account", account),
+        "realm": _normalize_context_value("realm", realm),
+        "tab_role": _normalize_context_value("tab_role", tab_role),
+        "activity": _normalize_context_value("activity", activity),
+        "scope": _normalize_context_value("scope", scope),
+    }
+    merged = _LogContext(
+        **{
+            field: (
+                supplied[field]
+                if supplied[field] is not None
+                else getattr(current, field)
+            )
+            for field in _LOG_CONTEXT_FIELDS
+        }
+    )
+    token = _CURRENT_LOG_CONTEXT.set(merged)
+    try:
+        yield
+    finally:
+        _CURRENT_LOG_CONTEXT.reset(token)
+
+
+def _record_context_value(
+    record: logging.LogRecord,
+    field: str,
+    inherited: str | None,
+) -> str | None:
+    value = record.__dict__.get(field)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return inherited
+
+
+def _display_context_value(value: str) -> str:
+    aliases = {
+        "browser": "Browser",
+        "isekai": "Isekai",
+        "persistent": "Persistent",
+        "system": "System",
+    }
+    normalized = value.strip()
+    alias = aliases.get(normalized.casefold())
+    if alias is not None:
+        return alias
+    if normalized.islower():
+        return normalized.replace("_", " ").title()
+    return normalized
+
+
+def _semantic_label(context: _LogContext) -> str:
+    if context.scope is not None:
+        return _display_context_value(context.scope)
+
+    target = context.realm or context.tab_role
+    components = []
+    if target is not None:
+        components.append(_display_context_value(target))
+    if context.activity is not None:
+        activity = _display_context_value(context.activity)
+        if not components or activity.casefold() != components[-1].casefold():
+            components.append(activity)
+    return " · ".join(components) if components else "System"
+
+
+def _inject_log_context(record: logging.LogRecord) -> None:
+    inherited = _CURRENT_LOG_CONTEXT.get()
+    values = {
+        field: _record_context_value(record, field, getattr(inherited, field))
+        for field in _LOG_CONTEXT_FIELDS
+    }
+    for field, value in values.items():
+        record.__dict__[field] = value
+    record.__dict__["semantic_label"] = _semantic_label(_LogContext(**values))
+
+
+class _LogContextFilter(logging.Filter):
+    """Attach semantic context before a managed handler consumes a record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        _inject_log_context(record)
+        return True
+
+
+_LOG_CONTEXT_FILTER = _LogContextFilter()
+
+
+class _SemanticFormatter(logging.Formatter):
+    """Render a concise user label while preserving logger diagnostics."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        _inject_log_context(record)
+        return super().format(record)
+
+
+def _configure_user_facing_handler(
+    handler: logging.Handler,
+    formatter: logging.Formatter,
+) -> None:
+    if _LOG_CONTEXT_FILTER not in handler.filters:
+        handler.addFilter(_LOG_CONTEXT_FILTER)
+    handler.setFormatter(formatter)
 
 
 class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -148,8 +298,8 @@ def _isolated_process_log_handlers_for_testing() -> Iterator[None]:
 
 
 def _formatter() -> logging.Formatter:
-    return logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    return _SemanticFormatter(
+        "%(asctime)s - %(levelname)s - [%(semantic_label)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -192,17 +342,19 @@ def setup_logger(name: str) -> logging.Logger:
         stdout_handler = logging.StreamHandler(sys.stdout)
         setattr(stdout_handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, True)
         stdout_handler.setLevel(level)
-        stdout_handler.setFormatter(_formatter())
+        _configure_user_facing_handler(stdout_handler, _formatter())
         logger.addHandler(stdout_handler)
     else:
         for managed_handler in managed_stdout_handlers:
             managed_handler.setLevel(level)
+            _configure_user_facing_handler(managed_handler, _formatter())
 
     process_handler = _process_log_handler()
-    if process_handler is not None and process_handler not in logger.handlers:
+    if process_handler is not None:
         process_handler.setLevel(logging.NOTSET)
-        process_handler.setFormatter(_formatter())
-        logger.addHandler(process_handler)
+        _configure_user_facing_handler(process_handler, _formatter())
+        if process_handler not in logger.handlers:
+            logger.addHandler(process_handler)
 
     # 防止日誌向上傳播到 root logger（避免重複輸出）
     logger.propagate = False

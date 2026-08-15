@@ -75,16 +75,21 @@ class PageChallengeHandler:
         if detection.kind == "none":
             return
 
-        self._logger.warning("Page challenge detected: kind=%s", detection.kind)
+        if detection.kind == "cf_managed_challenge":
+            self._logger.info("Cloudflare verification detected")
+        else:
+            self._logger.info(
+                "Browser verification detected (kind=%s)",
+                detection.kind,
+            )
         solver = self._automatic_solver
         if detection.kind == "cf_managed_challenge" and solver is not None:
-            self._logger.info("Trying FlareSolverr for the managed challenge")
+            self._logger.info("Solving Cloudflare verification automatically")
             try:
                 receipt = await solver.solve_managed(url)
             except FlareSolverrError as error:
                 self._logger.warning(
-                    "FlareSolverr automatic managed-challenge recovery "
-                    "is unavailable (%s)",
+                    "Automatic Cloudflare verification failed (%s)",
                     type(error).__name__,
                 )
             else:
@@ -99,17 +104,22 @@ class PageChallengeHandler:
                     timeout=detect_timeout,
                 )
                 if detection.kind == "none":
-                    self._logger.info("FlareSolverr resolved the managed challenge")
+                    self._logger.info("Cloudflare verification solved automatically")
                     return
                 self._logger.warning(
-                    "FlareSolverr identity left a page challenge unresolved: "
-                    "kind=%s; retiring solver session before manual resolution",
+                    "Automatic Cloudflare verification did not clear the "
+                    "challenge (kind=%s)",
                     detection.kind,
                 )
                 await solver.retire()
 
         await self._save_diagnostic("challenge_page")
         if self._headless:
+            self._logger.warning(
+                "Manual browser verification is required (kind=%s), but the "
+                "browser is headless",
+                detection.kind,
+            )
             raise LoginFailedException(
                 f"Page challenge {detection.kind!r} requires interaction, "
                 "but the browser is headless"
@@ -128,9 +138,9 @@ class PageChallengeHandler:
         challenge_kind: str,
         detect_timeout: float,
     ) -> None:
-        self._logger.info(
-            "Please resolve the page challenge in the browser: kind=%s. "
-            "Waiting up to %.0f seconds...",
+        self._logger.warning(
+            "Manual browser verification is required (kind=%s); complete it "
+            "within %.0f seconds",
             challenge_kind,
             self._manual_timeout,
         )
@@ -142,7 +152,7 @@ class PageChallengeHandler:
                 timeout=detect_timeout,
             )
             if detection.kind == "none":
-                self._logger.info("Page challenge resolved manually")
+                self._logger.info("Browser verification completed manually")
                 return
             await asyncio.sleep(1)
 

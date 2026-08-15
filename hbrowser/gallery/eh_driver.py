@@ -53,7 +53,7 @@ from .search_models import (
     GallerySearchResult,
     SearchRequest,
 )
-from .utils import get_log_dir, is_connection_error, wait_for_new_tab
+from .utils import get_log_dir, is_connection_error, log_context, wait_for_new_tab
 
 MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
@@ -1330,6 +1330,10 @@ class EHDriver(Driver):
 
     async def punchin(self) -> PunchInResult:
         """Check in and return any trusted HentaiVerse random encounter."""
+        with log_context(activity="Check-in"):
+            return await self._punchin()
+
+    async def _punchin(self) -> PunchInResult:
         self.logger.info("Starting daily check-in")
         await self.get("https://e-hentai.org/news.php")
 
@@ -1344,15 +1348,14 @@ class EHDriver(Driver):
             )
         initial_result = _parse_punch_in_result(initial_html_content)
         if isinstance(initial_result, RandomEncounterFound):
-            self.logger.info(
-                "Daily check-in found a HentaiVerse random encounter: phase=initial"
-            )
+            self.logger.info("Daily check-in found a random encounter")
             return initial_result
 
         # 刷新以免沒簽到成功
         initial_loader_id = await self._current_loader_id()
+        self.logger.debug("Refreshing the daily check-in page")
         await self.wait(self.page.reload, ischangeurl=False)
-        self.logger.info("Daily check-in page refresh completed")
+        self.logger.debug("Daily check-in page refresh completed")
 
         html_content = await self._read_stable_punchin_document(
             previous_loader_id=initial_loader_id,
@@ -1366,14 +1369,9 @@ class EHDriver(Driver):
             )
         result = _parse_punch_in_result(html_content)
         if isinstance(result, RandomEncounterFound):
-            self.logger.info(
-                "Daily check-in found a HentaiVerse random encounter: phase=reloaded"
-            )
+            self.logger.info("Daily check-in found a random encounter after refresh")
         else:
-            self.logger.info(
-                "Daily check-in found no HentaiVerse random encounter after "
-                "initial and reloaded page checks"
-            )
+            self.logger.info("Daily check-in completed; no random encounter found")
         return result
 
     async def search(self, request: SearchRequest) -> GallerySearchResult:

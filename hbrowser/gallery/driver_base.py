@@ -32,6 +32,7 @@ from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandle
 from .forums_auth import ForumsAuthState, detect_forums_auth_state
 from .utils import (
     get_log_dir,
+    log_context,
     matchurl,
     setup_logger,
     wait_for_zendriver,
@@ -479,16 +480,17 @@ class Driver(ABC):
 
     async def login(self) -> None:
         """Log in, sharing one FlareSolverr browser across both challenges."""
-        flaresolverr_url = get_flaresolverr_url()
-        if not flaresolverr_url or not should_use_flaresolverr():
-            await self._login(None)
-            return
+        with log_context(activity="Login"):
+            flaresolverr_url = get_flaresolverr_url()
+            if not flaresolverr_url or not should_use_flaresolverr():
+                await self._login(None)
+                return
 
-        async with FlareSolverrClient(flaresolverr_url) as client:
-            async with client.session(
-                max_attempts=self.flaresolverr_session_attempts
-            ) as session:
-                await self._login(session)
+            async with FlareSolverrClient(flaresolverr_url) as client:
+                async with client.session(
+                    max_attempts=self.flaresolverr_session_attempts
+                ) as session:
+                    await self._login(session)
 
     async def _login(
         self,
@@ -502,7 +504,7 @@ class Driver(ABC):
         3. 輸入帳號密碼並點擊 "Log me in"
         4. 驗證登入成功後前往主頁
         """
-        self.logger.info("Starting login process")
+        self.logger.info("Signing in")
 
         await self.myget(self.url["Forums"])
         await self._handle_page_challenge(
@@ -512,7 +514,7 @@ class Driver(ABC):
 
         auth_state = await detect_forums_auth_state(self.page)
         if auth_state is ForumsAuthState.AUTHENTICATED:
-            self.logger.info("Already logged in, skipping login")
+            self.logger.info("Already signed in")
             await self.gohomepage()
             return
         if auth_state is not ForumsAuthState.GUEST:
@@ -558,7 +560,7 @@ class Driver(ABC):
             await asyncio.sleep(0.1)
 
         await self._verify_login_succeeded(flaresolverr_session)
-        self.logger.info("Login completed successfully")
+        self.logger.info("Signed in")
 
         await self.gohomepage()
 
