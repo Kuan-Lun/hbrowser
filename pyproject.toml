@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -12,9 +12,9 @@ license = { text = "GNU Affero General Public License v3" }
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "beautifulsoup4>=4.15.0",
-    "h2h-galleryinfo-parser>=0.2.2",
+    "h2h-galleryinfo-parser>=0.5.0",
     "httpx>=0.28.1",
-    "websockets>=16.0",
+    "websockets>=17.0.1",
     "zendriver>=0.15.5,<0.16",
 ]
 
@@ -29,9 +29,9 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
     "black>=26.5.1",
-    "ruff>=0.15.20",
-    "mypy>=2.1.0",
-    "pymarkdownlnt>=0.9.38",
+    "ruff>=0.16.3",
+    "mypy>=2.3.0",
+    "pymarkdownlnt>=0.9.39",
     "pytest>=9.1.1",
 ]
 
