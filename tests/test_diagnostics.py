@@ -149,9 +149,9 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.driver = _TestDriver(headless=True)
         self.logger = Mock()
         self.driver.logger = self.logger
-        self.driver.page = Mock()
-        self.driver.page.get_content = AsyncMock(return_value="<html>failure</html>")
-        self.driver.browser = Mock()
+        page = Mock()
+        page.get_content = AsyncMock(return_value="<html>failure</html>")
+        self.driver.bind_existing_browser(Mock(), page, owns_browser=True)
 
     async def test_exit_keeps_each_error_page_and_logs_safe_error_types(self) -> None:
         try:

@@ -12,7 +12,11 @@ from urllib.parse import urlsplit
 
 from zendriver import cdp
 
-from ..exceptions import BrowserIdentityApplyException, LoginFailedException
+from ..exceptions import (
+    BrowserIdentityApplyException,
+    DriverBrowserBindingError,
+    LoginFailedException,
+)
 from .browser import (
     FlareSolverrClient,
     FlareSolverrResult,
@@ -134,14 +138,74 @@ class Driver(ABC):
         self.browser: Any = None
         self.page: Any = None
         self.myget: Any = None
+        self._browser_bound = False
+        self._owns_browser = False
         self.flaresolverr_session_attempts = flaresolverr_session_attempts
         self.captcha_manual_timeout = captcha_manual_timeout
         self.turnstile_tabs = turnstile_tabs
         self.captcha_detector = CaptchaDetector()
 
+    @property
+    def is_browser_bound(self) -> bool:
+        """Whether this driver has an immutable browser/page binding."""
+
+        return self._browser_bound
+
+    @property
+    def owns_browser(self) -> bool:
+        """Whether this driver is responsible for closing its bound browser."""
+
+        return self._owns_browser
+
+    def bind_existing_browser(
+        self,
+        browser: Any,
+        page: Any,
+        *,
+        owns_browser: bool = False,
+    ) -> None:
+        """Bind this driver to one browser and page for its complete lifetime.
+
+        A second call with the identical objects and ownership is a no-op.  A
+        caller may not retarget a bound driver or transfer browser ownership;
+        it must construct a new driver instead.
+        """
+
+        if browser is None:
+            raise ValueError("browser must not be None")
+        if page is None:
+            raise ValueError("page must not be None")
+        if type(owns_browser) is not bool:
+            raise TypeError("owns_browser must be a bool")
+
+        if self._browser_bound:
+            if (
+                self.browser is browser
+                and self.page is page
+                and self._owns_browser is owns_browser
+            ):
+                return
+            raise DriverBrowserBindingError(
+                "driver is already bound to a different browser, page, or "
+                "ownership mode"
+            )
+
+        if self.browser is not None or self.page is not None or self.myget is not None:
+            raise DriverBrowserBindingError(
+                "driver browser state was assigned without bind_existing_browser"
+            )
+
+        self.browser = browser
+        self.page = page
+        self.myget = handle_ban_decorator(page)
+        self._owns_browser = owns_browser
+        self._browser_bound = True
+
     async def _init_browser(self) -> None:
-        self.browser, self.page = await create_browser(headless=self.headless)
-        self.myget = handle_ban_decorator(self.page)
+        if self._browser_bound:
+            raise DriverBrowserBindingError("driver already has a browser binding")
+        browser, page = await create_browser(headless=self.headless)
+        self.bind_existing_browser(browser, page, owns_browser=True)
         await self.get(self.url["Forums"])
 
     async def __aenter__(self) -> Self:
@@ -170,7 +234,10 @@ class Driver(ABC):
                 error_type,
                 type(cause).__name__ if cause is not None else "none",
             )
-            await self._save_page_diagnostic("driver_error")
+            if self.page is not None:
+                await self._save_page_diagnostic("driver_error")
+        if not self._owns_browser or self.browser is None:
+            return
         self.logger.info("Closing browser")
         try:
             await stop_browser(self.browser)

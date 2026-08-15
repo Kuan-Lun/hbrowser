@@ -1,6 +1,7 @@
 __all__ = [
     "ConfirmedGalleryMissing",
     "beep_os_independent",
+    "DriverBrowserBindingError",
     "EHDriver",
     "ExHDriver",
     "GalleryFound",
@@ -27,6 +28,7 @@ __all__ = [
 
 from .beep import beep_os_independent
 from .exceptions import (
+    DriverBrowserBindingError,
     GalleryLookupError,
     GallerySearchError,
     InvalidSearchRequestError,

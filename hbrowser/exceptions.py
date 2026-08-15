@@ -31,6 +31,10 @@ class BrowserIdentityApplyException(RuntimeError):
     """Applying an external solver identity failed and cannot be rolled back."""
 
 
+class DriverBrowserBindingError(RuntimeError):
+    """A driver was asked to replace its immutable browser/page binding."""
+
+
 class GallerySearchError(RuntimeError):
     """Base class for gallery-search and exact-lookup failures."""
 
