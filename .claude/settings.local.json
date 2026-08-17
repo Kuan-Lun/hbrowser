@@ -21,7 +21,9 @@
       "Bash(uv run python -c ' *)",
       "Bash(python3 -)",
       "Bash(python3 -c ' *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(bash scripts/hooks/finalize-markdown.sh)",
+      "Bash(bash scripts/hooks/finalize-python.sh)"
     ],
     "additionalDirectories": [
       "/tmp"
