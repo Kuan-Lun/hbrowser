@@ -10,6 +10,10 @@ import zendriver as zd
 
 from ..utils import log_context, setup_logger
 from .chrome_manager import ensure_chrome_installed
+from .mapper import (
+    start_zendriver_mapper_janitor,
+    stop_zendriver_mapper_janitor,
+)
 from .proxy import (
     configure_proxy,
     find_available_port,
@@ -243,6 +247,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
     try:
         page = await _wait_for_main_tab(browser)
         await _post_create_setup(browser, page, use_tor)
+        start_zendriver_mapper_janitor(browser)
         logger.info("Browser ready (%s, %s)", mode, connection)
     except BaseException:
         await stop_browser(browser)
@@ -255,7 +260,10 @@ async def stop_browser(browser: Any) -> None:
     """停止 browser 並清理資源（包含 Tor 進程）。"""
     tor_process = getattr(browser, "_tor_process", None)
     try:
-        await browser.stop()
+        try:
+            await stop_zendriver_mapper_janitor(browser)
+        finally:
+            await browser.stop()
     finally:
         if tor_process is not None:
             terminate_tor_process(tor_process)
