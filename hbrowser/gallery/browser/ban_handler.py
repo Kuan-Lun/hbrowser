@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from ..utils import setup_logger
+from ..utils import setup_logger, wait_for_zendriver
 
 logger = setup_logger(__name__)
 
@@ -18,6 +18,7 @@ _HOUR_SECONDS = 60 * 60
 _RETRY_BUFFER_SECONDS = 15 * 60
 _BLANK_PAGE_QUICK_RETRIES = 3
 _BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS = 2.0
+_PAGE_READ_TIMEOUT_SECONDS = 5.0
 
 
 def parse_ban_time(page_source: str) -> int:
@@ -112,8 +113,10 @@ async def _retry_until_unbanned(page: Any, source: str) -> None:
         await _wait_out_ban(wait_seconds)
 
         logger.info("Retrying connection")
-        await page.reload()
-        source = await page.get_content()
+        await wait_for_zendriver(page.reload(), timeout=_PAGE_READ_TIMEOUT_SECONDS)
+        source = await wait_for_zendriver(
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+        )
         is_first = False
         status = check_ban_status(source)
 
@@ -133,8 +136,10 @@ async def _resolve_transient_blank_page(page: Any, source: str) -> str:
         if not check_ban_status(source).is_blank_page:
             break
         await asyncio.sleep(_BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS)
-        await page.reload()
-        source = await page.get_content()
+        await wait_for_zendriver(page.reload(), timeout=_PAGE_READ_TIMEOUT_SECONDS)
+        source = await wait_for_zendriver(
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+        )
     return source
 
 
@@ -152,8 +157,10 @@ def handle_ban_decorator(
     """
 
     async def myget(*args: Any, **kwargs: Any) -> None:
-        await page.get(*args, **kwargs)
-        source = await page.get_content()
+        await wait_for_zendriver(page.get(*args, **kwargs), timeout=15.0)
+        source = await wait_for_zendriver(
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+        )
         if check_ban_status(source).is_blank_page:
             source = await _resolve_transient_blank_page(page, source)
         if check_ban_status(source).should_wait:
