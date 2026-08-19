@@ -54,7 +54,15 @@ from .search_models import (
     GallerySearchResult,
     SearchRequest,
 )
-from .utils import get_log_dir, is_connection_error, log_context, wait_for_new_tab
+from .utils import (
+    get_log_dir,
+    is_connection_error,
+    log_context,
+    wait_for_new_tab,
+    wait_for_zendriver,
+)
+
+_PAGE_READ_TIMEOUT_SECONDS = 5.0
 
 MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
@@ -706,7 +714,10 @@ class EHDriver(Driver):
             raise cleanup_error
 
     async def _current_loader_id(self) -> str:
-        frame_tree = await self.page.send(cdp.page.get_frame_tree())
+        frame_tree = await wait_for_zendriver(
+            self.page.send(cdp.page.get_frame_tree()),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+        )
         return str(frame_tree.frame.loader_id)
 
     async def _read_stable_punchin_document(
@@ -750,7 +761,10 @@ class EHDriver(Driver):
         )
 
     async def _read_raw_page_snapshot(self) -> _RawPageSnapshot:
-        page_data = await self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT)
+        page_data = await wait_for_zendriver(
+            self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+        )
         if not isinstance(page_data, dict):
             raise TypeError("Search-page snapshot was not an object")
 
@@ -1313,15 +1327,27 @@ class EHDriver(Driver):
         """檢查 H@H 客戶端是否在線"""
         self.logger.info("Checking H@H client status")
         await self.get("https://e-hentai.org/hentaiathome.php")
-        table = await self.page.select("#hct", timeout=10)
-        header_row = await table.query_selector("tr")
-        headers = await header_row.query_selector_all("th")
+        table = await wait_for_zendriver(
+            self.page.select("#hct", timeout=10),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+        )
+        header_row = await wait_for_zendriver(
+            table.query_selector("tr"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+        )
+        headers = await wait_for_zendriver(
+            header_row.query_selector_all("th"),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+        )
         status_index = [
             index for index, th in enumerate(headers) if th.text == "Status"
         ][0]
-        rows = await table.query_selector_all("tr")
+        rows = await wait_for_zendriver(
+            table.query_selector_all("tr"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+        )
         for row in rows[1:]:
-            cells = await row.query_selector_all("td")
+            cells = await wait_for_zendriver(
+                row.query_selector_all("td"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            )
             status = cells[status_index].text
             if status.lower() == "online":
                 self.logger.info("H@H client is online")
@@ -1554,7 +1580,10 @@ class EHDriver(Driver):
                 "//input[@id='f_search']",
             ]
             xpath_query = " | ".join(xpath_query_list)
-            results = await self.page.xpath(xpath_query, timeout=2)
+            results = await wait_for_zendriver(
+                self.page.xpath(xpath_query, timeout=2),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            )
             if results:
                 self.logger.warning(
                     "Gallery unavailable or deleted: gid=%d",
@@ -1569,9 +1598,14 @@ class EHDriver(Driver):
 
         key_xpath = "//a[contains(text(), 'Archive Download')]"
         try:
-            archive_links = await self.page.xpath(key_xpath, timeout=2)
+            archive_links = await wait_for_zendriver(
+                self.page.xpath(key_xpath, timeout=2),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            )
             if archive_links:
-                await archive_links[0].click()
+                await wait_for_zendriver(
+                    archive_links[0].click(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+                )
             else:
                 raise RuntimeError("Archive Download not found")
         except Exception as error:
@@ -1601,16 +1635,22 @@ class EHDriver(Driver):
         retrytime: int | None = None
         try:
             await new_tab.activate()
-            original_links = await self.page.xpath(
-                "//a[contains(text(), 'Original')]", timeout=10
+            original_links = await wait_for_zendriver(
+                self.page.xpath("//a[contains(text(), 'Original')]", timeout=10),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
             )
             if original_links:
-                await original_links[0].click()
+                await wait_for_zendriver(
+                    original_links[0].click(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+                )
 
             try:
                 deadline = asyncio.get_event_loop().time() + 10
                 while asyncio.get_event_loop().time() < deadline:
-                    html = await self.page.get_content()
+                    html = await wait_for_zendriver(
+                        self.page.get_content(),
+                        timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                    )
                     if (
                         "Downloads should start processing within a couple of minutes."
                         in html
@@ -1622,7 +1662,10 @@ class EHDriver(Driver):
                         raise InsufficientFundsException()
                     await asyncio.sleep(0.5)
                 else:
-                    html = await self.page.get_content()
+                    html = await wait_for_zendriver(
+                        self.page.get_content(),
+                        timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                    )
                     if "Cannot start download: Insufficient funds" in html:
                         raise InsufficientFundsException()
                     raise TimeoutError()
@@ -1671,8 +1714,9 @@ class EHDriver(Driver):
     async def gallery2tag(self, gallery: GalleryURLParser, filter: str) -> list[Tag]:
         await self.get(gallery.url)
         try:
-            elements = await self.page.xpath(
-                f"//a[contains(@id, 'ta_{filter}')]", timeout=2
+            elements = await wait_for_zendriver(
+                self.page.xpath(f"//a[contains(@id, 'ta_{filter}')]", timeout=2),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
             )
         except TimeoutError:
             return list()
