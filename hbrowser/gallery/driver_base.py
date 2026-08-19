@@ -40,6 +40,7 @@ from .utils import (
 )
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
+_NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
 _SAFE_NAVIGATION_ROUTES = {
     "favorites.php": "favorites",
     "g": "gallery",
@@ -299,7 +300,10 @@ class Driver(ABC):
 
     async def gohomepage(self, force: bool = False) -> None:
         url = self.url[self.name]
-        current_url = await self.page.evaluate("window.location.href")
+        current_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         source_scheme, source_host, source_route, source_has_query = (
             _redacted_url_context(current_url)
         )
@@ -336,14 +340,39 @@ class Driver(ABC):
                 force,
             )
 
+    async def _wait_for_url_change(
+        self, old_url: str, *, deadline_seconds: float = 10.0
+    ) -> None:
+        """Best-effort wait for navigation; gives up silently on timeout."""
+        deadline = asyncio.get_event_loop().time() + deadline_seconds
+        while True:
+            try:
+                current_url = await wait_for_zendriver(
+                    self.page.evaluate("window.location.href"),
+                    timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                return
+            if current_url != old_url:
+                return
+            if asyncio.get_event_loop().time() >= deadline:
+                return
+            await asyncio.sleep(0.1)
+
     async def find_element_chain(self, *selectors: str) -> Any:
         element: Any = self.page
         for selector in selectors:
-            element = await element.query_selector(selector)
+            element = await wait_for_zendriver(
+                element.query_selector(selector),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         return element
 
     async def get(self, url: str) -> None:
-        current_url = await self.page.evaluate("window.location.href")
+        current_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         scheme, hostname, route, has_query = _redacted_url_context(url)
         self.logger.debug(
             "Navigate to URL: scheme=%s host=%s route=%s has_query=%s",
@@ -358,7 +387,11 @@ class Driver(ABC):
             try:
                 deadline = asyncio.get_event_loop().time() + 10
                 while matchurl(
-                    await self.page.evaluate("window.location.href"), current_url
+                    await wait_for_zendriver(
+                        self.page.evaluate("window.location.href"),
+                        timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                    ),
+                    current_url,
                 ):
                     if asyncio.get_event_loop().time() >= deadline:
                         break
@@ -366,7 +399,12 @@ class Driver(ABC):
             except TimeoutError:
                 pass
         else:
-            await self.page.wait(1)
+            try:
+                await wait_for_zendriver(
+                    self.page.wait(1), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                pass
         await asyncio.sleep(3 * random())
 
     async def wait(
@@ -382,7 +420,10 @@ class Driver(ABC):
             ischangeurl: 是否等待 URL 變化
             sleeptime: 等待時間（秒），-1 表示隨機等待
         """
-        old_url = await self.page.evaluate("window.location.href")
+        old_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -395,14 +436,14 @@ class Driver(ABC):
                 await asyncio.sleep(0.5)
 
         if ischangeurl:
-            deadline = asyncio.get_event_loop().time() + 10
-            while (
-                await self.page.evaluate("window.location.href") == old_url
-                and asyncio.get_event_loop().time() < deadline
-            ):
-                await asyncio.sleep(0.1)
+            await self._wait_for_url_change(old_url)
         else:
-            await self.page.wait(1)
+            try:
+                await wait_for_zendriver(
+                    self.page.wait(1), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                pass
 
         if sleeptime < 0:
             await asyncio.sleep(3 * random())
@@ -523,41 +564,58 @@ class Driver(ABC):
             )
 
         self.logger.debug("Clicking 'Log In' link on Forums page")
-        login_link = await self.page.select(
-            "#userlinksguest a[href*='act=Login&CODE=00']"
+        login_link = await wait_for_zendriver(
+            self.page.select("#userlinksguest a[href*='act=Login&CODE=00']"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
         )
-        old_url = await self.page.evaluate("window.location.href")
-        await login_link.click()
-        deadline = asyncio.get_event_loop().time() + 10
-        while (
-            await self.page.evaluate("window.location.href") == old_url
-            and asyncio.get_event_loop().time() < deadline
-        ):
-            await asyncio.sleep(0.1)
+        old_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
+        await wait_for_zendriver(
+            login_link.click(), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+        )
+        await self._wait_for_url_change(old_url)
 
-        await self.page.select("[name='UserName']", timeout=10)
+        await wait_for_zendriver(
+            self.page.select("[name='UserName']", timeout=10),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
 
-        username_input = await self.page.select("[name='UserName']")
-        await username_input.send_keys(self.username)
+        username_input = await wait_for_zendriver(
+            self.page.select("[name='UserName']"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
+        await wait_for_zendriver(
+            username_input.send_keys(self.username),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
 
-        password_input = await self.page.select("[name='PassWord']")
-        await password_input.send_keys(self.password)
+        password_input = await wait_for_zendriver(
+            self.page.select("[name='PassWord']"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
+        await wait_for_zendriver(
+            password_input.send_keys(self.password),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
 
         await self._handle_login_challenge(flaresolverr_session)
 
-        old_url = await self.page.evaluate("window.location.href")
-        submit_button = await self.page.select(
-            "input[type='submit'][value='Log me in']"
+        old_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
         )
-        await submit_button.click()
+        submit_button = await wait_for_zendriver(
+            self.page.select("input[type='submit'][value='Log me in']"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
+        await wait_for_zendriver(
+            submit_button.click(), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+        )
         self.logger.debug("'Log me in' button clicked, waiting for redirect...")
 
-        deadline = asyncio.get_event_loop().time() + 10
-        while (
-            await self.page.evaluate("window.location.href") == old_url
-            and asyncio.get_event_loop().time() < deadline
-        ):
-            await asyncio.sleep(0.1)
+        await self._wait_for_url_change(old_url)
 
         await self._verify_login_succeeded(flaresolverr_session)
         self.logger.info("Signed in")
