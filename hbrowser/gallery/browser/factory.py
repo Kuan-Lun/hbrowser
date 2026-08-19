@@ -8,7 +8,7 @@ from typing import Any
 
 import zendriver as zd
 
-from ..utils import log_context, setup_logger
+from ..utils import log_context, setup_logger, wait_for_zendriver
 from .chrome_manager import ensure_chrome_installed
 from .mapper import (
     start_zendriver_mapper_janitor,
@@ -123,7 +123,9 @@ async def _post_create_setup(
 ) -> None:
     from zendriver import cdp
 
-    await page.send(cdp.emulation.set_geolocation_override())
+    await wait_for_zendriver(
+        page.send(cdp.emulation.set_geolocation_override()), timeout=5.0
+    )
 
     if use_tor and not has_residential_proxy():
         await verify_proxy_ip(browser, page)
