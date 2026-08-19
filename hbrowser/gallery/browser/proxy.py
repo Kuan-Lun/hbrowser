@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
-from ..utils import is_connection_error, setup_logger
+from ..utils import is_connection_error, setup_logger, wait_for_zendriver
 
 logger = setup_logger(__name__)
+_PROXY_CHECK_TIMEOUT_SECONDS = 10.0
 
 
 def _create_proxy_extension(
@@ -159,8 +160,10 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
     try:
         local_ip = await asyncio.to_thread(_get_local_ip)
 
-        await page.get("https://api.ipify.org")
-        body = await page.select("body")
+        await wait_for_zendriver(page.get("https://api.ipify.org"), timeout=15.0)
+        body = await wait_for_zendriver(
+            page.select("body"), timeout=_PROXY_CHECK_TIMEOUT_SECONDS
+        )
         proxy_ip: str = body.text.strip()
 
         if local_ip == proxy_ip:
