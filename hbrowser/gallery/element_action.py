@@ -6,7 +6,7 @@ from typing import Any
 
 import zendriver as zd
 
-from .utils import is_connection_error
+from .utils import is_connection_error, wait_for_zendriver
 
 
 class ElementAction:
@@ -25,10 +25,13 @@ class ElementAction:
     def page(self) -> zd.Tab:
         return self._page_provider()
 
-    async def click(self, element: Any) -> None:
-        """捲動到可見範圍後觸發元素的 DOM click()。"""
-        await element.apply(
-            "(el) => { el.scrollIntoView({block: 'center'}); el.click(); }"
+    async def click(self, element: Any, timeout: float = 3.0) -> None:
+        """捲動到可見範圍後觸發元素的 DOM click()，並在 timeout 秒內未回應時逾時。"""
+        await wait_for_zendriver(
+            element.apply(
+                "(el) => { el.scrollIntoView({block: 'center'}); el.click(); }"
+            ),
+            timeout=timeout,
         )
 
     async def click_resilient(
