@@ -1637,7 +1637,7 @@ class EHDriver(Driver):
             await new_tab.activate()
             original_links = await wait_for_zendriver(
                 self.page.xpath("//a[contains(text(), 'Original')]", timeout=10),
-                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                timeout=12.0,
             )
             if original_links:
                 await wait_for_zendriver(
