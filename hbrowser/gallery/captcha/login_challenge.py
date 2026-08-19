@@ -8,8 +8,11 @@ from typing import Any, Protocol
 
 from ...exceptions import BrowserIdentityApplyException, LoginFailedException
 from ..browser.flaresolverr import FlareSolverrError
+from ..utils import wait_for_zendriver
 from .detector import CaptchaDetector
 from .models import Kind
+
+_TOKEN_READ_TIMEOUT_SECONDS = 3.0
 
 
 class TurnstileSolver(Protocol):
@@ -160,12 +163,15 @@ class LoginChallengeHandler:
     @staticmethod
     async def _read_response_token(page: Any, selector: str) -> str:
         selector_json = json.dumps(selector)
-        value = await page.evaluate(
-            "(() => {"
-            f"const element = document.querySelector({selector_json});"
-            "return element && typeof element.value === 'string' "
-            "? element.value : '';"
-            "})()"
+        value = await wait_for_zendriver(
+            page.evaluate(
+                "(() => {"
+                f"const element = document.querySelector({selector_json});"
+                "return element && typeof element.value === 'string' "
+                "? element.value : '';"
+                "})()"
+            ),
+            timeout=_TOKEN_READ_TIMEOUT_SECONDS,
         )
         return value if isinstance(value, str) else ""
 
@@ -178,15 +184,18 @@ class LoginChallengeHandler:
         selector_json = json.dumps(selector)
         token_json = json.dumps(token)
         try:
-            result = await page.evaluate(
-                "(() => {"
-                f"const element = document.querySelector({selector_json});"
-                "if (!element) return false;"
-                f"element.value = {token_json};"
-                "element.dispatchEvent(new Event('input', { bubbles: true }));"
-                "element.dispatchEvent(new Event('change', { bubbles: true }));"
-                f"return element.value === {token_json};"
-                "})()"
+            result = await wait_for_zendriver(
+                page.evaluate(
+                    "(() => {"
+                    f"const element = document.querySelector({selector_json});"
+                    "if (!element) return false;"
+                    f"element.value = {token_json};"
+                    "element.dispatchEvent(new Event('input', { bubbles: true }));"
+                    "element.dispatchEvent(new Event('change', { bubbles: true }));"
+                    f"return element.value === {token_json};"
+                    "})()"
+                ),
+                timeout=_TOKEN_READ_TIMEOUT_SECONDS,
             )
         except Exception:
             # CDP exceptions can include the full evaluate expression. Do not
