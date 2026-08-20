@@ -12,9 +12,14 @@ from unittest.mock import Mock, patch
 
 from hbrowser.gallery.utils import log as log_module
 from hbrowser.gallery.utils.log import (
+    LogLevel,
+    LogPersistenceError,
+    _isolated_logging_state_for_testing,
     _isolated_process_log_handlers_for_testing,
+    configure_logging,
     get_log_dir,
     log_context,
+    log_to_process_file,
     setup_logger,
 )
 
@@ -152,6 +157,13 @@ class AsyncSemanticLogContextTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LoggerSetupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.logging_state = _isolated_logging_state_for_testing()
+        self.logging_state.__enter__()
+
+    def tearDown(self) -> None:
+        self.logging_state.__exit__(None, None, None)
+
     def test_logger_keeps_stdout_handler_and_non_propagating_contract(self) -> None:
         logger_name = f"hbrowser.tests.compatibility.{id(self)}"
         logger = logging.getLogger(logger_name)
@@ -165,15 +177,12 @@ class LoggerSetupTests(unittest.TestCase):
                 patch("hbrowser.gallery.utils.log.sys.stdout", output),
                 patch.dict(
                     "os.environ",
-                    {
-                        "HBROWSER_LOG_LEVEL": "DEBUG",
-                        "HBROWSER_PROCESS_LOG_FILE": "",
-                    },
+                    {"HBROWSER_PROCESS_LOG_FILE": ""},
                     clear=False,
                 ),
             ):
                 configured = setup_logger(logger_name)
-                configured.debug("compatibility record")
+                configured.info("compatibility record")
                 configured_handlers = configured.handlers[:]
                 configured_level = configured.level
                 handler_level = configured.handlers[0].level
@@ -186,10 +195,334 @@ class LoggerSetupTests(unittest.TestCase):
         self.assertIs(configured, logger)
         self.assertEqual(len(configured_handlers), 1)
         self.assertIsInstance(configured_handlers[0], logging.StreamHandler)
-        self.assertEqual(configured_level, logging.DEBUG)
-        self.assertEqual(handler_level, logging.DEBUG)
+        self.assertEqual(configured_level, logging.INFO)
+        self.assertEqual(handler_level, logging.INFO)
         self.assertFalse(configured_propagate)
         self.assertIn("compatibility record", output.getvalue())
+
+    def test_defaults_write_debug_to_file_without_printing_it(self) -> None:
+        logger_name = f"hbrowser.tests.split_defaults.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        output = io.StringIO()
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+                patch("hbrowser.gallery.utils.log.sys.stdout", output),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_PROCESS_LOG_FILE": str(
+                            Path(directory_name) / "battle.log"
+                        )
+                    },
+                    clear=False,
+                ),
+            ):
+                configured = setup_logger(logger_name)
+                process_handler = next(
+                    handler
+                    for handler in configured.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+                stdout_handler = next(
+                    handler
+                    for handler in configured.handlers
+                    if not isinstance(handler, logging.FileHandler)
+                )
+                with patch.object(
+                    process_handler,
+                    "flush",
+                    wraps=process_handler.flush,
+                ) as flush:
+                    configured.debug("durable debug record")
+                    configured.info("visible info record")
+                self.assertEqual(flush.call_count, 2)
+                contents = Path(process_handler.baseFilename).read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertEqual(configured.level, logging.DEBUG)
+                self.assertEqual(stdout_handler.level, logging.INFO)
+                self.assertEqual(process_handler.level, logging.DEBUG)
+                self.assertNotIn("durable debug record", output.getvalue())
+                self.assertIn("visible info record", output.getvalue())
+                self.assertIn("durable debug record", contents)
+                self.assertIn("visible info record", contents)
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+
+    def test_configuration_is_strict_and_atomic(self) -> None:
+        for keyword, value, error_type in (
+            ("console_level", "INFO", TypeError),
+            ("file_level", logging.DEBUG, TypeError),
+            ("max_bytes", True, TypeError),
+            ("max_bytes", 0, ValueError),
+            ("backup_count", 1.5, TypeError),
+            ("backup_count", -1, ValueError),
+        ):
+            with self.subTest(keyword=keyword), self.assertRaises(error_type):
+                configure_logging(**{keyword: value})  # type: ignore[arg-type]
+
+        logger_name = f"hbrowser.tests.strict_defaults.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        try:
+            logger.handlers = []
+            with patch.dict(
+                os.environ,
+                {"HBROWSER_PROCESS_LOG_FILE": ""},
+                clear=False,
+            ):
+                configured = setup_logger(logger_name)
+            self.assertEqual(configured.level, logging.INFO)
+            self.assertEqual(configured.handlers[0].level, logging.INFO)
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+
+    def test_setup_rejects_unmanaged_stream_handler_without_mutation(self) -> None:
+        logger_name = f"hbrowser.tests.unmanaged_stream.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        unmanaged = logging.StreamHandler(io.StringIO())
+        try:
+            logger.handlers = [unmanaged]
+            logger.setLevel(logging.ERROR)
+            logger.propagate = True
+            with (
+                patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": ""},
+                    clear=False,
+                ),
+                self.assertRaisesRegex(ValueError, "unmanaged handlers"),
+            ):
+                setup_logger(logger_name)
+
+            self.assertEqual(logger.handlers, [unmanaged])
+            self.assertEqual(logger.level, logging.ERROR)
+            self.assertTrue(logger.propagate)
+            self.assertNotIn(logger_name, log_module._MANAGED_LOGGER_NAMES)
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+            unmanaged.close()
+
+    def test_setup_rejects_unmanaged_file_handler_without_mutation(self) -> None:
+        logger_name = f"hbrowser.tests.unmanaged_file.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        with TemporaryDirectory() as directory_name:
+            unmanaged = logging.FileHandler(
+                Path(directory_name) / "unmanaged.log",
+                encoding="utf-8",
+            )
+            try:
+                logger.handlers = [unmanaged]
+                logger.setLevel(logging.CRITICAL)
+                logger.propagate = False
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"HBROWSER_PROCESS_LOG_FILE": ""},
+                        clear=False,
+                    ),
+                    self.assertRaisesRegex(ValueError, "unmanaged handlers"),
+                ):
+                    setup_logger(logger_name)
+
+                self.assertEqual(logger.handlers, [unmanaged])
+                self.assertEqual(logger.level, logging.CRITICAL)
+                self.assertFalse(logger.propagate)
+                self.assertIsNotNone(unmanaged.stream)
+                self.assertNotIn(logger_name, log_module._MANAGED_LOGGER_NAMES)
+            finally:
+                logger.handlers = original_handlers
+                logger.setLevel(original_level)
+                logger.propagate = original_propagate
+                unmanaged.close()
+
+    def test_reconfiguration_preserves_post_registration_instrumentation(self) -> None:
+        logger_name = f"hbrowser.tests.instrumented.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        instrumentation = logging.StreamHandler(io.StringIO())
+        instrumentation.setLevel(logging.CRITICAL)
+        try:
+            logger.handlers = []
+            with patch.dict(
+                os.environ,
+                {"HBROWSER_PROCESS_LOG_FILE": ""},
+                clear=False,
+            ):
+                configured = setup_logger(logger_name)
+                managed_handler = configured.handlers[0]
+                configured.addHandler(instrumentation)
+
+                configure_logging(console_level=LogLevel.WARNING)
+                repeated = setup_logger(logger_name)
+
+            self.assertIs(repeated, configured)
+            self.assertEqual(
+                configured.handlers,
+                [managed_handler, instrumentation],
+            )
+            self.assertEqual(managed_handler.level, logging.WARNING)
+            self.assertEqual(instrumentation.level, logging.CRITICAL)
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            instrumentation.close()
+
+    def test_file_only_record_never_reaches_console(self) -> None:
+        logger_name = f"hbrowser.tests.file_only.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        output = io.StringIO()
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+                patch("hbrowser.gallery.utils.log.sys.stdout", output),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_PROCESS_LOG_FILE": str(
+                            Path(directory_name) / "battle.log"
+                        )
+                    },
+                    clear=False,
+                ),
+            ):
+                configured = setup_logger(logger_name)
+                configure_logging(
+                    console_level=LogLevel.DEBUG,
+                    file_level=LogLevel.DEBUG,
+                )
+                with log_context(realm="isekai", activity="Worker"):
+                    log_to_process_file(
+                        configured,
+                        LogLevel.ERROR,
+                        '{"result":"error"}',
+                    )
+                process_handler = next(
+                    handler
+                    for handler in configured.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+                process_handler.flush()
+                contents = Path(process_handler.baseFilename).read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn(" - ERROR - [Isekai · Worker] ", contents)
+                self.assertIn('{"result":"error"}', contents)
+        finally:
+            logger.handlers = original_handlers
+
+    def test_file_only_record_respects_sink_threshold_and_absence(self) -> None:
+        logger_name = f"hbrowser.tests.file_only_threshold.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with patch.dict(
+                os.environ,
+                {"HBROWSER_PROCESS_LOG_FILE": ""},
+                clear=False,
+            ):
+                configured = setup_logger(logger_name)
+                log_to_process_file(configured, LogLevel.ERROR, "no sink")
+
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_PROCESS_LOG_FILE": str(
+                            Path(directory_name) / "battle.log"
+                        )
+                    },
+                    clear=False,
+                ),
+            ):
+                configure_logging(file_level=LogLevel.CRITICAL)
+                log_to_process_file(configured, LogLevel.ERROR, "filtered")
+                process_handler = next(
+                    handler
+                    for handler in configured.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+                process_handler.flush()
+                self.assertNotIn(
+                    "filtered",
+                    Path(process_handler.baseFilename).read_text(encoding="utf-8"),
+                )
+
+            unmanaged = logging.getLogger(f"hbrowser.tests.unmanaged.{id(self)}")
+            with self.assertRaisesRegex(ValueError, "setup_logger"):
+                log_to_process_file(unmanaged, LogLevel.ERROR, "rejected")
+        finally:
+            logger.handlers = original_handlers
+
+    def test_file_only_call_detaches_sink_after_path_is_unset(self) -> None:
+        logger_name = f"hbrowser.tests.file_only_unset.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+            ):
+                process_path = Path(directory_name) / "battle.log"
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(process_path)},
+                    clear=False,
+                ):
+                    configured = setup_logger(logger_name)
+                    process_handler = next(
+                        handler
+                        for handler in configured.handlers
+                        if isinstance(handler, logging.FileHandler)
+                    )
+
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": ""},
+                    clear=False,
+                ):
+                    log_to_process_file(
+                        configured,
+                        LogLevel.ERROR,
+                        "must not use stale sink",
+                    )
+
+                self.assertNotIn(process_handler, configured.handlers)
+                self.assertEqual(log_module._PROCESS_LOG_HANDLERS, {})
+                self.assertIsNone(process_handler.stream)
+                self.assertNotIn(
+                    "must not use stale sink",
+                    process_path.read_text(encoding="utf-8"),
+                )
+        finally:
+            logger.handlers = original_handlers
 
     def test_repeated_setup_does_not_duplicate_handlers(self) -> None:
         logger_name = f"hbrowser.tests.idempotent.{id(self)}"
@@ -212,7 +545,66 @@ class LoggerSetupTests(unittest.TestCase):
         self.assertIs(second, first)
         self.assertEqual(configured_handlers, [handler])
 
-    def test_repeated_setup_refreshes_only_managed_stdout_level(self) -> None:
+    def test_reconfiguration_attaches_file_sink_to_all_existing_loggers(self) -> None:
+        first_name = f"hbrowser.tests.reconfigure.first.{id(self)}"
+        second_name = f"hbrowser.tests.reconfigure.second.{id(self)}"
+        first = logging.getLogger(first_name)
+        second = logging.getLogger(second_name)
+        original_first_handlers = first.handlers[:]
+        original_second_handlers = second.handlers[:]
+        try:
+            first.handlers = []
+            second.handlers = []
+            with patch.dict(
+                os.environ,
+                {"HBROWSER_PROCESS_LOG_FILE": ""},
+                clear=False,
+            ):
+                setup_logger(first_name)
+                setup_logger(second_name)
+                self.assertFalse(
+                    any(
+                        isinstance(handler, logging.FileHandler)
+                        for handler in first.handlers + second.handlers
+                    )
+                )
+
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_PROCESS_LOG_FILE": str(
+                            Path(directory_name) / "battle.log"
+                        )
+                    },
+                    clear=False,
+                ),
+            ):
+                configure_logging(
+                    console_level=LogLevel.ERROR,
+                    file_level=LogLevel.DEBUG,
+                )
+                first_file_handler = next(
+                    handler
+                    for handler in first.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+                second_file_handler = next(
+                    handler
+                    for handler in second.handlers
+                    if isinstance(handler, logging.FileHandler)
+                )
+
+                self.assertIs(first_file_handler, second_file_handler)
+                self.assertEqual(first.level, logging.DEBUG)
+                self.assertEqual(second.level, logging.DEBUG)
+        finally:
+            first.handlers = original_first_handlers
+            second.handlers = original_second_handlers
+
+    def test_reconfiguration_updates_existing_managed_logger_levels(self) -> None:
         logger_name = f"hbrowser.tests.level_refresh.{id(self)}"
         logger = logging.getLogger(logger_name)
         original_handlers = logger.handlers[:]
@@ -227,7 +619,6 @@ class LoggerSetupTests(unittest.TestCase):
                 patch.dict(
                     os.environ,
                     {
-                        "HBROWSER_LOG_LEVEL": "INFO",
                         "HBROWSER_PROCESS_LOG_FILE": str(
                             Path(directory_name) / "process.log"
                         ),
@@ -244,18 +635,33 @@ class LoggerSetupTests(unittest.TestCase):
                 process_handler = next(
                     handler
                     for handler in first.handlers
-                    if isinstance(handler, logging.FileHandler)
+                    if isinstance(handler, logging.handlers.RotatingFileHandler)
                 )
 
-                os.environ["HBROWSER_LOG_LEVEL"] = "DEBUG"
+                configure_logging(
+                    console_level=LogLevel.WARNING,
+                    file_level=LogLevel.DEBUG,
+                    max_bytes=2048,
+                    backup_count=2,
+                )
                 second = setup_logger(logger_name)
-                second.debug("refreshed debug record")
+                second.debug("file-only debug record")
+                second.warning("shared warning record")
+                process_handler.flush()
 
                 self.assertIs(second, first)
                 self.assertEqual(second.level, logging.DEBUG)
-                self.assertEqual(stdout_handler.level, logging.DEBUG)
-                self.assertEqual(process_handler.level, logging.NOTSET)
-                self.assertIn("refreshed debug record", output.getvalue())
+                self.assertEqual(stdout_handler.level, logging.WARNING)
+                self.assertEqual(process_handler.level, logging.DEBUG)
+                self.assertEqual(process_handler.maxBytes, 2048)
+                self.assertEqual(process_handler.backupCount, 2)
+                self.assertNotIn("file-only debug record", output.getvalue())
+                self.assertIn("shared warning record", output.getvalue())
+                contents = Path(process_handler.baseFilename).read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn("file-only debug record", contents)
+                self.assertIn("shared warning record", contents)
         finally:
             logger.handlers = original_handlers
             logger.setLevel(original_level)
@@ -340,9 +746,12 @@ class LoggerSetupTests(unittest.TestCase):
                         {"HBROWSER_PROCESS_LOG_FILE": str(link_path)},
                         clear=False,
                     ),
-                    self.assertRaisesRegex(OSError, "regular file"),
+                    self.assertRaises(LogPersistenceError) as error_info,
                 ):
                     setup_logger(logger_name)
+                self.assertEqual(error_info.exception.operation, "configure")
+                self.assertIsInstance(error_info.exception.__cause__, OSError)
+                self.assertIn("regular file", str(error_info.exception.__cause__))
         finally:
             logger.handlers = original_handlers
 
@@ -382,10 +791,12 @@ class LoggerSetupTests(unittest.TestCase):
                         "_validate_process_log_target",
                         side_effect=replace_after_validation,
                     ),
-                    self.assertRaises(OSError),
+                    self.assertRaises(LogPersistenceError) as error_info,
                 ):
                     setup_logger(logger_name)
 
+                self.assertEqual(error_info.exception.operation, "configure")
+                self.assertIsInstance(error_info.exception.__cause__, OSError)
                 self.assertTrue(link_path.is_symlink())
                 self.assertEqual(
                     real_path.read_text(encoding="utf-8"),
@@ -419,12 +830,15 @@ class LoggerSetupTests(unittest.TestCase):
                     process_path.rename(moved_path)
                     process_path.write_text("replacement\n", encoding="utf-8")
 
-                    with self.assertRaisesRegex(
-                        OSError,
-                        "no longer names the opened file",
-                    ):
+                    with self.assertRaises(LogPersistenceError) as error_info:
                         configured.info("must not reach either file")
 
+                    self.assertEqual(error_info.exception.operation, "emit")
+                    self.assertIsInstance(error_info.exception.__cause__, OSError)
+                    self.assertIn(
+                        "no longer names the opened file",
+                        str(error_info.exception.__cause__),
+                    )
                     self.assertNotIn(
                         "must not reach either file",
                         moved_path.read_text(encoding="utf-8"),
@@ -433,6 +847,83 @@ class LoggerSetupTests(unittest.TestCase):
                         process_path.read_text(encoding="utf-8"),
                         "replacement\n",
                     )
+        finally:
+            logger.handlers = original_handlers
+
+    def test_failed_old_sink_close_remains_owned_and_can_be_retried(self) -> None:
+        logger_name = f"hbrowser.tests.process.close_retry.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+            ):
+                directory = Path(directory_name)
+                first_path = directory / "first.log"
+                second_path = directory / "second.log"
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(first_path)},
+                    clear=False,
+                ):
+                    configured = setup_logger(logger_name)
+                    first_handler = next(
+                        handler
+                        for handler in configured.handlers
+                        if isinstance(handler, logging.FileHandler)
+                    )
+
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"HBROWSER_PROCESS_LOG_FILE": str(second_path)},
+                        clear=False,
+                    ),
+                    patch.object(
+                        first_handler,
+                        "close",
+                        side_effect=OSError("simulated close failure"),
+                    ),
+                    self.assertRaises(LogPersistenceError) as error_info,
+                ):
+                    configure_logging(
+                        console_level=LogLevel.WARNING,
+                        file_level=LogLevel.ERROR,
+                        max_bytes=2048,
+                        backup_count=2,
+                    )
+
+                self.assertEqual(error_info.exception.operation, "close")
+                self.assertIs(
+                    log_module._PROCESS_LOG_HANDLERS[first_path],
+                    first_handler,
+                )
+                self.assertNotIn(first_handler, configured.handlers)
+                second_handler = log_module._PROCESS_LOG_HANDLERS[second_path]
+                self.assertIn(second_handler, configured.handlers)
+                self.assertEqual(configured.level, logging.WARNING)
+                self.assertEqual(second_handler.level, logging.ERROR)
+                self.assertEqual(second_handler.maxBytes, 2048)
+                self.assertEqual(second_handler.backupCount, 2)
+
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(second_path)},
+                    clear=False,
+                ):
+                    configure_logging(
+                        console_level=LogLevel.WARNING,
+                        file_level=LogLevel.ERROR,
+                        max_bytes=2048,
+                        backup_count=2,
+                    )
+                self.assertNotIn(first_path, log_module._PROCESS_LOG_HANDLERS)
+                self.assertIs(
+                    log_module._PROCESS_LOG_HANDLERS[second_path],
+                    second_handler,
+                )
         finally:
             logger.handlers = original_handlers
 
@@ -445,8 +936,6 @@ class LoggerSetupTests(unittest.TestCase):
             with (
                 TemporaryDirectory() as directory_name,
                 _isolated_process_log_handlers_for_testing(),
-                patch.object(log_module, "_PROCESS_LOG_MAX_BYTES", 1),
-                patch.object(log_module, "_PROCESS_LOG_BACKUP_COUNT", 2),
             ):
                 process_path = Path(directory_name) / "battle.log"
                 with patch.dict(
@@ -454,6 +943,7 @@ class LoggerSetupTests(unittest.TestCase):
                     {"HBROWSER_PROCESS_LOG_FILE": str(process_path)},
                     clear=False,
                 ):
+                    configure_logging(max_bytes=1, backup_count=2)
                     configured = setup_logger(logger_name)
                     for sequence in range(1, 5):
                         configured.info("rotation-record-%d", sequence)
@@ -493,6 +983,125 @@ class LoggerSetupTests(unittest.TestCase):
         finally:
             logger.handlers = original_handlers
 
+    def test_rollover_secures_existing_backup_before_shifting_it(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX file modes are required")
+
+        logger_name = f"hbrowser.tests.process.rotation_mode.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+            ):
+                process_path = Path(directory_name) / "battle.log"
+                first_backup = Path(f"{process_path}.1")
+                second_backup = Path(f"{process_path}.2")
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(process_path)},
+                    clear=False,
+                ):
+                    configure_logging(max_bytes=1, backup_count=2)
+                    configured = setup_logger(logger_name)
+                    configured.info("seed active log")
+                    first_backup.write_text("legacy backup\n", encoding="utf-8")
+                    first_backup.chmod(0o644)
+
+                    configured.info("trigger secure rollover")
+
+                    self.assertEqual(
+                        second_backup.read_text(encoding="utf-8"),
+                        "legacy backup\n",
+                    )
+                    for path in (process_path, first_backup, second_backup):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        finally:
+            logger.handlers = original_handlers
+
+    def test_rollover_rejects_symlink_backup_without_touching_target(self) -> None:
+        logger_name = f"hbrowser.tests.process.rotation_symlink.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+            ):
+                directory = Path(directory_name)
+                process_path = directory / "battle.log"
+                target_path = directory / "target.log"
+                target_path.write_text("must remain unchanged\n", encoding="utf-8")
+                backup_path = Path(f"{process_path}.1")
+
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(process_path)},
+                    clear=False,
+                ):
+                    configure_logging(max_bytes=1, backup_count=2)
+                    configured = setup_logger(logger_name)
+                    configured.info("seed active log")
+                    try:
+                        backup_path.symlink_to(target_path)
+                    except OSError as error:
+                        self.skipTest(f"symbolic links are unavailable: {error}")
+                    with self.assertRaises(LogPersistenceError) as error_info:
+                        configured.info("must fail before rollover")
+
+                self.assertEqual(error_info.exception.operation, "rollover")
+                self.assertTrue(backup_path.is_symlink())
+                self.assertEqual(
+                    target_path.read_text(encoding="utf-8"),
+                    "must remain unchanged\n",
+                )
+        finally:
+            logger.handlers = original_handlers
+
+    def test_rollover_rejects_hardlink_backup_without_touching_target(self) -> None:
+        logger_name = f"hbrowser.tests.process.rotation_hardlink.{id(self)}"
+        logger = logging.getLogger(logger_name)
+        original_handlers = logger.handlers[:]
+        try:
+            logger.handlers = []
+            with (
+                TemporaryDirectory() as directory_name,
+                _isolated_process_log_handlers_for_testing(),
+            ):
+                directory = Path(directory_name)
+                process_path = directory / "battle.log"
+                target_path = directory / "target.log"
+                target_path.write_text("must remain unchanged\n", encoding="utf-8")
+                backup_path = Path(f"{process_path}.1")
+
+                with patch.dict(
+                    os.environ,
+                    {"HBROWSER_PROCESS_LOG_FILE": str(process_path)},
+                    clear=False,
+                ):
+                    configure_logging(max_bytes=1, backup_count=2)
+                    configured = setup_logger(logger_name)
+                    configured.info("seed active log")
+                    try:
+                        os.link(target_path, backup_path)
+                    except OSError as error:
+                        self.skipTest(f"hard links are unavailable: {error}")
+                    with self.assertRaises(LogPersistenceError) as error_info:
+                        configured.info("must fail before rollover")
+
+                self.assertEqual(error_info.exception.operation, "rollover")
+                self.assertEqual(target_path.stat().st_nlink, 2)
+                self.assertEqual(backup_path.stat().st_nlink, 2)
+                self.assertEqual(
+                    target_path.read_text(encoding="utf-8"),
+                    "must remain unchanged\n",
+                )
+        finally:
+            logger.handlers = original_handlers
+
     def test_process_log_write_failure_is_raised(self) -> None:
         logger_name = f"hbrowser.tests.process.write_failure.{id(self)}"
         logger = logging.getLogger(logger_name)
@@ -528,12 +1137,16 @@ class LoggerSetupTests(unittest.TestCase):
                         ),
                         patch.object(process_handler, "stream", failing_stream),
                         patch.object(logging, "raiseExceptions", False),
-                        self.assertRaisesRegex(
-                            OSError,
-                            "simulated process-log write failure",
-                        ),
+                        self.assertRaises(LogPersistenceError) as error_info,
                     ):
                         configured.error("write must fail closed")
+                    self.assertEqual(error_info.exception.operation, "emit")
+                    self.assertIsInstance(error_info.exception.__cause__, OSError)
+                    self.assertEqual(
+                        str(error_info.exception.__cause__),
+                        "simulated process-log write failure",
+                    )
+                    self.assertNotIn("simulated", str(error_info.exception))
         finally:
             logger.handlers = original_handlers
 
@@ -574,12 +1187,16 @@ class LoggerSetupTests(unittest.TestCase):
                             ),
                         ),
                         patch.object(logging, "raiseExceptions", False),
-                        self.assertRaisesRegex(
-                            OSError,
-                            "simulated process-log rollover failure",
-                        ),
+                        self.assertRaises(LogPersistenceError) as error_info,
                     ):
                         configured.error("rollover must fail closed")
+                    self.assertEqual(error_info.exception.operation, "emit")
+                    self.assertIsInstance(error_info.exception.__cause__, OSError)
+                    self.assertEqual(
+                        str(error_info.exception.__cause__),
+                        "simulated process-log rollover failure",
+                    )
+                    self.assertNotIn("simulated", str(error_info.exception))
         finally:
             logger.handlers = original_handlers
 

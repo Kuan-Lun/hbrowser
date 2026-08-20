@@ -1,5 +1,7 @@
 """日誌相關工具函數"""
 
+from __future__ import annotations
+
 import logging
 import logging.handlers
 import os
@@ -9,17 +11,64 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 
 _LOG_DIR_ENVIRONMENT_VARIABLE = "HBROWSER_LOG_DIR"
 _PROCESS_LOG_FILE_ENVIRONMENT_VARIABLE = "HBROWSER_PROCESS_LOG_FILE"
-_PROCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
-_PROCESS_LOG_BACKUP_COUNT = 5
-_PROCESS_LOG_HANDLER_LOCK = Lock()
-_PROCESS_LOG_HANDLERS: dict[Path, logging.Handler] = {}
+_DEFAULT_PROCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
+_DEFAULT_PROCESS_LOG_BACKUP_COUNT = 5
+_LOGGING_CONFIGURATION_LOCK = RLock()
+_PROCESS_LOG_HANDLERS: dict[Path, _PrivateRotatingFileHandler] = {}
+_MANAGED_LOGGER_NAMES: set[str] = set()
 _MANAGED_STDOUT_HANDLER_ATTRIBUTE = "_hbrowser_managed_stdout_handler"
+_MANAGED_PROCESS_HANDLER_ATTRIBUTE = "_hbrowser_managed_process_handler"
 _LOG_CONTEXT_FIELDS = ("account", "realm", "tab_role", "activity", "scope")
+
+
+class LogLevel(StrEnum):
+    """Supported process logging thresholds."""
+
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+    @property
+    def number(self) -> int:
+        """Return the corresponding :mod:`logging` numeric level."""
+        return {
+            LogLevel.DEBUG: logging.DEBUG,
+            LogLevel.INFO: logging.INFO,
+            LogLevel.WARNING: logging.WARNING,
+            LogLevel.ERROR: logging.ERROR,
+            LogLevel.CRITICAL: logging.CRITICAL,
+        }[self]
+
+
+class LogPersistenceError(RuntimeError):
+    """A configured application-log sink could not persist a record safely."""
+
+    def __init__(self, operation: str, error: BaseException) -> None:
+        self.operation = operation
+        self.error_type = type(error).__name__
+        super().__init__(
+            "Process log persistence failed: "
+            f"operation={operation} error_type={self.error_type}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LoggingConfiguration:
+    console_level: LogLevel = LogLevel.INFO
+    file_level: LogLevel = LogLevel.DEBUG
+    max_bytes: int = _DEFAULT_PROCESS_LOG_MAX_BYTES
+    backup_count: int = _DEFAULT_PROCESS_LOG_BACKUP_COUNT
+
+
+_LOGGING_CONFIGURATION = _LoggingConfiguration()
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,18 +276,88 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
             Path(self.baseFilename),
         )
 
+    @classmethod
+    def _secure_existing_rollover_path(
+        cls,
+        path: Path,
+        *,
+        required: bool,
+    ) -> None:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            if required:
+                raise
+            return
+        if (
+            stat.S_ISLNK(path_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
+        ):
+            raise OSError(
+                "Process log rollover path must be a regular, "
+                f"single-link file: {path}"
+            )
+
+        flags = os.O_WRONLY | os.O_APPEND
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            if required:
+                raise
+            return
+        try:
+            cls._validate_open_descriptor(descriptor, path)
+            if os.name == "posix":
+                os.fchmod(descriptor, 0o600)
+            cls._validate_open_descriptor(descriptor, path)
+        finally:
+            os.close(descriptor)
+
+    def _secure_rollover_paths(self) -> None:
+        base_path = Path(self.baseFilename)
+        self._secure_existing_rollover_path(base_path, required=True)
+        self._validate_stream_path_identity()
+        for backup_index in range(1, self.backupCount + 1):
+            self._secure_existing_rollover_path(
+                Path(f"{base_path}.{backup_index}"),
+                required=False,
+            )
+
+    def doRollover(self) -> None:  # noqa: N802
+        """Rotate only private, single-link regular files."""
+        try:
+            self._secure_rollover_paths()
+            super().doRollover()
+            self._secure_rollover_paths()
+        except LogPersistenceError:
+            raise
+        except Exception as error:
+            raise LogPersistenceError("rollover", error) from error
+
     def emit(self, record: logging.LogRecord) -> None:
-        self._validate_stream_path_identity()
-        super().emit(record)
-        self._validate_stream_path_identity()
+        try:
+            self._validate_stream_path_identity()
+            super().emit(record)
+            self._validate_stream_path_identity()
+        except LogPersistenceError:
+            raise
+        except Exception as error:
+            raise LogPersistenceError("emit", error) from error
 
     def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
         """Never let a configured process-log failure remain best effort."""
         del record
         error = sys.exception()
         if error is None:
-            raise RuntimeError("Process log handler failed without an exception")
-        raise error
+            error = RuntimeError("Process log handler failed without an exception")
+        if isinstance(error, LogPersistenceError):
+            raise error
+        raise LogPersistenceError("emit", error) from error
 
 
 def _configured_process_log_path() -> Path | None:
@@ -261,24 +380,59 @@ def _validate_process_log_target(path: Path) -> None:
         raise OSError(f"Process log target must be a regular file: {path}")
 
 
-def _process_log_handler() -> logging.Handler | None:
-    path = _configured_process_log_path()
+def _process_log_handler(
+    path: Path | None,
+    configuration: _LoggingConfiguration,
+) -> _PrivateRotatingFileHandler | None:
     if path is None:
         return None
 
-    with _PROCESS_LOG_HANDLER_LOCK:
-        handler = _PROCESS_LOG_HANDLERS.get(path)
-        if handler is not None:
-            return handler
-        _validate_process_log_target(path)
-        handler = _PrivateRotatingFileHandler(
-            path,
-            maxBytes=_PROCESS_LOG_MAX_BYTES,
-            backupCount=_PROCESS_LOG_BACKUP_COUNT,
-            encoding="utf-8",
-        )
+    handler = _PROCESS_LOG_HANDLERS.get(path)
+    if handler is None:
+        try:
+            _validate_process_log_target(path)
+            handler = _PrivateRotatingFileHandler(
+                path,
+                maxBytes=configuration.max_bytes,
+                backupCount=configuration.backup_count,
+                encoding="utf-8",
+            )
+        except LogPersistenceError:
+            raise
+        except Exception as error:
+            raise LogPersistenceError("configure", error) from error
+        setattr(handler, _MANAGED_PROCESS_HANDLER_ATTRIBUTE, True)
         _PROCESS_LOG_HANDLERS[path] = handler
-        return handler
+
+    handler.acquire()
+    try:
+        handler.maxBytes = configuration.max_bytes
+        handler.backupCount = configuration.backup_count
+        handler.setLevel(configuration.file_level.number)
+    finally:
+        handler.release()
+    return handler
+
+
+def _close_inactive_process_log_handlers(active_path: Path | None) -> None:
+    inactive = tuple(
+        (path, handler)
+        for path, handler in _PROCESS_LOG_HANDLERS.items()
+        if path != active_path
+    )
+    if not inactive:
+        return
+
+    for logger_name in _MANAGED_LOGGER_NAMES:
+        logger = logging.getLogger(logger_name)
+        for _, handler in inactive:
+            logger.removeHandler(handler)
+    for path, handler in inactive:
+        try:
+            handler.close()
+        except Exception as error:
+            raise LogPersistenceError("close", error) from error
+        _PROCESS_LOG_HANDLERS.pop(path, None)
 
 
 @contextmanager
@@ -287,13 +441,44 @@ def _isolated_process_log_handlers_for_testing() -> Iterator[None]:
     try:
         yield
     finally:
-        with _PROCESS_LOG_HANDLER_LOCK:
+        with _LOGGING_CONFIGURATION_LOCK:
             handlers = tuple(_PROCESS_LOG_HANDLERS.values())
             _PROCESS_LOG_HANDLERS.clear()
         for handler in handlers:
             for logger_object in logging.Logger.manager.loggerDict.values():
                 if isinstance(logger_object, logging.Logger):
                     logger_object.removeHandler(handler)
+            handler.close()
+
+
+@contextmanager
+def _isolated_logging_state_for_testing() -> Iterator[None]:
+    """Isolate mutable process logging state for one unit test."""
+    global _LOGGING_CONFIGURATION
+
+    with _LOGGING_CONFIGURATION_LOCK:
+        previous_configuration = _LOGGING_CONFIGURATION
+        previous_logger_names = set(_MANAGED_LOGGER_NAMES)
+        previous_handlers = dict(_PROCESS_LOG_HANDLERS)
+        _LOGGING_CONFIGURATION = _LoggingConfiguration()
+        _MANAGED_LOGGER_NAMES.clear()
+        _PROCESS_LOG_HANDLERS.clear()
+    try:
+        yield
+    finally:
+        with _LOGGING_CONFIGURATION_LOCK:
+            current_handlers = tuple(_PROCESS_LOG_HANDLERS.values())
+            current_logger_names = tuple(_MANAGED_LOGGER_NAMES)
+            for logger_name in current_logger_names:
+                logger = logging.getLogger(logger_name)
+                for handler in current_handlers:
+                    logger.removeHandler(handler)
+            _PROCESS_LOG_HANDLERS.clear()
+            _MANAGED_LOGGER_NAMES.clear()
+            _LOGGING_CONFIGURATION = previous_configuration
+            _PROCESS_LOG_HANDLERS.update(previous_handlers)
+            _MANAGED_LOGGER_NAMES.update(previous_logger_names)
+        for handler in current_handlers:
             handler.close()
 
 
@@ -304,62 +489,182 @@ def _formatter() -> logging.Formatter:
     )
 
 
-def setup_logger(name: str) -> logging.Logger:
-    """
-    創建或獲取 logger
-
-    日誌級別可通過環境變量 HBROWSER_LOG_LEVEL 控制：
-    - DEBUG: 詳細的調試信息
-    - INFO: 一般信息（默認）
-    - WARNING: 警告信息
-    - ERROR: 錯誤信息
-
-    Args:
-        name: logger 名稱（通常使用 __name__）
-
-    Returns:
-        配置好的 Logger 實例
-
-    Example:
-        >>> import os
-        >>> os.environ["HBROWSER_LOG_LEVEL"] = "DEBUG"
-        >>> logger = setup_logger(__name__)
-        >>> logger.debug("這是調試信息")
-    """
-    logger = logging.getLogger(name)
-
-    # 從環境變量獲取日誌級別
-    level_str = os.getenv("HBROWSER_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_str, logging.INFO)
-    logger.setLevel(level)
-
+def _configure_managed_logger(
+    logger: logging.Logger,
+    configuration: _LoggingConfiguration,
+    process_handler: _PrivateRotatingFileHandler | None,
+    formatter: logging.Formatter,
+) -> None:
     managed_stdout_handlers = [
         handler
         for handler in logger.handlers
         if getattr(handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, False)
     ]
-    if not logger.handlers:
+    if managed_stdout_handlers:
+        stdout_handler = managed_stdout_handlers[0]
+        for duplicate in managed_stdout_handlers[1:]:
+            logger.removeHandler(duplicate)
+            duplicate.close()
+    else:
         stdout_handler = logging.StreamHandler(sys.stdout)
         setattr(stdout_handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, True)
-        stdout_handler.setLevel(level)
-        _configure_user_facing_handler(stdout_handler, _formatter())
         logger.addHandler(stdout_handler)
-    else:
-        for managed_handler in managed_stdout_handlers:
-            managed_handler.setLevel(level)
-            _configure_user_facing_handler(managed_handler, _formatter())
 
-    process_handler = _process_log_handler()
+    stdout_handler.setLevel(configuration.console_level.number)
+    _configure_user_facing_handler(stdout_handler, formatter)
+
+    for handler in tuple(logger.handlers):
+        if (
+            getattr(handler, _MANAGED_PROCESS_HANDLER_ATTRIBUTE, False)
+            and handler is not process_handler
+        ):
+            logger.removeHandler(handler)
     if process_handler is not None:
-        process_handler.setLevel(logging.NOTSET)
-        _configure_user_facing_handler(process_handler, _formatter())
+        process_handler.setLevel(configuration.file_level.number)
+        _configure_user_facing_handler(process_handler, formatter)
         if process_handler not in logger.handlers:
             logger.addHandler(process_handler)
 
-    # 防止日誌向上傳播到 root logger（避免重複輸出）
+    active_levels = [configuration.console_level.number]
+    if process_handler is not None:
+        active_levels.append(configuration.file_level.number)
+    logger.setLevel(min(active_levels))
     logger.propagate = False
 
-    return logger
+
+def _validate_managed_logger_handlers(logger: logging.Logger) -> None:
+    unmanaged_handlers = [
+        handler
+        for handler in logger.handlers
+        if not getattr(handler, _MANAGED_STDOUT_HANDLER_ATTRIBUTE, False)
+        and not getattr(handler, _MANAGED_PROCESS_HANDLER_ATTRIBUTE, False)
+    ]
+    if unmanaged_handlers:
+        raise ValueError(
+            f"Logger {logger.name!r} already has unmanaged handlers; "
+            "setup_logger requires exclusive handler ownership"
+        )
+
+
+def _apply_logging_configuration(configuration: _LoggingConfiguration) -> None:
+    managed_loggers = tuple(
+        logging.getLogger(logger_name) for logger_name in _MANAGED_LOGGER_NAMES
+    )
+    process_path = _configured_process_log_path()
+    process_handler = _process_log_handler(process_path, configuration)
+    formatter = _formatter()
+    for logger in managed_loggers:
+        _configure_managed_logger(
+            logger,
+            configuration,
+            process_handler,
+            formatter,
+        )
+    _close_inactive_process_log_handlers(process_path)
+
+
+def configure_logging(
+    *,
+    console_level: LogLevel = LogLevel.INFO,
+    file_level: LogLevel = LogLevel.DEBUG,
+    max_bytes: int = _DEFAULT_PROCESS_LOG_MAX_BYTES,
+    backup_count: int = _DEFAULT_PROCESS_LOG_BACKUP_COUNT,
+) -> None:
+    """Configure every managed logger in the current process.
+
+    The console and optional rotating file sink have independent thresholds.
+    ``HBROWSER_PROCESS_LOG_FILE`` selects the file path; when it is absent,
+    only the console threshold participates in each logger's effective level.
+    Existing managed loggers are updated immediately.
+    """
+    global _LOGGING_CONFIGURATION
+
+    if not isinstance(console_level, LogLevel):
+        raise TypeError("console_level must be a LogLevel")
+    if not isinstance(file_level, LogLevel):
+        raise TypeError("file_level must be a LogLevel")
+    for field, value in (("max_bytes", max_bytes), ("backup_count", backup_count)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{field} must be positive")
+
+    configuration = _LoggingConfiguration(
+        console_level=console_level,
+        file_level=file_level,
+        max_bytes=max_bytes,
+        backup_count=backup_count,
+    )
+    with _LOGGING_CONFIGURATION_LOCK:
+        previous_configuration = _LOGGING_CONFIGURATION
+        try:
+            _apply_logging_configuration(configuration)
+        except LogPersistenceError as error:
+            _LOGGING_CONFIGURATION = (
+                configuration if error.operation == "close" else previous_configuration
+            )
+            raise
+        else:
+            _LOGGING_CONFIGURATION = configuration
+
+
+def log_to_process_file(
+    logger: logging.Logger,
+    level: LogLevel,
+    message: str,
+) -> None:
+    """Write one record only to the configured process-file sink.
+
+    This is intended for a terminal record that another boundary renders to
+    the console in a different representation. It avoids duplicate console
+    output without adding routing fields to ordinary log records.
+    """
+    if not isinstance(logger, logging.Logger):
+        raise TypeError("logger must be a logging.Logger")
+    if not isinstance(level, LogLevel):
+        raise TypeError("level must be a LogLevel")
+    if not isinstance(message, str):
+        raise TypeError("message must be a string")
+
+    with _LOGGING_CONFIGURATION_LOCK:
+        if (
+            logger.name not in _MANAGED_LOGGER_NAMES
+            or logging.getLogger(logger.name) is not logger
+        ):
+            raise ValueError("logger must be registered by setup_logger")
+        process_path = _configured_process_log_path()
+        _apply_logging_configuration(_LOGGING_CONFIGURATION)
+        if process_path is None:
+            return
+        process_handler = _PROCESS_LOG_HANDLERS[process_path]
+        if level.number < process_handler.level:
+            return
+        record = logger.makeRecord(
+            logger.name,
+            level.number,
+            "",
+            0,
+            message,
+            (),
+            None,
+        )
+        process_handler.handle(record)
+
+
+def setup_logger(name: str) -> logging.Logger:
+    """Create or retrieve one logger managed by the process configuration."""
+    if not isinstance(name, str):
+        raise TypeError("name must be a string")
+    if not name.strip():
+        raise ValueError("name must not be empty")
+
+    with _LOGGING_CONFIGURATION_LOCK:
+        logger = logging.getLogger(name)
+        if name not in _MANAGED_LOGGER_NAMES:
+            _validate_managed_logger_handlers(logger)
+        _MANAGED_LOGGER_NAMES.add(name)
+        _apply_logging_configuration(_LOGGING_CONFIGURATION)
+        return logger
 
 
 def get_log_dir() -> Path:

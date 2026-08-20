@@ -53,17 +53,15 @@ HBrowser requires the following environment variables:
 
 - `EH_USERNAME`: Your E-Hentai account username
 - `EH_PASSWORD`: Your E-Hentai account password
-- `HBROWSER_LOG_LEVEL` (optional): Control logging verbosity (DEBUG, INFO, WARNING, ERROR). Default: INFO
 - `HBROWSER_LOG_DIR` (optional): Store HTML failure diagnostics in this
   directory. Default: a `log` directory next to the main script
 - `HBROWSER_CAPTURE_PUNCHIN_PAGES` (optional): Set to `1`, `true`, `yes`, or
   `on` to save the initial and, when needed, reloaded daily check-in documents
   in `HBROWSER_LOG_DIR`. Encounter query values are redacted, but the remaining
   HTML is account-specific and must be kept private
-- `HBROWSER_PROCESS_LOG_FILE` (optional): Mirror all HBrowser-family logger
-  records to this UTF-8 file. The file rotates at 10 MiB with five backups;
-  applications should leave it unset when an external supervisor already
-  captures stdout/stderr
+- `HBROWSER_PROCESS_LOG_FILE` (optional): Select the private UTF-8 application
+  log owned by HBrowser's Python file handler. The default configuration writes
+  DEBUG and above to this file and rotates it at 10 MiB with five backups
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
 - `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used to auto-solve Cloudflare managed challenges and the Forums login Turnstile. Ignored when Tor or a residential proxy is active
@@ -75,7 +73,6 @@ Set the environment variables before running the script:
 ```bash
 export EH_USERNAME=your_username
 export EH_PASSWORD=your_password
-export HBROWSER_LOG_LEVEL=INFO          # Optional
 export HBROWSER_LOG_DIR=/path/to/log    # Optional: shared diagnostic directory
 export USE_TOR=0                        # Optional: disable Tor proxy
 export TOR_BINARY_PATH=/path/to/tor     # Optional: custom tor path
@@ -87,7 +84,6 @@ export FLARESOLVERR_URL=http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudfl
 ```fish
 set -x EH_USERNAME your_username
 set -x EH_PASSWORD your_password
-set -x HBROWSER_LOG_LEVEL INFO          # Optional
 set -x USE_TOR 0                        # Optional: disable Tor proxy
 set -x TOR_BINARY_PATH /path/to/tor     # Optional: custom tor path
 set -x FLARESOLVERR_URL http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudflare
@@ -98,7 +94,6 @@ set -x FLARESOLVERR_URL http://127.0.0.1:8191/v1  # Optional: auto-solve Cloudfl
 ```cmd
 set EH_USERNAME=your_username
 set EH_PASSWORD=your_password
-set HBROWSER_LOG_LEVEL=INFO
 set USE_TOR=0
 set TOR_BINARY_PATH=C:\path\to\tor.exe
 set FLARESOLVERR_URL=http://127.0.0.1:8191/v1
@@ -109,7 +104,6 @@ set FLARESOLVERR_URL=http://127.0.0.1:8191/v1
 ```powershell
 $env:EH_USERNAME="your_username"
 $env:EH_PASSWORD="your_password"
-$env:HBROWSER_LOG_LEVEL="INFO"
 $env:USE_TOR="0"
 $env:TOR_BINARY_PATH="C:\path\to\tor.exe"
 $env:FLARESOLVERR_URL="http://127.0.0.1:8191/v1"
@@ -123,47 +117,91 @@ HBrowser does not restart Chrome or claim that a proxy was rotated.
 
 ## Logging
 
-HBrowser uses Python's built-in `logging` module. You can control the log level using the `HBROWSER_LOG_LEVEL` environment variable:
+HBrowser uses Python's built-in `logging` module with independent console and
+application-file thresholds. By default, the console displays INFO and above,
+while a configured application file records DEBUG and above. Configure the
+process explicitly with `configure_logging()`:
 
-- **DEBUG**: Detailed information for diagnosing problems (most verbose)
-- **INFO**: Confirmation that things are working as expected (default)
-- **WARNING**: Something unexpected happened, but the software is still working
-- **ERROR**: A serious problem that prevented a function from executing
+```python
+from hbrowser import LogLevel, configure_logging
 
-Example:
-
-```bash
-# Set log level to DEBUG for detailed output
-export HBROWSER_LOG_LEVEL=DEBUG
-python your_script.py
-
-# Set log level to WARNING to see only warnings and errors
-export HBROWSER_LOG_LEVEL=WARNING
-python your_script.py
+configure_logging(
+    console_level=LogLevel.INFO,
+    file_level=LogLevel.DEBUG,
+    max_bytes=10 * 1024 * 1024,
+    backup_count=5,
+)
 ```
 
-Applications without an external process-log supervisor can also request a
-rotating text file for HBrowser-family logger records:
+`LogLevel` supports `DEBUG`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL`.
+`configure_logging()` immediately updates loggers that HBrowser, HVBrowser,
+HVBattle, or the application already created. When no application file is
+configured, only the console threshold determines the effective logger level.
+When a logger name is first registered, `setup_logger()` rejects a pre-existing
+unmanaged stream or file handler without modifying that logger. Handlers added
+after registration by test instrumentation are preserved; process
+reconfiguration only updates HBrowser-managed handlers.
+
+Set the application-log path before importing HBrowser-family packages when
+the earliest import-time records must also be retained:
 
 ```bash
 export HBROWSER_PROCESS_LOG_FILE=/private/path/battle.log
 ```
 
-One file handler is shared by all HBrowser, HVBrowser, and HVBattle loggers in
-the process, so each record is written once. Existing targets must be regular,
-single-link files rather than symbolic links. The handler verifies that the
-configured path still names its open file before and after each record. Where
-the platform provides them, opening also uses `O_NOFOLLOW` and `O_CLOEXEC`; on
-POSIX, active and rotated files use owner-only permissions. Open, write, path
-replacement, and rollover failures are raised to the logging caller instead of
-being silently ignored.
+One rotating file handler is shared by all managed loggers in the process, so
+each record is written once. The active file plus the five default backups use
+approximately 60 MiB at most, aside from a record that crosses a rotation
+boundary. Existing targets must be regular, single-link files rather than
+symbolic links. The handler verifies that the configured path still names its
+open file before and after each record. Where the platform provides them,
+opening also uses `O_NOFOLLOW` and `O_CLOEXEC`; on POSIX, active and rotated
+files use owner-only permissions. Before and after rollover, every configured
+backup slot is checked as a regular, single-link, non-symlink file and secured
+to mode `0600` on POSIX. A successful rollover prunes the oldest backup in the
+configured window. Lowering `backup_count` does not delete older suffixes that
+are already outside the new window; application-level run retention should
+remove those after the process no longer owns the log.
+
+Each record is flushed from Python's stream before the logging call returns;
+there is deliberately no multi-megabyte in-memory batch that could disappear
+with the final diagnostics during a crash. This is not an `fsync` guarantee,
+so the operating system may still hold data in its page cache. Configure file
+rotation or application-level run retention to bound disk usage rather than
+using a write buffer.
+
+Open, write, path replacement, rollover, and reconfiguration-close failures
+raise the public `LogPersistenceError`. Supervisors should classify this
+exception as terminal instead of retrying uncertain work. When switching paths,
+the new sink is attached and the old sink is detached before the old sink is
+closed. If that close fails, the new sink remains usable and the old handler
+remains strongly owned for a later cleanup attempt, but the failed
+reconfiguration is still terminal for the current command. The Python handler
+must be the only writer to its configured file; a supervisor may allocate and
+export the path, but must not concurrently append or `tee` output into that same
+file.
+
+When a command boundary must print a machine-readable terminal result without
+duplicating it through the console formatter, it can persist a separately
+formatted file record explicitly:
+
+```python
+from hbrowser import LogLevel, log_to_process_file
+
+log_to_process_file(logger, LogLevel.ERROR, terminal_json)
+print(terminal_json)
+```
+
+`logger` must come from `setup_logger()`. The helper respects the configured
+file threshold, never emits through the console handler, and is a no-op when no
+process file is configured.
 
 This optional handler records logger output only. It does not capture arbitrary
 stdout/stderr, subprocess output, or exceptions raised before logging is
-configured, and it does not provide an `fsync`-based process transcript. Use an
-external checked supervisor when those guarantees or terminal fail-closed
-behavior are required. The parent directory remains part of the application's
-trust boundary, and Windows file confidentiality depends on its inherited ACLs.
+configured. Applications should route terminal status and uncaught exceptions
+through a managed logger when those records belong in the application log. The
+parent directory remains part of the application's trust boundary, and Windows
+file confidentiality depends on its inherited ACLs.
 
 On browser failures, HBrowser saves uniquely named HTML diagnostics instead of
 overwriting a single `error.txt`. Page diagnostics and search diagnostics each

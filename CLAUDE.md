@@ -40,7 +40,8 @@ uv run black .
 ## Environment Variables
 
 - `EH_USERNAME` / `EH_PASSWORD` - Login credentials for E-Hentai
-- `HBROWSER_LOG_LEVEL` - Optional: DEBUG, INFO, WARNING, ERROR (default: INFO)
+- `HBROWSER_PROCESS_LOG_FILE` - Optional private rotating application-log path;
+  configure independent console/file thresholds with `configure_logging()`
 - `FLARESOLVERR_URL` - Optional: FlareSolverr 3.5.0+ endpoint (e.g. `http://127.0.0.1:8191/v1`) for automated Cloudflare challenge solving; unset disables it. For local testing, run `docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr` and set this to `http://127.0.0.1:8191/v1`
 
 ## Architecture

@@ -12,7 +12,11 @@ __all__ = [
     "GallerySearchError",
     "GallerySearchResult",
     "InvalidSearchRequestError",
+    "LogLevel",
+    "LogPersistenceError",
     "MalformedSearchPageError",
+    "configure_logging",
+    "log_to_process_file",
     "notify",
     "PunchInComplete",
     "PunchInResult",
@@ -57,5 +61,11 @@ from .gallery import (
     RandomEncounterFound,
     SearchRequest,
     Tag,
+)
+from .gallery.utils import (
+    LogLevel,
+    LogPersistenceError,
+    configure_logging,
+    log_to_process_file,
 )
 from .notify import notify
