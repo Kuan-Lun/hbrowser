@@ -1,8 +1,10 @@
 import unittest
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 from hbrowser.gallery.captcha import CaptchaDetector
+from hbrowser.gallery.utils import ZendriverOperationTimeout
 
 
 @dataclass
@@ -94,3 +96,25 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
         detection = await CaptchaDetector().detect(page)
 
         self.assertEqual(detection.kind, "turnstile_widget")
+
+    async def test_dynamic_turnstile_timeout_is_terminal(self) -> None:
+        timeout = ZendriverOperationTimeout(timeout_seconds=2)
+        page = _Page("<html></html>")
+        page.select = AsyncMock(side_effect=timeout)  # type: ignore[method-assign]
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await CaptchaDetector()._find_turnstile_widget(page, page.html, 0)
+
+        self.assertIs(raised.exception, timeout)
+        page.select.assert_awaited_once()
+
+    async def test_dynamic_recaptcha_timeout_is_terminal(self) -> None:
+        timeout = ZendriverOperationTimeout(timeout_seconds=2)
+        page = _Page("<html></html>")
+        page.select = AsyncMock(side_effect=timeout)  # type: ignore[method-assign]
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await CaptchaDetector()._find_recaptcha_div(page, 0)
+
+        self.assertIs(raised.exception, timeout)
+        page.select.assert_awaited_once()

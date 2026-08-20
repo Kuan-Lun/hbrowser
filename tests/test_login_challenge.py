@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from hbrowser.exceptions import (
     BrowserIdentityApplyException,
     LoginFailedException,
+    LoginTokenInjectionOutcomeUnknownError,
 )
 from hbrowser.gallery.browser.flaresolverr import FlareSolverrSessionUnavailable
 from hbrowser.gallery.captcha import (
@@ -173,21 +174,30 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(solver.calls), 1)
         sleep.assert_not_awaited()
 
-    async def test_token_is_not_exposed_when_cdp_injection_fails(self) -> None:
+    async def test_token_injection_failure_is_redacted_and_never_falls_back(
+        self,
+    ) -> None:
         page = _Page(
             "",
             RuntimeError("protocol params included generated-token"),
+            "manual-token-must-not-be-read",
         )
         solver = _Solver(token="generated-token")
 
-        with self.assertRaises(LoginFailedException) as raised:
-            await _handler(
-                "turnstile_widget",
-                solver=solver,
-                headless=True,
-            ).resolve(page)
+        with (
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginTokenInjectionOutcomeUnknownError) as raised,
+        ):
+            await _handler("turnstile_widget", solver=solver).resolve(page)
 
         self.assertNotIn("generated-token", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(len(page.expressions), 2)
+        sleep.assert_not_awaited()
 
     async def test_existing_recaptcha_token_needs_no_solver(self) -> None:
         page = _Page("existing-recaptcha-token")

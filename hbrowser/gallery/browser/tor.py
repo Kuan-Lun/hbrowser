@@ -18,6 +18,7 @@ logger = setup_logger(__name__)
 
 # Tor SOCKS proxy 預設端口
 TOR_SOCKS_PORT = 9150
+_TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
 
 # Tor 執行檔路徑（使用者需自行安裝 Tor Browser）
 _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
@@ -39,13 +40,74 @@ _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyTyp
 )
 
 
-def terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
-    """終止 Tor 子程序，正常 terminate 逾時才強制 kill。"""
+class _TorProcessCleanupError(Exception):
+    """A failed bootstrap left a Tor process whose termination was not proven."""
+
+
+class _TorProcessAtexitCleanup:
+    """Retain exact Tor process ownership until it has been proven reaped."""
+
+    def __init__(self, tor_process: subprocess.Popen[bytes]) -> None:
+        self._tor_process: subprocess.Popen[bytes] | None = tor_process
+        self._registered = False
+        self._lock = threading.Lock()
+
+    def __call__(self) -> None:
+        """Reap during interpreter shutdown without mutating atexit's registry."""
+        self._reap()
+
+    def register(self) -> None:
+        atexit.register(self)
+        with self._lock:
+            self._registered = True
+
+    def cleanup(self) -> None:
+        """Reap normally, then release the durable atexit registration."""
+        self._reap()
+        self._unregister()
+
+    def _reap(self) -> None:
+        with self._lock:
+            if self._tor_process is None:
+                return
+            _terminate_tor_process(self._tor_process)
+            self._tor_process = None
+
+    def _unregister(self) -> None:
+        with self._lock:
+            if not self._registered:
+                return
+            self._registered = False
+        try:
+            atexit.unregister(self)
+        except Exception:
+            # The exact process reference was already released. A stale no-op
+            # callback is preferable to reporting an unproven process cleanup.
+            logger.exception("Failed to unregister completed Tor cleanup callback")
+
+
+def _terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
     try:
         tor_process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
         tor_process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        tor_process.kill()
+        try:
+            tor_process.kill()
+        except ProcessLookupError:
+            pass
+        tor_process.wait(timeout=5)
+
+
+def terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
+    """終止 Tor 子程序，正常 terminate 逾時才強制 kill。"""
+    process_cleanup = getattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, None)
+    if isinstance(process_cleanup, _TorProcessAtexitCleanup):
+        process_cleanup.cleanup()
+        return
+    _terminate_tor_process(tor_process)
 
 
 def _find_tor_binary() -> str:
@@ -99,68 +161,98 @@ def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+    process_cleanup: _TorProcessAtexitCleanup | None = None
+    cleanup_registered = False
+    try:
+        process_cleanup = _TorProcessAtexitCleanup(tor_process)
+        setattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, process_cleanup)
 
-    if tor_process.stdout is None:
-        raise RuntimeError("Failed to capture Tor process output")
+        # Register before bootstrap can fail. The retained callable stays retryable
+        # when synchronous cleanup cannot prove that this exact process was reaped.
+        process_cleanup.register()
+        cleanup_registered = True
 
-    # 使用背景 thread 讀取 stdout（跨平台，避免 fcntl/select）
-    line_queue: deque[str] = deque()
-    reader_done = threading.Event()
+        if tor_process.stdout is None:
+            raise RuntimeError("Failed to capture Tor process output")
 
-    def _reader() -> None:
-        assert tor_process.stdout is not None
-        for raw_line in tor_process.stdout:
-            line_queue.append(raw_line.decode("utf-8", errors="replace").strip())
-        reader_done.set()
+        # 使用背景 thread 讀取 stdout（跨平台，避免 fcntl/select）
+        line_queue: deque[str] = deque()
+        reader_done = threading.Event()
 
-    thread = threading.Thread(target=_reader, daemon=True)
-    thread.start()
+        def _reader() -> None:
+            assert tor_process.stdout is not None
+            for raw_line in tor_process.stdout:
+                line_queue.append(raw_line.decode("utf-8", errors="replace").strip())
+            reader_done.set()
 
-    # 等待 Tor bootstrap 完成
-    bootstrap_timeout = 120
-    start_time = time.time()
-    last_status_time = start_time
-    last_bootstrap_pct = "0%"
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
 
-    while time.time() - start_time < bootstrap_timeout:
-        if tor_process.poll() is not None:
-            raise RuntimeError(
-                f"Tor process exited unexpectedly "
-                f"with code {tor_process.returncode}"
+        # 等待 Tor bootstrap 完成
+        bootstrap_timeout = 120
+        start_time = time.time()
+        last_status_time = start_time
+        last_bootstrap_pct = "0%"
+
+        while time.time() - start_time < bootstrap_timeout:
+            if tor_process.poll() is not None:
+                raise RuntimeError(
+                    f"Tor process exited unexpectedly "
+                    f"with code {tor_process.returncode}"
+                )
+
+            now = time.time()
+            if now - last_status_time >= 10:
+                elapsed = int(now - start_time)
+                remaining = bootstrap_timeout - elapsed
+                logger.info(
+                    f"Tor bootstrapping... {last_bootstrap_pct} "
+                    f"({elapsed}s elapsed, {remaining}s remaining)"
+                )
+                last_status_time = now
+
+            # 處理佇列中的所有行
+            while line_queue:
+                line = line_queue.popleft()
+                if not line:
+                    continue
+
+                if "Bootstrapped 100%" in line:
+                    elapsed = int(time.time() - start_time)
+                    logger.info(f"Tor bootstrap completed successfully ({elapsed}s)")
+                    return tor_process
+
+                if "Bootstrapped " in line:
+                    match = re.search(r"Bootstrapped (\d+%)", line)
+                    if match:
+                        last_bootstrap_pct = match.group(1)
+
+                logger.debug(f"Tor: {line}")
+
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            f"Tor failed to bootstrap within {bootstrap_timeout} seconds"
+        )
+    except BaseException as startup_error:
+        try:
+            if cleanup_registered:
+                assert process_cleanup is not None
+                process_cleanup.cleanup()
+            else:
+                # Construction, attachment, and registration are the only
+                # points before durable ownership exists. Reap the exact Popen
+                # directly when any of them fails.
+                _terminate_tor_process(tor_process)
+        except BaseException as cleanup_error:
+            ownership_error = _TorProcessCleanupError(
+                "Tor bootstrap failed and its process could not be reaped"
             )
-
-        now = time.time()
-        if now - last_status_time >= 10:
-            elapsed = int(now - start_time)
-            remaining = bootstrap_timeout - elapsed
-            logger.info(
-                f"Tor bootstrapping... {last_bootstrap_pct} "
-                f"({elapsed}s elapsed, {remaining}s remaining)"
+            ownership_error.add_note(
+                "Bootstrap failure type: " f"{type(startup_error).__name__}"
             )
-            last_status_time = now
-
-        # 處理佇列中的所有行
-        while line_queue:
-            line = line_queue.popleft()
-            if not line:
-                continue
-
-            if "Bootstrapped 100%" in line:
-                elapsed = int(time.time() - start_time)
-                logger.info(f"Tor bootstrap completed successfully ({elapsed}s)")
-                return tor_process
-
-            if "Bootstrapped " in line:
-                match = re.search(r"Bootstrapped (\d+%)", line)
-                if match:
-                    last_bootstrap_pct = match.group(1)
-
-            logger.debug(f"Tor: {line}")
-
-        time.sleep(0.5)
-
-    tor_process.terminate()
-    raise RuntimeError(f"Tor failed to bootstrap within {bootstrap_timeout} seconds")
+            raise ownership_error from cleanup_error
+        raise
 
 
 def should_use_tor() -> bool:
@@ -211,6 +303,4 @@ def start_tor_with_retry(
 
     assert tor_process is not None
 
-    # 註冊 atexit 確保 Tor 進程被清理
-    atexit.register(terminate_tor_process, tor_process)
     return tor_process

@@ -4,7 +4,7 @@ import asyncio
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +28,8 @@ from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
 from ..exceptions import (
+    ArchiveDownloadOutcomeUnknownError,
+    BrowserMutationOutcomeUnknownError,
     ClientOfflineException,
     GalleryLookupError,
     InsufficientFundsException,
@@ -55,14 +57,20 @@ from .search_models import (
     SearchRequest,
 )
 from .utils import (
+    ZendriverOperationTimeout,
     get_log_dir,
-    is_connection_error,
+    is_browser_generation_error,
     log_context,
     wait_for_new_tab,
     wait_for_zendriver,
 )
+from .utils.mutation import wait_for_zendriver_mutation
+from .utils.protocol import _begin_zendriver_retirement
 
 _PAGE_READ_TIMEOUT_SECONDS = 5.0
+_PAGE_MUTATION_TIMEOUT_SECONDS = 15.0
+_LONG_SELECT_TIMEOUT_SECONDS = 10.0
+_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS = 12.0
 
 MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
@@ -80,6 +88,29 @@ _SEARCH_DIAGNOSTIC_LOCK_FILENAME = ".hbrowser-search-diagnostics.lock"
 _SEARCH_DIAGNOSTIC_THREAD_LOCK = Lock()
 _SEARCH_DIAGNOSTIC_MAX_SEQUENCE = (1 << 64) - 1
 _SEARCH_DOCUMENT_READY_STATES = frozenset({"interactive", "complete"})
+
+
+async def _wait_for_archive_mutation[ResultT](
+    awaitable: Awaitable[ResultT],
+    *,
+    owner: Any,
+    operation: str,
+    failure_message: str,
+) -> ResultT:
+    """Run an archive mutation and raise a redacted domain marker on failure."""
+
+    try:
+        return await wait_for_zendriver_mutation(
+            awaitable,
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=owner,
+            operation=operation,
+        )
+    except BrowserMutationOutcomeUnknownError:
+        pass
+
+    raise ArchiveDownloadOutcomeUnknownError(failure_message)
+
 
 _GALLERY_PATH_PATTERN = re.compile(r"/g/\d+/[A-Za-z0-9]+/?")
 _GALLERY_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
@@ -664,15 +695,14 @@ class EHDriver(Driver):
             return path
 
     async def _close_page_safely(self, page: object) -> None:
-        try:
-            await page.close()  # type: ignore[attr-defined]
-        except Exception as error:
-            if is_connection_error(error):
-                raise
-            self.logger.debug(
-                "Failed to close page (non-fatal): error_type=%s",
-                type(error).__name__,
-            )
+        await _wait_for_archive_mutation(
+            page.close(),  # type: ignore[attr-defined]
+            owner=page,
+            operation="Archive tab close",
+            failure_message=(
+                "Archive tab close outcome is unknown; refusing gallery activation"
+            ),
+        )
 
     def _browser_has_tab(self, page: object) -> bool:
         page_target = getattr(page, "target", None)
@@ -691,32 +721,24 @@ class EHDriver(Driver):
         gallery_tab: Any,
         archive_tab: Any,
     ) -> None:
-        cleanup_error: BaseException | None = None
         if self._browser_has_tab(archive_tab):
-            try:
-                await self._close_page_safely(archive_tab)
-            except BaseException as error:
-                cleanup_error = error
+            await self._close_page_safely(archive_tab)
 
         self.page = gallery_tab
-        try:
-            await gallery_tab.activate()
-        except BaseException as error:
-            if cleanup_error is None:
-                cleanup_error = error
-            else:
-                cleanup_error.add_note(
-                    "Gallery activation also failed during archive cleanup: "
-                    f"{type(error).__name__}"
-                )
-
-        if cleanup_error is not None:
-            raise cleanup_error
+        await _wait_for_archive_mutation(
+            gallery_tab.activate(),
+            owner=gallery_tab,
+            operation="Gallery tab activation",
+            failure_message=(
+                "Gallery tab activation outcome is unknown after archive cleanup"
+            ),
+        )
 
     async def _current_loader_id(self) -> str:
         frame_tree = await wait_for_zendriver(
             self.page.send(cdp.page.get_frame_tree()),
             timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         return str(frame_tree.frame.loader_id)
 
@@ -740,7 +762,7 @@ class EHDriver(Driver):
                 snapshot = await self._read_raw_page_snapshot()
                 loader_after = await self._current_loader_id()
             except Exception as error:
-                if is_connection_error(error):
+                if is_browser_generation_error(error):
                     raise
                 if _is_transient_context_error(error):
                     await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
@@ -764,6 +786,7 @@ class EHDriver(Driver):
         page_data = await wait_for_zendriver(
             self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT),
             timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         if not isinstance(page_data, dict):
             raise TypeError("Search-page snapshot was not an object")
@@ -864,7 +887,7 @@ class EHDriver(Driver):
             try:
                 current_loader_id = await self._current_loader_id()
             except Exception as error:
-                if is_connection_error(error):
+                if is_browser_generation_error(error):
                     raise
                 if not _is_transient_context_error(error):
                     raise SearchNavigationError(
@@ -903,18 +926,22 @@ class EHDriver(Driver):
             )
             diagnostic_path = await self._save_search_diagnostic(snapshot.html)
         except Exception as error:
-            if is_connection_error(error):
+            if is_browser_generation_error(error):
                 raise
             reason += f"; could not capture timeout diagnostic: {error!r}"
         if last_error is not None:
             reason += f"; last transient context error: {last_error!r}"
+        _begin_zendriver_retirement(self.page)
+        outcome_unknown = BrowserMutationOutcomeUnknownError(
+            "Gallery search navigation completed without an observable loader change"
+        )
         raise SearchNavigationError(
             url=target_url,
             reason=reason,
             diagnostic_path=(
                 str(diagnostic_path) if diagnostic_path is not None else None
             ),
-        )
+        ) from outcome_unknown
 
     async def _read_stable_search_page(
         self,
@@ -935,7 +962,7 @@ class EHDriver(Driver):
                 snapshot = await self._read_search_page()
                 loader_after = await self._current_loader_id()
             except Exception as error:
-                if is_connection_error(error):
+                if is_browser_generation_error(error):
                     raise
                 if _is_transient_context_error(error):
                     last_transient_error = error
@@ -981,16 +1008,27 @@ class EHDriver(Driver):
                 f"; loader before={last_loader_before!r}"
                 f"; loader after={last_loader_after!r}"
             )
-            diagnostic_path = await self._save_search_diagnostic(last_snapshot.html)
+            try:
+                diagnostic_path = await self._save_search_diagnostic(last_snapshot.html)
+            except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
+                reason += (
+                    "; could not save timeout diagnostic: " f"{type(error).__name__}"
+                )
         if last_transient_error is not None:
             reason += f"; last transient context error: {last_transient_error!r}"
+        _begin_zendriver_retirement(self.page)
+        outcome_unknown = BrowserMutationOutcomeUnknownError(
+            "Gallery search navigation completed without a stable observable document"
+        )
         raise SearchNavigationError(
             url=target_url,
             reason=reason,
             diagnostic_path=(
                 str(diagnostic_path) if diagnostic_path is not None else None
             ),
-        )
+        ) from outcome_unknown
 
     async def _navigate_search_url(
         self,
@@ -1003,7 +1041,7 @@ class EHDriver(Driver):
                 old_loader_id = await self._current_loader_id()
                 break
             except Exception as error:
-                if is_connection_error(error):
+                if is_browser_generation_error(error):
                     raise
                 if (
                     not _is_transient_context_error(error)
@@ -1019,27 +1057,27 @@ class EHDriver(Driver):
                 await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
         assert old_loader_id is not None
 
-        for attempt in range(SEARCH_NAVIGATION_RETRIES + 1):
-            try:
-                await self.get(url)
-                break
-            except Exception as error:
-                if is_connection_error(error):
-                    raise
-                if (
-                    not _is_transient_context_error(error)
-                    or attempt == SEARCH_NAVIGATION_RETRIES
-                ):
-                    raise SearchNavigationError(
-                        url=url,
-                        reason=f"trusted GET failed: {error!r}",
-                    ) from error
-                self.logger.warning(
-                    "Transient browser context loss during search navigation; "
-                    "retrying the trusted GET once: query_length=%d error_type=%s",
-                    len(diagnostic_query),
-                    type(error).__name__,
-                )
+        navigation_failure_type: str | None = None
+        try:
+            await self.get(url)
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            navigation_failure_type = type(error).__name__
+        if navigation_failure_type is not None:
+            # GET is a remote mutation. A transport/context failure cannot prove
+            # whether Chrome already navigated, so replaying it is forbidden.
+            _begin_zendriver_retirement(self.page)
+            outcome_unknown = BrowserMutationOutcomeUnknownError(
+                "Gallery search navigation was invoked, but its outcome is unknown"
+            )
+            raise SearchNavigationError(
+                url=url,
+                reason=(
+                    "trusted GET failed after invocation; navigation outcome is "
+                    f"unknown ({navigation_failure_type})"
+                ),
+            ) from outcome_unknown
         await self._wait_for_new_loader(old_loader_id, url)
         return await self._read_stable_search_page(
             url,
@@ -1328,25 +1366,33 @@ class EHDriver(Driver):
         self.logger.info("Checking H@H client status")
         await self.get("https://e-hentai.org/hentaiathome.php")
         table = await wait_for_zendriver(
-            self.page.select("#hct", timeout=10),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            self.page.select("#hct", timeout=_LONG_SELECT_TIMEOUT_SECONDS),
+            timeout=_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         header_row = await wait_for_zendriver(
-            table.query_selector("tr"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            table.query_selector("tr"),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            owner=table,
         )
         headers = await wait_for_zendriver(
             header_row.query_selector_all("th"),
             timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            owner=header_row,
         )
         status_index = [
             index for index, th in enumerate(headers) if th.text == "Status"
         ][0]
         rows = await wait_for_zendriver(
-            table.query_selector_all("tr"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            table.query_selector_all("tr"),
+            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            owner=table,
         )
         for row in rows[1:]:
             cells = await wait_for_zendriver(
-                row.query_selector_all("td"), timeout=_PAGE_READ_TIMEOUT_SECONDS
+                row.query_selector_all("td"),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                owner=row,
             )
             status = cells[status_index].text
             if status.lower() == "online":
@@ -1381,7 +1427,12 @@ class EHDriver(Driver):
         # 刷新以免沒簽到成功
         initial_loader_id = await self._current_loader_id()
         self.logger.debug("Refreshing the daily check-in page")
-        await self.wait(self.page.reload, ischangeurl=False)
+        await self.wait(
+            self.page.reload,
+            ischangeurl=False,
+            owner=self.page,
+            operation_timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+        )
         self.logger.debug("Daily check-in page refresh completed")
 
         html_content = await self._read_stable_punchin_document(
@@ -1583,6 +1634,7 @@ class EHDriver(Driver):
             results = await wait_for_zendriver(
                 self.page.xpath(xpath_query, timeout=2),
                 timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
             if results:
                 self.logger.warning(
@@ -1590,6 +1642,8 @@ class EHDriver(Driver):
                     gallery.gid,
                 )
                 return False
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError:
             pass
 
@@ -1601,15 +1655,12 @@ class EHDriver(Driver):
             archive_links = await wait_for_zendriver(
                 self.page.xpath(key_xpath, timeout=2),
                 timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
-            if archive_links:
-                await wait_for_zendriver(
-                    archive_links[0].click(), timeout=_PAGE_READ_TIMEOUT_SECONDS
-                )
-            else:
-                raise RuntimeError("Archive Download not found")
+        except ZendriverOperationTimeout:
+            raise
         except Exception as error:
-            if is_connection_error(error):
+            if is_browser_generation_error(error):
                 raise
             self.logger.warning(
                 "Archive Download control unavailable; retrying: "
@@ -1621,35 +1672,93 @@ class EHDriver(Driver):
             )
             return None
 
+        if not archive_links:
+            self.logger.warning(
+                "Archive Download control unavailable; retrying: "
+                "gid=%d attempt=%d/%d error_type=%s",
+                gallery.gid,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+                "RuntimeError",
+            )
+            return None
+
+        try:
+            await _wait_for_archive_mutation(
+                archive_links[0].click(),
+                owner=archive_links[0],
+                operation="Archive Download click",
+                failure_message=(
+                    "Archive download outcome is unknown after click failure; "
+                    "refusing replay"
+                ),
+            )
+        except ArchiveDownloadOutcomeUnknownError as error:
+            self.logger.warning(
+                "Archive Download click failed after invocation; not replaying: "
+                "gid=%d attempt=%d/%d error_type=%s",
+                gallery.gid,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+                type(error).__name__,
+            )
+            raise
+
         new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
             self.logger.warning(
-                "Archive download tab did not open; retrying: " "gid=%d attempt=%d/%d",
+                "Archive download tab did not appear after click; not replaying: "
+                "gid=%d attempt=%d/%d",
                 gallery.gid,
                 attempt,
                 MAX_DOWNLOAD_RETRIES,
             )
-            return None
+            _begin_zendriver_retirement(archive_links[0])
+            raise ArchiveDownloadOutcomeUnknownError(
+                "Archive download outcome is unknown because its tab did not appear; "
+                "refusing replay"
+            )
 
         self.page = new_tab
-        retrytime: int | None = None
+        deferred_operation_error: BaseException | None = None
+        terminal_cleanup_error: BaseException | None = None
         try:
-            await new_tab.activate()
+            await _wait_for_archive_mutation(
+                new_tab.activate(),
+                owner=new_tab,
+                operation="Archive tab activation",
+                failure_message=(
+                    "Archive download outcome is unknown after tab activation; "
+                    "refusing further browser mutations"
+                ),
+            )
             original_links = await wait_for_zendriver(
-                self.page.xpath("//a[contains(text(), 'Original')]", timeout=10),
-                timeout=12.0,
+                self.page.xpath(
+                    "//a[contains(text(), 'Original')]",
+                    timeout=_LONG_SELECT_TIMEOUT_SECONDS,
+                ),
+                timeout=_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS,
+                owner=self.page,
             )
             if original_links:
-                await wait_for_zendriver(
-                    original_links[0].click(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+                await _wait_for_archive_mutation(
+                    original_links[0].click(),
+                    owner=original_links[0],
+                    operation="Original archive link click",
+                    failure_message=(
+                        "Archive download outcome is unknown after Original link "
+                        "click; refusing further browser mutations"
+                    ),
                 )
 
+            status_timeout = False
             try:
                 deadline = asyncio.get_event_loop().time() + 10
                 while asyncio.get_event_loop().time() < deadline:
                     html = await wait_for_zendriver(
                         self.page.get_content(),
                         timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                        owner=self.page,
                     )
                     if (
                         "Downloads should start processing within a couple of minutes."
@@ -1665,46 +1774,82 @@ class EHDriver(Driver):
                     html = await wait_for_zendriver(
                         self.page.get_content(),
                         timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                        owner=self.page,
                     )
                     if "Cannot start download: Insufficient funds" in html:
                         raise InsufficientFundsException()
                     raise TimeoutError()
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError:
                 error_file = await self._save_page_diagnostic("download_timeout")
-                retrytime = 60
                 if error_file is None:
                     self.logger.warning(
-                        "Archive download timed out; diagnostic unavailable; "
-                        "retrying: gid=%d attempt=%d/%d delay=%ds",
+                        "Archive download status timed out after click; diagnostic "
+                        "unavailable; not replaying: gid=%d attempt=%d/%d",
                         gallery.gid,
                         attempt,
                         MAX_DOWNLOAD_RETRIES,
-                        retrytime,
                     )
                 else:
                     self.logger.warning(
-                        "Archive download timed out; diagnostic=%s; retrying: "
-                        "gid=%d attempt=%d/%d delay=%ds",
+                        "Archive download status timed out after click; diagnostic=%s; "
+                        "not replaying: gid=%d attempt=%d/%d",
                         error_file,
                         gallery.gid,
                         attempt,
                         MAX_DOWNLOAD_RETRIES,
-                        retrytime,
                     )
+                status_timeout = True
+            if status_timeout:
+                _begin_zendriver_retirement(self.page)
+                raise ArchiveDownloadOutcomeUnknownError(
+                    "Archive download outcome is unknown after click; refusing replay"
+                )
+        except ZendriverOperationTimeout:
+            # Any timed-out protocol operation is still live. Do not issue a
+            # diagnostic, close, activation, or retry against this generation.
+            raise
+        except ArchiveDownloadOutcomeUnknownError:
+            # A remote mutation was invoked but its outcome cannot be proven.
+            # Closing or activating another tab would compound that uncertainty.
+            raise
+        except asyncio.CancelledError:
+            # wait_for_zendriver tombstones a generation when its caller abandons
+            # live work. Never issue cleanup commands on that generation.
+            raise
         except BaseException as operation_error:
+            if is_browser_generation_error(operation_error):
+                raise
             try:
                 await self._close_archive_tab_and_restore(gallery_tab, new_tab)
             except BaseException as cleanup_error:
-                operation_error.add_note(
-                    "Archive cleanup also failed: " f"{type(cleanup_error).__name__}"
-                )
-            raise
+                if isinstance(
+                    cleanup_error,
+                    asyncio.CancelledError,
+                ) or is_browser_generation_error(cleanup_error):
+                    cleanup_error.add_note(
+                        "Archive operation also failed before cleanup: "
+                        f"{type(operation_error).__name__}"
+                    )
+                    cleanup_error.__cause__ = None
+                    cleanup_error.__context__ = None
+                    terminal_cleanup_error = cleanup_error
+                else:
+                    operation_error.add_note(
+                        "Archive cleanup also failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+                    deferred_operation_error = operation_error
+            else:
+                deferred_operation_error = operation_error
         else:
             await self._close_archive_tab_and_restore(gallery_tab, new_tab)
 
-        if retrytime is not None:
-            await asyncio.sleep(retrytime)
-            return None
+        if terminal_cleanup_error is not None:
+            raise terminal_cleanup_error from None
+        if deferred_operation_error is not None:
+            raise deferred_operation_error
 
         await asyncio.sleep(random())
         await asyncio.sleep(random())
@@ -1717,7 +1862,10 @@ class EHDriver(Driver):
             elements = await wait_for_zendriver(
                 self.page.xpath(f"//a[contains(@id, 'ta_{filter}')]", timeout=2),
                 timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError:
             return list()
 

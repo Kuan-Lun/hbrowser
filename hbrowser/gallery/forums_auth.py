@@ -21,6 +21,7 @@ async def detect_forums_auth_state(page: Any) -> ForumsAuthState:
     current_url = await wait_for_zendriver(
         page.evaluate("window.location.href"),
         timeout=_AUTH_STATE_READ_TIMEOUT_SECONDS,
+        owner=page,
     )
     if not isinstance(current_url, str):
         return ForumsAuthState.UNKNOWN
@@ -32,10 +33,12 @@ async def detect_forums_auth_state(page: Any) -> ForumsAuthState:
     guest_elements = await wait_for_zendriver(
         page.query_selector_all("#userlinksguest"),
         timeout=_AUTH_STATE_READ_TIMEOUT_SECONDS,
+        owner=page,
     )
     member_elements = await wait_for_zendriver(
         page.query_selector_all("#userlinks"),
         timeout=_AUTH_STATE_READ_TIMEOUT_SECONDS,
+        owner=page,
     )
     has_guest_marker = bool(guest_elements)
     has_member_marker = bool(member_elements)

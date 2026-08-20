@@ -15,7 +15,12 @@ from functools import partial
 from typing import Any, Self, cast
 from uuid import uuid4
 
+from ..utils.mutation import wait_for_zendriver_mutation
 from .factory import create_browser, stop_browser
+
+_TAB_OPEN_TIMEOUT_SECONDS = 15.0
+_TAB_NAVIGATION_TIMEOUT_SECONDS = 15.0
+_COMMAND_DRAIN_TIMEOUT_SECONDS = 5.0
 
 type BrowserFactory[BrowserT, TabT] = Callable[[], Awaitable[tuple[BrowserT, TabT]]]
 type BrowserCloser[BrowserT] = Callable[[BrowserT], Awaitable[None]]
@@ -59,11 +64,21 @@ class TabHandle:
 
 
 async def _open_zendriver_tab(browser: Any) -> Any:
-    return await browser.get("about:blank", new_tab=True)
+    return await wait_for_zendriver_mutation(
+        browser.get("about:blank", new_tab=True),
+        timeout=_TAB_OPEN_TIMEOUT_SECONDS,
+        owner=browser.connection,
+        operation="Browser tab creation",
+    )
 
 
 async def _navigate_zendriver_tab(tab: Any, url: str) -> None:
-    await tab.get(url)
+    await wait_for_zendriver_mutation(
+        tab.get(url),
+        timeout=_TAB_NAVIGATION_TIMEOUT_SECONDS,
+        owner=tab,
+        operation="Browser tab navigation",
+    )
 
 
 def _get_zendriver_target_id(tab: Any) -> str:
@@ -310,8 +325,11 @@ class BrowserOwner[BrowserT, TabT]:
                             "browser cleanup after startup failure also failed: "
                             f"{type(cleanup_error).__name__}"
                         )
-                self._browser = None
-                self._state = BrowserOwnerState.CLOSED
+                    else:
+                        self._browser = None
+                        self._state = BrowserOwnerState.CLOSED
+                else:
+                    self._state = BrowserOwnerState.CLOSED
                 raise
 
             self._state = BrowserOwnerState.OPEN
@@ -325,8 +343,10 @@ class BrowserOwner[BrowserT, TabT]:
     ) -> TabTransport[TabT]:
         """Create a new tab and permanently bind it to ``role``.
 
-        If initial navigation fails, the transport remains owned and retrievable
-        by role so diagnostics or recovery can inspect that exact target.
+        If initial navigation has an unknown outcome, the transport remains
+        owned only so shutdown can close that exact target. The browser
+        generation is terminal and callers must not use it for diagnostics,
+        recovery, or further commands.
         """
 
         self._validate_role(role)
@@ -349,22 +369,63 @@ class BrowserOwner[BrowserT, TabT]:
             return transport
 
     async def _finish_close(self) -> None:
-        try:
-            if self._tabs_by_role:
-                await asyncio.gather(
-                    *(transport._drain() for transport in self._tabs_by_role.values())
-                )
-            browser = self._browser
-            if browser is not None:
+        errors: list[BaseException] = []
+        browser_closed = self._browser is None
+        browser = self._browser
+        if browser is not None:
+            try:
+                # Tombstone and close the browser before waiting for command
+                # locks. Closing the transports is what wakes a stuck CDP
+                # command; draining first can deadlock forever.
                 await self._browser_closer(browser)
-        finally:
+            except BaseException as error:
+                errors.append(error)
+            else:
+                browser_closed = True
+
+        if self._tabs_by_role:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            transport._drain()
+                            for transport in self._tabs_by_role.values()
+                        )
+                    ),
+                    timeout=_COMMAND_DRAIN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                errors.append(
+                    TimeoutError(
+                        "Browser tab commands did not drain within "
+                        f"{_COMMAND_DRAIN_TIMEOUT_SECONDS:g} seconds"
+                    )
+                )
+
+        if browser_closed:
             self._browser = None
             self._state = BrowserOwnerState.CLOSED
+        else:
+            self._state = BrowserOwnerState.CLOSING
+
+        if errors:
+            primary, *secondary = errors
+            for secondary_error in secondary:
+                primary.add_note(
+                    "Additional browser-owner close failure: "
+                    f"{type(secondary_error).__name__}: {secondary_error}"
+                )
+            raise primary
 
     async def close(self) -> None:
-        """Drain tab commands and close the owned browser exactly once."""
+        """Run one shared close attempt, retaining the browser after failure."""
 
         async with self._lifecycle_lock:
+            if self._close_task is not None and self._close_task.done():
+                completed_task = self._close_task
+                if not completed_task.cancelled():
+                    completed_task.exception()
+                self._close_task = None
             if self._close_task is not None:
                 close_task = self._close_task
             elif self._state is BrowserOwnerState.CLOSED:
@@ -378,7 +439,14 @@ class BrowserOwner[BrowserT, TabT]:
                 close_task = self._close_task
 
         # One caller being cancelled must not cancel the shared browser cleanup.
-        await asyncio.shield(close_task)
+        try:
+            await asyncio.shield(close_task)
+        except BaseException:
+            if close_task.done():
+                async with self._lifecycle_lock:
+                    if self._close_task is close_task:
+                        self._close_task = None
+            raise
 
     async def __aenter__(self) -> Self:
         return await self.start()

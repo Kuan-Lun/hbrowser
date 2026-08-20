@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
-version = "0.36.12"
+version = "0.37.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = { text = "GNU Affero General Public License v3" }
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "asyncio-atexit>=1.0.1,<2",
     "beautifulsoup4>=4.15.0",
     "h2h-galleryinfo-parser>=0.5.1",
     "httpx>=0.28.1",

@@ -27,12 +27,29 @@ class LoginFailedException(Exception):
         return self.message
 
 
-class BrowserIdentityApplyException(RuntimeError):
+class BrowserMutationOutcomeUnknownError(RuntimeError):
+    """A browser mutation was invoked but its final outcome is unknowable.
+
+    This marker makes the current browser generation terminal. It is reserved
+    for failures after a state-changing operation has started; read-only
+    failures and mutations rejected before invocation must not use it.
+    """
+
+
+class BrowserIdentityApplyException(BrowserMutationOutcomeUnknownError):
     """Applying an external solver identity failed and cannot be rolled back."""
 
 
 class DriverBrowserBindingError(RuntimeError):
     """A driver was asked to replace its immutable browser/page binding."""
+
+
+class ArchiveDownloadOutcomeUnknownError(BrowserMutationOutcomeUnknownError):
+    """An archive mutation was sent but its final outcome could not be observed."""
+
+
+class LoginTokenInjectionOutcomeUnknownError(BrowserMutationOutcomeUnknownError):
+    """A login challenge token mutation had an unobservable final outcome."""
 
 
 class GallerySearchError(RuntimeError):

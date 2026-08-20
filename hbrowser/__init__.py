@@ -1,4 +1,6 @@
 __all__ = [
+    "ArchiveDownloadOutcomeUnknownError",
+    "BrowserMutationOutcomeUnknownError",
     "ConfirmedGalleryMissing",
     "beep_os_independent",
     "DriverBrowserBindingError",
@@ -28,6 +30,8 @@ __all__ = [
 
 from .beep import beep_os_independent
 from .exceptions import (
+    ArchiveDownloadOutcomeUnknownError,
+    BrowserMutationOutcomeUnknownError,
     DriverBrowserBindingError,
     GalleryLookupError,
     GallerySearchError,

@@ -6,13 +6,20 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ...exceptions import BrowserIdentityApplyException, LoginFailedException
+from ...exceptions import (
+    BrowserIdentityApplyException,
+    BrowserMutationOutcomeUnknownError,
+    LoginFailedException,
+    LoginTokenInjectionOutcomeUnknownError,
+)
 from ..browser.flaresolverr import FlareSolverrError
 from ..utils import wait_for_zendriver
+from ..utils.mutation import wait_for_zendriver_mutation
 from .detector import CaptchaDetector
 from .models import Kind
 
 _TOKEN_READ_TIMEOUT_SECONDS = 3.0
+_TOKEN_MUTATION_TIMEOUT_SECONDS = 15.0
 
 
 class TurnstileSolver(Protocol):
@@ -172,6 +179,7 @@ class LoginChallengeHandler:
                 "})()"
             ),
             timeout=_TOKEN_READ_TIMEOUT_SECONDS,
+            owner=page,
         )
         return value if isinstance(value, str) else ""
 
@@ -183,8 +191,10 @@ class LoginChallengeHandler:
     ) -> bool:
         selector_json = json.dumps(selector)
         token_json = json.dumps(token)
+        result: Any = None
+        injection_failed = False
         try:
-            result = await wait_for_zendriver(
+            result = await wait_for_zendriver_mutation(
                 page.evaluate(
                     "(() => {"
                     f"const element = document.querySelector({selector_json});"
@@ -195,10 +205,16 @@ class LoginChallengeHandler:
                     f"return element.value === {token_json};"
                     "})()"
                 ),
-                timeout=_TOKEN_READ_TIMEOUT_SECONDS,
+                timeout=_TOKEN_MUTATION_TIMEOUT_SECONDS,
+                owner=page,
+                operation="Login challenge token injection",
             )
-        except Exception:
+        except BrowserMutationOutcomeUnknownError:
             # CDP exceptions can include the full evaluate expression. Do not
-            # let a token embedded in that expression reach caller logs.
-            return False
+            # retain or chain an error that may contain the injected token.
+            injection_failed = True
+        if injection_failed:
+            raise LoginTokenInjectionOutcomeUnknownError(
+                "Login challenge token injection outcome is unknown"
+            )
         return result is True

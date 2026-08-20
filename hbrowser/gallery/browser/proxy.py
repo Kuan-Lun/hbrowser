@@ -9,10 +9,17 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
-from ..utils import is_connection_error, setup_logger, wait_for_zendriver
+from ..utils import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
+from ..utils.mutation import wait_for_zendriver_mutation
 
 logger = setup_logger(__name__)
-_PROXY_CHECK_TIMEOUT_SECONDS = 10.0
+_PROXY_ELEMENT_WAIT_TIMEOUT_SECONDS = 10.0
+_PROXY_ELEMENT_WATCHDOG_TIMEOUT_SECONDS = 12.0
+_PROXY_NAVIGATION_TIMEOUT_SECONDS = 15.0
 
 
 def _create_proxy_extension(
@@ -159,10 +166,25 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
 
     try:
         local_ip = await asyncio.to_thread(_get_local_ip)
+    except Exception as error:
+        logger.warning(
+            "Could not verify proxy IP (non-fatal): error_type=%s",
+            type(error).__name__,
+        )
+        return
 
-        await wait_for_zendriver(page.get("https://api.ipify.org"), timeout=15.0)
+    await wait_for_zendriver_mutation(
+        page.get("https://api.ipify.org"),
+        timeout=_PROXY_NAVIGATION_TIMEOUT_SECONDS,
+        owner=page,
+        operation="Proxy verification navigation",
+    )
+
+    try:
         body = await wait_for_zendriver(
-            page.select("body"), timeout=_PROXY_CHECK_TIMEOUT_SECONDS
+            page.select("body", timeout=_PROXY_ELEMENT_WAIT_TIMEOUT_SECONDS),
+            timeout=_PROXY_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=page,
         )
         proxy_ip: str = body.text.strip()
 
@@ -181,7 +203,7 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
     except RuntimeError:
         raise
     except Exception as error:
-        if is_connection_error(error):
+        if is_browser_generation_error(error):
             raise
         logger.warning(
             "Could not verify proxy IP (non-fatal): error_type=%s",

@@ -15,16 +15,19 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+from hbrowser.gallery.browser import ban_handler, proxy
 from hbrowser.gallery.browser.ban_handler import (
     _resolve_transient_blank_page,
     handle_ban_decorator,
 )
 from hbrowser.gallery.browser.proxy import verify_proxy_ip
+from hbrowser.gallery.captcha import login_challenge
 from hbrowser.gallery.captcha.detector import CaptchaDetector
 from hbrowser.gallery.captcha.login_challenge import LoginChallengeHandler
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.eh_driver import EHDriver
 from hbrowser.gallery.forums_auth import detect_forums_auth_state
+from hbrowser.gallery.utils import ZendriverOperationTimeout
 
 
 async def _hang(*_args: Any, **_kwargs: Any) -> Any:
@@ -71,7 +74,13 @@ class DriverHangProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(TimeoutError):
             await asyncio.wait_for(
-                driver.wait(AsyncMock(), ischangeurl=True), timeout=10
+                driver.wait(
+                    AsyncMock(),
+                    ischangeurl=True,
+                    owner=driver.page,
+                    operation_timeout=5.0,
+                ),
+                timeout=10,
             )
 
     async def test_find_element_chain_times_out_instead_of_hanging_forever(
@@ -105,20 +114,22 @@ class LoginChallengeHangProtectionTests(unittest.IsolatedAsyncioTestCase):
                 timeout=10,
             )
 
-    async def test_write_response_token_returns_false_instead_of_hanging(
+    async def test_write_response_token_timeout_is_terminal(
         self,
     ) -> None:
-        """The write path already catches any exception as a soft failure;
-        a hang must resolve to that same False outcome, not block forever."""
+        evaluate = AsyncMock(side_effect=_hang)
+        page = SimpleNamespace(evaluate=evaluate)
 
-        page = SimpleNamespace(evaluate=_hang)
-
-        result = await asyncio.wait_for(
-            LoginChallengeHandler._write_response_token(page, "#token", "abc"),
-            timeout=10,
-        )
-
-        self.assertFalse(result)
+        with (
+            patch.object(
+                login_challenge,
+                "_TOKEN_MUTATION_TIMEOUT_SECONDS",
+                0.05,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await LoginChallengeHandler._write_response_token(page, "#token", "abc")
+        evaluate.assert_awaited_once()
 
 
 class ForumsAuthHangProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -136,53 +147,71 @@ class BanHandlerHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         page = SimpleNamespace(get=_hang, get_content=_hang)
         myget = handle_ban_decorator(page)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(myget("https://e-hentai.org/"), timeout=15)
+        with (
+            patch.object(ban_handler, "_PAGE_MUTATION_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await myget("https://e-hentai.org/")
 
     async def test_resolve_transient_blank_page_times_out_instead_of_hanging(
         self,
     ) -> None:
         page = SimpleNamespace(reload=_hang, get_content=_hang)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(
-                _resolve_transient_blank_page(
-                    page, "<html><head></head><body></body></html>"
-                ),
-                timeout=15,
+        with (
+            patch.object(ban_handler, "_PAGE_MUTATION_TIMEOUT_SECONDS", 0.05),
+            patch(
+                "hbrowser.gallery.browser.ban_handler.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await _resolve_transient_blank_page(
+                page, "<html><head></head><body></body></html>"
             )
 
 
 class ProxyHangProtectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_verify_proxy_ip_swallows_a_hang_as_a_non_fatal_warning(
+    async def test_verify_proxy_ip_timeout_is_terminal(
         self,
     ) -> None:
-        """The whole check is already best-effort (except Exception: warn);
-        a hung page.get()/select() must resolve to that same non-fatal
-        warning path within a bounded time, not block startup forever."""
-
-        page = SimpleNamespace(get=_hang, select=_hang)
+        get = AsyncMock(side_effect=_hang)
+        select = AsyncMock(side_effect=_hang)
+        page = SimpleNamespace(get=get, select=select)
         browser = Mock()
 
-        with patch(
-            "hbrowser.gallery.browser.proxy.asyncio.to_thread",
-            new=AsyncMock(return_value="192.0.2.10"),
+        with (
+            patch(
+                "hbrowser.gallery.browser.proxy.asyncio.to_thread",
+                new=AsyncMock(return_value="192.0.2.10"),
+            ),
+            patch.object(proxy, "_PROXY_NAVIGATION_TIMEOUT_SECONDS", 0.05),
         ):
-            await asyncio.wait_for(verify_proxy_ip(browser, page), timeout=20)
+            with self.assertRaises(ZendriverOperationTimeout):
+                await verify_proxy_ip(browser, page)
+        get.assert_awaited_once_with("https://api.ipify.org")
+        select.assert_not_awaited()
 
 
 class EHDriverHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_gallery2tag_times_out_instead_of_hanging_forever(self) -> None:
         driver = EHDriver()
-        driver.page = SimpleNamespace(evaluate=_hang, xpath=_hang)
+        driver.page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=_hang),
+            xpath=AsyncMock(side_effect=_hang),
+        )
         driver.get = AsyncMock()  # type: ignore[method-assign]
 
         gallery = Mock()
         gallery.url = "https://e-hentai.org/g/1/deadbeef/"
 
-        tags = await asyncio.wait_for(driver.gallery2tag(gallery, "artist"), timeout=10)
-
-        self.assertEqual(tags, [])
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(
+                driver.gallery2tag(gallery, "artist"),
+                timeout=10,
+            )
+        driver.get.assert_awaited_once_with(gallery.url)
+        driver.page.xpath.assert_awaited_once()
 
 
 if __name__ == "__main__":

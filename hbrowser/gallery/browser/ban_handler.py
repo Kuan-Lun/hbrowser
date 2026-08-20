@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..utils import setup_logger, wait_for_zendriver
+from ..utils.mutation import wait_for_zendriver_mutation
 
 logger = setup_logger(__name__)
 
@@ -19,6 +20,7 @@ _RETRY_BUFFER_SECONDS = 15 * 60
 _BLANK_PAGE_QUICK_RETRIES = 3
 _BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS = 2.0
 _PAGE_READ_TIMEOUT_SECONDS = 5.0
+_PAGE_MUTATION_TIMEOUT_SECONDS = 15.0
 
 
 def parse_ban_time(page_source: str) -> int:
@@ -113,9 +115,14 @@ async def _retry_until_unbanned(page: Any, source: str) -> None:
         await _wait_out_ban(wait_seconds)
 
         logger.info("Retrying connection")
-        await wait_for_zendriver(page.reload(), timeout=_PAGE_READ_TIMEOUT_SECONDS)
+        await wait_for_zendriver_mutation(
+            page.reload(),
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=page,
+            operation="Ban-page reload",
+        )
         source = await wait_for_zendriver(
-            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS, owner=page
         )
         is_first = False
         status = check_ban_status(source)
@@ -136,9 +143,14 @@ async def _resolve_transient_blank_page(page: Any, source: str) -> str:
         if not check_ban_status(source).is_blank_page:
             break
         await asyncio.sleep(_BLANK_PAGE_QUICK_RETRY_DELAY_SECONDS)
-        await wait_for_zendriver(page.reload(), timeout=_PAGE_READ_TIMEOUT_SECONDS)
+        await wait_for_zendriver_mutation(
+            page.reload(),
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=page,
+            operation="Blank-page reload",
+        )
         source = await wait_for_zendriver(
-            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS, owner=page
         )
     return source
 
@@ -157,9 +169,14 @@ def handle_ban_decorator(
     """
 
     async def myget(*args: Any, **kwargs: Any) -> None:
-        await wait_for_zendriver(page.get(*args, **kwargs), timeout=15.0)
+        await wait_for_zendriver_mutation(
+            page.get(*args, **kwargs),
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=page,
+            operation="Page navigation",
+        )
         source = await wait_for_zendriver(
-            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS
+            page.get_content(), timeout=_PAGE_READ_TIMEOUT_SECONDS, owner=page
         )
         if check_ban_status(source).is_blank_page:
             source = await _resolve_transient_blank_page(page, source)

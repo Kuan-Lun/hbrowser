@@ -5,6 +5,10 @@ from typing import Any
 
 import zendriver as zd
 
+from .protocol import wait_for_zendriver
+
+_TARGET_REFRESH_TIMEOUT_SECONDS = 5.0
+
 
 async def wait_for_new_tab(
     browser: zd.Browser,
@@ -24,7 +28,12 @@ async def wait_for_new_tab(
     """
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
-        await browser.update_targets()
+        remaining = deadline - asyncio.get_event_loop().time()
+        await wait_for_zendriver(
+            browser.update_targets(),
+            timeout=min(_TARGET_REFRESH_TIMEOUT_SECONDS, remaining),
+            owner=browser.connection,
+        )
         current_tabs = {
             t.target.target_id for t in browser.tabs if t.target is not None
         }

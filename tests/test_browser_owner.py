@@ -2,8 +2,10 @@ import asyncio
 import unittest
 from collections.abc import Awaitable, Callable
 from dataclasses import FrozenInstanceError, dataclass
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import (
     BrowserOwner,
     BrowserOwnerState,
@@ -12,6 +14,8 @@ from hbrowser.gallery.browser import (
     TabHandle,
     TabTransportUnavailableError,
 )
+from hbrowser.gallery.browser import owner as owner_module
+from hbrowser.gallery.utils import ZendriverOperationTimeout
 
 
 @dataclass(slots=True)
@@ -199,9 +203,12 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         second_close = asyncio.create_task(owner.close())
         while owner.state is BrowserOwnerState.OPEN:
             await asyncio.sleep(0)
+        while browser_closer.await_count == 0:
+            await asyncio.sleep(0)
 
         self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
-        self.assertFalse(browser_closer.await_count)
+        browser_closer.assert_awaited_once_with(browser)
+        self.assertFalse(first_close.done())
         with self.assertRaises(TabTransportUnavailableError):
             await owner.main_tab.execute(_return)
 
@@ -209,6 +216,136 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(command_task, first_close, second_close)
         browser_closer.assert_awaited_once_with(browser)
         self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_close_is_bounded_after_browser_closes_with_stuck_command(
+        self,
+    ) -> None:
+        owner, browser, browser_closer, _ = self._owner()
+        await owner.start()
+        command_entered = asyncio.Event()
+        release_command = asyncio.Event()
+
+        async def stuck_command(_: _FakeTab) -> None:
+            command_entered.set()
+            await release_command.wait()
+
+        command_task = asyncio.create_task(owner.main_tab.execute(stuck_command))
+        await command_entered.wait()
+        try:
+            with (
+                patch.object(owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01),
+                self.assertRaisesRegex(TimeoutError, "did not drain"),
+            ):
+                await asyncio.wait_for(owner.close(), timeout=1)
+
+            browser_closer.assert_awaited_once_with(browser)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+        finally:
+            release_command.set()
+            await command_task
+
+    async def test_failed_close_is_single_flight_and_can_be_retried(self) -> None:
+        owner, browser, browser_closer, _ = self._owner()
+        await owner.start()
+        failure = RuntimeError("transport still live")
+        browser_closer.side_effect = failure
+
+        first, second = await asyncio.gather(
+            owner.close(),
+            owner.close(),
+            return_exceptions=True,
+        )
+
+        self.assertIs(first, failure)
+        self.assertIs(second, failure)
+        browser_closer.assert_awaited_once_with(browser)
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+
+        browser_closer.side_effect = None
+        await owner.close()
+
+        self.assertEqual(browser_closer.await_count, 2)
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_default_tab_adapters_bound_hung_zendriver_operations(self) -> None:
+        release_open = asyncio.Event()
+        release_navigation = asyncio.Event()
+
+        async def open_tab(*_: object, **__: object) -> object:
+            await release_open.wait()
+            return object()
+
+        async def navigate(*_: object, **__: object) -> None:
+            await release_navigation.wait()
+
+        browser = SimpleNamespace()
+        connection = SimpleNamespace(
+            _owner=browser,
+            websocket=object(),
+            mapper={},
+        )
+        browser.connection = connection
+        browser.get = AsyncMock(side_effect=open_tab)
+        navigation_browser = SimpleNamespace()
+        tab = SimpleNamespace(
+            browser=navigation_browser,
+            websocket=object(),
+            mapper={},
+            get=AsyncMock(side_effect=navigate),
+        )
+
+        with (
+            patch.object(owner_module, "_TAB_OPEN_TIMEOUT_SECONDS", 0),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await owner_module._open_zendriver_tab(browser)
+        with (
+            patch.object(owner_module, "_TAB_NAVIGATION_TIMEOUT_SECONDS", 0),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await owner_module._navigate_zendriver_tab(tab, "https://example.test")
+
+        release_open.set()
+        release_navigation.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    async def test_default_tab_open_generic_failure_is_outcome_unknown(self) -> None:
+        browser = SimpleNamespace()
+        browser.connection = SimpleNamespace(
+            _owner=browser,
+            websocket=object(),
+            mapper={},
+        )
+        browser.get = AsyncMock(side_effect=RuntimeError("sensitive open failure"))
+
+        with self.assertRaises(BrowserMutationOutcomeUnknownError) as raised:
+            await owner_module._open_zendriver_tab(browser)
+
+        browser.get.assert_awaited_once_with("about:blank", new_tab=True)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
+    async def test_default_tab_navigation_generic_failure_is_outcome_unknown(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        tab = SimpleNamespace(
+            browser=browser,
+            websocket=object(),
+            mapper={},
+            get=AsyncMock(side_effect=RuntimeError("sensitive navigation failure")),
+        )
+
+        with self.assertRaises(BrowserMutationOutcomeUnknownError) as raised:
+            await owner_module._navigate_zendriver_tab(
+                tab,
+                "https://example.test/private",
+            )
+
+        tab.get.assert_awaited_once_with("https://example.test/private")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     async def test_open_tab_rejects_duplicate_role_before_creating_target(
         self,

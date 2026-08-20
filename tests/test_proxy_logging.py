@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import proxy
 
 
@@ -45,7 +46,8 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
         sentinel = "SENSITIVE-PROXY-FAILURE\nSECOND-LINE"
         logger = Mock()
         page = Mock()
-        page.get = AsyncMock(side_effect=ValueError(sentinel))
+        page.get = AsyncMock()
+        page.select = AsyncMock(side_effect=ValueError(sentinel))
 
         with (
             patch.object(proxy, "logger", logger),
@@ -61,3 +63,23 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
             "ValueError",
         )
         self.assertNotIn(sentinel, repr(logger.method_calls))
+
+    async def test_navigation_failure_is_terminal_and_skips_proxy_read(self) -> None:
+        navigation_error = ValueError("navigation result unavailable")
+        page = Mock()
+        page.get = AsyncMock(side_effect=navigation_error)
+        page.select = AsyncMock()
+
+        with (
+            patch(
+                "hbrowser.gallery.browser.proxy.asyncio.to_thread",
+                new=AsyncMock(return_value="192.0.2.10"),
+            ),
+            self.assertRaises(BrowserMutationOutcomeUnknownError) as raised,
+        ):
+            await proxy.verify_proxy_ip(Mock(), page)
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        page.get.assert_awaited_once_with("https://api.ipify.org")
+        page.select.assert_not_awaited()

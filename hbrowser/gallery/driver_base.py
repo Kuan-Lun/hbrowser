@@ -14,6 +14,7 @@ from zendriver import cdp
 
 from ..exceptions import (
     BrowserIdentityApplyException,
+    BrowserMutationOutcomeUnknownError,
     DriverBrowserBindingError,
     LoginFailedException,
 )
@@ -31,16 +32,23 @@ from .browser.ban_handler import handle_ban_decorator
 from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandler
 from .forums_auth import ForumsAuthState, detect_forums_auth_state
 from .utils import (
+    ZendriverOperationTimeout,
     get_log_dir,
+    is_browser_generation_error,
     log_context,
     matchurl,
     setup_logger,
     wait_for_zendriver,
     write_page_diagnostic,
 )
+from .utils.mutation import wait_for_zendriver_mutation
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
 _NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
+_PAGE_MUTATION_TIMEOUT_SECONDS = 15.0
+_IDENTITY_MUTATION_TIMEOUT_SECONDS = 15.0
+_LOGIN_ELEMENT_WAIT_TIMEOUT_SECONDS = 10.0
+_LOGIN_ELEMENT_WATCHDOG_TIMEOUT_SECONDS = 12.0
 _SAFE_NAVIGATION_ROUTES = {
     "favorites.php": "favorites",
     "g": "gallery",
@@ -224,6 +232,8 @@ class Driver(ABC):
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         del exc_tb
+        primary_error = exc_val if isinstance(exc_val, BaseException) else None
+        diagnostic_error: BaseException | None = None
         if exc_type is not None:
             error_type = getattr(exc_type, "__name__", type(exc_val).__name__)
             cause = getattr(exc_val, "__cause__", None) or getattr(
@@ -236,18 +246,80 @@ class Driver(ABC):
                 error_type,
                 type(cause).__name__ if cause is not None else "none",
             )
-            if self.page is not None:
-                await self._save_page_diagnostic("driver_error")
+            may_capture_diagnostic = not isinstance(
+                exc_val, BaseException
+            ) or not is_browser_generation_error(exc_val)
+            if self.page is not None and may_capture_diagnostic:
+                try:
+                    await self._save_page_diagnostic("driver_error")
+                except BaseException as error:
+                    diagnostic_error = error
         if not self._owns_browser or self.browser is None:
+            if isinstance(diagnostic_error, asyncio.CancelledError):
+                if primary_error is not None:
+                    diagnostic_error.add_note(
+                        "Browser session was already exiting after: "
+                        f"{type(primary_error).__name__}"
+                    )
+                raise diagnostic_error
+            if primary_error is not None and diagnostic_error is not None:
+                primary_error.add_note(
+                    "Driver diagnostic also failed: "
+                    f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+                )
+            elif diagnostic_error is not None:
+                raise diagnostic_error
             return
         self.logger.info("Closing browser")
+        cleanup_error: BaseException | None = None
         try:
             await stop_browser(self.browser)
-        except Exception as error:
+        except BaseException as error:
+            cleanup_error = error
             self.logger.warning(
                 "Failed to close browser cleanly: error_type=%s",
                 type(error).__name__,
             )
+
+        secondary_errors = tuple(
+            error for error in (diagnostic_error, cleanup_error) if error is not None
+        )
+        cancellation_error = next(
+            (
+                error
+                for error in secondary_errors
+                if isinstance(error, asyncio.CancelledError)
+            ),
+            None,
+        )
+        if cancellation_error is not None:
+            if primary_error is not None:
+                cancellation_error.add_note(
+                    "Browser session was already exiting after: "
+                    f"{type(primary_error).__name__}"
+                )
+            for secondary_error in secondary_errors:
+                if secondary_error is not cancellation_error:
+                    cancellation_error.add_note(
+                        "Additional driver shutdown failure: "
+                        f"{type(secondary_error).__name__}: {secondary_error}"
+                    )
+            raise cancellation_error
+        if primary_error is not None:
+            for secondary_error in secondary_errors:
+                primary_error.add_note(
+                    "Driver shutdown also failed: "
+                    f"{type(secondary_error).__name__}: {secondary_error}"
+                )
+            return
+        if secondary_errors:
+            primary, *secondary = secondary_errors
+            for secondary_error in secondary:
+                primary.add_note(
+                    "Additional driver shutdown failure: "
+                    f"{type(secondary_error).__name__}: {secondary_error}"
+                )
+            raise primary
 
     @staticmethod
     def _write_page_diagnostic(kind: str, content: str) -> Path:
@@ -267,9 +339,14 @@ class Driver(ABC):
                     await wait_for_zendriver(
                         self.page.get_content(),
                         timeout=_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS,
+                        owner=self.page,
                     ),
                 )
+            except ZendriverOperationTimeout:
+                raise
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 self.logger.warning(
                     "Failed to capture %s page diagnostic: error_type=%s",
                     kind,
@@ -303,6 +380,7 @@ class Driver(ABC):
         current_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         source_scheme, source_host, source_route, source_has_query = (
             _redacted_url_context(current_url)
@@ -350,7 +428,10 @@ class Driver(ABC):
                 current_url = await wait_for_zendriver(
                     self.page.evaluate("window.location.href"),
                     timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                    owner=self.page,
                 )
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError:
                 return
             if current_url != old_url:
@@ -365,6 +446,7 @@ class Driver(ABC):
             element = await wait_for_zendriver(
                 element.query_selector(selector),
                 timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                owner=element,
             )
         return element
 
@@ -372,6 +454,7 @@ class Driver(ABC):
         current_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         scheme, hostname, route, has_query = _redacted_url_context(url)
         self.logger.debug(
@@ -390,19 +473,26 @@ class Driver(ABC):
                     await wait_for_zendriver(
                         self.page.evaluate("window.location.href"),
                         timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                        owner=self.page,
                     ),
                     current_url,
                 ):
                     if asyncio.get_event_loop().time() >= deadline:
                         break
                     await asyncio.sleep(0.1)
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError:
                 pass
         else:
             try:
                 await wait_for_zendriver(
-                    self.page.wait(1), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+                    self.page.wait(1),
+                    timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                    owner=self.page,
                 )
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError:
                 pass
         await asyncio.sleep(3 * random())
@@ -412,6 +502,9 @@ class Driver(ABC):
         fun: Any,
         ischangeurl: bool,
         sleeptime: int = -1,
+        *,
+        owner: Any,
+        operation_timeout: float,
     ) -> None:
         """執行 async 函數並等待頁面變化。
 
@@ -419,29 +512,35 @@ class Driver(ABC):
             fun: 要執行的 async callable
             ischangeurl: 是否等待 URL 變化
             sleeptime: 等待時間（秒），-1 表示隨機等待
+            owner: 執行操作的固定 Zendriver transport
+            operation_timeout: 操作 watchdog 秒數
         """
         old_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                await fun()
-                break
-            except Exception:
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(0.5)
+        # This callable may mutate remote state. Once invoked, any failure has
+        # an unknown outcome and must never cause the operation to be replayed.
+        await wait_for_zendriver_mutation(
+            fun(),
+            timeout=operation_timeout,
+            owner=owner,
+            operation="Driver mutation",
+        )
 
         if ischangeurl:
             await self._wait_for_url_change(old_url)
         else:
             try:
                 await wait_for_zendriver(
-                    self.page.wait(1), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+                    self.page.wait(1),
+                    timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                    owner=self.page,
                 )
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError:
                 pass
 
@@ -500,24 +599,42 @@ class Driver(ABC):
         result: FlareSolverrResult,
     ) -> None:
         if result.user_agent:
+            identity_failed = False
             try:
-                await self.page.send(
-                    cdp.network.set_user_agent_override(user_agent=result.user_agent)
+                await wait_for_zendriver_mutation(
+                    self.page.send(
+                        cdp.network.set_user_agent_override(
+                            user_agent=result.user_agent
+                        )
+                    ),
+                    timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
+                    owner=self.page,
+                    operation="Browser user-agent override",
                 )
-            except Exception:
+            except BrowserMutationOutcomeUnknownError:
+                identity_failed = True
+            if identity_failed:
                 raise BrowserIdentityApplyException(
                     "Could not apply the FlareSolverr browser identity"
-                ) from None
+                )
         cookie_params = result.to_cdp_cloudflare_cookie_params()
         if not cookie_params:
             return
+        cookie_apply_failed = False
         try:
-            await self.page.send(cdp.network.set_cookies(cookie_params))
-        except Exception:
+            await wait_for_zendriver_mutation(
+                self.page.send(cdp.network.set_cookies(cookie_params)),
+                timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
+                operation="Browser cookie replacement",
+            )
+        except BrowserMutationOutcomeUnknownError:
+            cookie_apply_failed = True
+        if cookie_apply_failed:
             # CDP protocol errors may contain cookie values in their params.
             raise BrowserIdentityApplyException(
                 "Could not apply the FlareSolverr Cloudflare cookies"
-            ) from None
+            )
 
     async def login(self) -> None:
         """Log in, sharing one FlareSolverr browser across both challenges."""
@@ -565,39 +682,52 @@ class Driver(ABC):
 
         self.logger.debug("Clicking 'Log In' link on Forums page")
         login_link = await wait_for_zendriver(
-            self.page.select("#userlinksguest a[href*='act=Login&CODE=00']"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            self.page.select(
+                "#userlinksguest a[href*='act=Login&CODE=00']",
+                timeout=_LOGIN_ELEMENT_WAIT_TIMEOUT_SECONDS,
+            ),
+            timeout=_LOGIN_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         old_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
-        await wait_for_zendriver(
-            login_link.click(), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+        await wait_for_zendriver_mutation(
+            login_link.click(),
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=login_link,
+            operation="Forums login-link click",
         )
         await self._wait_for_url_change(old_url)
 
-        await wait_for_zendriver(
-            self.page.select("[name='UserName']", timeout=10),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-        )
-
         username_input = await wait_for_zendriver(
-            self.page.select("[name='UserName']"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            self.page.select(
+                "[name='UserName']", timeout=_LOGIN_ELEMENT_WAIT_TIMEOUT_SECONDS
+            ),
+            timeout=_LOGIN_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=self.page,
         )
-        await wait_for_zendriver(
+        await wait_for_zendriver_mutation(
             username_input.send_keys(self.username),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=username_input,
+            operation="Forums username input",
         )
 
         password_input = await wait_for_zendriver(
-            self.page.select("[name='PassWord']"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            self.page.select(
+                "[name='PassWord']", timeout=_LOGIN_ELEMENT_WAIT_TIMEOUT_SECONDS
+            ),
+            timeout=_LOGIN_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=self.page,
         )
-        await wait_for_zendriver(
+        await wait_for_zendriver_mutation(
             password_input.send_keys(self.password),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=password_input,
+            operation="Forums password input",
         )
 
         await self._handle_login_challenge(flaresolverr_session)
@@ -605,13 +735,21 @@ class Driver(ABC):
         old_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         submit_button = await wait_for_zendriver(
-            self.page.select("input[type='submit'][value='Log me in']"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            self.page.select(
+                "input[type='submit'][value='Log me in']",
+                timeout=_LOGIN_ELEMENT_WAIT_TIMEOUT_SECONDS,
+            ),
+            timeout=_LOGIN_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
+            owner=self.page,
         )
-        await wait_for_zendriver(
-            submit_button.click(), timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+        await wait_for_zendriver_mutation(
+            submit_button.click(),
+            timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+            owner=submit_button,
+            operation="Forums login-form submission",
         )
         self.logger.debug("'Log me in' button clicked, waiting for redirect...")
 

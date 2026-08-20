@@ -21,6 +21,8 @@ from zendriver.core.connection import ProtocolException
 
 import hbrowser
 from hbrowser import (
+    ArchiveDownloadOutcomeUnknownError,
+    BrowserMutationOutcomeUnknownError,
     ConfirmedGalleryMissing,
     GalleryFound,
     GalleryLookupError,
@@ -35,7 +37,6 @@ from hbrowser import (
     SearchRateLimitError,
     SearchRequest,
 )
-from hbrowser.exceptions import ClientOfflineException
 from hbrowser.gallery.eh_driver import (
     _SEARCH_DIAGNOSTIC_FILE_LIMIT,
     _SEARCH_DIAGNOSTIC_FILENAME_PATTERN,
@@ -47,12 +48,47 @@ from hbrowser.gallery.eh_driver import (
     _parse_search_page,
 )
 from hbrowser.gallery.exh_driver import ExHDriver
+from hbrowser.gallery.utils import (
+    ZendriverOperationTimeout,
+    is_browser_generation_error,
+)
+from hbrowser.gallery.utils.protocol import (
+    _LIFECYCLE_ATTRIBUTE,
+    ZendriverOwnerRetiredError,
+    wait_for_zendriver,
+)
 
 EXH_HOME = "https://exhentai.org/"
 SCOPE_GALLERY = "https://exhentai.org/g/10/scope00000/"
 GID_349189_GALLERY = "https://exhentai.org/g/349189/f1bcce529e/"
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _DEFAULT_QUERY = object()
+
+
+async def _assert_generation_rejects_new_work(
+    test_case: unittest.TestCase,
+    *,
+    browser: object,
+    owner: object,
+    exact_connection: object,
+) -> None:
+    lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+    test_case.assertTrue(lifecycle.retired)
+    test_case.assertIn(exact_connection, lifecycle.shutdown_connections)
+    started = False
+
+    async def unexpected_operation() -> None:
+        nonlocal started
+        started = True
+
+    coroutine = unexpected_operation()
+    with test_case.assertRaises(ZendriverOwnerRetiredError):
+        await wait_for_zendriver(coroutine, timeout=1, owner=owner)
+    test_case.assertFalse(started)
+    test_case.assertEqual(
+        inspect.getcoroutinestate(coroutine),
+        inspect.CORO_CLOSED,
+    )
 
 
 class DriverDomainBoundaryTests(unittest.TestCase):
@@ -511,6 +547,11 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         search_url = _search_url(query)
         html = _result_page(query, GID_349189_GALLERY)
         driver = _HarnessExHDriver()
+        browser = SimpleNamespace()
+        driver.browser = browser
+        driver.page.browser = browser
+        driver.page.websocket = object()
+        driver.page.mapper = {}
         driver.page.current_document = _Document(
             url=search_url,
             html_reads=(html,),
@@ -550,11 +591,76 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"query={query!r}", raised.exception.reason)
         self.assertIn("loader before='loader-0'", raised.exception.reason)
         self.assertIn("loader after='loader-0'", raised.exception.reason)
+        self.assertTrue(is_browser_generation_error(raised.exception))
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            BrowserMutationOutcomeUnknownError,
+        )
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=driver.page,
+            exact_connection=driver.page,
+        )
+
+    async def test_loading_timeout_diagnostic_failure_still_retires_page(
+        self,
+    ) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        browser = SimpleNamespace()
+        driver.browser = browser
+        driver.page.browser = browser
+        driver.page.websocket = object()
+        driver.page.mapper = {}
+        driver.page.current_document = _Document(
+            url=search_url,
+            html_reads=(_result_page(query, GID_349189_GALLERY),),
+            ready_state_reads=("loading",),
+        )
+        fake_loop = Mock()
+        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
+                return_value=fake_loop,
+            ),
+            patch.object(
+                driver,
+                "_save_search_diagnostic",
+                new=AsyncMock(side_effect=OSError("diagnostic unavailable")),
+            ),
+            self.assertRaises(SearchNavigationError) as raised,
+        ):
+            await driver._read_stable_search_page(search_url, query)
+
+        self.assertTrue(is_browser_generation_error(raised.exception))
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            BrowserMutationOutcomeUnknownError,
+        )
+        self.assertIn(
+            "could not save timeout diagnostic: OSError",
+            raised.exception.reason,
+        )
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=driver.page,
+            exact_connection=driver.page,
+        )
 
     async def test_loader_timeout_saves_the_actual_gallery_page(self) -> None:
         target_url = _search_url("gid:349189")
         gallery_html = "<html><head><title>Gallery</title></head></html>"
         driver = _HarnessExHDriver()
+        browser = SimpleNamespace()
+        driver.browser = browser
+        driver.page.browser = browser
+        driver.page.websocket = object()
+        driver.page.mapper = {}
         driver.page.current_document = _Document(
             url=GID_349189_GALLERY,
             html_reads=(gallery_html,),
@@ -589,6 +695,17 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("query=None", raised.exception.reason)
         self.assertIn("capture loader before='loader-0'", raised.exception.reason)
         self.assertIn("capture loader after='loader-0'", raised.exception.reason)
+        self.assertTrue(is_browser_generation_error(raised.exception))
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            BrowserMutationOutcomeUnknownError,
+        )
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=driver.page,
+            exact_connection=driver.page,
+        )
 
     async def test_snapshot_is_discarded_when_loader_changes_during_read(
         self,
@@ -844,7 +961,7 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(driver.get_urls, [scope_url])
 
-    async def test_only_explicit_context_loss_retries_a_get(self) -> None:
+    async def test_navigation_get_is_never_replayed_after_invocation(self) -> None:
         sentinel = "SENSITIVESEARCHTOKEN987654"
         query = f"gid:1 {sentinel}"
         url = _search_url(query)
@@ -866,16 +983,16 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             ProtocolException({"message": "Execution context was destroyed."})
         )
 
-        snapshot = await transient_driver._navigate_search_url(query, url)
+        with self.assertRaises(SearchNavigationError) as raised:
+            await transient_driver._navigate_search_url(query, url)
 
-        self.assertEqual([gallery.gid for gallery in snapshot.galleries], [1])
-        self.assertEqual(transient_driver.get_urls, [url, url])
-        transient_driver.logger.warning.assert_called_once_with(
-            "Transient browser context loss during search navigation; "
-            "retrying the trusted GET once: query_length=%d error_type=%s",
-            len(query),
-            "ProtocolException",
+        self.assertEqual(transient_driver.get_urls, [url])
+        self.assertTrue(is_browser_generation_error(raised.exception))
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            BrowserMutationOutcomeUnknownError,
         )
+        transient_driver.logger.warning.assert_not_called()
         self.assertNotIn(
             sentinel,
             repr(transient_driver.logger.warning.call_args_list),
@@ -1658,6 +1775,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         archive_link = SimpleNamespace(click=AsyncMock())
         gallery_page = SimpleNamespace(
+            websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),
@@ -1677,6 +1795,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         browser = SimpleNamespace(
+            connection=SimpleNamespace(),
             tabs=[gallery_page],
             update_targets=AsyncMock(),
         )
@@ -1704,7 +1823,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         gallery_page.activate.assert_awaited_once()
         self.assertIs(driver.page, gallery_page)
 
-    async def test_archive_timeout_closes_child_before_clicking_fresh_link(
+    async def test_archive_timeout_runs_no_cleanup_or_replayed_click(
         self,
     ) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
@@ -1723,6 +1842,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         first_link = SimpleNamespace(click=AsyncMock())
         second_link = SimpleNamespace(click=AsyncMock())
         gallery_page = SimpleNamespace(
+            websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),
@@ -1731,6 +1851,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         first_archive_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
             target=SimpleNamespace(target_id="archive-1"),
             xpath=AsyncMock(return_value=[]),
             get_content=AsyncMock(side_effect=TimeoutError),
@@ -1738,6 +1860,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         second_archive_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
             target=SimpleNamespace(target_id="archive-2"),
             xpath=AsyncMock(return_value=[]),
             get_content=AsyncMock(
@@ -1749,6 +1873,11 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         browser = SimpleNamespace(tabs=[gallery_page])
+        gallery_page.browser = browser
+        first_archive_page.browser = browser
+        second_archive_page.browser = browser
+        first_link._tab = gallery_page
+        second_link._tab = gallery_page
 
         async def open_archive_page(page: object) -> None:
             browser.tabs.append(page)
@@ -1791,18 +1920,315 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=None),
             ),
         ):
-            downloaded = await driver.download(gallery)
+            with self.assertRaises(ArchiveDownloadOutcomeUnknownError):
+                await driver.download(gallery)
 
-        self.assertTrue(downloaded)
         gallery_page.close.assert_not_awaited()
         first_link.click.assert_awaited_once()
-        second_link.click.assert_awaited_once()
-        first_archive_page.close.assert_awaited_once()
-        second_archive_page.close.assert_awaited_once()
-        self.assertEqual(gallery_page.activate.await_count, 2)
-        self.assertIs(driver.page, gallery_page)
+        second_link.click.assert_not_awaited()
+        first_archive_page.close.assert_not_awaited()
+        second_archive_page.close.assert_not_awaited()
+        gallery_page.activate.assert_not_awaited()
+        self.assertIs(driver.page, first_archive_page)
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=gallery_page,
+            exact_connection=first_archive_page,
+        )
 
-    async def test_client_offline_restores_gallery_before_propagating(self) -> None:
+    async def test_protocol_timeout_after_click_runs_no_browser_cleanup(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        timeout = ZendriverOperationTimeout(timeout_seconds=5)
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            activate=AsyncMock(),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(side_effect=timeout),
+            close=AsyncMock(),
+        )
+        driver.page = gallery_page
+        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(return_value=archive_page),
+            ),
+            patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
+            patch.object(
+                driver,
+                "_save_page_diagnostic",
+                new=AsyncMock(),
+            ) as save_diagnostic,
+            patch.object(
+                driver,
+                "_close_archive_tab_and_restore",
+                new=AsyncMock(),
+            ) as close_and_restore,
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await driver.download(gallery)
+
+        self.assertIs(raised.exception, timeout)
+        driver.get.assert_awaited_once_with(gallery.url)
+        archive_link.click.assert_awaited_once_with()
+        archive_page.get_content.assert_awaited_once_with()
+        save_diagnostic.assert_not_awaited()
+        close_and_restore.assert_not_awaited()
+        archive_page.close.assert_not_awaited()
+
+    async def test_archive_tab_activation_failure_runs_no_followup_mutation(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        activation_error = RuntimeError("activation dispatch failed")
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            activate=AsyncMock(),
+            close=AsyncMock(),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            activate=AsyncMock(side_effect=activation_error),
+            xpath=AsyncMock(),
+            get_content=AsyncMock(),
+            close=AsyncMock(),
+        )
+        driver.page = gallery_page
+        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(return_value=archive_page),
+            ),
+            patch.object(
+                driver,
+                "_close_archive_tab_and_restore",
+                new=AsyncMock(),
+            ) as close_and_restore,
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised,
+        ):
+            await driver.download(gallery)
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        archive_link.click.assert_awaited_once_with()
+        archive_page.activate.assert_awaited_once_with()
+        archive_page.xpath.assert_not_awaited()
+        archive_page.close.assert_not_awaited()
+        gallery_page.activate.assert_not_awaited()
+        close_and_restore.assert_not_awaited()
+
+    async def test_original_link_click_failure_runs_no_followup_mutation(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        click_error = RuntimeError("Original click dispatch failed")
+        archive_link = SimpleNamespace(click=AsyncMock())
+        original_link = SimpleNamespace(click=AsyncMock(side_effect=click_error))
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            activate=AsyncMock(),
+            close=AsyncMock(),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            activate=AsyncMock(),
+            xpath=AsyncMock(return_value=[original_link]),
+            get_content=AsyncMock(),
+            close=AsyncMock(),
+        )
+        driver.page = gallery_page
+        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(return_value=archive_page),
+            ),
+            patch.object(
+                driver,
+                "_close_archive_tab_and_restore",
+                new=AsyncMock(),
+            ) as close_and_restore,
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised,
+        ):
+            await driver.download(gallery)
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        archive_link.click.assert_awaited_once_with()
+        archive_page.activate.assert_awaited_once_with()
+        original_link.click.assert_awaited_once_with()
+        archive_page.get_content.assert_not_awaited()
+        archive_page.close.assert_not_awaited()
+        gallery_page.activate.assert_not_awaited()
+        close_and_restore.assert_not_awaited()
+
+    async def test_archive_click_timeout_is_not_replayed(self) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        archive_link = SimpleNamespace(
+            click=AsyncMock(side_effect=ZendriverOperationTimeout(timeout_seconds=5.0))
+        )
+        gallery_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page])
+        gallery_page.browser = browser
+        archive_link._tab = gallery_page
+        driver.page = gallery_page
+        driver.browser = browser
+        driver.myget = AsyncMock()
+
+        with (
+            patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await driver.download(gallery)
+
+        archive_link.click.assert_awaited_once_with()
+        driver.myget.assert_awaited_once_with(gallery.url)
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=gallery_page,
+            exact_connection=gallery_page,
+        )
+
+    async def test_archive_generic_click_failure_is_not_replayed(self) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        click_error = RuntimeError("click dispatch failed")
+        archive_link = SimpleNamespace(
+            click=AsyncMock(side_effect=click_error),
+        )
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        driver.page = gallery_page
+        driver.browser = SimpleNamespace(tabs=[gallery_page])
+        driver.myget = AsyncMock()
+
+        with (
+            patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised,
+        ):
+            await driver.download(gallery)
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        archive_link.click.assert_awaited_once_with()
+        driver.myget.assert_awaited_once_with(gallery.url)
+
+    async def test_missing_archive_tab_after_click_is_not_replayed(self) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+
+        evaluation_count = 0
+
+        async def navigation_url(_: str) -> str:
+            nonlocal evaluation_count
+            evaluation_count += 1
+            if evaluation_count % 2:
+                return "about:blank"
+            return gallery.url
+
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            evaluate=AsyncMock(side_effect=navigation_url),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+            close=AsyncMock(),
+            activate=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page])
+        gallery_page.browser = browser
+        archive_link._tab = gallery_page
+        driver.page = gallery_page
+        driver.browser = browser
+        driver.myget = AsyncMock()
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_new_tab",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError),
+        ):
+            await driver.download(gallery)
+
+        archive_link.click.assert_awaited_once_with()
+        driver.myget.assert_awaited_once_with(gallery.url)
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=gallery_page,
+            exact_connection=gallery_page,
+        )
+
+    async def test_client_offline_cleanup_activation_failure_is_terminal(self) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
         driver = EHDriver(headless=True)
         driver.logger = Mock()
@@ -1849,17 +2275,45 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(),
             ),
         ):
-            with self.assertRaises(ClientOfflineException) as raised:
+            with self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised:
                 await driver.download(gallery)
 
         gallery_page.close.assert_not_awaited()
         archive_page.close.assert_awaited_once()
         gallery_page.activate.assert_awaited_once()
         self.assertIs(driver.page, gallery_page)
-        self.assertEqual(
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIn(
+            "Archive operation also failed before cleanup: ClientOfflineException",
             raised.exception.__notes__,
-            ["Archive cleanup also failed: RuntimeError"],
         )
+
+    async def test_archive_close_failure_skips_gallery_activation(self) -> None:
+        driver = EHDriver(headless=True)
+        close_error = RuntimeError("close dispatch failed")
+        gallery_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="gallery"),
+            activate=AsyncMock(),
+        )
+        archive_page = SimpleNamespace(
+            target=SimpleNamespace(target_id="archive"),
+            close=AsyncMock(side_effect=close_error),
+        )
+        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.page = archive_page
+
+        with self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised:
+            await driver._close_archive_tab_and_restore(
+                gallery_page,
+                archive_page,
+            )
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        archive_page.close.assert_awaited_once_with()
+        gallery_page.activate.assert_not_awaited()
+        self.assertIs(driver.page, archive_page)
 
 
 class GalleryDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):

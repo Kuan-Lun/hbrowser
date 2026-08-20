@@ -4,11 +4,16 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-from ..utils import is_connection_error, wait_for_zendriver
+from ..utils import (
+    ZendriverOperationTimeout,
+    is_browser_generation_error,
+    wait_for_zendriver,
+)
 from .constants import RAY_RE, SITEKEY_RE, TURNSTILE_WIDGET_CSS
 from .models import ChallengeDetection
 
 _DETECTION_READ_TIMEOUT_SECONDS = 2.0
+_SELECT_WATCHDOG_MARGIN_SECONDS = 2.0
 
 
 class CaptchaDetector:
@@ -28,17 +33,21 @@ class CaptchaDetector:
         url = await wait_for_zendriver(
             page.evaluate("window.location.href"),
             timeout=_DETECTION_READ_TIMEOUT_SECONDS,
+            owner=page,
         )
         title = (
             await wait_for_zendriver(
                 page.evaluate("document.title"),
                 timeout=_DETECTION_READ_TIMEOUT_SECONDS,
+                owner=page,
             )
             or ""
         ).strip()
         html = (
             await wait_for_zendriver(
-                page.get_content(), timeout=_DETECTION_READ_TIMEOUT_SECONDS
+                page.get_content(),
+                timeout=_DETECTION_READ_TIMEOUT_SECONDS,
+                owner=page,
             )
             or ""
         )
@@ -100,11 +109,15 @@ class CaptchaDetector:
 
         try:
             dynamic_widget = await wait_for_zendriver(
-                page.select(TURNSTILE_WIDGET_CSS, timeout=timeout), timeout=timeout
+                page.select(TURNSTILE_WIDGET_CSS, timeout=timeout),
+                timeout=timeout + _SELECT_WATCHDOG_MARGIN_SECONDS,
+                owner=page,
             )
             return self._turnstile_data(dynamic_widget.attrs)
+        except ZendriverOperationTimeout:
+            raise
         except Exception as e:
-            if is_connection_error(e):
+            if is_browser_generation_error(e):
                 raise
             return None
 
@@ -128,11 +141,14 @@ class CaptchaDetector:
         try:
             recaptcha_div = await wait_for_zendriver(
                 page.select("div.g-recaptcha[data-sitekey]", timeout=timeout),
-                timeout=timeout,
+                timeout=timeout + _SELECT_WATCHDOG_MARGIN_SECONDS,
+                owner=page,
             )
             sitekey = recaptcha_div.attrs.get("data-sitekey")
             return {"sitekey": sitekey}
+        except ZendriverOperationTimeout:
+            raise
         except Exception as e:
-            if is_connection_error(e):
+            if is_browser_generation_error(e):
                 raise
             return None

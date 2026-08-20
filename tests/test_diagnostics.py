@@ -10,8 +10,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
 
 from hbrowser.gallery.driver_base import Driver
+from hbrowser.gallery.utils import (
+    ZendriverOperationTimeout,
+)
 from hbrowser.gallery.utils import diagnostic as diagnostic_module
 from hbrowser.gallery.utils.diagnostic import write_page_diagnostic
+from hbrowser.gallery.utils.protocol import ZendriverOwnerRetiredError
 
 
 class _TestDriver(Driver):
@@ -295,7 +299,34 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             "RuntimeError",
         )
 
-    async def test_page_capture_has_a_timeout(self) -> None:
+    async def test_retired_capture_error_is_not_swallowed(self) -> None:
+        retired = ZendriverOwnerRetiredError("generation retired")
+        self.driver.page.get_content.side_effect = retired
+
+        with self.assertRaises(ZendriverOwnerRetiredError) as raised:
+            await self.driver._save_page_diagnostic("driver_error")
+
+        self.assertIs(raised.exception, retired)
+        self.logger.warning.assert_not_called()
+
+    async def test_generation_failure_exit_skips_same_browser_diagnostic(
+        self,
+    ) -> None:
+        timeout = ZendriverOperationTimeout(timeout_seconds=5)
+        with patch(
+            "hbrowser.gallery.driver_base.stop_browser",
+            new=AsyncMock(),
+        ) as stop_browser:
+            await self.driver.__aexit__(
+                ZendriverOperationTimeout,
+                timeout,
+                timeout.__traceback__,
+            )
+
+        self.driver.page.get_content.assert_not_awaited()
+        stop_browser.assert_awaited_once_with(self.driver.browser)
+
+    async def test_page_capture_protocol_timeout_is_terminal(self) -> None:
         started = asyncio.Event()
         release = asyncio.Event()
         finished = asyncio.Event()
@@ -314,20 +345,19 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 finished.set()
 
         self.driver.page.get_content.side_effect = returns_late
-        with patch(
-            "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
-            0.001,
+        with (
+            patch(
+                "hbrowser.gallery.driver_base."
+                "_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
+                0.001,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
         ):
-            path = await self.driver._save_page_diagnostic("driver_error")
+            await self.driver._save_page_diagnostic("driver_error")
 
         self.assertTrue(started.is_set())
-        self.assertIsNone(path)
         self.assertFalse(cancelled)
-        self.logger.warning.assert_called_once_with(
-            "Failed to capture %s page diagnostic: error_type=%s",
-            "driver_error",
-            "TimeoutError",
-        )
+        self.logger.warning.assert_not_called()
 
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=1)
@@ -355,9 +385,9 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
                 0.001,
             ):
-                path = await self.driver._save_page_diagnostic("driver_error")
+                with self.assertRaises(ZendriverOperationTimeout):
+                    await self.driver._save_page_diagnostic("driver_error")
 
-            self.assertIsNone(path)
             release.set()
             await asyncio.wait_for(finished.wait(), timeout=1)
             await asyncio.sleep(0)
@@ -372,9 +402,49 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             "hbrowser.gallery.driver_base.stop_browser",
             new=AsyncMock(side_effect=close_error),
         ):
-            await self.driver.__aexit__(None, None, None)
+            with self.assertRaisesRegex(RuntimeError, "process did not exit"):
+                await self.driver.__aexit__(None, None, None)
 
         self.logger.warning.assert_called_once_with(
             "Failed to close browser cleanly: error_type=%s",
             "RuntimeError",
+        )
+
+    async def test_cancellation_during_error_exit_propagates_after_cleanup(
+        self,
+    ) -> None:
+        stop_started = asyncio.Event()
+        allow_stop = asyncio.Event()
+
+        async def cancellation_deferring_stop(_: object) -> None:
+            stop_started.set()
+            cancellation: asyncio.CancelledError | None = None
+            try:
+                await allow_stop.wait()
+            except asyncio.CancelledError as error:
+                cancellation = error
+                await allow_stop.wait()
+            if cancellation is not None:
+                raise cancellation
+
+        primary = ValueError("primary browser failure")
+        with patch(
+            "hbrowser.gallery.driver_base.stop_browser",
+            new=AsyncMock(side_effect=cancellation_deferring_stop),
+        ):
+            exit_task = asyncio.create_task(
+                self.driver.__aexit__(ValueError, primary, primary.__traceback__)
+            )
+            await stop_started.wait()
+            exit_task.cancel()
+            await asyncio.sleep(0)
+
+            self.assertFalse(exit_task.done())
+            allow_stop.set()
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await exit_task
+
+        self.assertIn(
+            "Browser session was already exiting after: ValueError",
+            raised.exception.__notes__,
         )

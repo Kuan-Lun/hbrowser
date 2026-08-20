@@ -162,14 +162,23 @@ async def stop_zendriver_mapper_janitor(browser: Any) -> None:
         return
     if not isinstance(task, asyncio.Task):
         raise RuntimeError("Browser mapper janitor state is invalid")
-    setattr(browser, _JANITOR_TASK_ATTRIBUTE, None)
-    if not task.done():
-        task.cancel()
+    janitor_task: asyncio.Task[Any] = task
+    if not janitor_task.done():
+        janitor_task.cancel()
 
     # ``gather(..., return_exceptions=True)`` consumes the janitor's deliberate
     # cancellation while an independent cancellation of this caller still
     # propagates normally.
-    (outcome,) = await asyncio.gather(task, return_exceptions=True)
+    outcome: Any = None
+    try:
+        outcomes = await asyncio.gather(janitor_task, return_exceptions=True)
+        outcome = outcomes[0]
+    finally:
+        if (
+            getattr(browser, _JANITOR_TASK_ATTRIBUTE, None) is janitor_task
+            and janitor_task.done()
+        ):
+            setattr(browser, _JANITOR_TASK_ATTRIBUTE, None)
     if isinstance(outcome, BaseException) and not isinstance(
         outcome, asyncio.CancelledError
     ):

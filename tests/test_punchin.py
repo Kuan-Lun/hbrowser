@@ -203,8 +203,16 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         async def get(_url: str) -> None:
             events.append("get")
 
-        async def wait(_function: object, *, ischangeurl: bool) -> None:
+        async def wait(
+            _function: object,
+            *,
+            ischangeurl: bool,
+            owner: object,
+            operation_timeout: float,
+        ) -> None:
             self.assertFalse(ischangeurl)
+            self.assertIs(owner, driver.page)
+            self.assertEqual(operation_timeout, 15.0)
             events.append("reload")
 
         async def get_content(**_kwargs: object) -> str:
