@@ -3,7 +3,14 @@ name: Publish to PyPI
 on:
   push:
     branches: [master]
-    paths: [pyproject.toml]
+    paths:
+      - .github/workflows/publish.yml
+      - hbrowser/gallery/browser/factory.py
+      - hbrowser/gallery/browser/process.py
+      - hbrowser/gallery/browser/tor.py
+      - pyproject.toml
+      - tests/test_browser_factory.py
+      - tests/test_owned_process.py
 
 jobs:
   verify-windows-process-ownership:
@@ -19,10 +26,17 @@ jobs:
         run: python -m pip install --editable ".[dev]"
 
       - name: Verify Windows shutdown ownership
-        run: >-
-          python -m pytest
-          tests/test_owned_process.py
-          tests/test_browser_factory.py
+        shell: pwsh
+        run: |
+          $output = python -m pytest tests/test_owned_process.py tests/test_browser_factory.py 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exitCode -ne 0) {
+            $tail = ($output | Select-Object -Last 120) -join "`n"
+            $escaped = $tail.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Windows shutdown tests failed::$escaped"
+          }
+          exit $exitCode
 
   publish:
     needs: verify-windows-process-ownership
