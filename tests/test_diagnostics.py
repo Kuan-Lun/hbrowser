@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import stat
 import threading
@@ -9,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
 
+from hbrowser import EHDriver
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.utils import (
     ZendriverOperationTimeout,
@@ -24,6 +26,9 @@ class _TestDriver(Driver):
 
 
 class PageDiagnosticTests(unittest.TestCase):
+    def test_public_driver_exposes_async_page_diagnostic_capture(self) -> None:
+        self.assertTrue(inspect.iscoroutinefunction(EHDriver.save_page_diagnostic))
+
     def test_diagnostics_are_unique_and_private(self) -> None:
         with TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
@@ -254,7 +259,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             "_write_page_diagnostic",
             side_effect=write_diagnostic,
         ):
-            path = await self.driver._save_page_diagnostic(
+            path = await self.driver.save_page_diagnostic(
                 "driver_error",
                 "content",
             )
@@ -290,7 +295,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         capture_error = RuntimeError("session detached")
         self.driver.page.get_content.side_effect = capture_error
 
-        path = await self.driver._save_page_diagnostic("driver_error")
+        path = await self.driver.save_page_diagnostic("driver_error")
 
         self.assertIsNone(path)
         self.logger.warning.assert_called_once_with(
@@ -304,7 +309,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.driver.page.get_content.side_effect = retired
 
         with self.assertRaises(ZendriverOwnerRetiredError) as raised:
-            await self.driver._save_page_diagnostic("driver_error")
+            await self.driver.save_page_diagnostic("driver_error")
 
         self.assertIs(raised.exception, retired)
         self.logger.warning.assert_not_called()
@@ -353,7 +358,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(ZendriverOperationTimeout),
         ):
-            await self.driver._save_page_diagnostic("driver_error")
+            await self.driver.save_page_diagnostic("driver_error")
 
         self.assertTrue(started.is_set())
         self.assertFalse(cancelled)
@@ -386,7 +391,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 0.001,
             ):
                 with self.assertRaises(ZendriverOperationTimeout):
-                    await self.driver._save_page_diagnostic("driver_error")
+                    await self.driver.save_page_diagnostic("driver_error")
 
             release.set()
             await asyncio.wait_for(finished.wait(), timeout=1)

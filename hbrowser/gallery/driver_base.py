@@ -251,7 +251,7 @@ class Driver(ABC):
             ) or not is_browser_generation_error(exc_val)
             if self.page is not None and may_capture_diagnostic:
                 try:
-                    await self._save_page_diagnostic("driver_error")
+                    await self.save_page_diagnostic("driver_error")
                 except BaseException as error:
                     diagnostic_error = error
         if not self._owns_browser or self.browser is None:
@@ -325,11 +325,13 @@ class Driver(ABC):
     def _write_page_diagnostic(kind: str, content: str) -> Path:
         return write_page_diagnostic(get_log_dir(), kind, content)
 
-    async def _save_page_diagnostic(
+    async def save_page_diagnostic(
         self,
         kind: str,
         content: str | None = None,
     ) -> Path | None:
+        """Persist a bounded, redacted HTML snapshot for page-state failures."""
+
         if content is None:
             try:
                 if self.page is None:
@@ -584,7 +586,7 @@ class Driver(ABC):
             automatic_solver=flaresolverr_session,
             apply_identity=self._apply_flaresolverr_receipt,
             navigate=self.myget,
-            save_diagnostic=self._save_page_diagnostic,
+            save_diagnostic=self.save_page_diagnostic,
         )
         await handler.resolve(self.page, url, detect_timeout=detect_timeout)
 

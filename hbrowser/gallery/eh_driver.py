@@ -1415,7 +1415,7 @@ class EHDriver(Driver):
         if not isinstance(initial_html_content, str):
             raise TypeError("Initial daily check-in page content was not a string")
         if capture_pages:
-            await self._save_page_diagnostic(
+            await self.save_page_diagnostic(
                 "punchin_initial",
                 initial_html_content,
             )
@@ -1441,7 +1441,7 @@ class EHDriver(Driver):
         if not isinstance(html_content, str):
             raise TypeError("Daily check-in page content was not a string")
         if capture_pages:
-            await self._save_page_diagnostic(
+            await self.save_page_diagnostic(
                 "punchin_reloaded",
                 html_content,
             )
@@ -1782,7 +1782,7 @@ class EHDriver(Driver):
             except ZendriverOperationTimeout:
                 raise
             except TimeoutError:
-                error_file = await self._save_page_diagnostic("download_timeout")
+                error_file = await self.save_page_diagnostic("download_timeout")
                 if error_file is None:
                     self.logger.warning(
                         "Archive download status timed out after click; diagnostic "

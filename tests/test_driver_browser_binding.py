@@ -172,7 +172,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
                 "_init_browser",
                 new=AsyncMock(side_effect=startup_error),
             ),
-            patch.object(driver, "_save_page_diagnostic", new=AsyncMock()) as save,
+            patch.object(driver, "save_page_diagnostic", new=AsyncMock()) as save,
             patch(
                 "hbrowser.gallery.driver_base.stop_browser",
                 new=AsyncMock(),

@@ -230,7 +230,7 @@ class DriverPageChallengeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         driver.myget = navigator
         driver.captcha_detector = detector  # type: ignore[assignment]
         diagnostic = AsyncMock(return_value=None)
-        driver._save_page_diagnostic = diagnostic  # type: ignore[method-assign]
+        driver.save_page_diagnostic = diagnostic  # type: ignore[method-assign]
 
         with (
             patch.object(
@@ -370,7 +370,7 @@ class DriverPageChallengeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         driver.myget = navigator
         driver.captcha_detector = detector  # type: ignore[assignment]
         diagnostic = AsyncMock(return_value=None)
-        driver._save_page_diagnostic = diagnostic  # type: ignore[method-assign]
+        driver.save_page_diagnostic = diagnostic  # type: ignore[method-assign]
 
         with (
             patch.object(

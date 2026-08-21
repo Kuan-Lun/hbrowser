@@ -210,6 +210,10 @@ POSIX systems these files are created with owner-only permissions. Because page
 HTML can still contain account-specific data, keep `HBROWSER_LOG_DIR` in a
 private location.
 
+Browser clients can persist the current page source at an application-defined
+failure boundary with `await driver.save_page_diagnostic("failure_kind")`. The
+same redaction, private-file, size, and retention rules apply.
+
 ## Usage
 
 Daily check-in returns an explicit outcome. A random encounter URL is accepted

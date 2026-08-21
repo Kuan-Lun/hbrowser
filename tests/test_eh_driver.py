@@ -1916,7 +1916,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 driver,
-                "_save_page_diagnostic",
+                "save_page_diagnostic",
                 new=AsyncMock(return_value=None),
             ),
         ):
@@ -1969,7 +1969,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
             patch.object(
                 driver,
-                "_save_page_diagnostic",
+                "save_page_diagnostic",
                 new=AsyncMock(),
             ) as save_diagnostic,
             patch.object(

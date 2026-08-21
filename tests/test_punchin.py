@@ -269,7 +269,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
             return_value="initial-loader"
         )
         driver.logger = Mock()
-        driver._save_page_diagnostic = AsyncMock()  # type: ignore[method-assign]
+        driver.save_page_diagnostic = AsyncMock()  # type: ignore[method-assign]
 
         with patch.dict(
             environ,
@@ -280,7 +280,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, RandomEncounterFound)
         self.assertEqual(driver._read_stable_punchin_document.await_count, 2)
         self.assertEqual(
-            driver._save_page_diagnostic.await_args_list,
+            driver.save_page_diagnostic.await_args_list,
             [
                 unittest.mock.call("punchin_initial", initial_content),
                 unittest.mock.call("punchin_reloaded", reloaded_content),
