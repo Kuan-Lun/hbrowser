@@ -1558,6 +1558,14 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
 class TorProcessCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
+        tor_binary = patch.object(
+            tor_module,
+            "_find_tor_binary",
+            return_value="/tor",
+        )
+        tor_binary.start()
+        self.addCleanup(tor_binary.stop)
+
         data_directory = patch.object(
             tempfile,
             "mkdtemp",
@@ -1575,7 +1583,6 @@ class TorProcessCleanupTests(unittest.TestCase):
                 "start_owned_process",
                 return_value=process,
             ) as start_process,
-            patch.object(tor_module, "_find_tor_binary", return_value="/tor"),
             patch("hbrowser.gallery.browser.tor.atexit.register"),
         ):
             observed = tor_module._start_tor_process(9150)
