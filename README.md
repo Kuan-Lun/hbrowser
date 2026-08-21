@@ -229,7 +229,7 @@ cooperative stop without killing Chrome while a CDP mutation receipt is still
 being confirmed. Each generation uses an HBrowser-owned Chrome profile, and
 authenticated proxy material is removed only after process-tree termination is
 proven. The application remains responsible for closing its Browser owner after
-reaching a safe boundary. HBrowser pins Zendriver 0.15.5 because the
+reaching a safe boundary. HBrowser pins Zendriver 0.16.0 because the
 connect-existing lifecycle contract is verified against that exact release.
 
 ## Usage

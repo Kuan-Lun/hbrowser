@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
-version = "0.40.3"
+version = "0.41.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -13,10 +13,10 @@ requires-python = ">=3.14,<3.15"
 dependencies = [
     "asyncio-atexit>=1.0.1,<2",
     "beautifulsoup4>=4.15.0",
-    "h2h-galleryinfo-parser>=0.5.1",
+    "h2h-galleryinfo-parser>=0.5.2,<0.6",
     "httpx>=0.28.1",
     "websockets>=17.0.1",
-    "zendriver==0.15.5",
+    "zendriver==0.16.0",
 ]
 
 classifiers = [
@@ -30,8 +30,8 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
     "black>=26.5.1",
-    "ruff>=0.16.3",
-    "mypy>=2.3.0",
+    "ruff>=0.16.4",
+    "mypy>=2.3.1",
     "pymarkdownlnt>=0.9.39",
     "pytest>=9.1.1",
 ]
