@@ -31,6 +31,7 @@ from .owner import (
     TabTransportUnavailableError,
     TargetIdGetter,
 )
+from .process import ProcessOwnershipError
 
 __all__ = [
     "BrowserCloser",
@@ -39,6 +40,7 @@ __all__ = [
     "BrowserOwnerState",
     "BrowserOwnerStateError",
     "BrowserOwnershipError",
+    "ProcessOwnershipError",
     "FlareSolverrClient",
     "FlareSolverrConfigurationError",
     "FlareSolverrError",

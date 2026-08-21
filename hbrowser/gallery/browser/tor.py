@@ -13,12 +13,14 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..utils import setup_logger
+from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
 
 logger = setup_logger(__name__)
 
 # Tor SOCKS proxy 預設端口
 TOR_SOCKS_PORT = 9150
 _TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
+type _Process = OwnedProcess | subprocess.Popen[bytes]
 
 # Tor 執行檔路徑（使用者需自行安裝 Tor Browser）
 _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
@@ -40,15 +42,15 @@ _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyTyp
 )
 
 
-class _TorProcessCleanupError(Exception):
+class _TorProcessCleanupError(ProcessOwnershipError):
     """A failed bootstrap left a Tor process whose termination was not proven."""
 
 
 class _TorProcessAtexitCleanup:
     """Retain exact Tor process ownership until it has been proven reaped."""
 
-    def __init__(self, tor_process: subprocess.Popen[bytes]) -> None:
-        self._tor_process: subprocess.Popen[bytes] | None = tor_process
+    def __init__(self, tor_process: _Process) -> None:
+        self._tor_process: _Process | None = tor_process
         self._registered = False
         self._lock = threading.Lock()
 
@@ -86,7 +88,7 @@ class _TorProcessAtexitCleanup:
             logger.exception("Failed to unregister completed Tor cleanup callback")
 
 
-def _terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
+def _terminate_tor_process(tor_process: _Process) -> None:
     try:
         tor_process.terminate()
     except ProcessLookupError:
@@ -101,7 +103,7 @@ def _terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
         tor_process.wait(timeout=5)
 
 
-def terminate_tor_process(tor_process: subprocess.Popen[bytes]) -> None:
+def terminate_tor_process(tor_process: _Process) -> None:
     """終止 Tor 子程序，正常 terminate 逾時才強制 kill。"""
     process_cleanup = getattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, None)
     if isinstance(process_cleanup, _TorProcessAtexitCleanup):
@@ -136,7 +138,7 @@ def _find_tor_binary() -> str:
     )
 
 
-def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
+def _start_tor_process(socks_port: int) -> OwnedProcess:
     """
     啟動 Tor SOCKS proxy 進程
 
@@ -150,9 +152,9 @@ def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
     data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
 
     logger.info(f"Starting Tor process on SOCKS port {socks_port}...")
-    tor_process = subprocess.Popen(
+    tor_process = start_owned_process(
+        tor_binary,
         [
-            tor_binary,
             "--SocksPort",
             str(socks_port),
             "--DataDirectory",
@@ -160,6 +162,7 @@ def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        cleanup_paths=(data_dir,),
     )
     process_cleanup: _TorProcessAtexitCleanup | None = None
     cleanup_registered = False
@@ -176,14 +179,24 @@ def _start_tor_process(socks_port: int) -> subprocess.Popen[bytes]:
             raise RuntimeError("Failed to capture Tor process output")
 
         # 使用背景 thread 讀取 stdout（跨平台，避免 fcntl/select）
-        line_queue: deque[str] = deque()
+        line_queue: deque[str] = deque(maxlen=256)
         reader_done = threading.Event()
 
         def _reader() -> None:
             assert tor_process.stdout is not None
-            for raw_line in tor_process.stdout:
-                line_queue.append(raw_line.decode("utf-8", errors="replace").strip())
-            reader_done.set()
+            try:
+                for raw_line in tor_process.stdout:
+                    line_queue.append(
+                        raw_line.decode("utf-8", errors="replace").strip()
+                    )
+            finally:
+                try:
+                    close_output = getattr(tor_process.stdout, "close", None)
+                    if callable(close_output):
+                        close_output()
+                except OSError:
+                    pass
+                reader_done.set()
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
@@ -276,7 +289,7 @@ def start_tor_with_retry(
     socks_port: int,
     max_retries: int = 3,
     retry_wait: int = 300,
-) -> subprocess.Popen[bytes]:
+) -> OwnedProcess:
     """啟動 Tor 並在失敗時重試，同時註冊 atexit 清理。
 
     Args:
@@ -287,11 +300,13 @@ def start_tor_with_retry(
     Returns:
         tor 進程的 Popen 物件
     """
-    tor_process: subprocess.Popen[bytes] | None = None
+    tor_process: OwnedProcess | None = None
     for attempt in range(1, max_retries + 1):
         try:
             tor_process = _start_tor_process(socks_port)
             break
+        except ProcessOwnershipError:
+            raise
         except RuntimeError:
             if attempt == max_retries:
                 raise

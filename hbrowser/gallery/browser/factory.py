@@ -3,8 +3,12 @@
 import asyncio
 import os
 import platform
+import shutil
 import subprocess
+import tempfile
+import time
 from collections.abc import MutableMapping
+from pathlib import Path
 from typing import Any
 
 import asyncio_atexit  # type: ignore[import-untyped]
@@ -26,6 +30,11 @@ from .chrome_manager import ensure_chrome_installed
 from .mapper import (
     start_zendriver_mapper_janitor,
     stop_zendriver_mapper_janitor,
+)
+from .process import (
+    OwnedProcess,
+    ProcessOwnershipError,
+    start_owned_browser_process,
 )
 from .proxy import (
     configure_proxy,
@@ -60,16 +69,31 @@ _PAGE_SETUP_MUTATION_TIMEOUT_SECONDS = 15.0
 _DRAINING_SHUTDOWN_TASKS: set[asyncio.Future[Any]] = set()
 _CONNECTION_CLOSE_TASK_ATTRIBUTE = "_hbrowser_close_task"
 _BROWSER_ATEXIT_CLEANUP_ATTRIBUTE = "_hbrowser_asyncio_atexit_cleanup"
+_BROWSER_PROCESS_OWNER_ATTRIBUTE = "_hbrowser_process_owner"
+_DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 15.0
+_DEVTOOLS_ACTIVE_PORT_POLL_SECONDS = 0.02
+
+
+class _OwnedZendriverBrowser(zd.Browser):
+    """Zendriver connection whose OS process tree is owned by hbrowser."""
+
+    @property
+    def stopped(self) -> bool:
+        owner = getattr(self, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
+        if isinstance(owner, OwnedProcess):
+            return owner.poll() is not None
+        return super().stopped
 
 
 def _build_config(
     headless: bool,
     proxy_extension: str | None,
+    user_data_directory: str,
     use_tor: bool = False,
     socks_port: int | None = None,
     chrome_path: str | None = None,
 ) -> zd.Config:
-    config = zd.Config()
+    config = zd.Config(user_data_dir=user_data_directory)
 
     if chrome_path:
         config.browser_executable_path = chrome_path
@@ -79,7 +103,10 @@ def _build_config(
 
     if proxy_extension:
         logger.debug("Using residential proxy extension")
-        config.add_extension(proxy_extension)
+        extension_directory = Path(proxy_extension)
+        if not extension_directory.is_dir():
+            raise RuntimeError("Proxy extension directory is unavailable")
+        config.add_argument(f"--load-extension={extension_directory}")
     elif use_tor and socks_port is not None:
         config.add_argument(f"--proxy-server=socks5://127.0.0.1:{socks_port}")
         logger.debug("Using Tor SOCKS proxy")
@@ -132,9 +159,125 @@ def _build_config(
     return config
 
 
-def _attach_tor_process(
-    browser: zd.Browser, tor_process: subprocess.Popen[bytes] | None
-) -> None:
+def _parse_devtools_active_port(contents: str) -> int:
+    lines = contents.splitlines()
+    if len(lines) < 2:
+        raise RuntimeError("Chrome DevToolsActivePort record is incomplete")
+    try:
+        port = int(lines[0])
+    except ValueError as error:
+        raise RuntimeError(
+            "Chrome DevToolsActivePort contains an invalid port"
+        ) from error
+    if not 1 <= port <= 65535:
+        raise RuntimeError("Chrome DevToolsActivePort contains an invalid port")
+    if not lines[1].startswith("/devtools/browser/"):
+        raise RuntimeError("Chrome DevToolsActivePort contains an invalid endpoint")
+    return port
+
+
+def _wait_for_devtools_active_port(
+    owner: OwnedProcess,
+    user_data_directory: Path,
+    *,
+    timeout: float = _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS,
+) -> int:
+    active_port_file = user_data_directory / "DevToolsActivePort"
+    deadline = time.monotonic() + timeout
+    last_parse_error: RuntimeError | None = None
+    while time.monotonic() < deadline:
+        if active_port_file.is_file():
+            try:
+                return _parse_devtools_active_port(
+                    active_port_file.read_text(encoding="utf-8")
+                )
+            except (OSError, RuntimeError) as error:
+                last_parse_error = (
+                    error
+                    if isinstance(error, RuntimeError)
+                    else RuntimeError("Chrome DevToolsActivePort could not be read")
+                )
+        returncode = owner.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                "Chrome exited before publishing DevToolsActivePort "
+                f"(exit_code={returncode})"
+            )
+        time.sleep(_DEVTOOLS_ACTIVE_PORT_POLL_SECONDS)
+    timeout_error = TimeoutError(
+        f"Chrome did not publish DevToolsActivePort within {timeout:g} seconds"
+    )
+    if last_parse_error is not None:
+        timeout_error.add_note(
+            "Last DevToolsActivePort error: "
+            f"{type(last_parse_error).__name__}: {last_parse_error}"
+        )
+    raise timeout_error
+
+
+def _terminate_unbound_owner(owner: OwnedProcess) -> None:
+    owner.terminate()
+    try:
+        owner.wait(timeout=_BROWSER_PROCESS_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        owner.kill()
+        owner.wait(timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS)
+
+
+def _construct_owned_browser(
+    config: zd.Config,
+    *,
+    cleanup_paths: tuple[str, ...],
+) -> _OwnedZendriverBrowser:
+    """Prelaunch Chrome, discover its port, then construct a connection-only client."""
+
+    if config.host is not None or config.port is not None:
+        raise RuntimeError("Owned Chrome launch requires an unbound debugging endpoint")
+    if config.lang is not None:
+        raise RuntimeError(
+            "Owned Chrome launch does not accept implicit language mutation"
+        )
+    if getattr(config, "_extensions", None):
+        raise RuntimeError("Owned Chrome launch requires explicit extension arguments")
+
+    executable = Path(config.browser_executable_path)
+    if not executable.is_file():
+        raise FileNotFoundError(f"Browser executable is unavailable: {executable}")
+    config.add_argument("--remote-debugging-host=127.0.0.1")
+    config.add_argument("--remote-debugging-port=0")
+    parameters = config()
+    parameters.append("about:blank")
+
+    owner = start_owned_browser_process(
+        executable,
+        parameters,
+        cleanup_paths=cleanup_paths,
+    )
+    try:
+        port = _wait_for_devtools_active_port(
+            owner,
+            Path(config.user_data_dir),
+        )
+        config.host = "127.0.0.1"
+        config.port = port
+        browser = _OwnedZendriverBrowser(config)
+        setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+        return browser
+    except BaseException as startup_error:
+        try:
+            _terminate_unbound_owner(owner)
+        except BaseException as cleanup_error:
+            ownership_error = ProcessOwnershipError(
+                "Chrome startup failed and its process ownership remains unresolved"
+            )
+            ownership_error.add_note(
+                "Startup failure type: " f"{type(startup_error).__name__}"
+            )
+            raise ownership_error from cleanup_error
+        raise startup_error.with_traceback(startup_error.__traceback__)
+
+
+def _attach_tor_process(browser: zd.Browser, tor_process: OwnedProcess | None) -> None:
     """把 Tor 子程序掛在 browser 物件上，讓 stop_browser 之後能找到它清理。
 
     一拿到 browser 就立刻呼叫（在任何後續可能失敗的步驟之前），確保只要
@@ -313,10 +456,13 @@ async def _cleanup_browser_after_startup_failure(
         )
         raise
     except BaseException as cleanup_error:
-        startup_error.add_note(
-            f"Browser cleanup after {phase} failure also failed: "
-            f"{type(cleanup_error).__name__}"
+        ownership_error = ProcessOwnershipError(
+            f"Browser {phase} failed and generation cleanup remains unresolved"
         )
+        ownership_error.add_note(
+            "Startup failure type: " f"{type(startup_error).__name__}"
+        )
+        raise ownership_error from cleanup_error
 
 
 class _BrowserAtexitCleanup:
@@ -392,8 +538,11 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
     logger.info("Starting browser")
 
     use_tor = should_use_tor()
-    tor_process: subprocess.Popen[bytes] | None = None
+    tor_process: OwnedProcess | None = None
     socks_port: int | None = None
+    proxy_extension: str | None = None
+    profile_directory: str | None = None
+    private_paths_are_owned = False
     if use_tor:
         socks_port = find_available_port(TOR_SOCKS_PORT)
         tor_start_task = asyncio.create_task(
@@ -417,21 +566,71 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         else:
             connection = "direct"
         chrome_paths = ensure_chrome_installed()
+        profile_directory = tempfile.mkdtemp(prefix="hbrowser-profile-")
         config = _build_config(
-            headless, proxy_extension, use_tor, socks_port, chrome_paths.chrome
+            headless,
+            proxy_extension,
+            profile_directory,
+            use_tor,
+            socks_port,
+            chrome_paths.chrome,
         )
 
         logger.debug("Initializing browser")
-        browser = zd.Browser(config)
+        browser = _construct_owned_browser(
+            config,
+            cleanup_paths=tuple(
+                path
+                for path in (profile_directory, proxy_extension)
+                if path is not None
+            ),
+        )
+        private_paths_are_owned = True
     except BaseException as construction_error:
+        private_cleanup_error: BaseException | None = None
+        tor_cleanup_error: BaseException | None = None
+        if not private_paths_are_owned and not isinstance(
+            construction_error,
+            ProcessOwnershipError,
+        ):
+            for private_path in (profile_directory, proxy_extension):
+                if private_path is None:
+                    continue
+                try:
+                    shutil.rmtree(private_path)
+                except FileNotFoundError:
+                    pass
+                except BaseException as cleanup_error:
+                    if private_cleanup_error is None:
+                        private_cleanup_error = cleanup_error
+                    else:
+                        private_cleanup_error.add_note(
+                            "Additional private cleanup failure: "
+                            f"{type(cleanup_error).__name__}"
+                        )
         if tor_process is not None:
             try:
                 await asyncio.to_thread(terminate_tor_process, tor_process)
             except BaseException as cleanup_error:
-                construction_error.add_note(
-                    "Tor cleanup after browser startup failure also failed: "
-                    f"{type(cleanup_error).__name__}"
-                )
+                tor_cleanup_error = cleanup_error
+        if private_cleanup_error is not None:
+            ownership_error = ProcessOwnershipError(
+                "Browser construction failed and private generation material "
+                "could not be removed"
+            )
+            ownership_error.add_note(
+                "Construction failure type: " f"{type(construction_error).__name__}"
+            )
+            raise ownership_error from private_cleanup_error
+        if tor_cleanup_error is not None:
+            ownership_error = ProcessOwnershipError(
+                "Browser construction failed and Tor process ownership "
+                "remains unresolved"
+            )
+            ownership_error.add_note(
+                "Construction failure type: " f"{type(construction_error).__name__}"
+            )
+            raise ownership_error from tor_cleanup_error
         raise construction_error.with_traceback(construction_error.__traceback__)
 
     _attach_tor_process(browser, tor_process)
@@ -694,7 +893,29 @@ async def _await_browser_stop_task(
 
 
 def _terminate_browser_process(browser: Any) -> None:
-    """Synchronously terminate, kill if needed, and reap Browser._process."""
+    """Synchronously terminate and reap every process owner for one browser."""
+
+    owner = getattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
+    if isinstance(owner, OwnedProcess):
+        try:
+            try:
+                owner.terminate()
+                owner.wait(timeout=_BROWSER_PROCESS_GRACE_SECONDS)
+            except BaseException as graceful_error:
+                owner.kill()
+                try:
+                    owner.wait(timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS)
+                except BaseException as forced_error:
+                    forced_error.add_note(
+                        "Graceful owner cleanup failure type: "
+                        f"{type(graceful_error).__name__}"
+                    )
+                    raise
+        except BaseException as cleanup_error:
+            raise ProcessOwnershipError(
+                "Browser process-tree cleanup remains unresolved"
+            ) from cleanup_error
+        setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
 
     process = getattr(browser, "_process", None)
     if process is None:
@@ -763,11 +984,19 @@ async def _ensure_browser_cleanup(
             retirement.replace_browser_stop_task(task)
             task_started_now = True
         else:
+            try:
+                await asyncio.to_thread(_terminate_browser_process, browser)
+            except BaseException as process_error:
+                return [process_error]
             retirement.mark_browser_cleanup_complete()
             return []
 
     stop_error = await _await_browser_stop_task(task)
     if stop_error is None:
+        try:
+            await asyncio.to_thread(_terminate_browser_process, browser)
+        except BaseException as process_error:
+            return [process_error]
         retirement.mark_browser_cleanup_complete()
         return []
     if not allow_fallback or not retirement.protocol_is_retired():
@@ -782,6 +1011,10 @@ async def _ensure_browser_cleanup(
         task = replacement
         stop_error = await _await_browser_stop_task(task)
         if stop_error is None:
+            try:
+                await asyncio.to_thread(_terminate_browser_process, browser)
+            except BaseException as process_error:
+                return [process_error]
             retirement.mark_browser_cleanup_complete()
             return []
 

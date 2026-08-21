@@ -1,7 +1,9 @@
 import asyncio
 import subprocess
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -13,6 +15,7 @@ from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import factory
 from hbrowser.gallery.browser import tor as tor_module
 from hbrowser.gallery.browser.mapper import start_zendriver_mapper_janitor
+from hbrowser.gallery.browser.process import OwnedProcess, ProcessOwnershipError
 from hbrowser.gallery.browser.tor import terminate_tor_process
 from hbrowser.gallery.utils import (
     ZendriverOperationTimeout,
@@ -31,6 +34,111 @@ def _tab(target_id: str = "page-1", *, type_: str = "page") -> zd.Tab:
         can_access_opener=False,
     )
     return zd.Tab(f"ws://127.0.0.1/devtools/page/{target_id}", target)
+
+
+class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_config_uses_an_explicit_hbrowser_owned_profile(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-profile-test-") as profile:
+            config = factory._build_config(
+                True,
+                None,
+                profile,
+                chrome_path="/browser",
+            )
+
+            self.assertTrue(config.uses_custom_data_dir)
+            self.assertEqual(config.user_data_dir, profile)
+
+    async def test_connect_existing_never_calls_zendriver_process_launcher(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-profile-test-") as profile:
+            config = zd.Config(
+                user_data_dir=profile,
+                browser_executable_path="/browser",
+            )
+            config.host = "127.0.0.1"
+            config.port = 9222
+            config.autodiscover_targets = False
+            browser = factory._OwnedZendriverBrowser(config)
+            owner = Mock(spec=OwnedProcess)
+            owner.poll.return_value = None
+            setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+
+            async def connected() -> bool:
+                setattr(
+                    browser,
+                    "info",
+                    SimpleNamespace(
+                        webSocketDebuggerUrl=(
+                            "ws://127.0.0.1:9222/devtools/browser/test"
+                        )
+                    ),
+                )
+                return True
+
+            browser.test_connection = AsyncMock(side_effect=connected)  # type: ignore[method-assign]
+            browser.update_targets = AsyncMock()  # type: ignore[method-assign]
+            with (
+                patch.object(zd.util, "_start_process") as zendriver_launcher,
+                patch("zendriver.core.browser.Connection", return_value=Mock()),
+            ):
+                observed = await browser.start()
+
+            self.assertIs(observed, browser)
+            zendriver_launcher.assert_not_called()
+            browser.update_targets.assert_awaited_once_with()
+
+    def test_prelaunch_discovers_port_and_binds_owner_without_global_hook(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-contract-test-") as directory:
+            root = Path(directory)
+            executable = root / "browser"
+            executable.touch()
+            profile = root / "profile"
+            profile.mkdir()
+            config = zd.Config(
+                user_data_dir=profile,
+                browser_executable_path=executable,
+            )
+            owner = Mock(spec=OwnedProcess)
+            browser = Mock()
+            original_launcher = zd.util._start_process
+
+            with (
+                patch.object(
+                    factory,
+                    "start_owned_browser_process",
+                    return_value=owner,
+                ) as start_process,
+                patch.object(
+                    factory,
+                    "_wait_for_devtools_active_port",
+                    return_value=43123,
+                ),
+                patch.object(
+                    factory,
+                    "_OwnedZendriverBrowser",
+                    return_value=browser,
+                ),
+            ):
+                observed = factory._construct_owned_browser(
+                    config,
+                    cleanup_paths=(str(profile),),
+                )
+
+            self.assertIs(observed, browser)
+            self.assertIs(zd.util._start_process, original_launcher)
+            self.assertEqual(config.host, "127.0.0.1")
+            self.assertEqual(config.port, 43123)
+            parameters = start_process.call_args.args[1]
+            self.assertIn("--remote-debugging-port=0", parameters)
+            self.assertEqual(parameters[-1], "about:blank")
+            self.assertIs(
+                getattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE),
+                owner,
+            )
 
 
 class _Process:
@@ -212,8 +320,8 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
             patch.object(
-                zd,
-                "Browser",
+                factory,
+                "_construct_owned_browser",
                 return_value=browser,
             ),
             patch.object(factory, "_register_browser_atexit") as register_atexit,
@@ -247,8 +355,8 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
             patch.object(
-                zd,
-                "Browser",
+                factory,
+                "_construct_owned_browser",
                 return_value=browser,
             ),
             patch.object(factory, "_register_browser_atexit"),
@@ -337,7 +445,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(zd, "Browser", return_value=browser),
+            patch.object(factory, "_construct_owned_browser", return_value=browser),
             patch.object(factory, "_register_browser_atexit"),
             patch.object(
                 factory,
@@ -388,7 +496,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(zd, "Browser", return_value=browser),
+            patch.object(factory, "_construct_owned_browser", return_value=browser),
             patch.object(factory, "_register_browser_atexit"),
             self.assertRaises(RuntimeError) as raised,
         ):
@@ -408,6 +516,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         browser = _OwnedBrowser()
         startup_error = RuntimeError("target discovery failed")
+        cleanup_error = RuntimeError("first cleanup failed")
         registered_instances: set[object] = set()
         registered_cleanups: list[factory._BrowserAtexitCleanup] = []
 
@@ -419,14 +528,14 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             raise startup_error
 
         browser.start = AsyncMock(side_effect=failed_start)  # type: ignore[attr-defined]
-        browser.stop.side_effect = [RuntimeError("first cleanup failed"), None]
+        browser.stop.side_effect = [cleanup_error, None]
 
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(zd, "Browser", return_value=browser),
+            patch.object(factory, "_construct_owned_browser", return_value=browser),
             patch(
                 "hbrowser.gallery.browser.factory.asyncio_atexit.register",
                 side_effect=lambda cleanup, **_: registered_cleanups.append(cleanup),
@@ -441,10 +550,14 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             ensure_chrome.return_value.chrome = "/test/chrome"
-            with self.assertRaises(RuntimeError) as raised:
+            with self.assertRaises(ProcessOwnershipError) as raised:
                 await factory._create_browser(True)
 
-            self.assertIs(raised.exception, startup_error)
+            self.assertIs(raised.exception.__cause__, cleanup_error)
+            self.assertIn(
+                "Startup failure type: RuntimeError",
+                raised.exception.__notes__,
+            )
             self.assertEqual(len(registered_cleanups), 1)
             cleanup = registered_cleanups[0]
             self.assertIs(cleanup.browser, browser)
@@ -584,7 +697,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         # clears every callback only after all registered browsers have run.
         unregister_cleanup.assert_not_called()
 
-    async def test_post_setup_cancellation_preserves_cancel_on_cleanup_error(
+    async def test_post_setup_cleanup_failure_overrides_cancellation(
         self,
     ) -> None:
         page = _tab()
@@ -602,7 +715,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(zd, "Browser", return_value=browser),
+            patch.object(factory, "_construct_owned_browser", return_value=browser),
             patch.object(factory, "_register_browser_atexit"),
             patch.object(
                 factory,
@@ -619,12 +732,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             create_task = asyncio.create_task(factory._create_browser(True))
             await setup_started.wait()
             create_task.cancel()
-            with self.assertRaises(asyncio.CancelledError) as raised:
+            with self.assertRaises(ProcessOwnershipError) as raised:
                 await create_task
 
         stop_browser.assert_awaited_once_with(browser)
+        self.assertIs(raised.exception.__cause__, cleanup_error)
         self.assertIn(
-            "Browser cleanup after setup failure also failed: RuntimeError",
+            "Startup failure type: CancelledError",
             raised.exception.__notes__,
         )
 
@@ -1363,6 +1477,37 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TorProcessCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        data_directory = patch.object(
+            tempfile,
+            "mkdtemp",
+            return_value="/private/tmp/hbrowser-tor-unit-data",
+        )
+        data_directory.start()
+        self.addCleanup(data_directory.stop)
+
+    def test_tor_process_is_launched_outside_the_terminal_group(self) -> None:
+        process = Mock(stdout=[b"Bootstrapped 100%: Done\n"])
+        process.poll.return_value = None
+        with (
+            patch.object(
+                tor_module,
+                "start_owned_process",
+                return_value=process,
+            ) as start_process,
+            patch.object(tor_module, "_find_tor_binary", return_value="/tor"),
+            patch("hbrowser.gallery.browser.tor.atexit.register"),
+        ):
+            observed = tor_module._start_tor_process(9150)
+
+        self.assertIs(observed, process)
+        start_process.assert_called_once()
+        self.assertEqual(start_process.call_args.args[0], "/tor")
+        self.assertEqual(start_process.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(start_process.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(len(start_process.call_args.kwargs["cleanup_paths"]), 1)
+        terminate_tor_process(process)
+
     def test_cleanup_attachment_failure_reaps_exact_process_and_preserves_error(
         self,
     ) -> None:
@@ -1376,8 +1521,9 @@ class TorProcessCleanupTests(unittest.TestCase):
 
         process = _UnattachableProcess()
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 return_value=process,
             ),
             patch(
@@ -1411,8 +1557,9 @@ class TorProcessCleanupTests(unittest.TestCase):
     def test_missing_stdout_reaps_unowned_bootstrap_process(self) -> None:
         process = Mock(stdout=None)
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 return_value=process,
             ),
             self.assertRaisesRegex(RuntimeError, "capture Tor process output"),
@@ -1427,8 +1574,9 @@ class TorProcessCleanupTests(unittest.TestCase):
         process.poll.return_value = 7
         process.returncode = 7
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 return_value=process,
             ),
             self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 7"),
@@ -1442,8 +1590,9 @@ class TorProcessCleanupTests(unittest.TestCase):
         process = Mock(stdout=[])
         process.poll.return_value = None
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 return_value=process,
             ),
             patch(
@@ -1461,6 +1610,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         cleanup_failure = tor_module._TorProcessCleanupError(
             "Tor process ownership unresolved"
         )
+        self.assertIsInstance(cleanup_failure, ProcessOwnershipError)
         with (
             patch.object(
                 tor_module,
@@ -1486,8 +1636,9 @@ class TorProcessCleanupTests(unittest.TestCase):
             return cleanup
 
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 return_value=process,
             ),
             patch(
@@ -1541,8 +1692,9 @@ class TorProcessCleanupTests(unittest.TestCase):
             return thread
 
         with (
-            patch(
-                "hbrowser.gallery.browser.tor.subprocess.Popen",
+            patch.object(
+                tor_module,
+                "start_owned_process",
                 side_effect=[first_process, second_process],
             ),
             patch(

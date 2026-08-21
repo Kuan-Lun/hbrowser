@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
-version = "0.39.0"
+version = "0.40.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -16,7 +16,7 @@ dependencies = [
     "h2h-galleryinfo-parser>=0.5.1",
     "httpx>=0.28.1",
     "websockets>=17.0.1",
-    "zendriver>=0.15.5,<0.16",
+    "zendriver==0.15.5",
 ]
 
 classifiers = [

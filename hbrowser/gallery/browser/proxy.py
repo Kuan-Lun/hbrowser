@@ -1,10 +1,11 @@
 """代理設定"""
 
 import asyncio
+import json
 import os
+import shutil
 import socket
 import tempfile
-import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -15,6 +16,7 @@ from ..utils import (
     wait_for_zendriver,
 )
 from ..utils.mutation import wait_for_zendriver_mutation
+from .process import ProcessOwnershipError
 
 logger = setup_logger(__name__)
 _PROXY_ELEMENT_WAIT_TIMEOUT_SECONDS = 10.0
@@ -29,7 +31,7 @@ def _create_proxy_extension(
     創建一個 Chrome 擴充功能來處理代理認證
 
     Returns:
-        擴充功能 zip 檔案的路徑
+        只屬於本次瀏覽器 generation 的擴充功能目錄
     """
     manifest_json = """
 {
@@ -52,14 +54,17 @@ def _create_proxy_extension(
 }
 """
 
+    proxy_host_literal = json.dumps(proxy_host)
+    proxy_user_literal = json.dumps(proxy_user)
+    proxy_pass_literal = json.dumps(proxy_pass)
     background_js = f"""
 var config = {{
         mode: "fixed_servers",
         rules: {{
           singleProxy: {{
             scheme: "http",
-            host: "{proxy_host}",
-            port: parseInt({proxy_port})
+            host: {proxy_host_literal},
+            port: {proxy_port}
           }},
           bypassList: ["localhost"]
         }}
@@ -70,8 +75,8 @@ chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
 function callbackFn(details) {{
     return {{
         authCredentials: {{
-            username: "{proxy_user}",
-            password: "{proxy_pass}"
+            username: {proxy_user_literal},
+            password: {proxy_pass_literal}
         }}
     }};
 }}
@@ -86,21 +91,26 @@ chrome.webRequest.onAuthRequired.addListener(
     # 創建臨時目錄
     plugin_dir = Path(tempfile.mkdtemp())
 
-    # 寫入 manifest.json
-    manifest_path = plugin_dir / "manifest.json"
-    manifest_path.write_text(manifest_json)
+    try:
+        manifest_path = plugin_dir / "manifest.json"
+        manifest_path.write_text(manifest_json, encoding="utf-8")
 
-    # 寫入 background.js
-    background_path = plugin_dir / "background.js"
-    background_path.write_text(background_js)
-
-    # 創建 zip 檔案
-    plugin_file = Path(tempfile.gettempdir()) / "proxy_auth_plugin.zip"
-    with zipfile.ZipFile(plugin_file, "w") as zp:
-        zp.write(manifest_path, "manifest.json")
-        zp.write(background_path, "background.js")
-
-    return str(plugin_file)
+        background_path = plugin_dir / "background.js"
+        background_path.write_text(background_js, encoding="utf-8")
+        return str(plugin_dir)
+    except BaseException as creation_error:
+        try:
+            shutil.rmtree(plugin_dir)
+        except BaseException as cleanup_error:
+            private_error = ProcessOwnershipError(
+                "Proxy extension creation failed and private material "
+                "could not be removed"
+            )
+            private_error.add_note(
+                "Creation failure type: " f"{type(creation_error).__name__}"
+            )
+            raise private_error from cleanup_error
+        raise
 
 
 def configure_proxy() -> str | None:
@@ -122,20 +132,22 @@ def configure_proxy() -> str | None:
         proxy_host = rp_dns
         proxy_port = "8080"
 
+    try:
+        parsed_proxy_port = int(proxy_port)
+    except ValueError:
+        raise ValueError("Residential proxy port is invalid") from None
+    if not 1 <= parsed_proxy_port <= 65535:
+        raise ValueError("Residential proxy port is invalid")
+
     logger.debug("Using authenticated residential proxy")
-    logger.debug(
-        "Residential proxy endpoint: host=%s port=%s",
-        proxy_host,
-        proxy_port,
-    )
 
     proxy_extension = _create_proxy_extension(
         proxy_host=proxy_host,
-        proxy_port=int(proxy_port),
+        proxy_port=parsed_proxy_port,
         proxy_user=rp_username,
         proxy_pass=rp_password,
     )
-    logger.debug(f"Proxy extension created at: {proxy_extension}")
+    logger.debug("Proxy extension created for the current browser generation")
     return proxy_extension
 
 
@@ -190,16 +202,11 @@ async def verify_proxy_ip(browser: Any, page: Any) -> None:
 
         if local_ip == proxy_ip:
             raise RuntimeError(
-                f"Proxy IP safety check failed: proxy IP ({proxy_ip}) is the same "
-                f"as local IP ({local_ip}). Proxy may not be working properly."
+                "Proxy IP safety check failed: proxy resolved to the local "
+                "public address"
             )
 
         logger.info("Proxy IP verification succeeded")
-        logger.debug(
-            "Proxy IP verification context: proxy=%s local=%s",
-            proxy_ip,
-            local_ip,
-        )
     except RuntimeError:
         raise
     except Exception as error:

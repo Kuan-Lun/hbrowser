@@ -21,6 +21,7 @@ __all__ = [
     "PunchInComplete",
     "PunchInResult",
     "RandomEncounterFound",
+    "ProcessOwnershipError",
     "SearchAuthenticationError",
     "SearchChallengeError",
     "SearchLimitExceededError",
@@ -62,6 +63,7 @@ from .gallery import (
     SearchRequest,
     Tag,
 )
+from .gallery.browser.process import ProcessOwnershipError
 from .gallery.utils import (
     LogLevel,
     LogPersistenceError,

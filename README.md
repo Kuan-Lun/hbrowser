@@ -214,6 +214,24 @@ Browser clients can persist the current page source at an application-defined
 failure boundary with `await driver.save_page_diagnostic("failure_kind")`. The
 same redaction, private-file, size, and retention rules apply.
 
+Chrome and Tor are launched through a start-gated supervisor owned by HBrowser,
+not through Zendriver's global process hook and not in the application's
+terminal group. On POSIX, the supervisor owns a new session and the target owns
+a distinct process group inside it. Shutdown signals that target group, proves
+that it is empty, and only then releases its private files. On Windows, the
+supervisor is assigned to a non-inheritable Job Object before it is allowed to
+spawn the target; kill-on-close and active-process accounting cover every
+descendant. Missing Job APIs or failed assignment abort startup instead of
+falling back to an unowned process.
+
+A terminal interrupt can therefore be converted into an application-level
+cooperative stop without killing Chrome while a CDP mutation receipt is still
+being confirmed. Each generation uses an HBrowser-owned Chrome profile, and
+authenticated proxy material is removed only after process-tree termination is
+proven. The application remains responsible for closing its Browser owner after
+reaching a safe boundary. HBrowser pins Zendriver 0.15.5 because the
+connect-existing lifecycle contract is verified against that exact release.
+
 ## Usage
 
 Daily check-in returns an explicit outcome. A random encounter URL is accepted
