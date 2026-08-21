@@ -210,6 +210,44 @@ class _OwnedBrowser:
         self.stop = AsyncMock()
 
 
+class BrowserProcessShutdownTests(unittest.TestCase):
+    def test_owned_browser_delegates_to_the_bounded_shutdown_state_machine(
+        self,
+    ) -> None:
+        owner = Mock(spec=OwnedProcess)
+        browser = SimpleNamespace(_process=None)
+        setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+
+        factory._terminate_browser_process(browser)
+
+        owner.shutdown.assert_called_once_with(
+            graceful_timeout=factory._BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
+            terminate_timeout=factory._BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+            kill_timeout=factory._BROWSER_PROCESS_KILL_WAIT_SECONDS,
+            cleanup_timeout=factory._BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+        )
+        owner.terminate.assert_not_called()
+        owner.kill.assert_not_called()
+        self.assertIsNone(getattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE))
+
+    def test_failed_private_release_retains_exact_browser_owner(self) -> None:
+        owner = Mock(spec=OwnedProcess)
+        owner.shutdown.side_effect = PermissionError("profile locked")
+        browser = SimpleNamespace(_process=None)
+        setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+
+        with self.assertRaises(ProcessOwnershipError) as raised:
+            factory._terminate_browser_process(browser)
+
+        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+        self.assertIs(
+            getattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE),
+            owner,
+        )
+        owner.terminate.assert_not_called()
+        owner.kill.assert_not_called()
+
+
 class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
     async def test_returns_immediate_main_tab_without_sleeping(self) -> None:
         page = _tab()
@@ -695,6 +733,48 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(browser, registered_instances)
         # Avoid mutating asyncio-atexit's live callback iteration. The package
         # clears every callback only after all registered browsers have run.
+        unregister_cleanup.assert_not_called()
+
+    async def test_atexit_cleanup_does_not_require_the_default_executor(self) -> None:
+        browser = _OwnedBrowser()
+        owner = Mock(spec=OwnedProcess)
+        setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+        registered_instances: set[object] = {browser}
+
+        with (
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+            patch(
+                "hbrowser.gallery.browser.factory.asyncio_atexit.unregister"
+            ) as unregister_cleanup,
+            patch.object(
+                zd.util,
+                "get_registered_instances",
+                return_value=registered_instances,
+            ),
+            patch.object(
+                asyncio,
+                "to_thread",
+                new=AsyncMock(
+                    side_effect=RuntimeError("Executor shutdown has been called")
+                ),
+            ) as to_thread,
+        ):
+            factory._register_browser_atexit(cast(zd.Browser, browser))
+            cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+            await asyncio.get_running_loop().shutdown_default_executor()
+
+            await cleanup()
+
+        browser.stop.assert_awaited_once_with()
+        owner.shutdown.assert_called_once_with(
+            graceful_timeout=factory._BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
+            terminate_timeout=factory._BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+            kill_timeout=factory._BROWSER_PROCESS_KILL_WAIT_SECONDS,
+            cleanup_timeout=factory._BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+        )
+        to_thread.assert_not_awaited()
+        self.assertIsNone(cleanup.browser)
+        self.assertNotIn(browser, registered_instances)
         unregister_cleanup.assert_not_called()
 
     async def test_post_setup_cleanup_failure_overrides_cancellation(

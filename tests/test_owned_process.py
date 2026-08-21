@@ -1,14 +1,17 @@
 import atexit
 import ctypes
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import ANY, Mock, patch
+from typing import Any, cast
+from unittest.mock import ANY, Mock, call, patch
 
 import zendriver as zd
 
@@ -33,6 +36,12 @@ def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.02)
     return not _pid_exists(pid)
+
+
+def _windows_cleanup_error(code: int) -> PermissionError:
+    error = PermissionError(f"Windows cleanup error {code}")
+    setattr(error, "winerror", code)
+    return error
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
@@ -235,6 +244,187 @@ finally:
         kill_process_group.assert_not_called()
 
 
+class PrivateDirectoryCleanupTests(unittest.TestCase):
+    def test_windows_sharing_violation_retries_and_removes_same_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-private-retry-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(
+                private_directory,
+                platform_name="nt",
+            )
+            original_rmtree = shutil.rmtree
+            attempts = 0
+
+            def transient_rmtree(path: Path) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise _windows_cleanup_error(32)
+                original_rmtree(path)
+
+            with (
+                patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=transient_rmtree,
+                ),
+                patch.object(time, "sleep") as sleep,
+            ):
+                guard.remove(deadline=time.monotonic() + 1)
+
+            self.assertEqual(attempts, 2)
+            sleep.assert_called_once_with(
+                process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
+            )
+            self.assertFalse(private_directory.exists())
+
+    def test_persistent_windows_sharing_violation_stops_at_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-private-deadline-"
+        ) as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(
+                private_directory,
+                platform_name="nt",
+            )
+            cleanup_error = _windows_cleanup_error(33)
+
+            with (
+                patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=cleanup_error,
+                ) as rmtree,
+                patch.object(
+                    time,
+                    "monotonic",
+                    side_effect=[0.0, 0.3],
+                ),
+                patch.object(time, "sleep") as sleep,
+                self.assertRaises(process_module.ProcessOwnershipError) as raised,
+            ):
+                guard.remove(deadline=0.25)
+
+            self.assertIs(raised.exception.__cause__, cleanup_error)
+            self.assertIn(
+                "winerror=33 attempts=1",
+                "\n".join(raised.exception.__notes__),
+            )
+            rmtree.assert_called_once_with(private_directory)
+            sleep.assert_called_once_with(
+                process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
+            )
+            self.assertTrue(private_directory.is_dir())
+
+    def test_non_windows_or_non_sharing_errors_fail_without_retry(self) -> None:
+        cases = (("posix", 32), ("nt", 5))
+        for platform_name, error_code in cases:
+            with self.subTest(platform_name=platform_name, error_code=error_code):
+                with tempfile.TemporaryDirectory(
+                    prefix="hbrowser-private-policy-"
+                ) as directory:
+                    private_directory = Path(directory) / "profile"
+                    private_directory.mkdir()
+                    guard = process_module._PrivateDirectory.capture(
+                        private_directory,
+                        platform_name=platform_name,
+                    )
+                    cleanup_error = _windows_cleanup_error(error_code)
+
+                    with (
+                        patch.object(
+                            shutil,
+                            "rmtree",
+                            side_effect=cleanup_error,
+                        ) as rmtree,
+                        patch.object(time, "sleep") as sleep,
+                        self.assertRaises(PermissionError) as raised,
+                    ):
+                        guard.remove(deadline=time.monotonic() + 1)
+
+                    self.assertIs(raised.exception, cleanup_error)
+                    rmtree.assert_called_once_with(private_directory)
+                    sleep.assert_not_called()
+                    self.assertTrue(private_directory.is_dir())
+
+    def test_retry_revalidates_identity_before_deleting_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-private-identity-"
+        ) as directory:
+            root = Path(directory)
+            private_directory = root / "profile"
+            displaced_directory = root / "original-profile"
+            replacement_marker = private_directory / "replacement"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(
+                private_directory,
+                platform_name="nt",
+            )
+
+            def replace_during_backoff(_: float) -> None:
+                private_directory.rename(displaced_directory)
+                private_directory.mkdir()
+                replacement_marker.write_text("keep", encoding="utf-8")
+
+            with (
+                patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=_windows_cleanup_error(32),
+                ) as rmtree,
+                patch.object(
+                    time,
+                    "sleep",
+                    side_effect=replace_during_backoff,
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "identity changed",
+                ),
+            ):
+                guard.remove(deadline=time.monotonic() + 1)
+
+            rmtree.assert_called_once_with(private_directory)
+            self.assertEqual(
+                replacement_marker.read_text(encoding="utf-8"),
+                "keep",
+            )
+            self.assertTrue(displaced_directory.is_dir())
+
+    def test_directory_removed_during_backoff_is_idempotent_success(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-private-absence-"
+        ) as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(
+                private_directory,
+                platform_name="nt",
+            )
+            original_rmtree = shutil.rmtree
+
+            with (
+                patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=_windows_cleanup_error(32),
+                ) as rmtree,
+                patch.object(
+                    time,
+                    "sleep",
+                    side_effect=lambda _: original_rmtree(private_directory),
+                ),
+            ):
+                guard.remove(deadline=time.monotonic() + 1)
+
+            rmtree.assert_called_once_with(private_directory)
+            self.assertFalse(private_directory.exists())
+
+
 class ProcessPolicyTests(unittest.TestCase):
     def test_supervisor_protocol_contains_no_parent_pid(self) -> None:
         status_path, command = supervisor_module._parse_arguments(
@@ -306,7 +496,7 @@ class ProcessPolicyTests(unittest.TestCase):
     def test_windows_job_assignment_precedes_start_gate(self) -> None:
         events: list[str] = []
         launched: list[tuple[object, dict[str, object]]] = []
-        supervisor = Mock(pid=101, stdout=None, stderr=None)
+        supervisor = Mock(pid=101, stdout=None, stderr=None, returncode=None)
         supervisor.poll.return_value = None
         supervisor.wait.return_value = 0
         supervisor.stdin.write.side_effect = lambda _: events.append("start")
@@ -374,7 +564,11 @@ class ProcessPolicyTests(unittest.TestCase):
             options["env"],
             {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
         )
-        job.terminate.assert_called_once_with()
+        self.assertEqual(
+            supervisor.stdin.write.call_args_list,
+            [call(b"start\n"), call(b"terminate\n")],
+        )
+        job.terminate.assert_not_called()
         job.wait_empty.assert_called_once_with(timeout=ANY)
         job.close.assert_called_once_with()
 
@@ -455,6 +649,294 @@ class ProcessPolicyTests(unittest.TestCase):
             owner.wait(timeout=1)
             self.assertFalse(private_directory.exists())
             self.assertFalse(status_directory.exists())
+            job.close.assert_called_once_with()
+
+    def test_shutdown_allows_natural_exit_without_signalling_windows_job(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-natural-exit-") as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.return_value = 0
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=process_module._PrivateDirectory.capture(
+                    status_directory,
+                    platform_name="nt",
+                ),
+                cleanup_paths=(
+                    process_module._PrivateDirectory.capture(
+                        private_directory,
+                        platform_name="nt",
+                    ),
+                ),
+            )
+
+            owner.shutdown(
+                graceful_timeout=1,
+                terminate_timeout=1,
+                kill_timeout=1,
+            )
+
+            supervisor.wait.assert_called_once_with(timeout=ANY)
+            supervisor.stdin.write.assert_not_called()
+            job.terminate.assert_not_called()
+            job.wait_empty.assert_called_once_with(timeout=ANY)
+            job.close.assert_called_once_with()
+
+    def test_shutdown_terminates_only_after_natural_exit_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-terminate-phase-"
+        ) as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.side_effect = [
+                subprocess.TimeoutExpired("supervisor", 1),
+                0,
+            ]
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+
+            owner.shutdown(
+                graceful_timeout=1,
+                terminate_timeout=1,
+                kill_timeout=1,
+            )
+
+            self.assertEqual(supervisor.wait.call_count, 2)
+            supervisor.stdin.write.assert_called_once_with(b"terminate\n")
+            job.terminate.assert_not_called()
+            job.close.assert_called_once_with()
+
+    def test_shutdown_kills_job_only_after_terminate_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-kill-phase-") as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.side_effect = [
+                subprocess.TimeoutExpired("supervisor", 1),
+                subprocess.TimeoutExpired("supervisor", 1),
+                1,
+            ]
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+
+            owner.shutdown(
+                graceful_timeout=1,
+                terminate_timeout=1,
+                kill_timeout=1,
+            )
+
+            self.assertEqual(supervisor.wait.call_count, 3)
+            supervisor.stdin.write.assert_called_once_with(b"terminate\n")
+            job.terminate.assert_called_once_with()
+            job.wait_empty.assert_called_once_with(timeout=ANY)
+            job.close.assert_called_once_with()
+
+    def test_private_cleanup_retry_never_resignals_reaped_windows_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-release-retry-") as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.return_value = 0
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=process_module._PrivateDirectory.capture(
+                    status_directory,
+                    platform_name="nt",
+                ),
+                cleanup_paths=(
+                    process_module._PrivateDirectory.capture(
+                        private_directory,
+                        platform_name="nt",
+                    ),
+                ),
+            )
+            original_rmtree = shutil.rmtree
+            cleanup_error = _windows_cleanup_error(32)
+
+            def fail_profile(path: Path) -> None:
+                if Path(path) == private_directory:
+                    raise cleanup_error
+                original_rmtree(path)
+
+            with (
+                patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=fail_profile,
+                ),
+                self.assertRaises(process_module.ProcessOwnershipError) as raised,
+            ):
+                owner.shutdown(
+                    graceful_timeout=0,
+                    terminate_timeout=0,
+                    kill_timeout=0,
+                    cleanup_timeout=0,
+                )
+
+            self.assertIs(raised.exception.__cause__, cleanup_error)
+            self.assertTrue(private_directory.is_dir())
+            job.close.assert_not_called()
+
+            owner.shutdown(
+                graceful_timeout=0,
+                terminate_timeout=0,
+                kill_timeout=0,
+            )
+
+            supervisor.wait.assert_called_once_with(timeout=ANY)
+            job.wait_empty.assert_called_once_with(timeout=ANY)
+            supervisor.stdin.write.assert_not_called()
+            job.terminate.assert_not_called()
+            job.close.assert_called_once_with()
+            self.assertFalse(private_directory.exists())
+
+    def test_poll_remains_nonblocking_during_private_directory_release(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-release-poll-") as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.return_value = 0
+            supervisor.poll.return_value = 0
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+            release_started = threading.Event()
+            allow_release = threading.Event()
+            shutdown_errors: list[BaseException] = []
+            original_rmtree = shutil.rmtree
+
+            def blocking_profile_release(path: Path) -> None:
+                if Path(path) == private_directory:
+                    release_started.set()
+                    if not allow_release.wait(timeout=2):
+                        raise TimeoutError("test did not release private cleanup")
+                original_rmtree(path)
+
+            def shutdown_owner() -> None:
+                try:
+                    owner.shutdown(
+                        graceful_timeout=0,
+                        terminate_timeout=0,
+                        kill_timeout=0,
+                    )
+                except BaseException as error:
+                    shutdown_errors.append(error)
+
+            with patch.object(
+                shutil,
+                "rmtree",
+                side_effect=blocking_profile_release,
+            ):
+                shutdown_thread = threading.Thread(target=shutdown_owner, daemon=True)
+                shutdown_thread.start()
+                self.assertTrue(release_started.wait(timeout=1))
+
+                poll_result: list[int | None] = []
+                poll_finished = threading.Event()
+
+                def poll_owner() -> None:
+                    poll_result.append(owner.poll())
+                    poll_finished.set()
+
+                poll_thread = threading.Thread(target=poll_owner, daemon=True)
+                poll_thread.start()
+                try:
+                    self.assertTrue(
+                        poll_finished.wait(timeout=0.5),
+                        "poll blocked behind private directory cleanup",
+                    )
+                finally:
+                    allow_release.set()
+                    poll_thread.join(timeout=1)
+                    shutdown_thread.join(timeout=2)
+
+            self.assertEqual(poll_result, [0])
+            self.assertEqual(shutdown_errors, [])
+            self.assertFalse(shutdown_thread.is_alive())
             job.close.assert_called_once_with()
 
     def test_gate_flush_failure_keeps_unproven_private_paths(self) -> None:
@@ -631,6 +1113,114 @@ class ProcessPolicyTests(unittest.TestCase):
             job.wait_empty.assert_called_once_with(timeout=ANY)
             job.terminate.assert_not_called()
             job.close.assert_called_once_with()
+
+
+@unittest.skipUnless(os.name == "nt", "Windows file-sharing contract")
+class WindowsPrivateDirectoryIntegrationTests(unittest.TestCase):
+    def test_owned_job_releases_real_message_database_lock_before_profile(
+        self,
+    ) -> None:
+        from ctypes import wintypes
+
+        win_dll = getattr(ctypes, "WinDLL")
+        kernel32 = cast(Any, win_dll)("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        generic_read = 0x80000000
+        share_read_write = 0x00000001 | 0x00000002
+        open_existing = 3
+        normal_attributes = 0x00000080
+        invalid_handle = ctypes.c_void_p(-1).value
+
+        with tempfile.TemporaryDirectory(prefix="hbrowser-windows-lock-") as directory:
+            profile = Path(directory) / "profile"
+            message_database = profile / "Default" / "Collaboration" / "MessageDB"
+            message_database.parent.mkdir(parents=True)
+            message_database.write_bytes(b"locked")
+            base_executable = cast(str, getattr(sys, "_base_executable"))
+            owner = process_module.start_owned_process(
+                base_executable,
+                ["-c", "pass"],
+                cleanup_paths=(profile,),
+            )
+            handle = kernel32.CreateFileW(
+                str(message_database),
+                generic_read,
+                share_read_write,
+                None,
+                open_existing,
+                normal_attributes,
+                None,
+            )
+            self.assertNotIn(handle, (None, invalid_handle))
+
+            sharing_violation_observed = threading.Event()
+            release_handle_requested = threading.Event()
+            handle_closed = threading.Event()
+
+            def release_handle() -> None:
+                if not release_handle_requested.wait(timeout=2):
+                    return
+                if not kernel32.CloseHandle(handle):
+                    win_error = cast(Any, getattr(ctypes, "WinError"))
+                    get_last_error = cast(Any, getattr(ctypes, "get_last_error"))
+                    raise win_error(get_last_error())
+                handle_closed.set()
+
+            releaser = threading.Thread(target=release_handle, daemon=True)
+            releaser.start()
+            original_rmtree = shutil.rmtree
+
+            def observe_real_rmtree(path: Path) -> None:
+                try:
+                    original_rmtree(path)
+                except OSError as error:
+                    if getattr(error, "winerror", None) == 32:
+                        sharing_violation_observed.set()
+                        release_handle_requested.set()
+                    raise
+
+            try:
+                with patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=observe_real_rmtree,
+                ):
+                    owner.shutdown(
+                        graceful_timeout=3,
+                        terminate_timeout=3,
+                        kill_timeout=3,
+                        cleanup_timeout=3,
+                    )
+            finally:
+                release_handle_requested.set()
+                releaser.join(timeout=2)
+                if not handle_closed.is_set():
+                    kernel32.CloseHandle(handle)
+                if not owner._closed:
+                    owner.shutdown(
+                        graceful_timeout=0,
+                        terminate_timeout=3,
+                        kill_timeout=3,
+                        cleanup_timeout=3,
+                    )
+
+            self.assertTrue(sharing_violation_observed.is_set())
+            self.assertTrue(handle_closed.is_set())
+            self.assertFalse(profile.exists())
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner._windows_job)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows venv ownership contract")

@@ -89,6 +89,14 @@ class _TorProcessAtexitCleanup:
 
 
 def _terminate_tor_process(tor_process: _Process) -> None:
+    if isinstance(tor_process, OwnedProcess):
+        tor_process.shutdown(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+        )
+        return
+
     try:
         tor_process.terminate()
     except ProcessLookupError:

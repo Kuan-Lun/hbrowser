@@ -22,6 +22,10 @@ from typing import Any, BinaryIO, Final, cast
 
 _STARTUP_TIMEOUT_SECONDS: Final = 10.0
 _STATUS_POLL_SECONDS: Final = 0.01
+_PRIVATE_CLEANUP_TIMEOUT_SECONDS: Final = 5.0
+_PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS: Final = 0.02
+_PRIVATE_CLEANUP_RETRY_MAX_SECONDS: Final = 0.25
+_WINDOWS_RETRYABLE_PRIVATE_CLEANUP_ERRORS: Final = frozenset({32, 33})
 _OUTPUT_RING_BYTES: Final = 256 * 1024
 _SUPERVISOR_READY_PREFIX: Final = "ready "
 _SUPERVISOR_ERROR_PREFIX: Final = "error "
@@ -49,21 +53,32 @@ class _PrivateDirectory:
     path: Path
     device: int
     inode: int
+    platform_name: str
 
     @classmethod
-    def capture(cls, path: Path) -> _PrivateDirectory:
+    def capture(
+        cls,
+        path: Path,
+        *,
+        platform_name: str | None = None,
+    ) -> _PrivateDirectory:
         metadata = path.lstat()
         if not stat.S_ISDIR(metadata.st_mode):
             raise ProcessOwnershipError(
                 "Private generation path is not an owned directory"
             )
-        return cls(path, metadata.st_dev, metadata.st_ino)
+        return cls(
+            path,
+            metadata.st_dev,
+            metadata.st_ino,
+            _ownership_platform() if platform_name is None else platform_name,
+        )
 
-    def remove(self) -> None:
+    def _assert_identity_or_absence(self) -> bool:
         try:
             metadata = self.path.lstat()
         except FileNotFoundError:
-            return
+            return False
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or metadata.st_dev != self.device
@@ -72,14 +87,77 @@ class _PrivateDirectory:
             raise ProcessOwnershipError(
                 "Private generation directory identity changed before cleanup"
             )
-        shutil.rmtree(self.path)
-        try:
-            self.path.lstat()
-        except FileNotFoundError:
-            return
-        raise ProcessOwnershipError(
-            "Private generation directory remained after cleanup"
+        return True
+
+    def _is_retryable_error(self, error: OSError) -> bool:
+        return (
+            self.platform_name == "nt"
+            and getattr(error, "winerror", None)
+            in _WINDOWS_RETRYABLE_PRIVATE_CLEANUP_ERRORS
         )
+
+    def _deadline_error(
+        self,
+        error: OSError,
+        *,
+        attempts: int,
+    ) -> ProcessOwnershipError:
+        timeout_error = ProcessOwnershipError(
+            f"Private generation directory cleanup timed out: {self.path}"
+        )
+        timeout_error.add_note(
+            "Last Windows cleanup error: "
+            f"winerror={getattr(error, 'winerror', None)} attempts={attempts}"
+        )
+        return timeout_error
+
+    def remove(self, *, deadline: float) -> None:
+        """Remove the captured directory with per-attempt identity validation.
+
+        Windows can keep a just-exited Chromium database handle alive briefly.
+        Retry only the two native sharing/lock violations, revalidating the root
+        identity before every attempt and retaining ownership when the deadline
+        expires.
+        """
+
+        retry_delay = _PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
+        last_retryable_error: OSError | None = None
+        attempts = 0
+        while True:
+            if last_retryable_error is not None and time.monotonic() >= deadline:
+                raise self._deadline_error(
+                    last_retryable_error,
+                    attempts=attempts,
+                ) from last_retryable_error
+            if not self._assert_identity_or_absence():
+                return
+            try:
+                attempts += 1
+                shutil.rmtree(self.path)
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                if not self._is_retryable_error(error):
+                    raise
+                last_retryable_error = error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._deadline_error(
+                        error,
+                        attempts=attempts,
+                    ) from error
+                time.sleep(min(retry_delay, remaining))
+                retry_delay = min(
+                    retry_delay * 2,
+                    _PRIVATE_CLEANUP_RETRY_MAX_SECONDS,
+                )
+                continue
+
+            if not self._assert_identity_or_absence():
+                return
+            raise ProcessOwnershipError(
+                "Private generation directory remained after cleanup"
+            )
 
 
 class _BoundedPipeDrain:
@@ -337,8 +415,10 @@ class OwnedProcess:
             )
             for path in cleanup_paths
         ]
-        self._cleanup_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._shutdown_lock = threading.Lock()
         self._supervisor_reaped = False
+        self._supervisor_returncode: int | None = None
         self._target_not_started = False
         self._tree_reaped = False
         self._closed = False
@@ -355,7 +435,7 @@ class OwnedProcess:
     def bind_target_process_group(self, target_pid: int) -> None:
         if target_pid <= 0:
             raise ValueError("target_pid must be positive")
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed:
                 raise RuntimeError("Cannot bind a closed process owner")
             if self._target_process_group is not None:
@@ -367,7 +447,7 @@ class OwnedProcess:
     def bind_target_not_started(self) -> None:
         """Record the supervisor's atomic proof that no target was created."""
 
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed:
                 raise RuntimeError("Cannot bind a closed process owner")
             if self._target_process_group is not None:
@@ -395,10 +475,11 @@ class OwnedProcess:
         return self.poll()
 
     def poll(self) -> int | None:
-        with self._cleanup_lock:
+        with self._state_lock:
             returncode = self._supervisor.poll()
             if returncode is not None:
                 self._supervisor_reaped = True
+                self._supervisor_returncode = returncode
             return returncode
 
     def diagnostic_tail(self) -> bytes:
@@ -410,7 +491,7 @@ class OwnedProcess:
         return b"\n".join(part for part in parts if part)
 
     def begin_output_draining(self) -> None:
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed:
                 raise RuntimeError("Cannot drain output from a closed process owner")
             if self._stdout_drain is not None or self._stderr_drain is not None:
@@ -425,8 +506,11 @@ class OwnedProcess:
                 )
 
     def _request_supervisor_shutdown(self, command: bytes) -> None:
-        if self._supervisor_reaped or self._supervisor.returncode is not None:
+        returncode = self._supervisor.returncode
+        if self._supervisor_reaped or returncode is not None:
             self._supervisor_reaped = True
+            if returncode is not None:
+                self._supervisor_returncode = returncode
             return
         try:
             if self._supervisor.stdin is None:
@@ -440,16 +524,19 @@ class OwnedProcess:
             return
 
     def terminate(self) -> None:
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed or self._tree_reaped:
                 return
             if self._windows_job is not None:
-                self._windows_job.terminate()
+                # Let the supervisor reap the Chrome root first. Terminating the
+                # entire Job here interrupts SQLite/profile flushes and creates
+                # the very sharing-violation race private cleanup must avoid.
+                self._request_supervisor_shutdown(b"terminate\n")
                 return
             self._request_supervisor_shutdown(b"terminate\n")
 
     def kill(self) -> None:
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed or self._tree_reaped:
                 return
             if self._windows_job is not None:
@@ -458,85 +545,194 @@ class OwnedProcess:
             self._request_supervisor_shutdown(b"kill\n")
 
     def wait(self, timeout: float | None = None) -> int:
-        with self._cleanup_lock:
-            if self._closed:
-                return self._supervisor.returncode or 0
+        """Prove tree exit, then release private material within its own budget."""
+
+        with self._shutdown_lock:
+            with self._state_lock:
+                if self._closed:
+                    return self._supervisor_returncode or 0
             deadline = None if timeout is None else time.monotonic() + timeout
-            if self._supervisor_reaped:
-                returncode = self._supervisor.returncode
-                if returncode is None:
-                    raise ProcessOwnershipError(
-                        "Process supervisor reaping state is inconsistent"
-                    )
-            else:
-                remaining = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                returncode = self._supervisor.wait(timeout=remaining)
-                self._supervisor_reaped = True
-            if not self._tree_reaped:
-                if self._windows_job is not None:
-                    remaining = (
-                        None
-                        if deadline is None
-                        else max(0.0, deadline - time.monotonic())
-                    )
-                    self._windows_job.wait_empty(timeout=remaining)
-                elif self._target_process_group is not None:
-                    if returncode != 0:
-                        raise ProcessOwnershipError(
-                            "Process supervisor did not prove target-tree cleanup"
-                        )
-                elif not self._target_not_started:
-                    raise ProcessOwnershipError(
-                        "Process supervisor exited before target cleanup was proven"
-                    )
-                self._tree_reaped = True
-            self._release_ownership()
+            returncode = self._wait_for_process_tree(deadline=deadline)
+            self._release_ownership(
+                deadline=time.monotonic() + _PRIVATE_CLEANUP_TIMEOUT_SECONDS
+            )
             return returncode
 
-    def _release_ownership(self) -> None:
-        if self._closed:
-            return
-        if not self._tree_reaped:
-            raise ProcessOwnershipError(
-                "Private material cannot be released before process-tree cleanup"
+    def _wait_for_process_tree(self, *, deadline: float | None) -> int:
+        """Advance only the process-proof phase of the ownership state machine."""
+
+        with self._state_lock:
+            if self._closed:
+                return self._supervisor_returncode or 0
+            supervisor_reaped = self._supervisor_reaped
+            returncode = self._supervisor_returncode
+
+        if supervisor_reaped:
+            if returncode is None:
+                raise ProcessOwnershipError(
+                    "Process supervisor reaping state is inconsistent"
+                )
+        else:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
             )
+            returncode = self._supervisor.wait(timeout=remaining)
+            with self._state_lock:
+                self._supervisor_reaped = True
+                self._supervisor_returncode = returncode
+
+        with self._state_lock:
+            if self._tree_reaped:
+                return returncode
+            windows_job = self._windows_job
+            target_process_group = self._target_process_group
+            target_not_started = self._target_not_started
+
+        if windows_job is not None:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            windows_job.wait_empty(timeout=remaining)
+        elif target_process_group is not None:
+            if returncode != 0:
+                raise ProcessOwnershipError(
+                    "Process supervisor did not prove target-tree cleanup"
+                )
+        elif not target_not_started:
+            raise ProcessOwnershipError(
+                "Process supervisor exited before target cleanup was proven"
+            )
+
+        with self._state_lock:
+            self._tree_reaped = True
+        return returncode
+
+    def shutdown(
+        self,
+        *,
+        graceful_timeout: float,
+        terminate_timeout: float,
+        kill_timeout: float,
+        cleanup_timeout: float = _PRIVATE_CLEANUP_TIMEOUT_SECONDS,
+    ) -> int:
+        """Close one owned generation through monotonic, bounded phases.
+
+        Natural exit gets the first opportunity so Chromium can flush its
+        profile. Only a process-tree timeout advances to supervisor terminate,
+        then to the Windows Job / POSIX force-kill path. Private material is
+        released last and never causes an already-proven tree to be signalled
+        again.
+        """
+
+        timeouts = (
+            graceful_timeout,
+            terminate_timeout,
+            kill_timeout,
+            cleanup_timeout,
+        )
+        if any(timeout < 0 for timeout in timeouts):
+            raise ValueError("Process shutdown timeouts must be non-negative")
+
+        with self._shutdown_lock:
+            with self._state_lock:
+                if self._closed:
+                    return self._supervisor_returncode or 0
+                tree_reaped = self._tree_reaped
+
+            if not tree_reaped:
+                try:
+                    returncode = self._wait_for_process_tree(
+                        deadline=time.monotonic() + graceful_timeout
+                    )
+                except subprocess.TimeoutExpired, TimeoutError:
+                    self.terminate()
+                    try:
+                        returncode = self._wait_for_process_tree(
+                            deadline=time.monotonic() + terminate_timeout
+                        )
+                    except subprocess.TimeoutExpired, TimeoutError:
+                        self.kill()
+                        returncode = self._wait_for_process_tree(
+                            deadline=time.monotonic() + kill_timeout
+                        )
+            else:
+                with self._state_lock:
+                    known_returncode = self._supervisor_returncode
+                if known_returncode is None:
+                    raise ProcessOwnershipError(
+                        "Process-tree proof has no supervisor return code"
+                    )
+                returncode = known_returncode
+
+            self._release_ownership(deadline=time.monotonic() + cleanup_timeout)
+            return returncode
+
+    def _release_ownership(self, *, deadline: float) -> None:
+        """Release private paths and the Job only after tree exit is proven."""
+
+        with self._state_lock:
+            if self._closed:
+                return
+            if not self._tree_reaped:
+                raise ProcessOwnershipError(
+                    "Private material cannot be released before process-tree cleanup"
+                )
         try:
             if self._supervisor.stdin is not None:
                 self._supervisor.stdin.close()
         except OSError:
             pass
-        status_directory = self._status_directory
+        with self._state_lock:
+            status_directory = self._status_directory
         if status_directory is not None:
-            status_directory.remove()
-            self._status_directory = None
-        while self._cleanup_paths:
-            cleanup_path = self._cleanup_paths[0]
-            cleanup_path.remove()
-            self._cleanup_paths.pop(0)
-        if self._windows_job is not None:
-            self._windows_job.close()
-            self._windows_job = None
-        self._closed = True
+            status_directory.remove(deadline=deadline)
+            with self._state_lock:
+                self._status_directory = None
+        while True:
+            with self._state_lock:
+                cleanup_path = self._cleanup_paths[0] if self._cleanup_paths else None
+            if cleanup_path is None:
+                break
+            cleanup_path.remove(deadline=deadline)
+            with self._state_lock:
+                if (
+                    not self._cleanup_paths
+                    or self._cleanup_paths[0] is not cleanup_path
+                ):
+                    raise ProcessOwnershipError(
+                        "Private cleanup ownership state changed unexpectedly"
+                    )
+                self._cleanup_paths.pop(0)
+        with self._state_lock:
+            windows_job = self._windows_job
+        if windows_job is not None:
+            windows_job.close()
+            with self._state_lock:
+                if self._windows_job is not windows_job:
+                    raise ProcessOwnershipError(
+                        "Windows Job ownership state changed unexpectedly"
+                    )
+                self._windows_job = None
+        with self._state_lock:
+            self._closed = True
         try:
             atexit.unregister(self._atexit_cleanup)
         except Exception:
             pass
 
     def _atexit_cleanup(self) -> None:
-        with self._cleanup_lock:
+        with self._state_lock:
             if self._closed:
                 return
-            try:
-                self.terminate()
-                self.wait(timeout=5)
-            except BaseException:
-                try:
-                    self.kill()
-                    self.wait(timeout=5)
-                except BaseException:
-                    pass
+        try:
+            self.shutdown(
+                graceful_timeout=0,
+                terminate_timeout=5,
+                kill_timeout=5,
+                cleanup_timeout=_PRIVATE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            pass
 
 
 def _ownership_platform() -> str:
@@ -719,8 +915,11 @@ def start_owned_process(
     except BaseException as startup_error:
         if owner is not None:
             try:
-                owner.terminate()
-                owner.wait(timeout=5)
+                owner.shutdown(
+                    graceful_timeout=0,
+                    terminate_timeout=5,
+                    kill_timeout=5,
+                )
             except BaseException as owner_cleanup_error:
                 ownership_error = ProcessOwnershipError(
                     "Process startup failed and target ownership remains unresolved"
@@ -773,7 +972,9 @@ def start_owned_process(
         )
         for cleanup_path in guarded_paths:
             try:
-                cleanup_path.remove()
+                cleanup_path.remove(
+                    deadline=time.monotonic() + _PRIVATE_CLEANUP_TIMEOUT_SECONDS
+                )
             except BaseException as error:
                 if private_cleanup_error is None:
                     private_cleanup_error = error

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -60,8 +60,10 @@ _CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS = 2.0
 _STOP_TASK_CANCEL_TIMEOUT_SECONDS = 2.0
 _JANITOR_STOP_TIMEOUT_SECONDS = 2.0
 _TOR_STOP_TIMEOUT_SECONDS = 12.0
-_BROWSER_PROCESS_GRACE_SECONDS = 3.0
+_BROWSER_PROCESS_NATURAL_EXIT_SECONDS = 3.0
+_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS = 3.0
 _BROWSER_PROCESS_KILL_WAIT_SECONDS = 3.0
+_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS = 5.0
 _PROFILE_CLEANUP_TIMEOUT_SECONDS = 3.0
 _PROTOCOL_RETIREMENT_MAX_PASSES = 8
 _BROWSER_ATEXIT_CLEANUP_ATTEMPTS = 3
@@ -216,12 +218,12 @@ def _wait_for_devtools_active_port(
 
 
 def _terminate_unbound_owner(owner: OwnedProcess) -> None:
-    owner.terminate()
-    try:
-        owner.wait(timeout=_BROWSER_PROCESS_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        owner.kill()
-        owner.wait(timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS)
+    owner.shutdown(
+        graceful_timeout=0,
+        terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+        kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
+        cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+    )
 
 
 def _construct_owned_browser(
@@ -465,6 +467,19 @@ async def _cleanup_browser_after_startup_failure(
         raise ownership_error from cleanup_error
 
 
+type _BlockingCleanupRunner = Callable[[Callable[[], None]], Awaitable[None]]
+
+
+async def _run_blocking_cleanup_in_thread(operation: Callable[[], None]) -> None:
+    await asyncio.to_thread(operation)
+
+
+async def _run_blocking_cleanup_inline(operation: Callable[[], None]) -> None:
+    """Run bounded cleanup after asyncio has shut down its default executor."""
+
+    operation()
+
+
 class _BrowserAtexitCleanup:
     """Retain a browser only until its complete shutdown has been proven."""
 
@@ -482,7 +497,10 @@ class _BrowserAtexitCleanup:
             errors: list[Exception] = []
             for _ in range(_BROWSER_ATEXIT_CLEANUP_ATTEMPTS):
                 try:
-                    await stop_browser(browser)
+                    await _stop_browser(
+                        browser,
+                        run_blocking_cleanup=_run_blocking_cleanup_inline,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -893,27 +911,20 @@ async def _await_browser_stop_task(
 
 
 def _terminate_browser_process(browser: Any) -> None:
-    """Synchronously terminate and reap every process owner for one browser."""
+    """Synchronously retire every process owner and its private material."""
 
     owner = getattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
     if isinstance(owner, OwnedProcess):
         try:
-            try:
-                owner.terminate()
-                owner.wait(timeout=_BROWSER_PROCESS_GRACE_SECONDS)
-            except BaseException as graceful_error:
-                owner.kill()
-                try:
-                    owner.wait(timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS)
-                except BaseException as forced_error:
-                    forced_error.add_note(
-                        "Graceful owner cleanup failure type: "
-                        f"{type(graceful_error).__name__}"
-                    )
-                    raise
+            owner.shutdown(
+                graceful_timeout=_BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
+                terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+                kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
+                cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+            )
         except BaseException as cleanup_error:
             raise ProcessOwnershipError(
-                "Browser process-tree cleanup remains unresolved"
+                "Browser process/private-material cleanup remains unresolved"
             ) from cleanup_error
         setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
 
@@ -925,7 +936,7 @@ def _terminate_browser_process(browser: Any) -> None:
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=_BROWSER_PROCESS_GRACE_SECONDS)
+        process.wait(timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             process.kill()
@@ -937,12 +948,16 @@ def _terminate_browser_process(browser: Any) -> None:
         browser._process_pid = None
 
 
-async def _explicit_browser_cleanup(browser: Any) -> list[BaseException]:
+async def _explicit_browser_cleanup(
+    browser: Any,
+    *,
+    run_blocking_cleanup: _BlockingCleanupRunner,
+) -> list[BaseException]:
     """Finish process/profile cleanup after a repeatedly failed Browser.stop."""
 
     errors: list[BaseException] = []
     try:
-        await asyncio.to_thread(_terminate_browser_process, browser)
+        await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
     except BaseException as error:
         errors.append(error)
 
@@ -962,6 +977,7 @@ async def _ensure_browser_cleanup(
     retirement: _ZendriverRetirement,
     *,
     allow_fallback: bool,
+    run_blocking_cleanup: _BlockingCleanupRunner,
 ) -> list[BaseException]:
     """Start, resume, or safely recover the one Browser.stop sequence."""
 
@@ -985,7 +1001,7 @@ async def _ensure_browser_cleanup(
             task_started_now = True
         else:
             try:
-                await asyncio.to_thread(_terminate_browser_process, browser)
+                await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
             except BaseException as process_error:
                 return [process_error]
             retirement.mark_browser_cleanup_complete()
@@ -994,7 +1010,7 @@ async def _ensure_browser_cleanup(
     stop_error = await _await_browser_stop_task(task)
     if stop_error is None:
         try:
-            await asyncio.to_thread(_terminate_browser_process, browser)
+            await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
         except BaseException as process_error:
             return [process_error]
         retirement.mark_browser_cleanup_complete()
@@ -1012,7 +1028,7 @@ async def _ensure_browser_cleanup(
         stop_error = await _await_browser_stop_task(task)
         if stop_error is None:
             try:
-                await asyncio.to_thread(_terminate_browser_process, browser)
+                await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
             except BaseException as process_error:
                 return [process_error]
             retirement.mark_browser_cleanup_complete()
@@ -1034,7 +1050,10 @@ async def _ensure_browser_cleanup(
                 ),
             ]
 
-    fallback_errors = await _explicit_browser_cleanup(browser)
+    fallback_errors = await _explicit_browser_cleanup(
+        browser,
+        run_blocking_cleanup=run_blocking_cleanup,
+    )
     if fallback_errors:
         return [stop_error, *fallback_errors]
     retirement.mark_browser_cleanup_complete()
@@ -1044,6 +1063,8 @@ async def _ensure_browser_cleanup(
 async def _ensure_tor_cleanup(
     retirement: _ZendriverRetirement,
     tor_process: Any,
+    *,
+    run_blocking_cleanup: _BlockingCleanupRunner,
 ) -> list[BaseException]:
     if retirement.tor_cleanup_is_complete():
         return []
@@ -1054,7 +1075,7 @@ async def _ensure_tor_cleanup(
     task = retirement.existing_tor_stop_task()
     if task is None:
         task = asyncio.ensure_future(
-            asyncio.to_thread(terminate_tor_process, tor_process)
+            run_blocking_cleanup(lambda: terminate_tor_process(tor_process))
         )
         retirement.bind_tor_stop_task(task)
     elif task.done():
@@ -1062,7 +1083,7 @@ async def _ensure_tor_cleanup(
             task.result()
         except BaseException:
             task = asyncio.ensure_future(
-                asyncio.to_thread(terminate_tor_process, tor_process)
+                run_blocking_cleanup(lambda: terminate_tor_process(tor_process))
             )
             retirement.replace_tor_stop_task(task)
         else:
@@ -1170,6 +1191,7 @@ async def _stop_browser_cleanup(
     retirement: _ZendriverRetirement,
     initial_connections: tuple[Any, ...],
     tor_process: Any,
+    run_blocking_cleanup: _BlockingCleanupRunner,
 ) -> None:
     """Run the first bounded shutdown attempt for one browser generation."""
 
@@ -1179,6 +1201,7 @@ async def _stop_browser_cleanup(
             browser,
             retirement,
             allow_fallback=False,
+            run_blocking_cleanup=run_blocking_cleanup,
         )
     )
     retirement.capture_connections(
@@ -1189,7 +1212,13 @@ async def _stop_browser_cleanup(
         )
     )
     errors.extend(await _retire_protocol_operations(browser, retirement))
-    errors.extend(await _ensure_tor_cleanup(retirement, tor_process))
+    errors.extend(
+        await _ensure_tor_cleanup(
+            retirement,
+            tor_process,
+            run_blocking_cleanup=run_blocking_cleanup,
+        )
+    )
     _mark_shutdown_complete_if_ready(browser, retirement)
     _raise_browser_shutdown_errors(errors)
 
@@ -1199,6 +1228,7 @@ async def _retry_browser_retirement(
     retirement: _ZendriverRetirement,
     connections: tuple[Any, ...],
     tor_process: Any,
+    run_blocking_cleanup: _BlockingCleanupRunner,
 ) -> None:
     """Retry incomplete resource cleanup without reviving the generation."""
 
@@ -1210,9 +1240,16 @@ async def _retry_browser_retirement(
             browser,
             retirement,
             allow_fallback=True,
+            run_blocking_cleanup=run_blocking_cleanup,
         )
     )
-    errors.extend(await _ensure_tor_cleanup(retirement, tor_process))
+    errors.extend(
+        await _ensure_tor_cleanup(
+            retirement,
+            tor_process,
+            run_blocking_cleanup=run_blocking_cleanup,
+        )
+    )
     _mark_shutdown_complete_if_ready(browser, retirement)
     _raise_browser_shutdown_errors(errors)
 
@@ -1245,8 +1282,12 @@ async def _await_cleanup_deferring_caller_cancellation(
     cleanup_task.result()
 
 
-async def stop_browser(browser: Any) -> None:
-    """Stop one browser generation, deferring caller cancellation until clean."""
+async def _stop_browser(
+    browser: Any,
+    *,
+    run_blocking_cleanup: _BlockingCleanupRunner,
+) -> None:
+    """Stop one generation using the supplied blocking-cleanup execution mode."""
 
     # Tombstone synchronously before the first shutdown await. This closes the
     # race where another task could register work on a detached target while
@@ -1267,6 +1308,7 @@ async def stop_browser(browser: Any) -> None:
                 retirement,
                 initial_connections,
                 getattr(browser, "_tor_process", None),
+                run_blocking_cleanup,
             )
         )
         retirement.bind_shutdown_task(cleanup_task)
@@ -1283,7 +1325,17 @@ async def stop_browser(browser: Any) -> None:
                 retirement,
                 retirement.captured_connections(),
                 getattr(browser, "_tor_process", None),
+                run_blocking_cleanup,
             )
         )
         retirement.replace_completed_shutdown_task(cleanup_task)
     await _await_cleanup_deferring_caller_cancellation(cleanup_task)
+
+
+async def stop_browser(browser: Any) -> None:
+    """Stop one browser generation, deferring caller cancellation until clean."""
+
+    await _stop_browser(
+        browser,
+        run_blocking_cleanup=_run_blocking_cleanup_in_thread,
+    )
