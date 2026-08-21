@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import ntpath
 import os
 import shutil
 import signal
@@ -556,6 +557,40 @@ def _supervisor_creation_options() -> dict[str, Any]:
     raise AssertionError("unreachable process ownership platform")
 
 
+def _supervisor_launch_context(
+    platform_name: str,
+) -> tuple[str, dict[str, str] | None]:
+    """Select an interpreter whose process identity can be owned directly."""
+
+    executable = sys.executable
+    if not isinstance(executable, str) or not executable:
+        raise ProcessOwnershipError("Python did not expose its executable path")
+    if platform_name != "nt":
+        return executable, None
+
+    base_executable = getattr(sys, "_base_executable", None)
+    if not isinstance(base_executable, str) or not base_executable:
+        raise ProcessOwnershipError(
+            "Windows Python did not expose its base executable path"
+        )
+    executable_identity = ntpath.normcase(ntpath.normpath(executable))
+    base_identity = ntpath.normcase(ntpath.normpath(base_executable))
+    if executable_identity == base_identity:
+        return executable, None
+
+    # A Windows venv's python.exe is a redirector process. Launching it would
+    # make Popen and the Job own that short-lived redirector rather than the
+    # real supervisor. This is the same launch contract used by multiprocessing.
+    if not Path(base_executable).is_file():
+        raise ProcessOwnershipError(
+            "Windows Python base executable is unavailable for process ownership"
+        )
+
+    environment = os.environ.copy()
+    environment["__PYVENV_LAUNCHER__"] = executable
+    return base_executable, environment
+
+
 def _read_supervisor_status(
     owner: OwnedProcess,
     status_path: Path,
@@ -608,16 +643,6 @@ def start_owned_process(
 
     status_directory = Path(tempfile.mkdtemp(prefix="hbrowser-process-owner-"))
     status_path = status_directory / "status"
-    command = [
-        sys.executable,
-        "-m",
-        "hbrowser.gallery.browser._process_supervisor",
-        str(status_path),
-        str(os.getpid()),
-        "--",
-        str(executable),
-        *parameters,
-    ]
     windows_job: _WindowsJob | None = None
     supervisor: subprocess.Popen[bytes] | None = None
     target_pid: int | None = None
@@ -631,12 +656,25 @@ def start_owned_process(
         for path in cleanup_paths:
             cleanup_guard_list.append(_PrivateDirectory.capture(Path(path)))
         cleanup_guards = tuple(cleanup_guard_list)
+        supervisor_executable, supervisor_environment = _supervisor_launch_context(
+            platform_name
+        )
+        command = [
+            supervisor_executable,
+            "-m",
+            "hbrowser.gallery.browser._process_supervisor",
+            str(status_path),
+            "--",
+            str(executable),
+            *parameters,
+        ]
         supervisor = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=stdout,
             stderr=stderr,
             close_fds=True,
+            env=supervisor_environment,
             **_supervisor_creation_options(),
         )
         if platform_name == "nt":

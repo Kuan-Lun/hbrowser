@@ -134,27 +134,14 @@ def _terminate_windows_target(
     target.wait(timeout=_TERM_GRACE_SECONDS)
 
 
-def _parent_is_alive(expected_parent_pid: int) -> bool:
-    if os.getppid() != expected_parent_pid:
-        return False
-    try:
-        os.kill(expected_parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _parse_arguments(arguments: Sequence[str]) -> tuple[Path, int, tuple[str, ...]]:
-    if len(arguments) < 4 or arguments[2] != "--":
+def _parse_arguments(arguments: Sequence[str]) -> tuple[Path, tuple[str, ...]]:
+    if len(arguments) < 3 or arguments[1] != "--":
         raise ValueError("invalid supervisor arguments")
     status_path = Path(arguments[0])
-    parent_pid = int(arguments[1])
-    command = tuple(arguments[3:])
-    if parent_pid <= 0 or not command:
+    command = tuple(arguments[2:])
+    if not command:
         raise ValueError("invalid supervisor arguments")
-    return status_path, parent_pid, command
+    return status_path, command
 
 
 def _read_start_gate(file_descriptor: int) -> bytes:
@@ -171,7 +158,7 @@ def _read_start_gate(file_descriptor: int) -> bytes:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     try:
-        status_path, parent_pid, command = _parse_arguments(
+        status_path, command = _parse_arguments(
             tuple(sys.argv[1:] if arguments is None else arguments)
         )
     except OSError, ValueError:
@@ -181,9 +168,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
     start_command = _read_start_gate(control_file_descriptor)
     if start_command != b"start\n":
         _write_status(status_path, "error InvalidStartGate")
-        return 4
-    if not _parent_is_alive(parent_pid):
-        _write_status(status_path, "error ParentUnavailable")
         return 4
 
     shutdown_requested = threading.Event()
@@ -218,6 +202,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _write_status(status_path, f"ready {target.pid}")
 
         def watch_control_pipe() -> None:
+            # EOF is the parent-death signal. Unlike a cached parent PID, the
+            # pipe cannot be reused by an unrelated process and is safe on Windows.
             pending = bytearray()
             try:
                 while chunk := os.read(control_file_descriptor, 64 * 1024):
@@ -242,9 +228,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
         ).start()
 
         while not shutdown_requested.wait(_POLL_SECONDS):
-            if not _parent_is_alive(parent_pid):
-                shutdown_requested.set()
-                break
             if _target_exited_without_reaping(target):
                 break
     finally:

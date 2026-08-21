@@ -12,6 +12,7 @@ from unittest.mock import ANY, Mock, patch
 
 import zendriver as zd
 
+from hbrowser.gallery.browser import _process_supervisor as supervisor_module
 from hbrowser.gallery.browser import process as process_module
 
 
@@ -235,6 +236,66 @@ finally:
 
 
 class ProcessPolicyTests(unittest.TestCase):
+    def test_supervisor_protocol_contains_no_parent_pid(self) -> None:
+        status_path, command = supervisor_module._parse_arguments(
+            ("status", "--", "browser", "--flag")
+        )
+
+        self.assertEqual(status_path, Path("status"))
+        self.assertEqual(command, ("browser", "--flag"))
+        with self.assertRaisesRegex(ValueError, "invalid supervisor arguments"):
+            supervisor_module._parse_arguments(("status", "123", "--", "browser"))
+
+    def test_windows_venv_supervisor_bypasses_python_redirector(self) -> None:
+        venv_python = r"C:\workspace\.venv\Scripts\python.exe"
+        base_python = r"C:\Python314\python.exe"
+        with (
+            patch.object(sys, "executable", venv_python),
+            patch.object(sys, "_base_executable", base_python),
+            patch.object(Path, "is_file", return_value=True),
+            patch.dict(
+                os.environ,
+                {"HBROWSER_TEST_SENTINEL": "retained"},
+                clear=True,
+            ),
+        ):
+            executable, environment = process_module._supervisor_launch_context("nt")
+
+        self.assertEqual(executable, base_python)
+        self.assertEqual(
+            environment,
+            {
+                "HBROWSER_TEST_SENTINEL": "retained",
+                "__PYVENV_LAUNCHER__": venv_python,
+            },
+        )
+
+    def test_windows_non_venv_supervisor_uses_current_interpreter(self) -> None:
+        executable_path = r"C:\Python314\python.exe"
+        with (
+            patch.object(sys, "executable", executable_path),
+            patch.object(sys, "_base_executable", r"c:\python314\PYTHON.EXE"),
+        ):
+            executable, environment = process_module._supervisor_launch_context("nt")
+
+        self.assertEqual(executable, executable_path)
+        self.assertIsNone(environment)
+
+    def test_missing_windows_base_interpreter_fails_closed(self) -> None:
+        with (
+            patch.object(
+                sys,
+                "executable",
+                r"C:\workspace\.venv\Scripts\python.exe",
+            ),
+            patch.object(sys, "_base_executable", None),
+            self.assertRaisesRegex(
+                process_module.ProcessOwnershipError,
+                "base executable path",
+            ),
+        ):
+            process_module._supervisor_launch_context("nt")
+
     def test_unknown_platform_fails_closed(self) -> None:
         with (
             patch.object(os, "name", "unsupported"),
@@ -244,6 +305,7 @@ class ProcessPolicyTests(unittest.TestCase):
 
     def test_windows_job_assignment_precedes_start_gate(self) -> None:
         events: list[str] = []
+        launched: list[tuple[object, dict[str, object]]] = []
         supervisor = Mock(pid=101, stdout=None, stderr=None)
         supervisor.poll.return_value = None
         supervisor.wait.return_value = 0
@@ -252,8 +314,12 @@ class ProcessPolicyTests(unittest.TestCase):
         job.assign.side_effect = lambda _: events.append("assign")
         job.wait_empty.return_value = None
 
-        def launch_supervisor(*_: object, **__: object) -> Mock:
+        def launch_supervisor(
+            command: object,
+            **options: object,
+        ) -> Mock:
             events.append("popen")
+            launched.append((command, options))
             return supervisor
 
         def create_job() -> Mock:
@@ -270,6 +336,14 @@ class ProcessPolicyTests(unittest.TestCase):
                 process_module,
                 "_supervisor_creation_options",
                 return_value={"creationflags": 512},
+            ),
+            patch.object(
+                process_module,
+                "_supervisor_launch_context",
+                return_value=(
+                    r"C:\Python314\python.exe",
+                    {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
+                ),
             ),
             patch.object(subprocess, "Popen", side_effect=launch_supervisor),
             patch.object(
@@ -288,6 +362,18 @@ class ProcessPolicyTests(unittest.TestCase):
             owner.wait(timeout=1)
 
         self.assertEqual(events[:5], ["popen", "job", "assign", "start", "ready"])
+        command, options = launched[0]
+        assert isinstance(command, list)
+        self.assertEqual(command[0], r"C:\Python314\python.exe")
+        self.assertEqual(
+            command[1:4],
+            ["-m", "hbrowser.gallery.browser._process_supervisor", ANY],
+        )
+        self.assertEqual(command[4:], ["--", "browser"])
+        self.assertEqual(
+            options["env"],
+            {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
+        )
         job.terminate.assert_called_once_with()
         job.wait_empty.assert_called_once_with(timeout=ANY)
         job.close.assert_called_once_with()
@@ -545,6 +631,53 @@ class ProcessPolicyTests(unittest.TestCase):
             job.wait_empty.assert_called_once_with(timeout=ANY)
             job.terminate.assert_not_called()
             job.close.assert_called_once_with()
+
+
+@unittest.skipUnless(os.name == "nt", "Windows venv ownership contract")
+class WindowsVenvOwnedProcessTests(unittest.TestCase):
+    def test_real_venv_redirector_keeps_supervisor_parent_alive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-windows-venv-") as directory:
+            venv_path = Path(directory) / "venv"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "venv",
+                    "--system-site-packages",
+                    "--without-pip",
+                    str(venv_path),
+                ],
+                check=True,
+                timeout=60,
+            )
+            venv_python = venv_path / "Scripts" / "python.exe"
+            harness = """
+import sys
+
+from hbrowser.gallery.browser.process import start_owned_process
+
+assert sys.executable.lower() != sys._base_executable.lower()
+owner = start_owned_process(
+    sys._base_executable,
+    ["-c", "import time; time.sleep(30)"],
+)
+assert owner.target_pid is not None
+owner.terminate()
+owner.wait(timeout=10)
+"""
+            result = subprocess.run(
+                [str(venv_python), "-c", harness],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
 
 if __name__ == "__main__":
