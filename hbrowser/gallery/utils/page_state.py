@@ -576,6 +576,61 @@ _DOM_CHANGE_EVENTS = (
 )
 
 
+async def _run_dom_command(
+    page: Any,
+    command: Callable[[], Awaitable[Any]],
+    *,
+    deadline: Deadline,
+    description: str,
+) -> Any:
+    """Run one DOM command under independent transport and semantic bounds.
+
+    A command started before the semantic deadline gets the full protocol
+    watchdog.  A successful reply that arrives after the semantic deadline is
+    a page-state timeout, not evidence that the browser generation hung.
+    """
+
+    _require_deadline(deadline, description)
+    result = await wait_for_zendriver(
+        command(),
+        timeout=ZENDRIVER_COMMAND_TIMEOUT_SECONDS,
+        owner=page,
+    )
+    _require_deadline(deadline, description)
+    return result
+
+
+async def _wait_for_dom_change(
+    changed: asyncio.Event,
+    *,
+    deadline: Deadline,
+    description: str,
+) -> bool:
+    """Return whether an event fired, or false when reconciliation is due."""
+
+    while True:
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise PageStateTimeout(f"{description} did not appear before its deadline")
+        wait_seconds = min(_DOM_RECONCILIATION_SECONDS, remaining)
+        wait_reaches_deadline = remaining <= _DOM_RECONCILIATION_SECONDS
+        change_task = asyncio.create_task(changed.wait())
+        try:
+            done, _ = await asyncio.wait((change_task,), timeout=wait_seconds)
+        finally:
+            if not change_task.done():
+                change_task.cancel()
+                await asyncio.gather(change_task, return_exceptions=True)
+        if change_task in done:
+            change_task.result()
+            return True
+        if not wait_reaches_deadline:
+            return False
+        # A timeout intended to reach the semantic deadline must not cause an
+        # early PageStateTimeout if the event-loop timer returned slightly
+        # early. Keep waiting without issuing another DOM query.
+
+
 async def _wait_for_dom_query(
     page: Any,
     query: Callable[[], Awaitable[Any]],
@@ -598,21 +653,20 @@ async def _wait_for_dom_query(
             page.add_handler(event_type, on_dom_change)
     try:
         if supports_events:
-            command_timeout = _command_timeout(deadline)
-            await wait_for_zendriver(
-                page.send(cdp.dom.enable()),
-                timeout=command_timeout,
-                owner=page,
+            await _run_dom_command(
+                page,
+                lambda: page.send(cdp.dom.enable()),
+                deadline=deadline,
+                description="DOM event subscription",
             )
         while True:
             changed.clear()
-            command_timeout = _command_timeout(deadline)
-            element = await wait_for_zendriver(
-                query(),
-                timeout=command_timeout,
-                owner=page,
+            element = await _run_dom_command(
+                page,
+                query,
+                deadline=deadline,
+                description=description,
             )
-            _require_deadline(deadline, description)
             if isinstance(element, list):
                 if element:
                     return element[0]
@@ -627,14 +681,11 @@ async def _wait_for_dom_query(
             # CDP DOM mutation events are delivered immediately for materialized
             # nodes.  Reconciliation covers browser versions that do not emit an
             # event until their subtree has first been requested.
-            wait_seconds = min(_DOM_RECONCILIATION_SECONDS, remaining)
-            change_task = asyncio.create_task(changed.wait())
-            try:
-                await asyncio.wait((change_task,), timeout=wait_seconds)
-            finally:
-                if not change_task.done():
-                    change_task.cancel()
-                    await asyncio.gather(change_task, return_exceptions=True)
+            await _wait_for_dom_change(
+                changed,
+                deadline=deadline,
+                description=description,
+            )
     finally:
         if supports_events:
             for event_type in _DOM_CHANGE_EVENTS:

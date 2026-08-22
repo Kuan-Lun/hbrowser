@@ -5,21 +5,17 @@ on:
     branches: [master]
     paths:
       - .github/workflows/publish.yml
-      - hbrowser/gallery/browser/_directory_cleanup_worker.py
-      - hbrowser/gallery/browser/factory.py
-      - hbrowser/gallery/browser/process.py
-      - hbrowser/gallery/browser/tor.py
+      - hbrowser/**
       - pyproject.toml
-      - tests/test_browser_factory.py
-      - tests/test_owned_process.py
+      - tests/**
 
 jobs:
   verify-windows-process-ownership:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -46,9 +42,9 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 

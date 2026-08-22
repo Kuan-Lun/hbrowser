@@ -1,10 +1,11 @@
+import asyncio
 import unittest
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock
 
 from hbrowser.gallery.captcha import CaptchaDetector
-from hbrowser.gallery.utils import ZendriverOperationTimeout
+from hbrowser.gallery.utils import ZendriverOperationTimeout, wait_for_zendriver
 
 
 @dataclass
@@ -37,6 +38,17 @@ class _Page:
             if configured_selector in selector:
                 return element
         raise LookupError(selector)
+
+
+class _AbsentDynamicWidgetPage(_Page):
+    def __init__(self) -> None:
+        super().__init__("<html></html>")
+        self.query_count = 0
+
+    async def query_selector(self, _selector: str) -> None:
+        self.query_count += 1
+        await asyncio.sleep(0.03)
+        return None
 
 
 class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
@@ -113,3 +125,18 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(raised.exception, timeout)
         page.select.assert_awaited_once()
+
+    async def test_absent_dynamic_widget_is_not_a_generation_failure(self) -> None:
+        page = _AbsentDynamicWidgetPage()
+
+        detection = await CaptchaDetector().detect(page, timeout=0.02)
+
+        self.assertEqual(detection.kind, "none")
+        self.assertEqual(detection.url, page.url)
+        self.assertEqual(page.query_count, 1)
+        result = await wait_for_zendriver(
+            asyncio.sleep(0, result="healthy"),
+            timeout=0.05,
+            owner=page,
+        )
+        self.assertEqual(result, "healthy")

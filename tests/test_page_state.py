@@ -21,7 +21,10 @@ from hbrowser.gallery.utils import (
     wait_for_zendriver,
 )
 from hbrowser.gallery.utils import page_state as page_state_module
-from hbrowser.gallery.utils.protocol import ZendriverOperationTimeout
+from hbrowser.gallery.utils.protocol import (
+    ZendriverOperationTimeout,
+    ZendriverOwnerRetiredError,
+)
 
 
 class _EventPage:
@@ -40,6 +43,7 @@ class _EventPage:
         self.delay_same_document = 0.0
         self.reload_payload: dict[str, Any] | None = None
         self.selector_results: list[Any] = []
+        self.selector_queries = 0
 
     def add_handler(self, event_type: type[Any], handler: Any) -> None:
         self.handlers[event_type].append(handler)
@@ -119,6 +123,7 @@ class _EventPage:
         return {"url": self.url, "readyState": self.ready_state}
 
     async def query_selector(self, _selector: str) -> Any:
+        self.selector_queries += 1
         result = self.selector_results.pop(0)
         if result is None:
             asyncio.create_task(self.emit(cdp.dom.DocumentUpdated, SimpleNamespace()))
@@ -148,6 +153,24 @@ class _RemainingDeadline:
 
     def remaining(self) -> float:
         return self._remaining.popleft()
+
+
+class _ExpiresDuringCommandDeadline:
+    """Expose a tiny budget that expires only after one command starts."""
+
+    def __init__(self) -> None:
+        self._expiration_checks = 0
+
+    def bounded(self, _seconds: float) -> _ExpiresDuringCommandDeadline:
+        return self
+
+    def remaining(self) -> float:
+        return 0.001
+
+    @property
+    def expired(self) -> bool:
+        self._expiration_checks += 1
+        return self._expiration_checks > 1
 
 
 class PageStateTests(unittest.IsolatedAsyncioTestCase):
@@ -307,14 +330,155 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         element = object()
         page.selector_results = [None, element]
 
-        result = await wait_for_selector(
-            page,
-            "#ready",
-            deadline=Deadline.after(0.5),
-        )
+        with patch.object(page_state_module, "_DOM_RECONCILIATION_SECONDS", 1.0):
+            result = await asyncio.wait_for(
+                wait_for_selector(
+                    page,
+                    "#ready",
+                    deadline=Deadline.after(0.5),
+                ),
+                timeout=0.25,
+            )
 
         self.assertIs(result, element)
-        self.assertEqual(page.handlers[cdp.dom.DocumentUpdated], [])
+        self.assertEqual(page.selector_queries, 2)
+        for event_type in page_state_module._DOM_CHANGE_EVENTS:
+            self.assertEqual(page.handlers[event_type], [])
+
+    async def test_close_to_deadline_reply_is_a_healthy_semantic_timeout(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+
+        async def completed_query(_selector: str) -> object:
+            return object()
+
+        page = SimpleNamespace(browser=browser, query_selector=completed_query)
+        with (
+            patch.object(
+                page_state_module,
+                "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
+                0.05,
+            ),
+            self.assertRaisesRegex(PageStateTimeout, "completed after"),
+        ):
+            await wait_for_selector(
+                page,
+                "#late",
+                deadline=_ExpiresDuringCommandDeadline(),  # type: ignore[arg-type]
+            )
+
+        result = await wait_for_zendriver(
+            asyncio.sleep(0, result="healthy"),
+            timeout=0.05,
+            owner=page,
+        )
+        self.assertEqual(result, "healthy")
+
+    async def test_43ms_remaining_does_not_become_a_protocol_watchdog(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+
+        async def reply_after_semantic_deadline(_selector: str) -> object:
+            await asyncio.sleep(0.06)
+            return object()
+
+        page = SimpleNamespace(
+            browser=browser,
+            query_selector=reply_after_semantic_deadline,
+        )
+        with (
+            patch.object(
+                page_state_module,
+                "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
+                0.2,
+            ),
+            self.assertRaises(PageStateTimeout),
+        ):
+            await wait_for_selector(
+                page,
+                "#late",
+                deadline=Deadline.after(0.043),
+            )
+
+        result = await wait_for_zendriver(
+            asyncio.sleep(0, result="healthy"),
+            timeout=0.05,
+            owner=page,
+        )
+        self.assertEqual(result, "healthy")
+
+    async def test_no_event_at_deadline_does_not_submit_a_final_query(self) -> None:
+        query_selector = AsyncMock(return_value=None)
+        page = SimpleNamespace(query_selector=query_selector)
+
+        with self.assertRaisesRegex(PageStateTimeout, "did not appear"):
+            await wait_for_selector(
+                page,
+                "#absent",
+                deadline=Deadline.after(0.02),
+            )
+
+        query_selector.assert_awaited_once_with("#absent")
+
+    async def test_final_interval_rechecks_deadline_before_timing_out(self) -> None:
+        protocol_wait = AsyncMock(return_value=(set(), set()))
+
+        with (
+            patch(
+                "hbrowser.gallery.utils.page_state.asyncio.wait",
+                protocol_wait,
+            ),
+            self.assertRaisesRegex(PageStateTimeout, "did not appear"),
+        ):
+            await page_state_module._wait_for_dom_change(
+                asyncio.Event(),
+                deadline=_RemainingDeadline(0.043, 0.01, 0.0),  # type: ignore[arg-type]
+                description="Selector '#absent'",
+            )
+
+        self.assertEqual(protocol_wait.await_count, 2)
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in protocol_wait.await_args_list],
+            [0.043, 0.01],
+        )
+
+    async def test_hung_dom_query_uses_watchdog_and_retires_generation(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        release_query = asyncio.Event()
+
+        async def hung_query(_selector: str) -> None:
+            await release_query.wait()
+
+        page = SimpleNamespace(browser=browser, query_selector=hung_query)
+        try:
+            with (
+                patch.object(
+                    page_state_module,
+                    "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
+                    0.03,
+                ),
+                self.assertRaises(ZendriverOperationTimeout) as raised,
+            ):
+                await wait_for_selector(
+                    page,
+                    "#hung",
+                    deadline=Deadline.after(0.005),
+                )
+
+            self.assertEqual(raised.exception.timeout_seconds, 0.03)
+            with self.assertRaises(ZendriverOwnerRetiredError):
+                await wait_for_zendriver(
+                    asyncio.sleep(0),
+                    timeout=0.05,
+                    owner=page,
+                )
+        finally:
+            release_query.set()
+            await asyncio.sleep(0)
 
     async def test_command_timeout_still_retires_generation(self) -> None:
         page = _EventPage()
