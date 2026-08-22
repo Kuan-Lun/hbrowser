@@ -105,7 +105,7 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_owns_bounded_scope_and_passes_it_to_login_flow(
         self,
     ) -> None:
-        driver = _TestDriver(flaresolverr_session_attempts=5)
+        driver = _TestDriver(flaresolverr_session_attempts=3)
         login_flow = AsyncMock()
         driver._login = login_flow  # type: ignore[method-assign]
         scope = Mock(spec=FlareSolverrSessionScope)
@@ -145,7 +145,7 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
             await driver.login()
 
         client_type.assert_called_once_with("http://127.0.0.1:8191/v1")
-        client.session.assert_called_once_with(max_attempts=5)
+        client.session.assert_called_once_with(max_attempts=3)
         login_flow.assert_awaited_once_with(scope)
         session_context.__aenter__.assert_awaited_once_with()
         session_context.__aexit__.assert_awaited_once_with(None, None, None)
@@ -426,9 +426,16 @@ class DriverChallengeConfigurationTests(unittest.TestCase):
         self.assertNotIn("max_captcha_retries", parameters)
 
     def test_constructor_requires_positive_integer_session_attempts(self) -> None:
-        for invalid in (0, -1, True, 1.5):
+        for invalid in (0, -1, True, 1.5, 4):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 _TestDriver(flaresolverr_session_attempts=invalid)  # type: ignore[arg-type]
 
-        driver = _TestDriver(flaresolverr_session_attempts=4)
-        self.assertEqual(driver.flaresolverr_session_attempts, 4)
+        driver = _TestDriver(flaresolverr_session_attempts=3)
+        self.assertEqual(driver.flaresolverr_session_attempts, 3)
+
+    def test_constructor_bounds_turnstile_solver_work(self) -> None:
+        for invalid in (0, -1, True, 1.5, float("inf"), 31, 10**9):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _TestDriver(turnstile_tabs=invalid)  # type: ignore[arg-type]
+
+        self.assertEqual(_TestDriver(turnstile_tabs=30).turnstile_tabs, 30)

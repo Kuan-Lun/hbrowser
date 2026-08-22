@@ -1,12 +1,14 @@
 """瀏覽器工廠"""
 
 import asyncio
+import json
+import math
 import os
 import platform
-import shutil
+import secrets
 import subprocess
+import sys
 import tempfile
-import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from pathlib import Path
 from typing import Any
@@ -15,18 +17,19 @@ import asyncio_atexit  # type: ignore[import-untyped]
 import zendriver as zd
 
 from ..utils import (
+    Deadline,
     is_browser_generation_error,
     log_context,
     setup_logger,
-    wait_for_zendriver,
 )
 from ..utils.mutation import wait_for_zendriver_mutation
 from ..utils.protocol import (
     _begin_zendriver_retirement,
+    _validate_zendriver_operation,
     _ZendriverQuiescenceChanged,
     _ZendriverRetirement,
 )
-from .chrome_manager import ensure_chrome_installed
+from .chrome_manager import ChromePaths, create_chrome_install_staging_root
 from .mapper import (
     start_zendriver_mapper_janitor,
     stop_zendriver_mapper_janitor,
@@ -34,7 +37,9 @@ from .mapper import (
 from .process import (
     OwnedProcess,
     ProcessOwnershipError,
+    _PrivateDirectory,
     start_owned_browser_process,
+    start_owned_process,
 )
 from .proxy import (
     configure_proxy,
@@ -53,27 +58,35 @@ logger = setup_logger(__name__)
 
 MAIN_TAB_WAIT_TIMEOUT = 5.0
 MAIN_TAB_POLL_INTERVAL = 0.1
-_BROWSER_STOP_TIMEOUT_SECONDS = 15.0
-_BROWSER_START_TIMEOUT_SECONDS = 30.0
+_BROWSER_STOP_TIMEOUT_SECONDS = 5.0
+_BROWSER_STARTUP_DEADLINE_SECONDS = 300.0
+_BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS = 15.0
+_BROWSER_ATTACH_DEADLINE_SECONDS = 30.0
+_BROWSER_CONSTRUCTION_DEADLINE_SECONDS = 25.0
+_BROWSER_CONSTRUCTION_CLEANUP_RESERVE_SECONDS = 5.0
+_PROCESS_OWNERSHIP_START_TIMEOUT_SECONDS = 10.0
 _CONNECTION_CLOSE_TIMEOUT_SECONDS = 5.0
 _CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS = 2.0
 _STOP_TASK_CANCEL_TIMEOUT_SECONDS = 2.0
 _JANITOR_STOP_TIMEOUT_SECONDS = 2.0
-_TOR_STOP_TIMEOUT_SECONDS = 12.0
 _BROWSER_PROCESS_NATURAL_EXIT_SECONDS = 3.0
 _BROWSER_PROCESS_TERMINATE_WAIT_SECONDS = 3.0
 _BROWSER_PROCESS_KILL_WAIT_SECONDS = 3.0
 _BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS = 5.0
 _PROFILE_CLEANUP_TIMEOUT_SECONDS = 3.0
+_CHROME_INSTALL_WORKER_READY_SECONDS = 5.0
+_CHROME_INSTALL_RECEIPT_MAX_BYTES = 16 * 1024
 _PROTOCOL_RETIREMENT_MAX_PASSES = 8
 _BROWSER_ATEXIT_CLEANUP_ATTEMPTS = 3
-_PAGE_SETUP_MUTATION_TIMEOUT_SECONDS = 15.0
+_PAGE_SETUP_MUTATION_TIMEOUT_SECONDS = 5.0
 _DRAINING_SHUTDOWN_TASKS: set[asyncio.Future[Any]] = set()
 _CONNECTION_CLOSE_TASK_ATTRIBUTE = "_hbrowser_close_task"
 _BROWSER_ATEXIT_CLEANUP_ATTRIBUTE = "_hbrowser_asyncio_atexit_cleanup"
 _BROWSER_PROCESS_OWNER_ATTRIBUTE = "_hbrowser_process_owner"
 _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 15.0
 _DEVTOOLS_ACTIVE_PORT_POLL_SECONDS = 0.02
+# This bounds the complete local cleanup state machine, not one CDP command.
+_BROWSER_SHUTDOWN_DEADLINE_SECONDS = 15.0
 
 
 class _OwnedZendriverBrowser(zd.Browser):
@@ -178,21 +191,26 @@ def _parse_devtools_active_port(contents: str) -> int:
     return port
 
 
-def _wait_for_devtools_active_port(
+async def _wait_for_devtools_active_port_async(
     owner: OwnedProcess,
     user_data_directory: Path,
     *,
-    timeout: float = _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS,
+    deadline: Deadline,
 ) -> int:
+    """Observe Chrome's local readiness without blocking the event loop."""
+
+    active_port_deadline = deadline.bounded(_DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS)
     active_port_file = user_data_directory / "DevToolsActivePort"
-    deadline = time.monotonic() + timeout
     last_parse_error: RuntimeError | None = None
-    while time.monotonic() < deadline:
+    while not active_port_deadline.expired:
         if active_port_file.is_file():
             try:
-                return _parse_devtools_active_port(
+                port = _parse_devtools_active_port(
                     active_port_file.read_text(encoding="utf-8")
                 )
+                if active_port_deadline.expired:
+                    break
+                return port
             except (OSError, RuntimeError) as error:
                 last_parse_error = (
                     error
@@ -205,9 +223,11 @@ def _wait_for_devtools_active_port(
                 "Chrome exited before publishing DevToolsActivePort "
                 f"(exit_code={returncode})"
             )
-        time.sleep(_DEVTOOLS_ACTIVE_PORT_POLL_SECONDS)
+        await asyncio.sleep(
+            min(_DEVTOOLS_ACTIVE_PORT_POLL_SECONDS, active_port_deadline.remaining())
+        )
     timeout_error = TimeoutError(
-        f"Chrome did not publish DevToolsActivePort within {timeout:g} seconds"
+        "Chrome did not publish DevToolsActivePort before its shared deadline"
     )
     if last_parse_error is not None:
         timeout_error.add_note(
@@ -217,22 +237,19 @@ def _wait_for_devtools_active_port(
     raise timeout_error
 
 
-def _terminate_unbound_owner(owner: OwnedProcess) -> None:
+def _terminate_unbound_owner(owner: OwnedProcess, *, deadline: Deadline) -> None:
     owner.shutdown(
         graceful_timeout=0,
         terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
         kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
         cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+        deadline=deadline.expires_at,
     )
 
 
-def _construct_owned_browser(
+def _prepare_owned_browser_launch(
     config: zd.Config,
-    *,
-    cleanup_paths: tuple[str, ...],
-) -> _OwnedZendriverBrowser:
-    """Prelaunch Chrome, discover its port, then construct a connection-only client."""
-
+) -> tuple[Path, list[str]]:
     if config.host is not None or config.port is not None:
         raise RuntimeError("Owned Chrome launch requires an unbound debugging endpoint")
     if config.lang is not None:
@@ -249,33 +266,97 @@ def _construct_owned_browser(
     config.add_argument("--remote-debugging-port=0")
     parameters = config()
     parameters.append("about:blank")
+    return executable, parameters
 
-    owner = start_owned_browser_process(
-        executable,
-        parameters,
-        cleanup_paths=cleanup_paths,
+
+async def _construct_owned_browser_async(
+    config: zd.Config,
+    *,
+    cleanup_paths: tuple[str, ...],
+    startup_deadline: Deadline,
+) -> _OwnedZendriverBrowser:
+    """Launch in a bounded owner phase, then await local readiness asynchronously."""
+
+    construction_deadline = startup_deadline.bounded(
+        _BROWSER_CONSTRUCTION_DEADLINE_SECONDS
     )
+    cleanup_reserve = min(
+        _BROWSER_CONSTRUCTION_CLEANUP_RESERVE_SECONDS,
+        construction_deadline.remaining() / 2.0,
+    )
+    construction_work_deadline = Deadline(
+        construction_deadline.expires_at - cleanup_reserve
+    )
+
+    def require_construction_budget(phase: str) -> None:
+        if construction_work_deadline.expired:
+            raise TimeoutError(f"Chrome construction deadline expired before {phase}")
+
+    require_construction_budget("configuration validation")
+    executable, parameters = _prepare_owned_browser_launch(config)
+    require_construction_budget("owned process launch")
+    owner: OwnedProcess | None = None
     try:
-        port = _wait_for_devtools_active_port(
+        launch_task = asyncio.create_task(
+            asyncio.to_thread(
+                start_owned_browser_process,
+                executable,
+                parameters,
+                cleanup_paths=cleanup_paths,
+                startup_timeout=min(
+                    _PROCESS_OWNERSHIP_START_TIMEOUT_SECONDS,
+                    construction_work_deadline.remaining(),
+                ),
+                deadline=construction_deadline.expires_at,
+            )
+        )
+        owner, launch_cancellation = await _settle_owned_startup_task(launch_task)
+        if launch_cancellation is not None:
+            raise launch_cancellation
+        assert owner is not None
+
+        require_construction_budget("DevToolsActivePort discovery")
+        port = await _wait_for_devtools_active_port_async(
             owner,
             Path(config.user_data_dir),
+            deadline=construction_work_deadline,
         )
+        require_construction_budget("Zendriver client construction")
         config.host = "127.0.0.1"
         config.port = port
         browser = _OwnedZendriverBrowser(config)
         setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
+        require_construction_budget("browser ownership publication")
+        owner = None
         return browser
     except BaseException as startup_error:
-        try:
-            _terminate_unbound_owner(owner)
-        except BaseException as cleanup_error:
-            ownership_error = ProcessOwnershipError(
-                "Chrome startup failed and its process ownership remains unresolved"
+        if owner is not None:
+            cleanup_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _terminate_unbound_owner,
+                    owner,
+                    deadline=construction_deadline,
+                )
             )
-            ownership_error.add_note(
-                "Startup failure type: " f"{type(startup_error).__name__}"
-            )
-            raise ownership_error from cleanup_error
+            try:
+                _, cleanup_cancellation = await _settle_owned_startup_task(cleanup_task)
+            except BaseException as cleanup_error:
+                ownership_error = ProcessOwnershipError(
+                    "Chrome startup failed and its process ownership remains unresolved"
+                )
+                ownership_error.add_note(
+                    f"Startup failure type: {type(startup_error).__name__}"
+                )
+                raise ownership_error from cleanup_error
+            if cleanup_cancellation is not None and not isinstance(
+                startup_error,
+                asyncio.CancelledError,
+            ):
+                cleanup_cancellation.add_note(
+                    "Chrome construction was already failing with: "
+                    f"{type(startup_error).__name__}"
+                )
+                raise cleanup_cancellation
         raise startup_error.with_traceback(startup_error.__traceback__)
 
 
@@ -294,18 +375,26 @@ async def _post_create_setup(
     browser: zd.Browser,
     page: zd.Tab,
     use_tor: bool,
+    *,
+    deadline: Deadline,
 ) -> None:
     from zendriver import cdp
 
+    command_timeout = min(
+        _PAGE_SETUP_MUTATION_TIMEOUT_SECONDS,
+        deadline.remaining(),
+    )
+    if command_timeout <= 0:
+        raise TimeoutError("Browser startup expired before page setup")
     await wait_for_zendriver_mutation(
         page.send(cdp.emulation.set_geolocation_override()),
-        timeout=_PAGE_SETUP_MUTATION_TIMEOUT_SECONDS,
+        timeout=command_timeout,
         owner=page,
         operation="Browser geolocation reset",
     )
 
     if use_tor and not has_residential_proxy():
-        await verify_proxy_ip(browser, page)
+        await verify_proxy_ip(browser, page, deadline=deadline)
 
 
 def _select_main_tab(browser: zd.Browser) -> zd.Tab | None:
@@ -348,6 +437,22 @@ async def _wait_for_main_tab(
     timeout: float = MAIN_TAB_WAIT_TIMEOUT,
     poll_interval: float = MAIN_TAB_POLL_INTERVAL,
 ) -> zd.Tab:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not math.isfinite(float(timeout))
+        or not 0 <= timeout <= MAIN_TAB_WAIT_TIMEOUT
+    ):
+        raise ValueError(
+            f"main-tab timeout must be finite and in [0, {MAIN_TAB_WAIT_TIMEOUT:g}]"
+        )
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, int | float)
+        or not math.isfinite(float(poll_interval))
+        or poll_interval <= 0
+    ):
+        raise ValueError("main-tab poll interval must be finite and positive")
     if not browser.stopped:
         page = _select_main_tab(browser)
         if page is not None and not browser.stopped:
@@ -366,6 +471,8 @@ async def _wait_for_main_tab(
                 break
             await asyncio.sleep(min(poll_interval, remaining))
             if browser.stopped:
+                break
+            if loop.time() >= deadline:
                 break
             page = _select_main_tab(browser)
             if page is not None and not browser.stopped:
@@ -420,12 +527,65 @@ async def _settle_owned_startup_task[T](
     return result, caller_cancellation
 
 
+async def _await_browser_start(
+    browser: zd.Browser,
+    *,
+    deadline: Deadline,
+) -> zd.Browser:
+    """Await the composite cold-start lifecycle without a long CDP watchdog."""
+
+    task = asyncio.create_task(browser.start())
+    _, _, connection, lifecycle = _validate_zendriver_operation(
+        task,
+        timeout=5.0,
+        owner=browser,
+    )
+    lifecycle.register(task, connection, browser)
+    while not task.done():
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            lifecycle.begin_retirement_for_operation(
+                task,
+                owner=browser,
+                connection=connection,
+            )
+            timeout_error = TimeoutError(
+                "Browser cold-start lifecycle exceeded its shared deadline"
+            )
+            raise timeout_error
+        try:
+            await asyncio.wait((task,), timeout=remaining)
+        except asyncio.CancelledError:
+            lifecycle.begin_retirement_for_operation(
+                task,
+                owner=browser,
+                connection=connection,
+            )
+            raise
+    if deadline.expired:
+        lifecycle.begin_retirement_for_operation(
+            task,
+            owner=browser,
+            connection=connection,
+        )
+        raise TimeoutError(
+            "Browser cold-start lifecycle completed after its shared deadline"
+        )
+    return task.result()
+
+
 async def _terminate_owned_tor_after_cancellation(
     tor_process: Any,
     cancellation: asyncio.CancelledError,
+    *,
+    deadline: Deadline,
 ) -> None:
     cleanup_task = asyncio.create_task(
-        asyncio.to_thread(terminate_tor_process, tor_process)
+        asyncio.to_thread(
+            terminate_tor_process,
+            tor_process,
+            deadline=deadline,
+        )
     )
     try:
         _, settled_cancellation = await _settle_owned_startup_task(
@@ -443,9 +603,10 @@ async def _cleanup_browser_after_startup_failure(
     startup_error: BaseException,
     *,
     phase: str,
+    deadline: Deadline,
 ) -> None:
     try:
-        await stop_browser(browser)
+        await stop_browser(browser, deadline)
     except asyncio.CancelledError as cleanup_cancellation:
         if isinstance(startup_error, asyncio.CancelledError):
             startup_error.add_note(
@@ -465,6 +626,299 @@ async def _cleanup_browser_after_startup_failure(
             "Startup failure type: " f"{type(startup_error).__name__}"
         )
         raise ownership_error from cleanup_error
+
+
+async def _cleanup_unowned_private_paths(
+    paths: tuple[str, ...],
+    *,
+    deadline: Deadline,
+) -> list[BaseException]:
+    """Remove pre-process private material through settled owned workers."""
+
+    cleanup_deadline = deadline.bounded(_PROFILE_CLEANUP_TIMEOUT_SECONDS)
+    guards: list[_PrivateDirectory] = []
+    errors: list[BaseException] = []
+    for path in paths:
+        try:
+            guards.append(_PrivateDirectory.capture(Path(path)))
+        except FileNotFoundError:
+            pass
+        except BaseException as error:
+            errors.append(error)
+
+    tasks = tuple(
+        asyncio.create_task(
+            asyncio.to_thread(
+                guard.remove,
+                deadline=cleanup_deadline.expires_at,
+            )
+        )
+        for guard in guards
+    )
+    if not tasks:
+        return errors
+
+    aggregate = asyncio.gather(*tasks, return_exceptions=True)
+    caller_cancellation: asyncio.CancelledError | None = None
+    while not aggregate.done():
+        try:
+            await asyncio.shield(aggregate)
+        except asyncio.CancelledError as error:
+            current_task = asyncio.current_task()
+            if aggregate.done() and (
+                current_task is None or current_task.cancelling() == 0
+            ):
+                break
+            if current_task is None or current_task.cancelling() == 0:
+                raise
+            if caller_cancellation is None:
+                caller_cancellation = error
+
+    errors.extend(
+        result for result in aggregate.result() if isinstance(result, BaseException)
+    )
+    if caller_cancellation is not None:
+        if errors:
+            errors[0].add_note(
+                "Private-path cleanup was cancelled but settled every owned worker"
+            )
+            raise errors[0]
+        raise caller_cancellation
+    return errors
+
+
+def _chrome_install_worker_command(
+    receipt_path: Path,
+    nonce: str,
+    *,
+    work_deadline: Deadline,
+    staging_directory: Path,
+) -> tuple[str, tuple[str, ...]]:
+    return (
+        sys.executable,
+        (
+            "-m",
+            "hbrowser.gallery.browser._chrome_install_worker",
+            str(receipt_path),
+            nonce,
+            repr(work_deadline.expires_at),
+            str(staging_directory),
+        ),
+    )
+
+
+async def _install_chrome_in_owned_worker(
+    *,
+    work_deadline: Deadline,
+    cleanup_deadline: Deadline,
+) -> ChromePaths:
+    """Run shared-cache installation in a killable, fully reaped process tree."""
+
+    receipt_directory = Path(tempfile.mkdtemp(prefix="hbrowser-chrome-install-"))
+    receipt_path = receipt_directory / "receipt.json"
+    nonce = secrets.token_hex(16)
+    staging_directory: Path | None = None
+    owner: OwnedProcess | None = None
+    result: ChromePaths | None = None
+    primary_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+
+    try:
+        remaining = work_deadline.remaining()
+        if remaining <= 0:
+            raise TimeoutError("Chrome install deadline expired before worker startup")
+        staging_directory = create_chrome_install_staging_root()
+        if work_deadline.expired:
+            raise TimeoutError(
+                "Chrome install deadline expired while creating staging ownership"
+            )
+        worker_executable, worker_parameters = _chrome_install_worker_command(
+            receipt_path,
+            nonce,
+            work_deadline=work_deadline,
+            staging_directory=staging_directory,
+        )
+        startup_task = asyncio.create_task(
+            asyncio.to_thread(
+                start_owned_process,
+                worker_executable,
+                worker_parameters,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startup_timeout=min(
+                    _CHROME_INSTALL_WORKER_READY_SECONDS,
+                    remaining,
+                ),
+                cleanup_paths=(staging_directory,),
+                deadline=cleanup_deadline.expires_at,
+            )
+        )
+        owner, startup_cancellation = await _settle_owned_startup_task(startup_task)
+        if startup_cancellation is not None:
+            raise startup_cancellation
+        assert owner is not None
+
+        while owner.poll() is None:
+            remaining = work_deadline.remaining()
+            if remaining <= 0:
+                raise TimeoutError("Chrome installation worker exceeded its deadline")
+            await asyncio.sleep(min(0.05, remaining))
+
+        remaining = cleanup_deadline.remaining()
+        if remaining <= 0:
+            raise ProcessOwnershipError(
+                "Chrome installer exited after its ownership deadline"
+            )
+        wait_task = asyncio.create_task(
+            asyncio.to_thread(
+                owner.wait,
+                timeout=min(15.0, remaining),
+            )
+        )
+        _, wait_cancellation = await _settle_owned_startup_task(wait_task)
+        if wait_cancellation is not None:
+            raise wait_cancellation
+        owner = None
+
+        if work_deadline.expired:
+            raise TimeoutError(
+                "Chrome installation receipt arrived after its work deadline"
+            )
+        encoded_receipt = receipt_path.read_bytes()
+        if len(encoded_receipt) > _CHROME_INSTALL_RECEIPT_MAX_BYTES:
+            raise RuntimeError("Chrome installation receipt exceeded its size limit")
+        if work_deadline.expired:
+            raise TimeoutError(
+                "Chrome installation receipt read completed after its deadline"
+            )
+        try:
+            receipt: object = json.loads(encoded_receipt)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                "Chrome installation worker returned invalid JSON"
+            ) from None
+        if work_deadline.expired:
+            raise TimeoutError(
+                "Chrome installation receipt parsing completed after its deadline"
+            )
+        if not isinstance(receipt, dict) or receipt.get("schema") != 1:
+            raise RuntimeError("Chrome installation worker returned an invalid receipt")
+        if receipt.get("nonce") != nonce:
+            raise RuntimeError("Chrome installation receipt identity did not match")
+        chrome = receipt.get("chrome")
+        version = receipt.get("version")
+        if (
+            not isinstance(chrome, str)
+            or not Path(chrome).is_absolute()
+            or not Path(chrome).is_file()
+            or not isinstance(version, str)
+            or not version
+        ):
+            raise RuntimeError("Chrome installation receipt was not trustworthy")
+        if work_deadline.expired:
+            raise TimeoutError(
+                "Chrome installation validation completed after its deadline"
+            )
+        result = ChromePaths(chrome=chrome, version=version)
+    except BaseException as error:
+        primary_error = error
+
+    if owner is not None:
+        remaining = cleanup_deadline.remaining()
+        try:
+            if remaining <= 0:
+                raise ProcessOwnershipError(
+                    "Chrome installation worker ownership deadline expired"
+                )
+            shutdown_task = asyncio.create_task(
+                asyncio.to_thread(
+                    owner.shutdown,
+                    graceful_timeout=0,
+                    terminate_timeout=min(3.0, remaining),
+                    kill_timeout=min(3.0, remaining),
+                    cleanup_timeout=min(5.0, remaining),
+                    deadline=cleanup_deadline.expires_at,
+                )
+            )
+            _, shutdown_cancellation = await _settle_owned_startup_task(shutdown_task)
+            if shutdown_cancellation is not None and primary_error is None:
+                primary_error = shutdown_cancellation
+            owner = None
+        except BaseException as error:
+            cleanup_error = error
+
+    unowned_private_paths = [str(receipt_directory)]
+    if (
+        staging_directory is not None
+        and cleanup_error is None
+        and not isinstance(primary_error, ProcessOwnershipError)
+    ):
+        # A successful wait/shutdown or an ordinary startup failure proves no
+        # process can still mutate staging. In the unresolved-ownership case,
+        # OwnedProcess retains its identity guard for durable atexit cleanup.
+        unowned_private_paths.append(str(staging_directory))
+    try:
+        private_errors = await _cleanup_unowned_private_paths(
+            tuple(unowned_private_paths),
+            deadline=cleanup_deadline,
+        )
+    except BaseException as error:
+        private_errors = [error]
+    if private_errors and cleanup_error is None:
+        cleanup_error = private_errors[0]
+
+    if cleanup_error is not None:
+        ownership_error = ProcessOwnershipError(
+            "Chrome installation ended with unresolved worker or receipt ownership"
+        )
+        if primary_error is not None:
+            ownership_error.add_note(
+                f"Install failure type: {type(primary_error).__name__}"
+            )
+        raise ownership_error from cleanup_error
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if result is None:
+        raise RuntimeError("Chrome installation produced no result")
+    return result
+
+
+async def _cleanup_failed_construction(
+    tor_process: OwnedProcess | None,
+    private_paths: tuple[str, ...],
+    *,
+    deadline: Deadline,
+) -> tuple[list[BaseException], BaseException | None]:
+    """Clean independent startup resources concurrently under one deadline."""
+
+    private_task = asyncio.create_task(
+        _cleanup_unowned_private_paths(private_paths, deadline=deadline)
+    )
+    tor_task = (
+        None
+        if tor_process is None
+        else asyncio.create_task(
+            asyncio.to_thread(
+                terminate_tor_process,
+                tor_process,
+                deadline=deadline,
+            )
+        )
+    )
+    if tor_task is None:
+        return await private_task, None
+    private_result, tor_result = await asyncio.gather(
+        private_task,
+        tor_task,
+        return_exceptions=True,
+    )
+    private_errors = (
+        [private_result]
+        if isinstance(private_result, BaseException)
+        else private_result
+    )
+    tor_error = tor_result if isinstance(tor_result, BaseException) else None
+    return private_errors, tor_error
 
 
 type _BlockingCleanupRunner = Callable[[Callable[[], None]], Awaitable[None]]
@@ -500,6 +954,7 @@ class _BrowserAtexitCleanup:
                     await _stop_browser(
                         browser,
                         run_blocking_cleanup=_run_blocking_cleanup_inline,
+                        renew_expired_atexit_attempt=True,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -554,6 +1009,12 @@ def _release_browser_atexit(browser: Any) -> None:
 async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
     mode = "headless" if headless else "windowed"
     logger.info("Starting browser")
+    # This semantic deadline covers external Tor bootstrap, Chrome metadata /
+    # artifact installation, local process launch, and target discovery.
+    browser_startup_deadline = Deadline.after(_BROWSER_STARTUP_DEADLINE_SECONDS)
+    browser_startup_work_deadline = Deadline(
+        browser_startup_deadline.expires_at - _BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS
+    )
 
     use_tor = should_use_tor()
     tor_process: OwnedProcess | None = None
@@ -564,7 +1025,11 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
     if use_tor:
         socks_port = find_available_port(TOR_SOCKS_PORT)
         tor_start_task = asyncio.create_task(
-            asyncio.to_thread(start_tor_with_retry, socks_port)
+            asyncio.to_thread(
+                start_tor_with_retry,
+                socks_port,
+                deadline=browser_startup_work_deadline,
+            )
         )
         tor_process, tor_start_cancellation = await _settle_owned_startup_task(
             tor_start_task
@@ -573,6 +1038,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             await _terminate_owned_tor_after_cancellation(
                 tor_process,
                 tor_start_cancellation,
+                deadline=browser_startup_deadline,
             )
 
     try:
@@ -583,7 +1049,10 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             connection = "Tor"
         else:
             connection = "direct"
-        chrome_paths = ensure_chrome_installed()
+        chrome_paths = await _install_chrome_in_owned_worker(
+            work_deadline=browser_startup_work_deadline,
+            cleanup_deadline=browser_startup_deadline,
+        )
         profile_directory = tempfile.mkdtemp(prefix="hbrowser-profile-")
         config = _build_config(
             headless,
@@ -595,43 +1064,44 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         )
 
         logger.debug("Initializing browser")
-        browser = _construct_owned_browser(
+        browser = await _construct_owned_browser_async(
             config,
             cleanup_paths=tuple(
                 path
                 for path in (profile_directory, proxy_extension)
                 if path is not None
             ),
+            startup_deadline=browser_startup_work_deadline,
         )
         private_paths_are_owned = True
     except BaseException as construction_error:
-        private_cleanup_error: BaseException | None = None
-        tor_cleanup_error: BaseException | None = None
-        if not private_paths_are_owned and not isinstance(
-            construction_error,
-            ProcessOwnershipError,
-        ):
-            for private_path in (profile_directory, proxy_extension):
-                if private_path is None:
-                    continue
-                try:
-                    shutil.rmtree(private_path)
-                except FileNotFoundError:
-                    pass
-                except BaseException as cleanup_error:
-                    if private_cleanup_error is None:
-                        private_cleanup_error = cleanup_error
-                    else:
-                        private_cleanup_error.add_note(
-                            "Additional private cleanup failure: "
-                            f"{type(cleanup_error).__name__}"
-                        )
-        if tor_process is not None:
-            try:
-                await asyncio.to_thread(terminate_tor_process, tor_process)
-            except BaseException as cleanup_error:
-                tor_cleanup_error = cleanup_error
-        if private_cleanup_error is not None:
+        private_paths = (
+            ()
+            if private_paths_are_owned
+            or isinstance(construction_error, ProcessOwnershipError)
+            else tuple(
+                path
+                for path in (profile_directory, proxy_extension)
+                if path is not None
+            )
+        )
+        cleanup_task = asyncio.create_task(
+            _cleanup_failed_construction(
+                tor_process,
+                private_paths,
+                deadline=browser_startup_deadline,
+            )
+        )
+        cleanup_result, cleanup_cancellation = await _settle_owned_startup_task(
+            cleanup_task,
+            (
+                construction_error
+                if isinstance(construction_error, asyncio.CancelledError)
+                else None
+            ),
+        )
+        private_cleanup_errors, tor_cleanup_error = cleanup_result
+        if private_cleanup_errors:
             ownership_error = ProcessOwnershipError(
                 "Browser construction failed and private generation material "
                 "could not be removed"
@@ -639,7 +1109,12 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             ownership_error.add_note(
                 "Construction failure type: " f"{type(construction_error).__name__}"
             )
-            raise ownership_error from private_cleanup_error
+            for additional_error in private_cleanup_errors[1:]:
+                private_cleanup_errors[0].add_note(
+                    "Additional private cleanup failure: "
+                    f"{type(additional_error).__name__}"
+                )
+            raise ownership_error from private_cleanup_errors[0]
         if tor_cleanup_error is not None:
             ownership_error = ProcessOwnershipError(
                 "Browser construction failed and Tor process ownership "
@@ -649,15 +1124,20 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
                 "Construction failure type: " f"{type(construction_error).__name__}"
             )
             raise ownership_error from tor_cleanup_error
+        if cleanup_cancellation is not None:
+            raise cleanup_cancellation
         raise construction_error.with_traceback(construction_error.__traceback__)
 
     _attach_tor_process(browser, tor_process)
+
+    browser_attach_deadline = browser_startup_work_deadline.bounded(
+        _BROWSER_ATTACH_DEADLINE_SECONDS
+    )
     try:
         _register_browser_atexit(browser)
-        started_browser = await wait_for_zendriver(
-            browser.start(),
-            timeout=_BROWSER_START_TIMEOUT_SECONDS,
-            owner=browser,
+        started_browser = await _await_browser_start(
+            browser,
+            deadline=browser_attach_deadline,
         )
         if started_browser is not browser:
             raise RuntimeError("Zendriver Browser.start returned another instance")
@@ -666,12 +1146,21 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             browser,
             startup_error,
             phase="launch",
+            deadline=browser_startup_deadline,
         )
         raise startup_error.with_traceback(startup_error.__traceback__)
 
     try:
-        page = await _wait_for_main_tab(browser)
-        await _post_create_setup(browser, page, use_tor)
+        page = await _wait_for_main_tab(
+            browser,
+            timeout=min(MAIN_TAB_WAIT_TIMEOUT, browser_attach_deadline.remaining()),
+        )
+        await _post_create_setup(
+            browser,
+            page,
+            use_tor,
+            deadline=browser_attach_deadline,
+        )
         start_zendriver_mapper_janitor(browser)
         logger.info("Browser ready (%s, %s)", mode, connection)
     except BaseException as startup_error:
@@ -679,6 +1168,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             browser,
             startup_error,
             phase="setup",
+            deadline=browser_startup_deadline,
         )
         raise startup_error.with_traceback(startup_error.__traceback__)
 
@@ -756,15 +1246,29 @@ async def _bounded_shutdown_awaitable(
     *,
     timeout: float,
     description: str,
+    deadline: Deadline | None = None,
 ) -> tuple[bool, list[BaseException]]:
     """Wait for cleanup without letting a cancellation-resistant task hang."""
 
+    effective_timeout = (
+        timeout if deadline is None else min(timeout, deadline.remaining())
+    )
+    if effective_timeout <= 0:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        return False, [TimeoutError(f"{description} had no shutdown budget left")]
     task = asyncio.ensure_future(awaitable)
-    done, _ = await asyncio.wait((task,), timeout=timeout)
+    done, _ = await asyncio.wait((task,), timeout=effective_timeout)
     if not done:
         task.cancel()
         _detach_shutdown_task(task)
-        return False, [TimeoutError(f"{description} exceeded {timeout:g} seconds")]
+        return False, [
+            TimeoutError(
+                f"{description} exceeded its {effective_timeout:g}-second "
+                "shutdown phase"
+            )
+        ]
     try:
         task.result()
     except BaseException as error:
@@ -774,6 +1278,8 @@ async def _bounded_shutdown_awaitable(
 
 async def _close_and_wait_for_connection(
     connection: Any,
+    *,
+    deadline: Deadline,
 ) -> tuple[bool, list[BaseException]]:
     """Close one transport and await its listener's terminal state."""
 
@@ -788,18 +1294,40 @@ async def _close_and_wait_for_connection(
             except TypeError:
                 close_task = None
             if not isinstance(close_task, asyncio.Future) or close_task.done():
-                close_task = asyncio.ensure_future(aclose())
-                try:
-                    setattr(connection, _CONNECTION_CLOSE_TASK_ATTRIBUTE, close_task)
-                except (AttributeError, TypeError) as error:
-                    close_task.cancel()
-                    errors.append(error)
-            _, close_errors = await _bounded_shutdown_awaitable(
-                close_task,
-                timeout=_CONNECTION_CLOSE_TIMEOUT_SECONDS,
-                description="Zendriver connection close",
-            )
-            errors.extend(close_errors)
+                if deadline.expired:
+                    errors.append(
+                        ProcessOwnershipError(
+                            "Browser shutdown expired before connection close"
+                        )
+                    )
+                    close_task = None
+                else:
+                    close_task = asyncio.ensure_future(aclose())
+                    try:
+                        setattr(
+                            connection,
+                            _CONNECTION_CLOSE_TASK_ATTRIBUTE,
+                            close_task,
+                        )
+                    except (AttributeError, TypeError) as error:
+                        close_task.cancel()
+                        errors.append(error)
+            if isinstance(close_task, asyncio.Future):
+                if deadline.expired and not close_task.done():
+                    _detach_shutdown_task(close_task)
+                    errors.append(
+                        ProcessOwnershipError(
+                            "Connection close remained pending at shutdown deadline"
+                        )
+                    )
+                else:
+                    _, close_errors = await _bounded_shutdown_awaitable(
+                        close_task,
+                        timeout=_CONNECTION_CLOSE_TIMEOUT_SECONDS,
+                        description="Zendriver connection close",
+                        deadline=deadline,
+                    )
+                    errors.extend(close_errors)
 
     listener_task = _connection_listener_task(connection)
     if listener_task is not None:
@@ -816,7 +1344,10 @@ async def _close_and_wait_for_connection(
                 listener_task.cancel()
         listener_done, _ = await asyncio.wait(
             (listener_task,),
-            timeout=_CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS,
+            timeout=min(
+                _CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS,
+                deadline.remaining(),
+            ),
         )
         if listener_done:
             try:
@@ -842,15 +1373,26 @@ async def _close_and_wait_for_connection(
 
 async def _close_and_wait_for_browser_connections(
     connections: tuple[Any, ...],
+    *,
+    deadline: Deadline,
 ) -> tuple[bool, list[BaseException]]:
     """Quiesce every captured connection before protocol tasks are cancelled."""
 
     all_closed = True
     errors: list[BaseException] = []
-    for connection in connections:
-        connection_closed, connection_errors = await _close_and_wait_for_connection(
-            connection
-        )
+    results = await asyncio.gather(
+        *(
+            _close_and_wait_for_connection(connection, deadline=deadline)
+            for connection in connections
+        ),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            all_closed = False
+            errors.append(result)
+            continue
+        connection_closed, connection_errors = result
         all_closed = all_closed and connection_closed
         errors.extend(connection_errors)
     return all_closed, errors
@@ -868,18 +1410,34 @@ def _clear_closed_connection_mappers(connections: tuple[Any, ...]) -> None:
             mapper.clear()
 
 
-def _raise_browser_shutdown_errors(errors: list[BaseException]) -> None:
+def _raise_browser_shutdown_errors(
+    errors: list[BaseException],
+    *,
+    retirement: _ZendriverRetirement,
+) -> None:
     if not errors:
         return
     primary, *secondary = errors
     for error in secondary:
         primary.add_note(f"Additional shutdown error: {type(error).__name__}: {error}")
-    raise primary
+    if retirement.is_complete():
+        raise primary
+    if isinstance(primary, ProcessOwnershipError):
+        raise primary
+    ownership_error = ProcessOwnershipError(
+        "Browser generation cleanup remains unresolved"
+    )
+    ownership_error.add_note(
+        f"Primary shutdown failure: {type(primary).__name__}: {primary}"
+    )
+    raise ownership_error from primary
 
 
 async def _stop_mapper_janitor(
     browser: Any,
     retirement: _ZendriverRetirement,
+    *,
+    deadline: Deadline,
 ) -> list[BaseException]:
     if retirement.janitor_cleanup_is_complete():
         return []
@@ -887,6 +1445,7 @@ async def _stop_mapper_janitor(
         stop_zendriver_mapper_janitor(browser),
         timeout=_JANITOR_STOP_TIMEOUT_SECONDS,
         description="Zendriver mapper janitor stop",
+        deadline=deadline,
     )
     if completed and not errors:
         retirement.mark_janitor_cleanup_complete()
@@ -895,14 +1454,14 @@ async def _stop_mapper_janitor(
 
 async def _await_browser_stop_task(
     task: asyncio.Future[Any],
+    *,
+    deadline: Deadline,
 ) -> BaseException | None:
-    done, _ = await asyncio.wait((task,), timeout=_BROWSER_STOP_TIMEOUT_SECONDS)
+    timeout = min(_BROWSER_STOP_TIMEOUT_SECONDS, deadline.remaining())
+    done, _ = await asyncio.wait((task,), timeout=timeout)
     if not done:
         _detach_shutdown_task(task)
-        return TimeoutError(
-            "Zendriver browser stop exceeded "
-            f"{_BROWSER_STOP_TIMEOUT_SECONDS:g} seconds"
-        )
+        return TimeoutError("Zendriver browser stop exceeded " f"{timeout:g} seconds")
     try:
         task.result()
     except BaseException as error:
@@ -910,10 +1469,17 @@ async def _await_browser_stop_task(
     return None
 
 
-def _terminate_browser_process(browser: Any) -> None:
+def _terminate_browser_process(browser: Any, *, deadline: Deadline) -> None:
     """Synchronously retire every process owner and its private material."""
 
     owner = getattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
+    process = getattr(browser, "_process", None)
+    if owner is None and process is None:
+        return
+    if deadline.expired:
+        raise ProcessOwnershipError(
+            "Browser process cleanup was not started after its deadline"
+        )
     if isinstance(owner, OwnedProcess):
         try:
             owner.shutdown(
@@ -921,6 +1487,7 @@ def _terminate_browser_process(browser: Any) -> None:
                 terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
                 kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
                 cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+                deadline=deadline.expires_at,
             )
         except BaseException as cleanup_error:
             raise ProcessOwnershipError(
@@ -928,7 +1495,6 @@ def _terminate_browser_process(browser: Any) -> None:
             ) from cleanup_error
         setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
 
-    process = getattr(browser, "_process", None)
     if process is None:
         return
     try:
@@ -936,13 +1502,27 @@ def _terminate_browser_process(browser: Any) -> None:
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS)
+        process.wait(
+            timeout=min(
+                _BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+                deadline.remaining(),
+            )
+        )
     except subprocess.TimeoutExpired:
+        if deadline.expired:
+            raise ProcessOwnershipError(
+                "Browser process termination exhausted the shutdown deadline"
+            )
         try:
             process.kill()
         except ProcessLookupError:
             pass
-        process.wait(timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS)
+        process.wait(
+            timeout=min(
+                _BROWSER_PROCESS_KILL_WAIT_SECONDS,
+                deadline.remaining(),
+            )
+        )
     browser._process = None
     if hasattr(browser, "_process_pid"):
         browser._process_pid = None
@@ -952,23 +1532,41 @@ async def _explicit_browser_cleanup(
     browser: Any,
     *,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    deadline: Deadline,
 ) -> list[BaseException]:
     """Finish process/profile cleanup after a repeatedly failed Browser.stop."""
 
     errors: list[BaseException] = []
-    try:
-        await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
-    except BaseException as error:
-        errors.append(error)
+    if deadline.expired:
+        errors.append(
+            ProcessOwnershipError(
+                "Browser shutdown expired before process cleanup was started"
+            )
+        )
+    else:
+        try:
+            await run_blocking_cleanup(
+                lambda: _terminate_browser_process(browser, deadline=deadline)
+            )
+        except BaseException as error:
+            errors.append(error)
 
     cleanup_profile = getattr(browser, "_cleanup_temporary_profile", None)
     if callable(cleanup_profile):
-        _, profile_errors = await _bounded_shutdown_awaitable(
-            cleanup_profile(),
-            timeout=_PROFILE_CLEANUP_TIMEOUT_SECONDS,
-            description="Zendriver temporary profile cleanup",
-        )
-        errors.extend(profile_errors)
+        if deadline.expired:
+            errors.append(
+                ProcessOwnershipError(
+                    "Browser shutdown expired before profile cleanup was started"
+                )
+            )
+        else:
+            _, profile_errors = await _bounded_shutdown_awaitable(
+                cleanup_profile(),
+                timeout=_PROFILE_CLEANUP_TIMEOUT_SECONDS,
+                description="Zendriver temporary profile cleanup",
+                deadline=deadline,
+            )
+            errors.extend(profile_errors)
     return errors
 
 
@@ -978,6 +1576,7 @@ async def _ensure_browser_cleanup(
     *,
     allow_fallback: bool,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    deadline: Deadline,
 ) -> list[BaseException]:
     """Start, resume, or safely recover the one Browser.stop sequence."""
 
@@ -985,32 +1584,52 @@ async def _ensure_browser_cleanup(
         return []
 
     task = retirement.existing_browser_stop_task()
-    task_started_now = False
+    prior_stop_is_still_pending = task is not None and not task.done()
+    stop_error: BaseException | None = None
     if task is None:
+        if deadline.expired:
+            return [
+                ProcessOwnershipError(
+                    "Browser shutdown expired before Zendriver stop was started"
+                )
+            ]
         task = asyncio.ensure_future(browser.stop())
         retirement.bind_browser_stop_task(task)
-        task_started_now = True
     elif task.done():
         try:
             task.result()
         except BaseException as previous_error:
             if not allow_fallback:
                 return [previous_error]
-            task = asyncio.ensure_future(browser.stop())
-            retirement.replace_browser_stop_task(task)
-            task_started_now = True
+            stop_error = previous_error
         else:
+            if deadline.expired:
+                return [
+                    ProcessOwnershipError(
+                        "Browser shutdown expired before process reconciliation"
+                    )
+                ]
             try:
-                await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
+                await run_blocking_cleanup(
+                    lambda: _terminate_browser_process(browser, deadline=deadline)
+                )
             except BaseException as process_error:
                 return [process_error]
             retirement.mark_browser_cleanup_complete()
             return []
 
-    stop_error = await _await_browser_stop_task(task)
+    if stop_error is None:
+        if prior_stop_is_still_pending and allow_fallback:
+            # The initial shutdown pass already spent the full stop watchdog on
+            # this exact task. Do not stack another wait during fallback.
+            stop_error = TimeoutError("Prior Zendriver browser stop is still pending")
+        else:
+            stop_error = await _await_browser_stop_task(task, deadline=deadline)
     if stop_error is None:
         try:
-            await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
+            await run_blocking_cleanup(
+                lambda: _terminate_browser_process(browser, deadline=deadline)
+            )
         except BaseException as process_error:
             return [process_error]
         retirement.mark_browser_cleanup_complete()
@@ -1018,44 +1637,34 @@ async def _ensure_browser_cleanup(
     if not allow_fallback or not retirement.protocol_is_retired():
         return [stop_error]
 
-    # If a prior attempt completed with an error while this retry awaited it,
-    # give Browser.stop one fresh idempotent cleanup attempt before falling back
-    # to its explicit process/profile equivalent.
-    if not task_started_now and not isinstance(stop_error, TimeoutError):
-        replacement = asyncio.ensure_future(browser.stop())
-        retirement.replace_browser_stop_task(replacement)
-        task = replacement
-        stop_error = await _await_browser_stop_task(task)
-        if stop_error is None:
-            try:
-                await run_blocking_cleanup(lambda: _terminate_browser_process(browser))
-            except BaseException as process_error:
-                return [process_error]
-            retirement.mark_browser_cleanup_complete()
-            return []
-
+    cancellation_errors: list[BaseException] = []
     if not task.done():
         task.cancel()
         cancelled, _ = await asyncio.wait(
             (task,),
-            timeout=_STOP_TASK_CANCEL_TIMEOUT_SECONDS,
+            timeout=min(_STOP_TASK_CANCEL_TIMEOUT_SECONDS, deadline.remaining()),
         )
         if not cancelled:
             _detach_shutdown_task(task)
-            return [
-                stop_error,
+            cancellation_errors.append(
                 TimeoutError(
                     "Repeatedly timed-out Zendriver Browser.stop task did not "
                     "accept cancellation"
-                ),
-            ]
+                )
+            )
 
     fallback_errors = await _explicit_browser_cleanup(
         browser,
         run_blocking_cleanup=run_blocking_cleanup,
+        deadline=deadline,
     )
     if fallback_errors:
-        return [stop_error, *fallback_errors]
+        return [stop_error, *cancellation_errors, *fallback_errors]
+    if cancellation_errors:
+        logger.warning(
+            "Zendriver Browser.stop did not settle, but explicit process and "
+            "profile ownership cleanup completed"
+        )
     retirement.mark_browser_cleanup_complete()
     return []
 
@@ -1065,6 +1674,7 @@ async def _ensure_tor_cleanup(
     tor_process: Any,
     *,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    deadline: Deadline,
 ) -> list[BaseException]:
     if retirement.tor_cleanup_is_complete():
         return []
@@ -1074,29 +1684,45 @@ async def _ensure_tor_cleanup(
 
     task = retirement.existing_tor_stop_task()
     if task is None:
+        if deadline.expired:
+            return [
+                ProcessOwnershipError(
+                    "Browser shutdown expired before Tor ownership was released"
+                )
+            ]
         task = asyncio.ensure_future(
-            run_blocking_cleanup(lambda: terminate_tor_process(tor_process))
+            run_blocking_cleanup(
+                lambda: terminate_tor_process(tor_process, deadline=deadline)
+            )
         )
         retirement.bind_tor_stop_task(task)
     elif task.done():
         try:
             task.result()
         except BaseException:
+            if deadline.expired:
+                return [
+                    ProcessOwnershipError(
+                        "Browser shutdown expired before Tor cleanup retry"
+                    )
+                ]
             task = asyncio.ensure_future(
-                run_blocking_cleanup(lambda: terminate_tor_process(tor_process))
+                run_blocking_cleanup(
+                    lambda: terminate_tor_process(tor_process, deadline=deadline)
+                )
             )
             retirement.replace_tor_stop_task(task)
         else:
             retirement.mark_tor_cleanup_complete()
             return []
 
-    done, _ = await asyncio.wait((task,), timeout=_TOR_STOP_TIMEOUT_SECONDS)
+    done, _ = await asyncio.wait((task,), timeout=deadline.remaining())
     if not done:
         _detach_shutdown_task(task)
         return [
-            TimeoutError(
-                f"Tor process termination exceeded {_TOR_STOP_TIMEOUT_SECONDS:g} "
-                "seconds"
+            ProcessOwnershipError(
+                "Tor process ownership was not released before the shared "
+                "browser shutdown deadline"
             )
         ]
     try:
@@ -1110,6 +1736,8 @@ async def _ensure_tor_cleanup(
 async def _retire_protocol_operations(
     browser: Any,
     retirement: _ZendriverRetirement,
+    *,
+    deadline: Deadline,
 ) -> list[BaseException]:
     if retirement.protocol_is_retired():
         return []
@@ -1123,7 +1751,10 @@ async def _retire_protocol_operations(
         )
         connections = retirement.captured_connections()
         all_connections_closed, close_errors = (
-            await _close_and_wait_for_browser_connections(connections)
+            await _close_and_wait_for_browser_connections(
+                connections,
+                deadline=deadline,
+            )
         )
         errors.extend(close_errors)
         if not all_connections_closed:
@@ -1192,17 +1823,21 @@ async def _stop_browser_cleanup(
     initial_connections: tuple[Any, ...],
     tor_process: Any,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    deadline: Deadline,
 ) -> None:
     """Run the first bounded shutdown attempt for one browser generation."""
 
-    errors = await _stop_mapper_janitor(browser, retirement)
-    errors.extend(
-        await _ensure_browser_cleanup(
-            browser,
-            retirement,
-            allow_fallback=False,
-            run_blocking_cleanup=run_blocking_cleanup,
-        )
+    errors = await _stop_mapper_janitor(
+        browser,
+        retirement,
+        deadline=deadline,
+    )
+    initial_browser_errors = await _ensure_browser_cleanup(
+        browser,
+        retirement,
+        allow_fallback=False,
+        run_blocking_cleanup=run_blocking_cleanup,
+        deadline=deadline,
     )
     retirement.capture_connections(
         _merge_connection_snapshots(
@@ -1211,16 +1846,40 @@ async def _stop_browser_cleanup(
             retirement.owned_connections(),
         )
     )
-    errors.extend(await _retire_protocol_operations(browser, retirement))
+    protocol_errors = await _retire_protocol_operations(
+        browser,
+        retirement,
+        deadline=deadline,
+    )
+    errors.extend(protocol_errors)
+
+    # Browser.stop gets only a short command/composite watchdog. Once every
+    # protocol connection is quiescent, use the remainder of this *same*
+    # shutdown deadline to release process/profile ownership. A late protocol
+    # response must not require a second public stop call before fallback runs.
+    if retirement.protocol_is_retired():
+        fallback_errors = await _ensure_browser_cleanup(
+            browser,
+            retirement,
+            allow_fallback=True,
+            run_blocking_cleanup=run_blocking_cleanup,
+            deadline=deadline,
+        )
+        if fallback_errors:
+            errors.extend(initial_browser_errors)
+            errors.extend(fallback_errors)
+    else:
+        errors.extend(initial_browser_errors)
     errors.extend(
         await _ensure_tor_cleanup(
             retirement,
             tor_process,
             run_blocking_cleanup=run_blocking_cleanup,
+            deadline=deadline,
         )
     )
     _mark_shutdown_complete_if_ready(browser, retirement)
-    _raise_browser_shutdown_errors(errors)
+    _raise_browser_shutdown_errors(errors, retirement=retirement)
 
 
 async def _retry_browser_retirement(
@@ -1229,18 +1888,30 @@ async def _retry_browser_retirement(
     connections: tuple[Any, ...],
     tor_process: Any,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    deadline: Deadline,
 ) -> None:
     """Retry incomplete resource cleanup without reviving the generation."""
 
     retirement.capture_connections(connections)
-    errors = await _stop_mapper_janitor(browser, retirement)
-    errors.extend(await _retire_protocol_operations(browser, retirement))
+    errors = await _stop_mapper_janitor(
+        browser,
+        retirement,
+        deadline=deadline,
+    )
+    errors.extend(
+        await _retire_protocol_operations(
+            browser,
+            retirement,
+            deadline=deadline,
+        )
+    )
     errors.extend(
         await _ensure_browser_cleanup(
             browser,
             retirement,
             allow_fallback=True,
             run_blocking_cleanup=run_blocking_cleanup,
+            deadline=deadline,
         )
     )
     errors.extend(
@@ -1248,21 +1919,34 @@ async def _retry_browser_retirement(
             retirement,
             tor_process,
             run_blocking_cleanup=run_blocking_cleanup,
+            deadline=deadline,
         )
     )
     _mark_shutdown_complete_if_ready(browser, retirement)
-    _raise_browser_shutdown_errors(errors)
+    _raise_browser_shutdown_errors(errors, retirement=retirement)
 
 
 async def _await_cleanup_deferring_caller_cancellation(
     cleanup_task: asyncio.Task[None],
+    deadline: Deadline,
 ) -> None:
-    """Propagate caller cancellation only after the cleanup task terminates."""
+    """Bound caller latency while allowing one shared cleanup task to finish."""
 
     caller_cancellation: asyncio.CancelledError | None = None
     while not cleanup_task.done():
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            _detach_shutdown_task(cleanup_task)
+            timeout_error = ProcessOwnershipError(
+                "Browser shutdown exceeded its overall deadline; durable "
+                "atexit ownership remains registered"
+            )
+            if caller_cancellation is not None:
+                caller_cancellation.add_note(str(timeout_error))
+                raise caller_cancellation
+            raise timeout_error
         try:
-            await asyncio.shield(cleanup_task)
+            await asyncio.wait((cleanup_task,), timeout=remaining)
         except asyncio.CancelledError as error:
             current_task = asyncio.current_task()
             if current_task is None or current_task.cancelling() == 0:
@@ -1286,6 +1970,8 @@ async def _stop_browser(
     browser: Any,
     *,
     run_blocking_cleanup: _BlockingCleanupRunner,
+    renew_expired_atexit_attempt: bool = False,
+    deadline: Deadline | None = None,
 ) -> None:
     """Stop one generation using the supplied blocking-cleanup execution mode."""
 
@@ -1293,9 +1979,33 @@ async def _stop_browser(
     # race where another task could register work on a detached target while
     # connection snapshots are being closed.
     retirement = _begin_zendriver_retirement(browser)
+    cleanup_task = retirement.existing_shutdown_task()
+    proposed_deadline = (
+        Deadline.after(_BROWSER_SHUTDOWN_DEADLINE_SECONDS)
+        if deadline is None
+        else deadline.bounded(_BROWSER_SHUTDOWN_DEADLINE_SECONDS)
+    )
+    bound_expires_at = retirement.bind_shutdown_deadline(proposed_deadline.expires_at)
+    if (
+        renew_expired_atexit_attempt
+        and cleanup_task is not None
+        and cleanup_task.done()
+        and Deadline(bound_expires_at).expired
+        and not retirement.is_complete()
+    ):
+        # Normal/concurrent close callers cannot reset a generation's budget.
+        # asyncio-atexit owns one explicit new terminal attempt only after the
+        # previous cleanup task has definitively stopped.
+        bound_expires_at = retirement.replace_shutdown_deadline(
+            proposed_deadline.expires_at
+        )
+    shutdown_deadline = Deadline(bound_expires_at)
     if retirement.is_complete():
         return
-    cleanup_task = retirement.existing_shutdown_task()
+    if shutdown_deadline.expired and (cleanup_task is None or cleanup_task.done()):
+        raise ProcessOwnershipError(
+            "Browser shutdown deadline expired; durable atexit ownership remains"
+        )
     if cleanup_task is None:
         initial_connections = _merge_connection_snapshots(
             _browser_connection_snapshot(browser),
@@ -1309,6 +2019,7 @@ async def _stop_browser(
                 initial_connections,
                 getattr(browser, "_tor_process", None),
                 run_blocking_cleanup,
+                shutdown_deadline,
             )
         )
         retirement.bind_shutdown_task(cleanup_task)
@@ -1326,16 +2037,24 @@ async def _stop_browser(
                 retirement.captured_connections(),
                 getattr(browser, "_tor_process", None),
                 run_blocking_cleanup,
+                shutdown_deadline,
             )
         )
         retirement.replace_completed_shutdown_task(cleanup_task)
-    await _await_cleanup_deferring_caller_cancellation(cleanup_task)
+    await _await_cleanup_deferring_caller_cancellation(
+        cleanup_task,
+        shutdown_deadline,
+    )
 
 
-async def stop_browser(browser: Any) -> None:
+async def stop_browser(
+    browser: Any,
+    deadline: Deadline | None = None,
+) -> None:
     """Stop one browser generation, deferring caller cancellation until clean."""
 
     await _stop_browser(
         browser,
         run_blocking_cleanup=_run_blocking_cleanup_in_thread,
+        deadline=deadline,
     )

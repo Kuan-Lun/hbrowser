@@ -47,6 +47,19 @@ class _Detector:
         return ChallengeDetection(url=FORUMS_URL, kind=kind)
 
 
+class _ScriptedDeadline:
+    def __init__(self, *, expired: list[bool], remaining: list[float]) -> None:
+        self._expired = deque(expired)
+        self._remaining = deque(remaining)
+
+    @property
+    def expired(self) -> bool:
+        return self._expired.popleft()
+
+    def remaining(self) -> float:
+        return self._remaining.popleft()
+
+
 class _Solver:
     def __init__(
         self,
@@ -85,6 +98,19 @@ async def _unexpected_callback(*args: object) -> None:
 
 
 class PageChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def test_manual_timeout_cannot_exceed_human_wait_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\(0, 180\]"):
+            PageChallengeHandler(
+                detector=_Detector(["none"], []),
+                logger=logging.getLogger("test-page-challenge"),
+                headless=False,
+                manual_timeout=181,
+                automatic_solver=None,
+                apply_identity=_unexpected_callback,
+                navigate=_unexpected_callback,
+                save_diagnostic=_unexpected_callback,
+            )
+
     async def test_automatic_solution_is_applied_committed_and_freshly_verified(
         self,
     ) -> None:
@@ -512,4 +538,119 @@ class PageChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(solver.solve_calls, [])
         self.assertEqual(solver.mark_calls, [])
+        sleep.assert_not_awaited()
+
+    async def test_expired_manual_deadline_does_not_probe_again(self) -> None:
+        events: list[str] = []
+        detector = _Detector(["turnstile_widget"], events)
+        handler = PageChallengeHandler(
+            detector=detector,
+            logger=logging.getLogger("test-page-challenge"),
+            headless=False,
+            manual_timeout=30,
+            automatic_solver=None,
+            apply_identity=cast(
+                Callable[[object], Awaitable[None]],
+                AsyncMock(side_effect=_unexpected_callback),
+            ),
+            navigate=AsyncMock(side_effect=_unexpected_callback),
+            save_diagnostic=AsyncMock(),
+        )
+
+        with (
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.Deadline.after",
+                return_value=_ScriptedDeadline(expired=[True], remaining=[]),
+            ),
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler.resolve(object(), FORUMS_URL)
+
+        self.assertEqual(detector.timeouts, [3.0])
+        sleep.assert_not_awaited()
+
+    async def test_near_manual_deadline_bounds_probe_and_sleep(self) -> None:
+        events: list[str] = []
+        detector = _Detector(
+            ["turnstile_widget", "turnstile_widget"],
+            events,
+        )
+        handler = PageChallengeHandler(
+            detector=detector,
+            logger=logging.getLogger("test-page-challenge"),
+            headless=False,
+            manual_timeout=30,
+            automatic_solver=None,
+            apply_identity=cast(
+                Callable[[object], Awaitable[None]],
+                AsyncMock(side_effect=_unexpected_callback),
+            ),
+            navigate=AsyncMock(side_effect=_unexpected_callback),
+            save_diagnostic=AsyncMock(),
+        )
+        deadline = _ScriptedDeadline(
+            expired=[False, True],
+            remaining=[0.25, 0.05],
+        )
+
+        with (
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.Deadline.after",
+                return_value=deadline,
+            ),
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler.resolve(object(), FORUMS_URL)
+
+        self.assertEqual(detector.timeouts, [3.0, 0.25])
+        sleep.assert_awaited_once_with(0.05)
+
+    async def test_challenge_disappearance_after_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        detector = _Detector(["none"], [])
+        handler = PageChallengeHandler(
+            detector=detector,
+            logger=logging.getLogger("test-page-challenge"),
+            headless=False,
+            manual_timeout=30,
+            automatic_solver=None,
+            apply_identity=cast(
+                Callable[[object], Awaitable[None]],
+                AsyncMock(side_effect=_unexpected_callback),
+            ),
+            navigate=AsyncMock(side_effect=_unexpected_callback),
+            save_diagnostic=AsyncMock(),
+        )
+        deadline = _ScriptedDeadline(
+            expired=[False],
+            remaining=[0.25, 0.0],
+        )
+
+        with (
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.Deadline.after",
+                return_value=deadline,
+            ),
+            patch(
+                "hbrowser.gallery.captcha.page_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler._wait_for_manual_resolution(
+                object(),
+                challenge_kind="turnstile_widget",
+                detect_timeout=3.0,
+            )
+
+        self.assertEqual(detector.timeouts, [0.25])
         sleep.assert_not_awaited()

@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 from ...exceptions import LoginFailedException
 from ..browser.flaresolverr import FlareSolverrError, FlareSolverrSolveReceipt
+from ..utils import Deadline
+from .constants import MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
 from .models import ChallengeDetection
 
 
@@ -52,8 +54,13 @@ class PageChallengeHandler:
         navigate: Navigate,
         save_diagnostic: SaveDiagnostic,
     ) -> None:
-        if manual_timeout <= 0:
-            raise ValueError("manual_timeout must be greater than zero")
+        if isinstance(manual_timeout, bool) or not (
+            0 < manual_timeout <= MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "manual_timeout must be in (0, "
+                f"{MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS:g}]"
+            )
 
         self._detector = detector
         self._logger = logger
@@ -144,17 +151,24 @@ class PageChallengeHandler:
             challenge_kind,
             self._manual_timeout,
         )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._manual_timeout
-        while loop.time() < deadline:
+        deadline = Deadline.after(self._manual_timeout)
+        while not deadline.expired:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                break
             detection = await self._detector.detect(
                 page,
-                timeout=detect_timeout,
+                timeout=min(detect_timeout, remaining),
             )
+            remaining = deadline.remaining()
             if detection.kind == "none":
-                self._logger.info("Browser verification completed manually")
-                return
-            await asyncio.sleep(1)
+                if remaining > 0:
+                    self._logger.info("Browser verification completed manually")
+                    return
+                break
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(1.0, remaining))
 
         raise LoginFailedException(
             f"Page challenge {challenge_kind!r} was not resolved within "

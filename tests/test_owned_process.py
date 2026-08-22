@@ -15,6 +15,7 @@ from unittest.mock import ANY, Mock, call, patch
 
 import zendriver as zd
 
+from hbrowser.gallery.browser import _directory_cleanup_worker as cleanup_worker_module
 from hbrowser.gallery.browser import _process_supervisor as supervisor_module
 from hbrowser.gallery.browser import process as process_module
 
@@ -101,6 +102,35 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     process.wait(timeout=5)
                 unrelated.terminate()
                 unrelated.wait(timeout=5)
+
+    def test_normal_leader_exit_still_kills_lingering_descendant(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-leader-exit-test-"
+        ) as directory:
+            descendant_path = Path(directory) / "descendant"
+            script = (
+                "import pathlib,subprocess,sys;"
+                "child=subprocess.Popen([sys.executable,'-c',"
+                "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "time.sleep(30)']);"
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8')"
+            )
+            process = process_module.start_owned_process(
+                sys.executable,
+                ["-c", script, str(descendant_path)],
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while not descendant_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertTrue(_wait_for_pid_exit(descendant_pid))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
 
     def test_zendriver_global_launcher_is_never_modified(self) -> None:
         original = zd.util._start_process
@@ -245,6 +275,168 @@ finally:
 
 
 class PrivateDirectoryCleanupTests(unittest.TestCase):
+    def test_owned_worker_removes_exact_private_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-owned-remove-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            (private_directory / "state").write_text("owned", encoding="utf-8")
+            guard = process_module._PrivateDirectory.capture(private_directory)
+
+            guard.remove(deadline=time.monotonic() + 3)
+
+            self.assertFalse(private_directory.exists())
+            with process_module._PRIVATE_DIRECTORY_CLEANUP_LOCK:
+                key = process_module._private_directory_key(guard)
+                self.assertNotIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+                self.assertNotIn(
+                    key,
+                    process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
+                )
+
+    def test_parent_channel_eof_is_a_terminal_worker_signal(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(write_descriptor)
+        try:
+            with (
+                patch(
+                    "hbrowser.gallery.browser._directory_cleanup_worker.os._exit",
+                    side_effect=SystemExit(5),
+                ) as exit_process,
+                self.assertRaises(SystemExit),
+            ):
+                cleanup_worker_module._exit_when_parent_channel_closes(read_descriptor)
+        finally:
+            os.close(read_descriptor)
+
+        exit_process.assert_called_once_with(5)
+
+    def test_worker_assignment_failure_kills_ungated_exact_process(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-worker-assign-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            process = Mock(
+                args=["cleanup-worker"],
+                stdin=Mock(),
+                returncode=None,
+            )
+            process.poll.return_value = None
+
+            def kill() -> None:
+                process.returncode = -9
+
+            process.kill.side_effect = kill
+            process.wait.return_value = -9
+            job = Mock()
+            job.assign.side_effect = OSError("assignment failed")
+
+            with (
+                patch.object(process_module, "_ownership_platform", return_value="nt"),
+                patch.object(
+                    process_module,
+                    "_supervisor_launch_context",
+                    return_value=("python", None),
+                ),
+                patch.object(
+                    process_module,
+                    "_supervisor_creation_options",
+                    return_value={},
+                ),
+                patch.object(subprocess, "Popen", return_value=process),
+                patch.object(process_module._WindowsJob, "create", return_value=job),
+                self.assertRaisesRegex(OSError, "assignment failed"),
+            ):
+                process_module._spawn_private_directory_cleanup(
+                    guard,
+                    work_deadline=time.monotonic() + 1,
+                    ownership_deadline=time.monotonic() + 2,
+                )
+
+            process.stdin.write.assert_not_called()
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=ANY)
+            job.terminate.assert_not_called()
+            job.close.assert_called_once_with()
+            with process_module._PRIVATE_DIRECTORY_CLEANUP_LOCK:
+                self.assertNotIn(
+                    process_module._private_directory_key(guard),
+                    process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
+                )
+
+    def test_timeout_reaps_worker_before_background_mutation_can_continue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-worker-timeout-"
+        ) as directory:
+            root = Path(directory)
+            private_directory = root / "profile"
+            private_directory.mkdir()
+            marker = root / "mutations"
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            stop = threading.Event()
+            mutation_thread: threading.Thread | None = None
+
+            def mutate() -> None:
+                while not stop.wait(0.001):
+                    with marker.open("a", encoding="utf-8") as output:
+                        output.write("x")
+
+            class Gate:
+                def write(self, value: bytes) -> int:
+                    nonlocal mutation_thread
+                    self_outer.assertEqual(value, b"start\n")
+                    mutation_thread = threading.Thread(target=mutate, daemon=True)
+                    mutation_thread.start()
+                    return len(value)
+
+                def flush(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            class SlowProcess:
+                args = ["cleanup-worker"]
+                returncode: int | None = None
+                stdin = Gate()
+
+                def poll(self) -> int | None:
+                    return self.returncode
+
+                def wait(self, *, timeout: float) -> int:
+                    if self.returncode is None:
+                        raise subprocess.TimeoutExpired(self.args, timeout)
+                    assert mutation_thread is not None
+                    mutation_thread.join(timeout=timeout)
+                    return self.returncode
+
+                def kill(self) -> None:
+                    stop.set()
+                    self.returncode = -9
+
+            self_outer = self
+            slow_process = SlowProcess()
+            try:
+                with (
+                    patch.object(subprocess, "Popen", return_value=slow_process),
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    guard.remove(deadline=time.monotonic() + 0.1)
+
+                assert mutation_thread is not None
+                self.assertFalse(mutation_thread.is_alive())
+                observed = marker.read_text(encoding="utf-8") if marker.exists() else ""
+                time.sleep(0.02)
+                current = marker.read_text(encoding="utf-8") if marker.exists() else ""
+                self.assertEqual(current, observed)
+                self.assertEqual(slow_process.returncode, -9)
+            finally:
+                stop.set()
+                if mutation_thread is not None:
+                    mutation_thread.join(timeout=1)
+                process_module._release_pending_private_directory(guard)
+
     def test_windows_sharing_violation_retries_and_removes_same_directory(
         self,
     ) -> None:
@@ -273,7 +465,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 ),
                 patch.object(time, "sleep") as sleep,
             ):
-                guard.remove(deadline=time.monotonic() + 1)
+                guard._remove_inline(deadline=time.monotonic() + 1)
 
             self.assertEqual(attempts, 2)
             sleep.assert_called_once_with(
@@ -302,12 +494,12 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 patch.object(
                     time,
                     "monotonic",
-                    side_effect=[0.0, 0.3],
+                    side_effect=[0.0, 0.0, 0.1, 0.3],
                 ),
                 patch.object(time, "sleep") as sleep,
                 self.assertRaises(process_module.ProcessOwnershipError) as raised,
             ):
-                guard.remove(deadline=0.25)
+                guard._remove_inline(deadline=0.25)
 
             self.assertIs(raised.exception.__cause__, cleanup_error)
             self.assertIn(
@@ -344,7 +536,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         patch.object(time, "sleep") as sleep,
                         self.assertRaises(PermissionError) as raised,
                     ):
-                        guard.remove(deadline=time.monotonic() + 1)
+                        guard._remove_inline(deadline=time.monotonic() + 1)
 
                     self.assertIs(raised.exception, cleanup_error)
                     rmtree.assert_called_once_with(private_directory)
@@ -386,7 +578,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     "identity changed",
                 ),
             ):
-                guard.remove(deadline=time.monotonic() + 1)
+                guard._remove_inline(deadline=time.monotonic() + 1)
 
             rmtree.assert_called_once_with(private_directory)
             self.assertEqual(
@@ -419,13 +611,300 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     side_effect=lambda _: original_rmtree(private_directory),
                 ),
             ):
-                guard.remove(deadline=time.monotonic() + 1)
+                guard._remove_inline(deadline=time.monotonic() + 1)
 
             rmtree.assert_called_once_with(private_directory)
             self.assertFalse(private_directory.exists())
 
 
 class ProcessPolicyTests(unittest.TestCase):
+    def _closed_owner(self, directory: str) -> process_module.OwnedProcess:
+        status_directory = Path(directory) / "status"
+        status_directory.mkdir()
+        supervisor = Mock(
+            pid=100,
+            stdin=Mock(),
+            stdout=None,
+            stderr=None,
+            returncode=0,
+        )
+        owner = process_module.OwnedProcess(
+            supervisor,
+            target_process_group=200,
+            windows_job=None,
+            stdout_drain=None,
+            stderr_drain=None,
+            status_directory=status_directory,
+            cleanup_paths=(),
+        )
+        owner._closed = True
+        owner._supervisor_returncode = 0
+        return owner
+
+    def test_wait_rejects_cached_success_acquired_after_positive_deadline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-wait-late-") as directory:
+            owner = self._closed_owner(directory)
+            now = [100.0]
+            late_lock = Mock()
+
+            def acquire(*, timeout: float) -> bool:
+                self.assertGreater(timeout, 0)
+                now[0] = 102.0
+                return True
+
+            late_lock.acquire.side_effect = acquire
+            owner._shutdown_lock = late_lock
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "expired while waiting",
+                ),
+            ):
+                owner.wait(timeout=1)
+
+            late_lock.release.assert_called_once_with()
+
+    def test_shutdown_rejects_cached_success_acquired_after_positive_deadline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-shutdown-late-") as directory:
+            owner = self._closed_owner(directory)
+            now = [100.0]
+            late_lock = Mock()
+
+            def acquire(*, timeout: float) -> bool:
+                self.assertGreater(timeout, 0)
+                now[0] = 102.0
+                return True
+
+            late_lock.acquire.side_effect = acquire
+            owner._shutdown_lock = late_lock
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "expired while waiting",
+                ),
+            ):
+                owner.shutdown(
+                    graceful_timeout=1,
+                    terminate_timeout=0,
+                    kill_timeout=0,
+                    cleanup_timeout=0,
+                )
+
+            late_lock.release.assert_called_once_with()
+
+    def test_zero_timeout_preserves_nonblocking_cached_success(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-zero-wait-") as directory:
+            owner = self._closed_owner(directory)
+
+            self.assertEqual(owner.wait(timeout=0), 0)
+            self.assertEqual(
+                owner.shutdown(
+                    graceful_timeout=0,
+                    terminate_timeout=0,
+                    kill_timeout=0,
+                    cleanup_timeout=0,
+                ),
+                0,
+            )
+
+    def test_stalled_control_write_does_not_hold_state_past_wait_deadline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-control-write-lock-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            write_started = threading.Event()
+            release_write = threading.Event()
+
+            def blocked_write(_: bytes) -> int:
+                write_started.set()
+                self.assertTrue(release_write.wait(timeout=1))
+                return 10
+
+            control_pipe = Mock()
+            control_pipe.fileno.return_value = Mock()
+            control_pipe.write.side_effect = blocked_write
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.poll.return_value = None
+            supervisor.wait.side_effect = subprocess.TimeoutExpired("supervisor", 0.05)
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+            terminate_thread = threading.Thread(target=owner.terminate, daemon=True)
+            terminate_thread.start()
+            self.assertTrue(write_started.wait(timeout=0.5))
+
+            started_at = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                owner.wait(timeout=0.05)
+            elapsed = time.monotonic() - started_at
+
+            release_write.set()
+            terminate_thread.join(timeout=1)
+            self.assertFalse(terminate_thread.is_alive())
+            self.assertLess(elapsed, 0.25)
+
+    def test_real_control_descriptor_is_written_nonblocking(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-control-write-nonblocking-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            control_pipe = Mock()
+            control_pipe.fileno.return_value = 42
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.poll.return_value = None
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+
+            with (
+                patch.object(os, "set_blocking") as set_blocking,
+                patch.object(
+                    os,
+                    "write",
+                    side_effect=BlockingIOError("pipe full"),
+                ) as write,
+            ):
+                owner.terminate()
+
+            set_blocking.assert_called_once_with(42, False)
+            write.assert_called_once_with(42, b"terminate\n")
+            control_pipe.write.assert_not_called()
+
+    def test_supervisor_ready_receipt_after_absolute_deadline_is_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-late-ready-") as directory:
+            status_path = Path(directory) / "status"
+            status_path.write_text("ready 123", encoding="utf-8")
+            now = [100.0]
+
+            def late_read(*_: object, **__: object) -> str:
+                now[0] = 101.0
+                return "ready 123"
+
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                patch.object(Path, "read_text", side_effect=late_read),
+                self.assertRaisesRegex(TimeoutError, "READY deadline"),
+            ):
+                process_module._read_supervisor_status(
+                    Mock(spec=process_module.OwnedProcess),
+                    status_path,
+                    deadline=101.0,
+                )
+
+    def test_concurrent_waiters_share_lock_wait_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-concurrent-wait-test-"
+        ) as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=0,
+            )
+            supervisor.wait.return_value = 0
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+            errors = list[BaseException]()
+
+            def wait_for_owner(timeout: float) -> None:
+                try:
+                    owner.wait(timeout=timeout)
+                except BaseException as error:
+                    errors.append(error)
+
+            owner._shutdown_lock.acquire()
+            try:
+                first = threading.Thread(
+                    target=wait_for_owner,
+                    args=(0.2,),
+                    daemon=True,
+                )
+                first.start()
+                deadline = time.monotonic() + 1
+                while (
+                    owner._shutdown_attempt_users != 1 and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                self.assertEqual(owner._shutdown_attempt_users, 1)
+
+                second = threading.Thread(
+                    target=wait_for_owner,
+                    args=(1.0,),
+                    daemon=True,
+                )
+                second.start()
+                deadline = time.monotonic() + 1
+                while (
+                    owner._shutdown_attempt_users != 2 and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                self.assertEqual(owner._shutdown_attempt_users, 2)
+                first.join(timeout=0.5)
+                second.join(timeout=0.5)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(len(errors), 2)
+                self.assertTrue(
+                    all(
+                        isinstance(error, process_module.ProcessOwnershipError)
+                        for error in errors
+                    )
+                )
+            finally:
+                owner._shutdown_lock.release()
+
+            owner.wait(timeout=1)
+
     def test_supervisor_protocol_contains_no_parent_pid(self) -> None:
         status_path, command = supervisor_module._parse_arguments(
             ("status", "--", "browser", "--flag")
@@ -546,6 +1025,13 @@ class ProcessPolicyTests(unittest.TestCase):
                 "_read_supervisor_status",
                 side_effect=report_ready,
             ),
+            patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: guard._remove_inline(
+                    deadline=deadline
+                ),
+            ),
         ):
             owner = process_module.start_owned_process("browser", [])
             owner.terminate()
@@ -575,6 +1061,7 @@ class ProcessPolicyTests(unittest.TestCase):
     def test_windows_assignment_failure_never_opens_start_gate(self) -> None:
         supervisor = Mock(pid=101, stdout=None, stderr=None)
         supervisor.wait.return_value = 0
+        supervisor.poll.side_effect = [None, 0]
         job = Mock()
         job.assign.side_effect = OSError("assignment failed")
 
@@ -585,14 +1072,146 @@ class ProcessPolicyTests(unittest.TestCase):
             ),
             patch.object(subprocess, "Popen", return_value=supervisor),
             patch.object(process_module._WindowsJob, "create", return_value=job),
+            patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: guard._remove_inline(
+                    deadline=deadline
+                ),
+            ),
             self.assertRaisesRegex(OSError, "assignment failed"),
         ):
             process_module.start_owned_process("browser", [])
 
         supervisor.stdin.write.assert_not_called()
         supervisor.terminate.assert_called_once_with()
-        supervisor.wait.assert_called_once_with(timeout=5)
+        supervisor.wait.assert_called_once_with(timeout=ANY)
+        wait_timeout = supervisor.wait.call_args.kwargs["timeout"]
+        self.assertGreater(wait_timeout, 0)
+        self.assertLessEqual(wait_timeout, 10)
         job.close.assert_called_once_with()
+
+    def test_startup_failure_cleanup_uses_the_same_absolute_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-start-deadline-test-"
+        ) as directory:
+            supervisor = Mock(
+                pid=101,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            expires_at = time.monotonic() + 2.0
+            with (
+                patch.object(tempfile, "mkdtemp", return_value=directory),
+                patch.object(
+                    process_module, "_ownership_platform", return_value="posix"
+                ),
+                patch.object(
+                    process_module, "_supervisor_creation_options", return_value={}
+                ),
+                patch.object(subprocess, "Popen", return_value=supervisor),
+                patch.object(atexit, "register"),
+                patch.object(
+                    process_module,
+                    "_read_supervisor_status",
+                    side_effect=TimeoutError("READY timed out"),
+                ) as read_status,
+                patch.object(
+                    process_module.OwnedProcess,
+                    "shutdown",
+                    autospec=True,
+                    return_value=0,
+                ) as shutdown,
+                self.assertRaisesRegex(TimeoutError, "READY timed out"),
+            ):
+                process_module.start_owned_process(
+                    "browser",
+                    [],
+                    startup_timeout=1.0,
+                    deadline=expires_at,
+                )
+
+        read_deadline = read_status.call_args.kwargs["deadline"]
+        self.assertGreater(read_deadline, time.monotonic())
+        self.assertLessEqual(read_deadline, expires_at)
+        self.assertLessEqual(read_deadline - time.monotonic(), 1.0)
+        shutdown.assert_called_once()
+        shutdown_kwargs = shutdown.call_args.kwargs
+        self.assertEqual(shutdown_kwargs["deadline"], expires_at)
+        self.assertLessEqual(shutdown_kwargs["terminate_timeout"], 2.0)
+        self.assertLessEqual(shutdown_kwargs["kill_timeout"], 2.0)
+        self.assertLessEqual(shutdown_kwargs["cleanup_timeout"], 2.0)
+
+    def test_pre_transfer_cleanup_failure_remains_in_durable_registry(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-provisional-owner-test-"
+        ) as directory:
+            supervisor = Mock(
+                pid=101,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+            )
+            job = Mock()
+            job.assign.side_effect = OSError("assignment failed")
+            job.terminate.side_effect = OSError("termination failed")
+            try:
+                with (
+                    patch.object(tempfile, "mkdtemp", return_value=directory),
+                    patch.object(
+                        process_module, "_ownership_platform", return_value="nt"
+                    ),
+                    patch.object(
+                        process_module,
+                        "_supervisor_creation_options",
+                        return_value={},
+                    ),
+                    patch.object(subprocess, "Popen", return_value=supervisor),
+                    patch.object(
+                        process_module._WindowsJob,
+                        "create",
+                        return_value=job,
+                    ),
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    process_module.start_owned_process("browser", [])
+
+                with process_module._PROVISIONAL_OWNERS_LOCK:
+                    self.assertEqual(len(process_module._PROVISIONAL_OWNERS), 1)
+            finally:
+                # This test deliberately injects an unreapable fake. Do not
+                # leave that fake in the interpreter's real atexit registry.
+                with process_module._PROVISIONAL_OWNERS_LOCK:
+                    process_module._PROVISIONAL_OWNERS.clear()
+
+    def test_provisional_cleanup_cannot_borrow_a_long_caller_deadline(self) -> None:
+        supervisor = Mock(pid=101, stdin=Mock(), stdout=None, stderr=None)
+        supervisor.poll.side_effect = (None, 0)
+        supervisor.wait.side_effect = (
+            subprocess.TimeoutExpired("supervisor", 5),
+            0,
+        )
+        guard = Mock()
+        owner = process_module._ProvisionalProcessOwner(
+            supervisor=supervisor,
+            status_guard=guard,
+            cleanup_guards=(),
+        )
+        process_module._register_provisional_owner(owner)
+        try:
+            process_module._cleanup_provisional_owner(
+                owner,
+                deadline=time.monotonic() + 120,
+            )
+        finally:
+            process_module._release_provisional_owner(owner)
+
+        for wait_call in supervisor.wait.call_args_list:
+            self.assertLessEqual(wait_call.kwargs["timeout"], 5.0)
+        cleanup_deadline = guard.remove.call_args.kwargs["deadline"]
+        self.assertLessEqual(cleanup_deadline - time.monotonic(), 5.0)
 
     def test_windows_job_termination_and_close_failures_retain_handle(self) -> None:
         accounting_type = type(
@@ -818,19 +1437,29 @@ class ProcessPolicyTests(unittest.TestCase):
                     ),
                 ),
             )
-            original_rmtree = shutil.rmtree
             cleanup_error = _windows_cleanup_error(32)
 
-            def fail_profile(path: Path) -> None:
-                if Path(path) == private_directory:
-                    raise cleanup_error
-                original_rmtree(path)
+            remove_calls = 0
+
+            def release_with_one_failure(
+                guard: process_module._PrivateDirectory,
+                *,
+                deadline: float,
+            ) -> None:
+                nonlocal remove_calls
+                remove_calls += 1
+                if guard.path == private_directory and remove_calls == 2:
+                    raise process_module.ProcessOwnershipError(
+                        "private cleanup timed out"
+                    ) from cleanup_error
+                guard._remove_inline(deadline=deadline)
 
             with (
                 patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=fail_profile,
+                    process_module._PrivateDirectory,
+                    "remove",
+                    autospec=True,
+                    side_effect=release_with_one_failure,
                 ),
                 self.assertRaises(process_module.ProcessOwnershipError) as raised,
             ):
@@ -838,7 +1467,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     graceful_timeout=0,
                     terminate_timeout=0,
                     kill_timeout=0,
-                    cleanup_timeout=0,
+                    cleanup_timeout=1,
                 )
 
             self.assertIs(raised.exception.__cause__, cleanup_error)
@@ -887,14 +1516,17 @@ class ProcessPolicyTests(unittest.TestCase):
             release_started = threading.Event()
             allow_release = threading.Event()
             shutdown_errors: list[BaseException] = []
-            original_rmtree = shutil.rmtree
 
-            def blocking_profile_release(path: Path) -> None:
-                if Path(path) == private_directory:
+            def blocking_profile_release(
+                guard: process_module._PrivateDirectory,
+                *,
+                deadline: float,
+            ) -> None:
+                if guard.path == private_directory:
                     release_started.set()
                     if not allow_release.wait(timeout=2):
                         raise TimeoutError("test did not release private cleanup")
-                original_rmtree(path)
+                guard._remove_inline(deadline=deadline)
 
             def shutdown_owner() -> None:
                 try:
@@ -907,8 +1539,9 @@ class ProcessPolicyTests(unittest.TestCase):
                     shutdown_errors.append(error)
 
             with patch.object(
-                shutil,
-                "rmtree",
+                process_module._PrivateDirectory,
+                "remove",
+                autospec=True,
                 side_effect=blocking_profile_release,
             ):
                 shutdown_thread = threading.Thread(target=shutdown_owner, daemon=True)

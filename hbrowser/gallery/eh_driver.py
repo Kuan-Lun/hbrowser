@@ -3,14 +3,10 @@
 import asyncio
 import os
 import re
-import stat
-from collections.abc import Awaitable, Iterator
-from contextlib import contextmanager
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from random import random
-from threading import Lock
 from typing import Any, Never
 from urllib.parse import (
     parse_qs,
@@ -20,7 +16,6 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
-from uuid import uuid4
 
 from bs4 import BeautifulSoup
 from h2h_galleryinfo_parser import GalleryURLParser
@@ -57,37 +52,33 @@ from .search_models import (
     SearchRequest,
 )
 from .utils import (
+    Deadline,
     ZendriverOperationTimeout,
-    get_log_dir,
     is_browser_generation_error,
     log_context,
-    wait_for_new_tab,
+    mutate_and_wait_for_new_tab,
+    reload_and_wait,
+    wait_for_selector,
+    wait_for_xpath,
     wait_for_zendriver,
 )
 from .utils.mutation import wait_for_zendriver_mutation
 from .utils.protocol import _begin_zendriver_retirement
 
 _PAGE_READ_TIMEOUT_SECONDS = 5.0
-_PAGE_MUTATION_TIMEOUT_SECONDS = 15.0
-_LONG_SELECT_TIMEOUT_SECONDS = 10.0
-_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS = 12.0
+_PAGE_MUTATION_TIMEOUT_SECONDS = 5.0
+_ELEMENT_DEADLINE_SECONDS = 10.0
+_ARCHIVE_STATUS_DEADLINE_SECONDS = 10.0
 
-MAX_DOWNLOAD_RETRIES = 5
 SEARCH_PAGE_TIMEOUT_SECONDS = 10.0
 SEARCH_PAGE_POLL_SECONDS = 0.1
-SEARCH_NAVIGATION_RETRIES = 1
 PUNCHIN_PAGE_TIMEOUT_SECONDS = 10.0
-PUNCHIN_PAGE_POLL_SECONDS = 0.1
-_SEARCH_DIAGNOSTIC_FILE_LIMIT = 20
-_SEARCH_DIAGNOSTIC_MAX_FILE_BYTES = 2 * 1024 * 1024
-_SEARCH_DIAGNOSTIC_TOTAL_BYTES = 20 * 1024 * 1024
-_SEARCH_DIAGNOSTIC_FILENAME_PATTERN = re.compile(
-    r"search_error_(?:(?P<sequence>[0-9a-f]{16})_)?[0-9a-f]{32}\.html\Z"
-)
-_SEARCH_DIAGNOSTIC_LOCK_FILENAME = ".hbrowser-search-diagnostics.lock"
-_SEARCH_DIAGNOSTIC_THREAD_LOCK = Lock()
-_SEARCH_DIAGNOSTIC_MAX_SEQUENCE = (1 << 64) - 1
 _SEARCH_DOCUMENT_READY_STATES = frozenset({"interactive", "complete"})
+
+
+def _require_active_deadline(deadline: Deadline | None, description: str) -> None:
+    if deadline is not None and deadline.remaining() <= 0:
+        raise TimeoutError(f"{description} completed after its deadline")
 
 
 async def _wait_for_archive_mutation[ResultT](
@@ -180,128 +171,6 @@ class _SearchPageSnapshot:
     query_value: str | None
     next_state: _NextPageState
     next_href: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _SearchDiagnosticCandidate:
-    path: Path
-    size: int
-    order: tuple[int, int, str]
-
-
-def _reset_search_diagnostic_thread_lock_after_fork() -> None:
-    global _SEARCH_DIAGNOSTIC_THREAD_LOCK
-
-    _SEARCH_DIAGNOSTIC_THREAD_LOCK = Lock()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_search_diagnostic_thread_lock_after_fork)
-
-
-def _lock_search_diagnostic_descriptor(descriptor: int) -> None:
-    if os.name == "posix":
-        import fcntl
-
-        fcntl.lockf(descriptor, fcntl.LOCK_EX, 0, 0, os.SEEK_SET)
-    elif os.name == "nt":
-        import msvcrt
-
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        getattr(msvcrt, "locking")(descriptor, getattr(msvcrt, "LK_LOCK"), 1)
-
-
-def _unlock_search_diagnostic_descriptor(descriptor: int) -> None:
-    if os.name == "posix":
-        import fcntl
-
-        fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
-    elif os.name == "nt":
-        import msvcrt
-
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        getattr(msvcrt, "locking")(
-            descriptor,
-            getattr(msvcrt, "LK_UNLCK"),
-            1,
-        )
-
-
-@contextmanager
-def _locked_search_diagnostic_directory(directory: Path) -> Iterator[None]:
-    flags = os.O_RDWR | os.O_CREAT
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    lock_path = directory / _SEARCH_DIAGNOSTIC_LOCK_FILENAME
-
-    with _SEARCH_DIAGNOSTIC_THREAD_LOCK:
-        descriptor = os.open(lock_path, flags, 0o600)
-        try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
-            _lock_search_diagnostic_descriptor(descriptor)
-            try:
-                yield
-            finally:
-                _unlock_search_diagnostic_descriptor(descriptor)
-        finally:
-            os.close(descriptor)
-
-
-def _bounded_search_diagnostic_content(content: str) -> bytes:
-    maximum_bytes = min(
-        _SEARCH_DIAGNOSTIC_MAX_FILE_BYTES,
-        _SEARCH_DIAGNOSTIC_TOTAL_BYTES,
-    )
-    if maximum_bytes <= 0:
-        raise OSError("Search diagnostic byte limits must be positive")
-
-    content_bytes = content.encode("utf-8", errors="ignore")
-    if len(content_bytes) <= maximum_bytes:
-        return content_bytes
-
-    marker = (
-        "\n<!-- hbrowser search diagnostic truncated at " f"{maximum_bytes} bytes -->\n"
-    ).encode()
-    if len(marker) >= maximum_bytes:
-        return marker[:maximum_bytes]
-    prefix = content_bytes[: maximum_bytes - len(marker)]
-    return prefix.decode("utf-8", errors="ignore").encode("utf-8") + marker
-
-
-def _write_private_file(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None = None
-    created = False
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        created = True
-        file = os.fdopen(descriptor, "wb")
-        descriptor = None
-        with file:
-            written = file.write(content)
-            if written != len(content):
-                raise OSError(
-                    f"Short search diagnostic write: {written}/{len(content)} bytes"
-                )
-    except BaseException as error:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError as close_error:
-                error.add_note(f"Could not close diagnostic file: {close_error!r}")
-        if created:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as cleanup_error:
-                error.add_note(
-                    f"Could not remove partial diagnostic file: {cleanup_error!r}"
-                )
-        raise
 
 
 def _normalize_gallery_url(href: str, page_url: str) -> GalleryURLParser | None:
@@ -614,86 +483,6 @@ class EHDriver(Driver):
     def _setname(self) -> str:
         return "E-Hentai"
 
-    @staticmethod
-    def _write_search_diagnostic(directory: Path, content: str) -> Path:
-        content_bytes = _bounded_search_diagnostic_content(content)
-        if _SEARCH_DIAGNOSTIC_FILE_LIMIT <= 0:
-            raise OSError("Search diagnostic file limit must be positive")
-
-        with _locked_search_diagnostic_directory(directory):
-            candidates = list[_SearchDiagnosticCandidate]()
-            maximum_sequence = -1
-            for directory_entry in directory.iterdir():
-                match = _SEARCH_DIAGNOSTIC_FILENAME_PATTERN.fullmatch(
-                    directory_entry.name
-                )
-                if match is None:
-                    continue
-                try:
-                    candidate_stat = directory_entry.lstat()
-                except OSError as error:
-                    raise OSError(
-                        "Could not inspect search diagnostic "
-                        f"{directory_entry}: {error!r}"
-                    ) from error
-                if not stat.S_ISREG(candidate_stat.st_mode):
-                    continue
-
-                sequence_text = match.group("sequence")
-                if sequence_text is None:
-                    order = (
-                        0,
-                        candidate_stat.st_mtime_ns,
-                        directory_entry.name,
-                    )
-                else:
-                    sequence = int(sequence_text, 16)
-                    maximum_sequence = max(maximum_sequence, sequence)
-                    order = (1, sequence, directory_entry.name)
-                candidates.append(
-                    _SearchDiagnosticCandidate(
-                        path=directory_entry,
-                        size=candidate_stat.st_size,
-                        order=order,
-                    )
-                )
-
-            candidates.sort(key=lambda candidate: candidate.order)
-            allowed_count = _SEARCH_DIAGNOSTIC_FILE_LIMIT - 1
-            allowed_bytes = _SEARCH_DIAGNOSTIC_TOTAL_BYTES - len(content_bytes)
-            remaining_count = len(candidates)
-            remaining_bytes = sum(candidate.size for candidate in candidates)
-            for diagnostic_candidate in candidates:
-                if (
-                    remaining_count <= allowed_count
-                    and remaining_bytes <= allowed_bytes
-                ):
-                    break
-                try:
-                    diagnostic_candidate.path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as error:
-                    raise OSError(
-                        "Could not enforce search diagnostic retention while "
-                        f"removing {diagnostic_candidate.path}: {error!r}"
-                    ) from error
-                remaining_count -= 1
-                remaining_bytes -= diagnostic_candidate.size
-
-            if remaining_count > allowed_count or remaining_bytes > allowed_bytes:
-                raise OSError(
-                    "Could not make room within search diagnostic retention "
-                    f"bounds: files={remaining_count}, bytes={remaining_bytes}"
-                )
-            if maximum_sequence >= _SEARCH_DIAGNOSTIC_MAX_SEQUENCE:
-                raise OSError("Search diagnostic sequence is exhausted")
-
-            sequence = maximum_sequence + 1
-            path = directory / (f"search_error_{sequence:016x}_{uuid4().hex}.html")
-            _write_private_file(path, content_bytes)
-            return path
-
     async def _close_page_safely(self, page: object) -> None:
         await _wait_for_archive_mutation(
             page.close(),  # type: ignore[attr-defined]
@@ -734,60 +523,68 @@ class EHDriver(Driver):
             ),
         )
 
-    async def _current_loader_id(self) -> str:
+    async def _current_loader_id(self, *, deadline: Deadline | None = None) -> str:
+        timeout = (
+            _PAGE_READ_TIMEOUT_SECONDS
+            if deadline is None
+            else min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining())
+        )
+        if timeout <= 0:
+            raise TimeoutError("Page-state deadline expired before loader read")
         frame_tree = await wait_for_zendriver(
             self.page.send(cdp.page.get_frame_tree()),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            timeout=timeout,
             owner=self.page,
         )
+        _require_active_deadline(deadline, "Page loader read")
         return str(frame_tree.frame.loader_id)
 
     async def _read_stable_punchin_document(
         self,
         *,
         previous_loader_id: str | None = None,
+        deadline: Deadline | None = None,
     ) -> str:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + PUNCHIN_PAGE_TIMEOUT_SECONDS
+        try:
+            loader_before = await self._current_loader_id(deadline=deadline)
+            if previous_loader_id is not None and loader_before == previous_loader_id:
+                raise RuntimeError("Daily check-in reload kept the previous loader")
+            snapshot = await self._read_raw_page_snapshot(deadline=deadline)
+            loader_after = await self._current_loader_id(deadline=deadline)
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            raise RuntimeError(
+                "Unable to read the lifecycle-confirmed daily check-in document"
+            ) from error
 
-        while loop.time() < deadline:
-            try:
-                loader_before = await self._current_loader_id()
-                if (
-                    previous_loader_id is not None
-                    and loader_before == previous_loader_id
-                ):
-                    await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
-                    continue
-                snapshot = await self._read_raw_page_snapshot()
-                loader_after = await self._current_loader_id()
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                if _is_transient_context_error(error):
-                    await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
-                    continue
-                raise RuntimeError(
-                    "Unable to read a stable daily check-in document"
-                ) from error
+        if (
+            loader_before != loader_after
+            or snapshot.ready_state not in _SEARCH_DOCUMENT_READY_STATES
+        ):
+            raise RuntimeError(
+                "Daily check-in document changed after lifecycle confirmation"
+            )
+        return snapshot.html
 
-            if (
-                loader_before == loader_after
-                and snapshot.ready_state in _SEARCH_DOCUMENT_READY_STATES
-            ):
-                return snapshot.html
-            await asyncio.sleep(PUNCHIN_PAGE_POLL_SECONDS)
-
-        raise RuntimeError(
-            "Daily check-in page did not expose a stable DOM-ready document"
+    async def _read_raw_page_snapshot(
+        self,
+        *,
+        deadline: Deadline | None = None,
+    ) -> _RawPageSnapshot:
+        timeout = (
+            _PAGE_READ_TIMEOUT_SECONDS
+            if deadline is None
+            else min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining())
         )
-
-    async def _read_raw_page_snapshot(self) -> _RawPageSnapshot:
+        if timeout <= 0:
+            raise TimeoutError("Page-state deadline expired before snapshot read")
         page_data = await wait_for_zendriver(
             self.page.evaluate(_SEARCH_PAGE_SNAPSHOT_SCRIPT),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            timeout=timeout,
             owner=self.page,
         )
+        _require_active_deadline(deadline, "Page snapshot read")
         if not isinstance(page_data, dict):
             raise TypeError("Search-page snapshot was not an object")
 
@@ -813,8 +610,12 @@ class EHDriver(Driver):
             query_value=query_value,
         )
 
-    async def _read_search_page(self) -> _SearchPageSnapshot:
-        raw_snapshot = await self._read_raw_page_snapshot()
+    async def _read_search_page(
+        self,
+        *,
+        deadline: Deadline | None = None,
+    ) -> _SearchPageSnapshot:
+        raw_snapshot = await self._read_raw_page_snapshot(deadline=deadline)
 
         (
             galleries,
@@ -840,20 +641,7 @@ class EHDriver(Driver):
         )
 
     async def _save_search_diagnostic(self, html_content: str) -> Path | None:
-        try:
-            path = await asyncio.to_thread(
-                self._write_search_diagnostic,
-                get_log_dir(),
-                html_content,
-            )
-        except OSError as error:
-            self.logger.warning(
-                "Failed to save search diagnostic: error_type=%s",
-                type(error).__name__,
-            )
-            return None
-        self.logger.warning("Search diagnostic saved to: %s", path)
-        return path
+        return await self.save_page_diagnostic("search_error", html_content)
 
     async def _raise_search_page_error(
         self,
@@ -873,193 +661,103 @@ class EHDriver(Driver):
             ),
         )
 
-    async def _wait_for_new_loader(
-        self,
-        old_loader_id: str,
-        target_url: str,
-    ) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
-        last_error: Exception | None = None
-        last_loader_id: str | None = None
-
-        while loop.time() < deadline:
-            try:
-                current_loader_id = await self._current_loader_id()
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                if not _is_transient_context_error(error):
-                    raise SearchNavigationError(
-                        url=target_url,
-                        reason=f"could not read the main-frame loader: {error!r}",
-                    ) from error
-                last_error = error
-                await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
-                continue
-            last_loader_id = current_loader_id
-            if current_loader_id != old_loader_id:
-                return
-            await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
-
-        reason = (
-            "the trusted GET did not replace the main-frame loader"
-            f"; old loader={old_loader_id!r}"
-            f"; last observed loader={last_loader_id!r}"
-        )
-        diagnostic_path: Path | None = None
-        try:
-            loader_before = await self._current_loader_id()
-            if loader_before != old_loader_id:
-                return
-            snapshot = await self._read_raw_page_snapshot()
-            loader_after = await self._current_loader_id()
-            if loader_after != old_loader_id:
-                return
-            reason += (
-                f"; actual url={snapshot.url!r}"
-                f"; title={snapshot.title!r}"
-                f"; query={snapshot.query_value!r}"
-                f"; readyState={snapshot.ready_state!r}"
-                f"; capture loader before={loader_before!r}"
-                f"; capture loader after={loader_after!r}"
-            )
-            diagnostic_path = await self._save_search_diagnostic(snapshot.html)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            reason += f"; could not capture timeout diagnostic: {error!r}"
-        if last_error is not None:
-            reason += f"; last transient context error: {last_error!r}"
-        _begin_zendriver_retirement(self.page)
-        outcome_unknown = BrowserMutationOutcomeUnknownError(
-            "Gallery search navigation completed without an observable loader change"
-        )
-        raise SearchNavigationError(
-            url=target_url,
-            reason=reason,
-            diagnostic_path=(
-                str(diagnostic_path) if diagnostic_path is not None else None
-            ),
-        ) from outcome_unknown
-
     async def _read_stable_search_page(
         self,
         target_url: str,
         diagnostic_query: str,
+        *,
+        deadline: Deadline,
     ) -> _SearchPageSnapshot:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + SEARCH_PAGE_TIMEOUT_SECONDS
-        last_transient_error: Exception | None = None
-        last_snapshot: _SearchPageSnapshot | None = None
-        last_loader_stable: bool | None = None
-        last_loader_before: str | None = None
-        last_loader_after: str | None = None
-
-        while loop.time() < deadline:
+        snapshot: _SearchPageSnapshot | None = None
+        loader_before: str | None = None
+        loader_after: str | None = None
+        last_transient_error: BaseException | None = None
+        while not deadline.expired:
             try:
-                loader_before = await self._current_loader_id()
-                snapshot = await self._read_search_page()
-                loader_after = await self._current_loader_id()
+                loader_before = await self._current_loader_id(deadline=deadline)
+                snapshot = await self._read_search_page(deadline=deadline)
+                loader_after = await self._current_loader_id(deadline=deadline)
             except Exception as error:
                 if is_browser_generation_error(error):
                     raise
                 if _is_transient_context_error(error):
                     last_transient_error = error
-                    await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
-                    continue
-                if isinstance(error, (TypeError, ValueError)):
+                elif isinstance(error, (TypeError, ValueError)):
                     raise MalformedSearchPageError(
                         query=diagnostic_query,
                         url=target_url,
                         title="",
                         reason=f"the atomic page snapshot was malformed: {error}",
                     ) from error
-                raise SearchNavigationError(
-                    url=target_url,
-                    reason=f"could not read the navigated document: {error!r}",
-                ) from error
+                elif isinstance(error, TimeoutError) and deadline.expired:
+                    break
+                else:
+                    raise SearchNavigationError(
+                        url=target_url,
+                        reason=f"could not read the navigated document: {error!r}",
+                    ) from error
+            else:
+                last_transient_error = None
+                if (
+                    loader_before == loader_after
+                    and snapshot.ready_state in _SEARCH_DOCUMENT_READY_STATES
+                ):
+                    return snapshot
 
-            last_snapshot = snapshot
-            last_loader_before = loader_before
-            last_loader_after = loader_after
-            last_loader_stable = loader_before == loader_after
-            if (
-                last_loader_stable
-                and snapshot.ready_state in _SEARCH_DOCUMENT_READY_STATES
-            ):
-                return snapshot
-            await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                break
+            # This is reconciliation for an observed changing document, not a
+            # readiness delay. All three reads continue to share one deadline.
+            await asyncio.sleep(min(0.05, remaining))
 
-        reason = (
-            "the page did not expose a stable DOM-ready snapshot from one "
-            "main-frame loader"
-        )
-        diagnostic_path: Path | None = None
-        if last_snapshot is None:
-            reason += "; no readable snapshot was captured"
-        else:
-            reason += (
-                f"; actual url={last_snapshot.url!r}"
-                f"; title={last_snapshot.title!r}"
-                f"; query={last_snapshot.query_value!r}"
-                f"; last readyState={last_snapshot.ready_state!r}"
-                f"; stable main-frame loader={last_loader_stable}"
-                f"; loader before={last_loader_before!r}"
-                f"; loader after={last_loader_after!r}"
-            )
-            try:
-                diagnostic_path = await self._save_search_diagnostic(last_snapshot.html)
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
+        if snapshot is None:
+            reason = "the navigated document never produced an atomic snapshot"
+            if last_transient_error is not None:
                 reason += (
-                    "; could not save timeout diagnostic: " f"{type(error).__name__}"
+                    "; last read failure: " f"{type(last_transient_error).__name__}"
                 )
-        if last_transient_error is not None:
-            reason += f"; last transient context error: {last_transient_error!r}"
-        _begin_zendriver_retirement(self.page)
-        outcome_unknown = BrowserMutationOutcomeUnknownError(
-            "Gallery search navigation completed without a stable observable document"
+            raise SearchNavigationError(url=target_url, reason=reason)
+
+        reason = "the lifecycle-confirmed document did not become stable"
+        diagnostic_path: Path | None = None
+        reason += (
+            f"; actual url={snapshot.url!r}"
+            f"; title={snapshot.title!r}"
+            f"; query={snapshot.query_value!r}"
+            f"; readyState={snapshot.ready_state!r}"
+            f"; loader before={loader_before!r}"
+            f"; loader after={loader_after!r}"
         )
+        try:
+            diagnostic_path = await self._save_search_diagnostic(snapshot.html)
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            reason += "; could not save diagnostic: " f"{type(error).__name__}"
         raise SearchNavigationError(
             url=target_url,
             reason=reason,
             diagnostic_path=(
                 str(diagnostic_path) if diagnostic_path is not None else None
             ),
-        ) from outcome_unknown
+        )
 
     async def _navigate_search_url(
         self,
         diagnostic_query: str,
         url: str,
+        *,
+        deadline: Deadline | None = None,
     ) -> _SearchPageSnapshot:
-        old_loader_id: str | None = None
-        for attempt in range(SEARCH_NAVIGATION_RETRIES + 1):
-            try:
-                old_loader_id = await self._current_loader_id()
-                break
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                if (
-                    not _is_transient_context_error(error)
-                    or attempt == SEARCH_NAVIGATION_RETRIES
-                ):
-                    raise SearchNavigationError(
-                        url=url,
-                        reason=(
-                            "could not capture the pre-navigation main-frame "
-                            f"loader: {error!r}"
-                        ),
-                    ) from error
-                await asyncio.sleep(SEARCH_PAGE_POLL_SECONDS)
-        assert old_loader_id is not None
-
+        search_document_deadline = (
+            Deadline.after(SEARCH_PAGE_TIMEOUT_SECONDS)
+            if deadline is None
+            else deadline.bounded(SEARCH_PAGE_TIMEOUT_SECONDS)
+        )
         navigation_failure_type: str | None = None
         try:
-            await self.get(url)
+            await self.get(url, deadline=search_document_deadline)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
@@ -1078,10 +776,10 @@ class EHDriver(Driver):
                     f"unknown ({navigation_failure_type})"
                 ),
             ) from outcome_unknown
-        await self._wait_for_new_loader(old_loader_id, url)
         return await self._read_stable_search_page(
             url,
             diagnostic_query,
+            deadline=search_document_deadline,
         )
 
     @staticmethod
@@ -1250,6 +948,8 @@ class EHDriver(Driver):
     async def _resolve_search_request(
         self,
         request: SearchRequest,
+        *,
+        deadline: Deadline | None = None,
     ) -> tuple[tuple[str, str], str, str]:
         request_origin = _trusted_origin(request.scope_url)
         driver_origin = _trusted_origin(self.url[self.name])
@@ -1265,6 +965,7 @@ class EHDriver(Driver):
         scope_snapshot = await self._navigate_search_url(
             f"<scope {request.scope_url}>",
             request.scope_url,
+            deadline=deadline,
         )
         await self._validate_search_page(
             scope_snapshot,
@@ -1364,36 +1065,59 @@ class EHDriver(Driver):
     async def checkh2h(self) -> bool:
         """檢查 H@H 客戶端是否在線"""
         self.logger.info("Checking H@H client status")
-        await self.get("https://e-hentai.org/hentaiathome.php")
-        table = await wait_for_zendriver(
-            self.page.select("#hct", timeout=_LONG_SELECT_TIMEOUT_SECONDS),
-            timeout=_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS,
-            owner=self.page,
+        h2h_deadline = Deadline.after(_ELEMENT_DEADLINE_SECONDS)
+        await self.get(
+            "https://e-hentai.org/hentaiathome.php",
+            deadline=h2h_deadline,
         )
+        table = await wait_for_selector(
+            self.page,
+            "#hct",
+            deadline=h2h_deadline,
+        )
+        read_timeout = min(_PAGE_READ_TIMEOUT_SECONDS, h2h_deadline.remaining())
+        if read_timeout <= 0:
+            raise TimeoutError("H@H status deadline expired before header read")
         header_row = await wait_for_zendriver(
             table.query_selector("tr"),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            timeout=read_timeout,
             owner=table,
         )
+        _require_active_deadline(h2h_deadline, "H@H header read")
+        read_timeout = min(_PAGE_READ_TIMEOUT_SECONDS, h2h_deadline.remaining())
+        if read_timeout <= 0:
+            raise TimeoutError("H@H status deadline expired before columns read")
         headers = await wait_for_zendriver(
             header_row.query_selector_all("th"),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            timeout=read_timeout,
             owner=header_row,
         )
+        _require_active_deadline(h2h_deadline, "H@H columns read")
         status_index = [
             index for index, th in enumerate(headers) if th.text == "Status"
         ][0]
+        read_timeout = min(_PAGE_READ_TIMEOUT_SECONDS, h2h_deadline.remaining())
+        if read_timeout <= 0:
+            raise TimeoutError("H@H status deadline expired before rows read")
         rows = await wait_for_zendriver(
             table.query_selector_all("tr"),
-            timeout=_PAGE_READ_TIMEOUT_SECONDS,
+            timeout=read_timeout,
             owner=table,
         )
+        _require_active_deadline(h2h_deadline, "H@H rows read")
         for row in rows[1:]:
+            read_timeout = min(
+                _PAGE_READ_TIMEOUT_SECONDS,
+                h2h_deadline.remaining(),
+            )
+            if read_timeout <= 0:
+                raise TimeoutError("H@H status deadline expired while reading rows")
             cells = await wait_for_zendriver(
                 row.query_selector_all("td"),
-                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                timeout=read_timeout,
                 owner=row,
             )
+            _require_active_deadline(h2h_deadline, "H@H status read")
             status = cells[status_index].text
             if status.lower() == "online":
                 self.logger.info("H@H client is online")
@@ -1408,10 +1132,16 @@ class EHDriver(Driver):
 
     async def _punchin(self) -> PunchInResult:
         self.logger.info("Starting daily check-in")
-        await self.get("https://e-hentai.org/news.php")
+        punchin_deadline = Deadline.after(PUNCHIN_PAGE_TIMEOUT_SECONDS)
+        await self.get(
+            "https://e-hentai.org/news.php",
+            deadline=punchin_deadline,
+        )
 
         capture_pages = _punchin_page_capture_enabled()
-        initial_html_content = await self._read_stable_punchin_document()
+        initial_html_content = await self._read_stable_punchin_document(
+            deadline=punchin_deadline
+        )
         if not isinstance(initial_html_content, str):
             raise TypeError("Initial daily check-in page content was not a string")
         if capture_pages:
@@ -1425,18 +1155,17 @@ class EHDriver(Driver):
             return initial_result
 
         # 刷新以免沒簽到成功
-        initial_loader_id = await self._current_loader_id()
+        initial_loader_id = await self._current_loader_id(deadline=punchin_deadline)
         self.logger.debug("Refreshing the daily check-in page")
-        await self.wait(
-            self.page.reload,
-            ischangeurl=False,
-            owner=self.page,
-            operation_timeout=_PAGE_MUTATION_TIMEOUT_SECONDS,
+        await reload_and_wait(
+            self.page,
+            deadline=punchin_deadline,
         )
         self.logger.debug("Daily check-in page refresh completed")
 
         html_content = await self._read_stable_punchin_document(
             previous_loader_id=initial_loader_id,
+            deadline=punchin_deadline,
         )
         if not isinstance(html_content, str):
             raise TypeError("Daily check-in page content was not a string")
@@ -1454,12 +1183,24 @@ class EHDriver(Driver):
 
     async def search(self, request: SearchRequest) -> GallerySearchResult:
         """Execute one bounded gallery search using trusted URL navigations."""
+        return await self._search(request)
+
+    async def _search(
+        self,
+        request: SearchRequest,
+        *,
+        deadline: Deadline | None = None,
+    ) -> GallerySearchResult:
+        """Execute a search, optionally sharing one caller-owned deadline."""
         if not isinstance(request, SearchRequest):
             raise InvalidSearchRequestError(
                 "search() requires a SearchRequest instance"
             )
 
-        origin, query, initial_url = await self._resolve_search_request(request)
+        origin, query, initial_url = await self._resolve_search_request(
+            request,
+            deadline=deadline,
+        )
         self.logger.debug(
             "Gallery search started: query=%r max_pages=%d max_results=%d",
             query,
@@ -1475,7 +1216,11 @@ class EHDriver(Driver):
         pages_visited = 0
 
         while True:
-            snapshot = await self._navigate_search_url(query, current_url)
+            snapshot = await self._navigate_search_url(
+                query,
+                current_url,
+                deadline=deadline,
+            )
             await self._validate_search_page(
                 snapshot,
                 expected_origin=origin,
@@ -1567,8 +1312,12 @@ class EHDriver(Driver):
             query=f"gid:{gid}",
             max_pages=1,
         )
+        # The second empty read is domain evidence against a transient empty
+        # result, not permission to reset the navigation timeout. Both fresh
+        # GETs, including their scope reads, share one semantic deadline.
+        lookup_deadline = Deadline.after(SEARCH_PAGE_TIMEOUT_SECONDS)
         for confirmation in range(1, MINIMUM_MISSING_CONFIRMATIONS + 1):
-            result = await self.search(request)
+            result = await self._search(request, deadline=lookup_deadline)
             if len(result.galleries) > 1:
                 raise GalleryLookupError(
                     f"Exact lookup for GID {gid} returned "
@@ -1598,31 +1347,16 @@ class EHDriver(Driver):
 
     async def download(self, gallery: GalleryURLParser) -> bool:
         self.logger.info(
-            "Gallery archive download started: gid=%d max_attempts=%d",
+            "Gallery archive download started: gid=%d",
             gallery.gid,
-            MAX_DOWNLOAD_RETRIES,
         )
-        for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
-            if attempt > 1:
-                self.logger.debug(
-                    "Gallery archive download retry started: gid=%d attempt=%d/%d",
-                    gallery.gid,
-                    attempt,
-                    MAX_DOWNLOAD_RETRIES,
-                )
-            downloaded = await self._download(gallery, attempt)
-            if downloaded is not None:
-                return downloaded
+        control_deadline = Deadline.after(_ELEMENT_DEADLINE_SECONDS)
+        return await self._download(gallery, deadline=control_deadline)
 
-        raise RuntimeError(
-            f"Failed to download gallery after {MAX_DOWNLOAD_RETRIES} "
-            f"attempts: gid={gallery.gid}"
-        )
-
-    async def _download(self, gallery: GalleryURLParser, attempt: int) -> bool | None:
+    async def _download(self, gallery: GalleryURLParser, *, deadline: Deadline) -> bool:
         prune_zendriver_connection_mapper(self.page)
 
-        await self.get(gallery.url)
+        await self.get(gallery.url, deadline=deadline)
         try:
             xpath_query_list = [
                 "//p[contains(text(), "
@@ -1631,11 +1365,20 @@ class EHDriver(Driver):
                 "//input[@id='f_search']",
             ]
             xpath_query = " | ".join(xpath_query_list)
+            availability_timeout = min(
+                _PAGE_READ_TIMEOUT_SECONDS,
+                deadline.remaining(),
+            )
+            if availability_timeout <= 0:
+                raise TimeoutError(
+                    "Gallery readiness deadline expired before availability read"
+                )
             results = await wait_for_zendriver(
                 self.page.xpath(xpath_query, timeout=2),
-                timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                timeout=availability_timeout,
                 owner=self.page,
             )
+            _require_active_deadline(deadline, "Gallery availability read")
             if results:
                 self.logger.warning(
                     "Gallery unavailable or deleted: gid=%d",
@@ -1645,17 +1388,18 @@ class EHDriver(Driver):
         except ZendriverOperationTimeout:
             raise
         except TimeoutError:
-            pass
+            if deadline.remaining() <= 0:
+                raise
 
         existing_tabs = {t.target.target_id for t in self.browser.tabs}
         gallery_tab = self.page
 
         key_xpath = "//a[contains(text(), 'Archive Download')]"
         try:
-            archive_links = await wait_for_zendriver(
-                self.page.xpath(key_xpath, timeout=2),
-                timeout=_PAGE_READ_TIMEOUT_SECONDS,
-                owner=self.page,
+            archive_link = await wait_for_xpath(
+                self.page,
+                key_xpath,
+                deadline=deadline,
             )
         except ZendriverOperationTimeout:
             raise
@@ -1663,57 +1407,52 @@ class EHDriver(Driver):
             if is_browser_generation_error(error):
                 raise
             self.logger.warning(
-                "Archive Download control unavailable; retrying: "
-                "gid=%d attempt=%d/%d error_type=%s",
+                "Archive Download control did not become ready before its "
+                "shared deadline: gid=%d error_type=%s",
                 gallery.gid,
-                attempt,
-                MAX_DOWNLOAD_RETRIES,
                 type(error).__name__,
             )
-            return None
+            raise RuntimeError(
+                f"Archive Download control did not become ready: gid={gallery.gid}"
+            ) from error
 
-        if not archive_links:
-            self.logger.warning(
-                "Archive Download control unavailable; retrying: "
-                "gid=%d attempt=%d/%d error_type=%s",
-                gallery.gid,
-                attempt,
-                MAX_DOWNLOAD_RETRIES,
-                "RuntimeError",
+        if deadline.remaining() <= 0:
+            raise TimeoutError(
+                "Archive Download control appeared after its shared deadline"
             )
-            return None
 
+        popup_deadline = Deadline.after(_ELEMENT_DEADLINE_SECONDS)
+        click_failed_after_invocation = False
         try:
-            await _wait_for_archive_mutation(
-                archive_links[0].click(),
-                owner=archive_links[0],
+            _, new_tab = await mutate_and_wait_for_new_tab(
+                self.browser,
+                existing_tabs,
+                archive_link.click,
+                owner=archive_link,
                 operation="Archive Download click",
-                failure_message=(
-                    "Archive download outcome is unknown after click failure; "
-                    "refusing replay"
-                ),
+                deadline=popup_deadline,
             )
-        except ArchiveDownloadOutcomeUnknownError as error:
+        except BrowserMutationOutcomeUnknownError as error:
             self.logger.warning(
                 "Archive Download click failed after invocation; not replaying: "
-                "gid=%d attempt=%d/%d error_type=%s",
+                "gid=%d error_type=%s",
                 gallery.gid,
-                attempt,
-                MAX_DOWNLOAD_RETRIES,
                 type(error).__name__,
             )
-            raise
+            click_failed_after_invocation = True
+            new_tab = None
+        if click_failed_after_invocation:
+            raise ArchiveDownloadOutcomeUnknownError(
+                "Archive download outcome is unknown after click failure; "
+                "refusing replay"
+            ) from None
 
-        new_tab = await wait_for_new_tab(self.browser, existing_tabs)
         if not new_tab:
             self.logger.warning(
                 "Archive download tab did not appear after click; not replaying: "
-                "gid=%d attempt=%d/%d",
+                "gid=%d",
                 gallery.gid,
-                attempt,
-                MAX_DOWNLOAD_RETRIES,
             )
-            _begin_zendriver_retirement(archive_links[0])
             raise ArchiveDownloadOutcomeUnknownError(
                 "Archive download outcome is unknown because its tab did not appear; "
                 "refusing replay"
@@ -1732,12 +1471,11 @@ class EHDriver(Driver):
                     "refusing further browser mutations"
                 ),
             )
+            # "Original" is optional. One immediate bounded query is evidence;
+            # waiting ten seconds for absence would only stack a semantic phase.
             original_links = await wait_for_zendriver(
-                self.page.xpath(
-                    "//a[contains(text(), 'Original')]",
-                    timeout=_LONG_SELECT_TIMEOUT_SECONDS,
-                ),
-                timeout=_LONG_SELECT_WATCHDOG_TIMEOUT_SECONDS,
+                self.page.xpath("//a[contains(text(), 'Original')]", timeout=0.05),
+                timeout=_PAGE_READ_TIMEOUT_SECONDS,
                 owner=self.page,
             )
             if original_links:
@@ -1751,14 +1489,26 @@ class EHDriver(Driver):
                     ),
                 )
 
-            status_timeout = False
             try:
-                deadline = asyncio.get_event_loop().time() + 10
-                while asyncio.get_event_loop().time() < deadline:
+                # Archive preparation is a server-side semantic operation; CDP
+                # reads stay capped at five seconds under one absolute deadline.
+                status_deadline = Deadline.after(_ARCHIVE_STATUS_DEADLINE_SECONDS)
+                html = ""
+                while not status_deadline.expired:
+                    read_timeout = min(
+                        _PAGE_READ_TIMEOUT_SECONDS,
+                        status_deadline.remaining(),
+                    )
+                    if read_timeout <= 0:
+                        raise TimeoutError
                     html = await wait_for_zendriver(
                         self.page.get_content(),
-                        timeout=_PAGE_READ_TIMEOUT_SECONDS,
+                        timeout=read_timeout,
                         owner=self.page,
+                    )
+                    _require_active_deadline(
+                        status_deadline,
+                        "Archive status read",
                     )
                     if (
                         "Downloads should start processing within a couple of minutes."
@@ -1769,40 +1519,35 @@ class EHDriver(Driver):
                         raise ClientOfflineException()
                     if "Cannot start download: Insufficient funds" in html:
                         raise InsufficientFundsException()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(min(0.5, status_deadline.remaining()))
                 else:
-                    html = await wait_for_zendriver(
-                        self.page.get_content(),
-                        timeout=_PAGE_READ_TIMEOUT_SECONDS,
-                        owner=self.page,
-                    )
                     if "Cannot start download: Insufficient funds" in html:
                         raise InsufficientFundsException()
                     raise TimeoutError()
             except ZendriverOperationTimeout:
                 raise
             except TimeoutError:
-                error_file = await self.save_page_diagnostic("download_timeout")
+                _begin_zendriver_retirement(self.page)
+                # The last snapshot was captured inside the semantic deadline.
+                # Never start a fresh browser read after a remote archive click
+                # has become outcome-unknown.
+                error_file = await self.save_page_diagnostic(
+                    "download_timeout",
+                    html,
+                )
                 if error_file is None:
                     self.logger.warning(
                         "Archive download status timed out after click; diagnostic "
-                        "unavailable; not replaying: gid=%d attempt=%d/%d",
+                        "unavailable; not replaying: gid=%d",
                         gallery.gid,
-                        attempt,
-                        MAX_DOWNLOAD_RETRIES,
                     )
                 else:
                     self.logger.warning(
                         "Archive download status timed out after click; diagnostic=%s; "
-                        "not replaying: gid=%d attempt=%d/%d",
+                        "not replaying: gid=%d",
                         error_file,
                         gallery.gid,
-                        attempt,
-                        MAX_DOWNLOAD_RETRIES,
                     )
-                status_timeout = True
-            if status_timeout:
-                _begin_zendriver_retirement(self.page)
                 raise ArchiveDownloadOutcomeUnknownError(
                     "Archive download outcome is unknown after click; refusing replay"
                 )
@@ -1851,8 +1596,6 @@ class EHDriver(Driver):
         if deferred_operation_error is not None:
             raise deferred_operation_error
 
-        await asyncio.sleep(random())
-        await asyncio.sleep(random())
         self.logger.info("Gallery archive download queued: gid=%d", gallery.gid)
         return True
 

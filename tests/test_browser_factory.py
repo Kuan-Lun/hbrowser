@@ -1,7 +1,10 @@
 import asyncio
+import json
+import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,10 +21,14 @@ from hbrowser.gallery.browser.mapper import start_zendriver_mapper_janitor
 from hbrowser.gallery.browser.process import OwnedProcess, ProcessOwnershipError
 from hbrowser.gallery.browser.tor import terminate_tor_process
 from hbrowser.gallery.utils import (
+    Deadline,
     ZendriverOperationTimeout,
     wait_for_zendriver,
 )
-from hbrowser.gallery.utils.protocol import ZendriverOwnerRetiredError
+from hbrowser.gallery.utils.protocol import (
+    ZendriverOwnerRetiredError,
+    _begin_zendriver_retirement,
+)
 
 
 def _tab(target_id: str = "page-1", *, type_: str = "page") -> zd.Tab:
@@ -37,6 +44,104 @@ def _tab(target_id: str = "page-1", *, type_: str = "page") -> zd.Tab:
 
 
 class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_devtools_discovery_rejects_an_expired_absolute_deadline(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(
+                TimeoutError,
+                "shared deadline",
+            ),
+        ):
+            await factory._wait_for_devtools_active_port_async(
+                Mock(spec=OwnedProcess),
+                Path(directory),
+                deadline=Deadline(0.0),
+            )
+
+    async def test_devtools_late_file_read_cannot_publish_a_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active_port = Path(directory) / "DevToolsActivePort"
+            active_port.write_text(
+                "43123\n/devtools/browser/test\n",
+                encoding="utf-8",
+            )
+            now = [100.0]
+
+            def late_read(*_: object, **__: object) -> str:
+                now[0] = 101.0
+                return "43123\n/devtools/browser/test\n"
+
+            with (
+                patch(
+                    "hbrowser.gallery.utils.deadline.time.monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                patch.object(Path, "read_text", side_effect=late_read),
+                self.assertRaisesRegex(TimeoutError, "shared deadline"),
+            ):
+                await factory._wait_for_devtools_active_port_async(
+                    Mock(spec=OwnedProcess),
+                    Path(directory),
+                    deadline=Deadline(101.0),
+                )
+
+    async def test_late_browser_client_construction_cleans_owner_without_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-late-client-") as directory:
+            root = Path(directory)
+            executable = root / "browser"
+            executable.touch()
+            profile = root / "profile"
+            profile.mkdir()
+            config = zd.Config(
+                user_data_dir=profile,
+                browser_executable_path=executable,
+            )
+            owner = Mock(spec=OwnedProcess)
+            browser = Mock()
+            now = [100.0]
+
+            def late_construct(_: object) -> Mock:
+                now[0] = 100.5
+                return browser
+
+            with (
+                patch(
+                    "hbrowser.gallery.utils.deadline.time.monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                patch.object(
+                    factory,
+                    "start_owned_browser_process",
+                    return_value=owner,
+                ),
+                patch.object(
+                    factory,
+                    "_wait_for_devtools_active_port_async",
+                    new=AsyncMock(return_value=43123),
+                ),
+                patch.object(
+                    factory,
+                    "_OwnedZendriverBrowser",
+                    side_effect=late_construct,
+                ),
+                patch.object(factory, "_terminate_unbound_owner") as terminate,
+                self.assertRaisesRegex(TimeoutError, "ownership publication"),
+            ):
+                await factory._construct_owned_browser_async(
+                    config,
+                    cleanup_paths=(str(profile),),
+                    startup_deadline=Deadline(101.0),
+                )
+
+            terminate.assert_called_once_with(
+                owner,
+                deadline=unittest.mock.ANY,
+            )
+
     def test_config_uses_an_explicit_hbrowser_owned_profile(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-profile-test-") as profile:
             config = factory._build_config(
@@ -89,7 +194,7 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
             zendriver_launcher.assert_not_called()
             browser.update_targets.assert_awaited_once_with()
 
-    def test_prelaunch_discovers_port_and_binds_owner_without_global_hook(
+    async def test_prelaunch_discovers_port_and_binds_owner_without_global_hook(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-contract-test-") as directory:
@@ -114,8 +219,8 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
                 ) as start_process,
                 patch.object(
                     factory,
-                    "_wait_for_devtools_active_port",
-                    return_value=43123,
+                    "_wait_for_devtools_active_port_async",
+                    new=AsyncMock(return_value=43123),
                 ),
                 patch.object(
                     factory,
@@ -123,9 +228,10 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
                     return_value=browser,
                 ),
             ):
-                observed = factory._construct_owned_browser(
+                observed = await factory._construct_owned_browser_async(
                     config,
                     cleanup_paths=(str(profile),),
+                    startup_deadline=Deadline.after(25.0),
                 )
 
             self.assertIs(observed, browser)
@@ -152,6 +258,15 @@ class _Process:
 class _Target:
     type_ = "page"
     url = "about:blank"
+
+
+class _LateDeadline:
+    def remaining(self) -> float:
+        return 1.0
+
+    @property
+    def expired(self) -> bool:
+        return True
 
 
 class _Browser:
@@ -191,6 +306,7 @@ class PostCreateSetupTests(unittest.IsolatedAsyncioTestCase):
                 cast(zd.Browser, Mock()),
                 cast(zd.Tab, page),
                 use_tor=True,
+                deadline=Deadline.after(1),
             )
 
         page.send.assert_awaited_once()
@@ -218,13 +334,14 @@ class BrowserProcessShutdownTests(unittest.TestCase):
         browser = SimpleNamespace(_process=None)
         setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
 
-        factory._terminate_browser_process(browser)
+        factory._terminate_browser_process(browser, deadline=Deadline.after(15))
 
         owner.shutdown.assert_called_once_with(
             graceful_timeout=factory._BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
             terminate_timeout=factory._BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
             kill_timeout=factory._BROWSER_PROCESS_KILL_WAIT_SECONDS,
             cleanup_timeout=factory._BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+            deadline=unittest.mock.ANY,
         )
         owner.terminate.assert_not_called()
         owner.kill.assert_not_called()
@@ -237,7 +354,10 @@ class BrowserProcessShutdownTests(unittest.TestCase):
         setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
 
         with self.assertRaises(ProcessOwnershipError) as raised:
-            factory._terminate_browser_process(browser)
+            factory._terminate_browser_process(
+                browser,
+                deadline=Deadline.after(15),
+            )
 
         self.assertIsInstance(raised.exception.__cause__, PermissionError)
         self.assertIs(
@@ -248,7 +368,48 @@ class BrowserProcessShutdownTests(unittest.TestCase):
         owner.kill.assert_not_called()
 
 
+class ExpiredShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_deadline_does_not_invoke_browser_stop(self) -> None:
+        browser = _OwnedBrowser()
+        retirement = _begin_zendriver_retirement(browser)
+        runner = AsyncMock()
+
+        errors = await factory._ensure_browser_cleanup(
+            browser,
+            retirement,
+            allow_fallback=True,
+            run_blocking_cleanup=runner,
+            deadline=Deadline(0.0),
+        )
+
+        browser.stop.assert_not_awaited()
+        runner.assert_not_awaited()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ProcessOwnershipError)
+
+    async def test_expired_deadline_does_not_invoke_connection_close(self) -> None:
+        close = AsyncMock()
+        connection = SimpleNamespace(websocket=object(), aclose=close)
+
+        closed, errors = await factory._close_and_wait_for_connection(
+            connection,
+            deadline=Deadline(0.0),
+        )
+
+        self.assertFalse(closed)
+        close.assert_not_awaited()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ProcessOwnershipError)
+
+
 class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_timeout_above_target_discovery_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\[0, 5\]"):
+            await factory._wait_for_main_tab(
+                cast(zd.Browser, _Browser(None)),
+                timeout=5.01,
+            )
+
     async def test_returns_immediate_main_tab_without_sleeping(self) -> None:
         page = _tab()
         browser = _Browser(page)
@@ -340,13 +501,292 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chrome_install_worker_receipt_is_nonce_bound_and_reaped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-install-receipt-"
+        ) as directory:
+            root = Path(directory)
+            receipt_directory = root / "receipt"
+            receipt_directory.mkdir()
+            staging_directory = root / "staging"
+            staging_directory.mkdir()
+            chrome = root / "chrome"
+            chrome.write_text("binary", encoding="utf-8")
+            owner = Mock(spec=OwnedProcess)
+            owner.poll.return_value = 0
+            owner.wait.return_value = 0
+
+            def start_worker(
+                _: object,
+                parameters: tuple[str, ...],
+                **__: object,
+            ) -> Mock:
+                receipt_path = Path(parameters[2])
+                nonce = parameters[3]
+                receipt_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": 1,
+                            "nonce": nonce,
+                            "chrome": str(chrome),
+                            "version": "test-version",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return owner
+
+            with (
+                patch(
+                    "hbrowser.gallery.browser.factory.tempfile.mkdtemp",
+                    return_value=str(receipt_directory),
+                ),
+                patch.object(
+                    factory,
+                    "create_chrome_install_staging_root",
+                    return_value=staging_directory,
+                ),
+                patch.object(
+                    factory,
+                    "start_owned_process",
+                    side_effect=start_worker,
+                ) as start,
+                patch.object(
+                    factory,
+                    "_cleanup_unowned_private_paths",
+                    new=AsyncMock(return_value=[]),
+                ) as cleanup_receipt,
+            ):
+                work_deadline = Deadline.after(1)
+                cleanup_deadline = Deadline.after(2)
+                result = await factory._install_chrome_in_owned_worker(
+                    work_deadline=work_deadline,
+                    cleanup_deadline=cleanup_deadline,
+                )
+
+        self.assertEqual(result.chrome, str(chrome))
+        self.assertEqual(result.version, "test-version")
+        owner.wait.assert_called_once_with(timeout=unittest.mock.ANY)
+        owner.shutdown.assert_not_called()
+        self.assertEqual(
+            start.call_args.kwargs["deadline"], cleanup_deadline.expires_at
+        )
+        self.assertEqual(
+            float(start.call_args.args[1][-2]),
+            work_deadline.expires_at,
+        )
+        self.assertEqual(
+            start.call_args.kwargs["cleanup_paths"],
+            (staging_directory,),
+        )
+        cleanup_receipt.assert_awaited_once_with(
+            (str(receipt_directory), str(staging_directory)),
+            deadline=cleanup_deadline,
+        )
+
+    async def test_chrome_install_cancellation_reaps_worker_before_return(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-install-cancel-"
+        ) as directory:
+            receipt_directory = Path(directory) / "receipt"
+            receipt_directory.mkdir()
+            staging_directory = Path(directory) / "staging"
+            staging_directory.mkdir()
+            owner = Mock(spec=OwnedProcess)
+            owner.poll.return_value = None
+            owner.shutdown.return_value = 0
+
+            with (
+                patch(
+                    "hbrowser.gallery.browser.factory.tempfile.mkdtemp",
+                    return_value=str(receipt_directory),
+                ),
+                patch.object(
+                    factory,
+                    "create_chrome_install_staging_root",
+                    return_value=staging_directory,
+                ),
+                patch.object(factory, "start_owned_process", return_value=owner),
+                patch.object(
+                    factory,
+                    "_cleanup_unowned_private_paths",
+                    new=AsyncMock(return_value=[]),
+                ),
+            ):
+                cleanup_deadline = Deadline.after(2)
+                install = asyncio.create_task(
+                    factory._install_chrome_in_owned_worker(
+                        work_deadline=Deadline.after(1),
+                        cleanup_deadline=cleanup_deadline,
+                    )
+                )
+                while not owner.poll.called:
+                    await asyncio.sleep(0)
+                install.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await install
+
+        owner.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=unittest.mock.ANY,
+            kill_timeout=unittest.mock.ANY,
+            cleanup_timeout=unittest.mock.ANY,
+            deadline=cleanup_deadline.expires_at,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group regression")
+    async def test_interrupted_chrome_worker_cannot_leave_staging_orphan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-install-interrupt-"
+        ) as directory:
+            root = Path(directory)
+            receipt_directory = root / "receipt"
+            receipt_directory.mkdir()
+            staging_directory = root / "staging"
+            staging_directory.mkdir()
+            worker = root / "blocked-installer.py"
+            worker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys, time\n"
+                "staging = pathlib.Path(sys.argv[1])\n"
+                "(staging / 'worker-started').write_text('started')\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            worker.chmod(0o700)
+
+            def worker_command(
+                _: Path,
+                __: str,
+                *,
+                work_deadline: Deadline,
+                staging_directory: Path,
+            ) -> tuple[str, tuple[str, ...]]:
+                self.assertFalse(work_deadline.expired)
+                return str(worker), (str(staging_directory),)
+
+            with (
+                patch(
+                    "hbrowser.gallery.browser.factory.tempfile.mkdtemp",
+                    return_value=str(receipt_directory),
+                ),
+                patch.object(
+                    factory,
+                    "create_chrome_install_staging_root",
+                    return_value=staging_directory,
+                ),
+                patch.object(
+                    factory,
+                    "_chrome_install_worker_command",
+                    side_effect=worker_command,
+                ),
+            ):
+                install = asyncio.create_task(
+                    factory._install_chrome_in_owned_worker(
+                        work_deadline=Deadline.after(5),
+                        cleanup_deadline=Deadline.after(10),
+                    )
+                )
+                started_marker = staging_directory / "worker-started"
+                marker_deadline = asyncio.get_running_loop().time() + 3
+                while not started_marker.exists():
+                    if asyncio.get_running_loop().time() >= marker_deadline:
+                        self.fail("Chrome installer fixture did not start")
+                    await asyncio.sleep(0.01)
+
+                install.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await install
+
+            self.assertFalse(staging_directory.exists())
+            self.assertFalse(receipt_directory.exists())
+
+    async def test_private_path_cleanup_cancellation_waits_for_owned_worker(
+        self,
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        guard = Mock()
+
+        def remove(*, deadline: float) -> None:
+            self.assertGreater(deadline, time.monotonic())
+            started.set()
+            self.assertTrue(release.wait(timeout=1))
+
+        guard.remove.side_effect = remove
+        with patch(
+            "hbrowser.gallery.browser.factory._PrivateDirectory.capture",
+            return_value=guard,
+        ):
+            cleanup = asyncio.create_task(
+                factory._cleanup_unowned_private_paths(
+                    ("/private/profile",),
+                    deadline=Deadline.after(1),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+            cleanup.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(cleanup.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await cleanup
+
+        guard.remove.assert_called_once_with(deadline=unittest.mock.ANY)
+
+    async def test_parallel_private_path_cleanup_shares_one_absolute_deadline(
+        self,
+    ) -> None:
+        guards = (Mock(), Mock())
+        observed_deadlines: list[float] = []
+        for guard in guards:
+            guard.remove.side_effect = lambda *, deadline: observed_deadlines.append(
+                deadline
+            )
+
+        with patch(
+            "hbrowser.gallery.browser.factory._PrivateDirectory.capture",
+            side_effect=guards,
+        ):
+            errors = await factory._cleanup_unowned_private_paths(
+                ("/private/profile", "/private/extension"),
+                deadline=Deadline.after(1),
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(observed_deadlines), 2)
+        self.assertEqual(observed_deadlines[0], observed_deadlines[1])
+
+    async def test_late_browser_start_receipt_retires_generation(self) -> None:
+        browser = SimpleNamespace(start=AsyncMock(return_value=object()))
+        lifecycle = Mock()
+
+        with (
+            patch.object(
+                factory,
+                "_validate_zendriver_operation",
+                return_value=(None, browser, None, lifecycle),
+            ),
+            self.assertRaisesRegex(TimeoutError, "completed after"),
+        ):
+            await factory._await_browser_start(
+                cast(zd.Browser, browser),
+                deadline=cast(Deadline, _LateDeadline()),
+            )
+
+        lifecycle.begin_retirement_for_operation.assert_called_once()
+
     async def test_success_starts_mapper_janitor_after_post_setup(self) -> None:
         page = _tab()
         browser = _Browser(page, tabs=[page])
         browser.start = AsyncMock(return_value=browser)  # type: ignore[attr-defined]
         events: list[str] = []
 
-        async def post_setup(*_: object) -> None:
+        async def post_setup(*_: object, **__: object) -> None:
             events.append("post-setup")
 
         def start_janitor(_: object) -> None:
@@ -355,12 +795,16 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ),
             patch.object(factory, "_build_config", return_value=object()),
             patch.object(
                 factory,
-                "_construct_owned_browser",
-                return_value=browser,
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
             ),
             patch.object(factory, "_register_browser_atexit") as register_atexit,
             patch.object(
@@ -374,7 +818,6 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=start_janitor,
             ) as start_mapper_janitor,
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
             result = await factory.create_browser()
 
         self.assertEqual(result, (browser, page))
@@ -390,13 +833,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ) as install_chrome,
             patch.object(factory, "_build_config", return_value=object()),
             patch.object(
                 factory,
-                "_construct_owned_browser",
-                return_value=browser,
-            ),
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
+            ) as construct_browser,
             patch.object(factory, "_register_browser_atexit"),
             patch.object(
                 factory,
@@ -419,10 +866,20 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             ) as start_mapper_janitor,
             self.assertRaisesRegex(RuntimeError, "main tab unavailable"),
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
             await factory.create_browser()
 
-        stop_browser.assert_awaited_once_with(browser)
+        stop_browser.assert_awaited_once_with(browser, unittest.mock.ANY)
+        work_deadline = install_chrome.call_args.kwargs["work_deadline"]
+        self.assertIs(
+            construct_browser.call_args.kwargs["startup_deadline"],
+            work_deadline,
+        )
+        assert stop_browser.await_args is not None
+        cleanup_deadline = stop_browser.await_args.args[1]
+        self.assertAlmostEqual(
+            cleanup_deadline.expires_at - work_deadline.expires_at,
+            factory._BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS,
+        )
         post_setup.assert_not_awaited()
         start_mapper_janitor.assert_not_called()
 
@@ -431,7 +888,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         allow_tor_start = threading.Event()
         tor_process = Mock()
 
-        def delayed_tor_start(_: int) -> Mock:
+        def delayed_tor_start(_: int, **__: object) -> Mock:
             tor_started.set()
             allow_tor_start.wait(timeout=1)
             return tor_process
@@ -443,7 +900,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 factory,
                 "start_tor_with_retry",
                 side_effect=delayed_tor_start,
-            ),
+            ) as start_tor,
             patch.object(factory, "terminate_tor_process") as terminate_tor,
             patch.object(factory, "configure_proxy") as configure_proxy,
         ):
@@ -458,8 +915,86 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await create_task
 
-        terminate_tor.assert_called_once_with(tor_process)
+        terminate_tor.assert_called_once_with(
+            tor_process,
+            deadline=unittest.mock.ANY,
+        )
+        work_deadline = start_tor.call_args.kwargs["deadline"]
+        cleanup_deadline = terminate_tor.call_args.kwargs["deadline"]
+        self.assertAlmostEqual(
+            cleanup_deadline.expires_at - work_deadline.expires_at,
+            factory._BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS,
+        )
         configure_proxy.assert_not_called()
+
+    async def test_constructor_cancellation_reaps_process_before_returning(
+        self,
+    ) -> None:
+        launch_started = threading.Event()
+        allow_launch = threading.Event()
+        owner = Mock(spec=OwnedProcess)
+
+        def delayed_launch(*_: object, **__: object) -> OwnedProcess:
+            launch_started.set()
+            allow_launch.wait(timeout=1)
+            return owner
+
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-construction-test-"
+        ) as directory:
+            root = Path(directory)
+            executable = root / "browser"
+            executable.touch()
+            profile = root / "profile"
+            profile.mkdir()
+            config = zd.Config(
+                user_data_dir=profile,
+                browser_executable_path=executable,
+            )
+            with (
+                patch.object(
+                    factory,
+                    "start_owned_browser_process",
+                    side_effect=delayed_launch,
+                ),
+                patch.object(
+                    factory,
+                    "_wait_for_devtools_active_port_async",
+                    new=AsyncMock(),
+                ) as wait_for_devtools,
+                patch.object(
+                    factory,
+                    "_terminate_unbound_owner",
+                ) as terminate_owner,
+            ):
+                construction_task = asyncio.create_task(
+                    factory._construct_owned_browser_async(
+                        config,
+                        cleanup_paths=(str(profile),),
+                        startup_deadline=Deadline.after(25.0),
+                    )
+                )
+                while not launch_started.is_set():
+                    await asyncio.sleep(0)
+
+                # Only the bounded process-ownership handshake runs in a
+                # thread; unrelated event-loop work remains responsive.
+                marker = AsyncMock()
+                await marker()
+                marker.assert_awaited_once_with()
+
+                construction_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(construction_task.done())
+                allow_launch.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await construction_task
+
+        terminate_owner.assert_called_once_with(
+            owner,
+            deadline=unittest.mock.ANY,
+        )
+        wait_for_devtools.assert_not_awaited()
 
     async def test_browser_launch_cancellation_stops_returned_browser(self) -> None:
         launch_started = asyncio.Event()
@@ -473,7 +1008,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         browser.start = AsyncMock(side_effect=delayed_launch)
 
-        async def cleanup_started_browser(actual_browser: object) -> None:
+        async def cleanup_started_browser(
+            actual_browser: object,
+            _deadline: Deadline,
+        ) -> None:
             self.assertIs(actual_browser, browser)
             allow_launch.set()
             await asyncio.sleep(0)
@@ -481,9 +1019,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ),
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(factory, "_construct_owned_browser", return_value=browser),
+            patch.object(
+                factory,
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
+            ),
             patch.object(factory, "_register_browser_atexit"),
             patch.object(
                 factory,
@@ -491,14 +1037,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=cleanup_started_browser),
             ) as stop_browser,
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
             create_task = asyncio.create_task(factory._create_browser(True))
             await launch_started.wait()
             create_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await create_task
 
-        stop_browser.assert_awaited_once_with(browser)
+        stop_browser.assert_awaited_once_with(browser, unittest.mock.ANY)
 
     async def test_browser_start_failure_cleans_exact_process_and_profile(
         self,
@@ -532,13 +1077,20 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ),
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(factory, "_construct_owned_browser", return_value=browser),
+            patch.object(
+                factory,
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
+            ),
             patch.object(factory, "_register_browser_atexit"),
             self.assertRaises(RuntimeError) as raised,
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
             await factory._create_browser(True)
 
         self.assertIs(raised.exception, startup_error)
@@ -549,7 +1101,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(browser._process)
         self.assertIsNone(browser._process_pid)
 
-    async def test_start_failure_keeps_atexit_fallback_until_retry_succeeds(
+    async def test_start_failure_runs_explicit_fallback_before_returning(
         self,
     ) -> None:
         browser = _OwnedBrowser()
@@ -571,9 +1123,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ),
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(factory, "_construct_owned_browser", return_value=browser),
+            patch.object(
+                factory,
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
+            ),
             patch(
                 "hbrowser.gallery.browser.factory.asyncio_atexit.register",
                 side_effect=lambda cleanup, **_: registered_cleanups.append(cleanup),
@@ -587,34 +1147,21 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 return_value=registered_instances,
             ),
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
-            with self.assertRaises(ProcessOwnershipError) as raised:
+            with self.assertRaises(RuntimeError) as raised:
                 await factory._create_browser(True)
 
-            self.assertIs(raised.exception.__cause__, cleanup_error)
-            self.assertIn(
-                "Startup failure type: RuntimeError",
-                raised.exception.__notes__,
-            )
+            self.assertIs(raised.exception, startup_error)
             self.assertEqual(len(registered_cleanups), 1)
             cleanup = registered_cleanups[0]
-            self.assertIs(cleanup.browser, browser)
-            self.assertIn(browser, registered_instances)
-            unregister_cleanup.assert_not_called()
-
-            await cleanup()
-
             self.assertIsNone(cleanup.browser)
             self.assertIsNone(
                 getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
             )
             self.assertNotIn(browser, registered_instances)
-            # The running callback is left in the registry's current iteration;
-            # asyncio-atexit clears the list after all browser callbacks run.
-            unregister_cleanup.assert_not_called()
+            unregister_cleanup.assert_called_once_with(cleanup, loop=cleanup.loop)
 
         register_cleanup.assert_called_once()
-        self.assertEqual(browser.stop.await_count, 2)
+        browser.stop.assert_awaited_once_with()
 
     async def test_normal_shutdown_releases_each_restart_generation(self) -> None:
         browsers = [_OwnedBrowser(), _OwnedBrowser()]
@@ -650,6 +1197,18 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE) is None
                 for browser in browsers
             )
+        )
+
+    async def test_caller_deadline_is_the_generation_shutdown_deadline(self) -> None:
+        browser = _OwnedBrowser()
+        caller_deadline = Deadline.after(1.0)
+
+        await factory.stop_browser(browser, caller_deadline)
+
+        lifecycle = getattr(browser, "_hbrowser_zendriver_lifecycle")
+        self.assertEqual(
+            lifecycle.shutdown_deadline_expires_at,
+            caller_deadline.expires_at,
         )
 
     async def test_ownership_release_failures_remain_retryable(self) -> None:
@@ -708,9 +1267,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registered_instances_mock.discard.call_count, 2)
         discard_browser.stop.assert_awaited_once_with()
 
-    async def test_atexit_callback_retries_before_the_loop_closes(self) -> None:
+    async def test_atexit_callback_renews_an_expired_ownership_deadline(
+        self,
+    ) -> None:
         browser = _OwnedBrowser()
-        browser.stop.side_effect = [RuntimeError("transient stop failure"), None]
+        owner = Mock(spec=OwnedProcess)
+        owner.shutdown.side_effect = [
+            RuntimeError("initial owner failure"),
+            RuntimeError("fallback owner failure"),
+            None,
+        ]
+        setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
         registered_instances: set[object] = {browser}
         with (
             patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
@@ -726,9 +1293,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             factory._register_browser_atexit(cast(zd.Browser, browser))
             cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
 
+            with self.assertRaises(ProcessOwnershipError):
+                await factory.stop_browser(browser)
+            lifecycle = getattr(browser, "_hbrowser_zendriver_lifecycle")
+            first_deadline = lifecycle.shutdown_deadline_expires_at
+            lifecycle.shutdown_deadline_expires_at = 0.0
+
             await cleanup()
 
-        self.assertEqual(browser.stop.await_count, 2)
+        browser.stop.assert_awaited_once_with()
+        self.assertEqual(owner.shutdown.call_count, 3)
+        self.assertGreater(lifecycle.shutdown_deadline_expires_at, first_deadline)
         self.assertIsNone(cleanup.browser)
         self.assertNotIn(browser, registered_instances)
         # Avoid mutating asyncio-atexit's live callback iteration. The package
@@ -771,6 +1346,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             terminate_timeout=factory._BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
             kill_timeout=factory._BROWSER_PROCESS_KILL_WAIT_SECONDS,
             cleanup_timeout=factory._BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+            deadline=unittest.mock.ANY,
         )
         to_thread.assert_not_awaited()
         self.assertIsNone(cleanup.browser)
@@ -785,7 +1361,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         browser.start = AsyncMock(return_value=browser)  # type: ignore[attr-defined]
         setup_started = asyncio.Event()
 
-        async def blocked_setup(*_: object) -> None:
+        async def blocked_setup(*_: object, **__: object) -> None:
             setup_started.set()
             await asyncio.Event().wait()
 
@@ -793,9 +1369,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
-            patch.object(factory, "ensure_chrome_installed") as ensure_chrome,
+            patch.object(
+                factory,
+                "_install_chrome_in_owned_worker",
+                new=AsyncMock(return_value=SimpleNamespace(chrome="/test/chrome")),
+            ),
             patch.object(factory, "_build_config", return_value=object()),
-            patch.object(factory, "_construct_owned_browser", return_value=browser),
+            patch.object(
+                factory,
+                "_construct_owned_browser_async",
+                new=AsyncMock(return_value=browser),
+            ),
             patch.object(factory, "_register_browser_atexit"),
             patch.object(
                 factory,
@@ -808,14 +1392,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=cleanup_error),
             ) as stop_browser,
         ):
-            ensure_chrome.return_value.chrome = "/test/chrome"
             create_task = asyncio.create_task(factory._create_browser(True))
             await setup_started.wait()
             create_task.cancel()
             with self.assertRaises(ProcessOwnershipError) as raised:
                 await create_task
 
-        stop_browser.assert_awaited_once_with(browser)
+        stop_browser.assert_awaited_once_with(browser, unittest.mock.ANY)
         self.assertIs(raised.exception.__cause__, cleanup_error)
         self.assertIn(
             "Startup failure type: CancelledError",
@@ -847,7 +1430,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(operation.cancelled())
         browser.stop.assert_awaited_once_with()
 
-    async def test_browser_stop_failure_retires_when_no_connection_is_live(
+    async def test_browser_stop_failure_uses_explicit_fallback_after_retirement(
         self,
     ) -> None:
         browser = SimpleNamespace(
@@ -860,8 +1443,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout):
             await wait_for_zendriver(operation, timeout=0, owner=browser)
 
-        with self.assertRaisesRegex(RuntimeError, "browser stop failed"):
-            await factory.stop_browser(browser)
+        await factory.stop_browser(browser)
 
         self.assertTrue(janitor.done())
         self.assertTrue(janitor.cancelled())
@@ -887,9 +1469,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout):
             await wait_for_zendriver(operation, timeout=0, owner=connection)
 
-        with self.assertRaisesRegex(RuntimeError, "browser stop failed"):
+        with self.assertRaises(ProcessOwnershipError) as raised:
             await factory.stop_browser(browser)
 
+        self.assertIn("connection close failed", str(raised.exception.__cause__))
         self.assertFalse(operation.done())
         self.assertIn(1, connection.mapper)
         operation.set_result(None)
@@ -927,9 +1510,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout):
             await wait_for_zendriver(operation, timeout=0, owner=target)
 
-        with self.assertRaisesRegex(RuntimeError, "connection close failed"):
+        with self.assertRaises(ProcessOwnershipError) as raised:
             await factory.stop_browser(browser)
 
+        self.assertIn("connection close failed", str(raised.exception.__cause__))
         self.assertEqual(browser.targets, [])
         self.assertTrue(operation.done())
         self.assertIn(1, target.mapper)
@@ -1231,7 +1815,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await stop_task
 
-            terminate_tor.assert_called_once_with(tor_process)
+            terminate_tor.assert_called_once_with(
+                tor_process,
+                deadline=unittest.mock.ANY,
+            )
 
         browser.stop.assert_awaited_once_with()
         self.assertTrue(operation.cancelled())
@@ -1265,7 +1852,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(first, second)
 
             browser.stop.assert_awaited_once_with()
-            terminate_tor.assert_called_once_with(tor_process)
+            terminate_tor.assert_called_once_with(
+                tor_process,
+                deadline=unittest.mock.ANY,
+            )
 
     async def test_stuck_target_listener_blocks_retirement_without_hanging(
         self,
@@ -1314,10 +1904,11 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 "_CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS",
                 0.01,
             ),
-            self.assertRaisesRegex(TimeoutError, "listener did not stop"),
+            self.assertRaises(ProcessOwnershipError) as raised,
         ):
             await asyncio.wait_for(factory.stop_browser(browser), timeout=1)
 
+        self.assertIn("listener did not stop", str(raised.exception.__cause__))
         self.assertFalse(operation.done())
         self.assertIn(1, target.mapper)
         browser.stop.assert_awaited_once_with()
@@ -1332,33 +1923,41 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(operation.cancelled())
         self.assertEqual(target.mapper, {})
 
-    async def test_browser_stop_watchdog_bounds_a_hung_stop(self) -> None:
+    async def test_browser_stop_watchdog_runs_process_fallback_in_same_call(
+        self,
+    ) -> None:
         async def blocking_stop() -> None:
             await asyncio.Event().wait()
 
+        owner = Mock(spec=OwnedProcess)
         browser = SimpleNamespace(
             targets=[],
             _tor_process=None,
             stop=AsyncMock(side_effect=blocking_stop),
         )
+        setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
         operation: asyncio.Future[None] = asyncio.Future()
         with self.assertRaises(ZendriverOperationTimeout):
             await wait_for_zendriver(operation, timeout=0, owner=browser)
 
-        with (
-            patch.object(factory, "_BROWSER_STOP_TIMEOUT_SECONDS", 0.01),
-            self.assertRaisesRegex(TimeoutError, "browser stop exceeded"),
-        ):
+        with patch.object(factory, "_BROWSER_STOP_TIMEOUT_SECONDS", 0.01):
             await asyncio.wait_for(factory.stop_browser(browser), timeout=1)
 
+        browser.stop.assert_awaited_once_with()
+        owner.shutdown.assert_called_once_with(
+            graceful_timeout=factory._BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
+            terminate_timeout=factory._BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+            kill_timeout=factory._BROWSER_PROCESS_KILL_WAIT_SECONDS,
+            cleanup_timeout=factory._BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+            deadline=unittest.mock.ANY,
+        )
         self.assertTrue(operation.cancelled())
 
-    async def test_timed_out_browser_stop_settles_and_is_reused_on_retry(
+    async def test_timed_out_browser_stop_does_not_reset_on_retry(
         self,
     ) -> None:
         stop_started = asyncio.Event()
         allow_stop = asyncio.Event()
-        stop_finished = asyncio.Event()
         process = Mock()
 
         async def delayed_stop() -> None:
@@ -1367,7 +1966,6 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             process.terminate()
             process.wait(timeout=3)
             browser._process = None
-            stop_finished.set()
 
         browser = SimpleNamespace(
             connection=None,
@@ -1376,16 +1974,11 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             _process=process,
             stop=AsyncMock(side_effect=delayed_stop),
         )
-        with (
-            patch.object(factory, "_BROWSER_STOP_TIMEOUT_SECONDS", 0.01),
-            self.assertRaisesRegex(TimeoutError, "browser stop exceeded"),
-        ):
+        with patch.object(factory, "_BROWSER_STOP_TIMEOUT_SECONDS", 0.01):
             await factory.stop_browser(browser)
 
         await stop_started.wait()
-        process.terminate.assert_not_called()
-        allow_stop.set()
-        await stop_finished.wait()
+        process.terminate.assert_called_once_with()
 
         with patch.object(factory, "_BROWSER_STOP_TIMEOUT_SECONDS", 0.01):
             await factory.stop_browser(browser)
@@ -1417,13 +2010,9 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             stop=AsyncMock(side_effect=stop_process),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "stop interrupted"):
-            await factory.stop_browser(browser)
-        self.assertIs(browser._process, process)
-
         await factory.stop_browser(browser)
 
-        self.assertEqual(browser.stop.await_count, 2)
+        self.assertEqual(browser.stop.await_count, 1)
         process.terminate.assert_called_once_with()
         process.wait.assert_called_once_with(timeout=3)
         self.assertIsNone(browser._process)
@@ -1443,15 +2032,19 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             "terminate_tor_process",
             side_effect=[RuntimeError("tor reap failed"), None],
         ) as terminate_tor:
-            with self.assertRaisesRegex(RuntimeError, "tor reap failed"):
+            with self.assertRaises(ProcessOwnershipError) as raised:
                 await factory.stop_browser(browser)
+            self.assertIn("tor reap failed", str(raised.exception.__cause__))
 
             await factory.stop_browser(browser)
 
         browser.stop.assert_awaited_once_with()
         self.assertEqual(
             terminate_tor.call_args_list,
-            [call(tor_process), call(tor_process)],
+            [
+                call(tor_process, deadline=unittest.mock.ANY),
+                call(tor_process, deadline=unittest.mock.ANY),
+            ],
         )
 
     async def test_retirement_drain_bounds_cancellation_resistant_operation(
@@ -1484,10 +2077,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                     "hbrowser.gallery.utils.protocol._OPERATION_DRAIN_TIMEOUT_SECONDS",
                     0.01,
                 ),
-                self.assertRaisesRegex(
-                    TimeoutError,
-                    "operations did not accept cancellation",
-                ),
+                self.assertRaises(ProcessOwnershipError),
             ):
                 await asyncio.wait_for(factory.stop_browser(browser), timeout=1)
 
@@ -1509,10 +2099,11 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 "stop_zendriver_mapper_janitor",
                 new=AsyncMock(side_effect=failure),
             ),
-            self.assertRaisesRegex(RuntimeError, "janitor stop failed"),
+            self.assertRaises(ProcessOwnershipError) as raised,
         ):
             await factory.stop_browser(browser)
 
+        self.assertIn("janitor stop failed", str(raised.exception.__cause__))
         browser.stop.assert_awaited_once_with()
 
     async def test_stubborn_janitor_keeps_shutdown_retryable_until_terminal(
@@ -1540,10 +2131,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         with patch.object(factory, "_JANITOR_STOP_TIMEOUT_SECONDS", 0.01):
             for _ in range(2):
-                with self.assertRaisesRegex(
-                    TimeoutError,
-                    "mapper janitor stop exceeded",
-                ):
+                with self.assertRaises(ProcessOwnershipError):
                     await factory.stop_browser(browser)
                 self.assertFalse(janitor.done())
 
@@ -1676,6 +2264,11 @@ class TorProcessCleanupTests(unittest.TestCase):
     def test_bootstrap_timeout_terminates_and_reaps_process(self) -> None:
         process = Mock(stdout=[])
         process.poll.return_value = None
+        deadline = Mock(
+            expires_at=time.monotonic() + 1.0,
+            expired=True,
+        )
+        deadline.remaining.return_value = 1.0
         with (
             patch.object(
                 tor_module,
@@ -1683,15 +2276,24 @@ class TorProcessCleanupTests(unittest.TestCase):
                 return_value=process,
             ),
             patch(
-                "hbrowser.gallery.browser.tor.time.time",
-                side_effect=[0, 121],
+                "hbrowser.gallery.browser.tor.Deadline.after",
+                return_value=deadline,
             ),
             self.assertRaisesRegex(RuntimeError, "failed to bootstrap"),
         ):
             tor_module._start_tor_process(9150)
 
         process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
+        process.wait.assert_called_once_with(timeout=1.0)
+
+    def test_expired_shared_deadline_does_not_start_tor(self) -> None:
+        with (
+            patch.object(tor_module, "start_owned_process") as start_process,
+            self.assertRaisesRegex(RuntimeError, "shared browser deadline"),
+        ):
+            tor_module._start_tor_process(9150, deadline=Deadline(0.0))
+
+        start_process.assert_not_called()
 
     def test_unreaped_bootstrap_process_is_never_retried(self) -> None:
         cleanup_failure = tor_module._TorProcessCleanupError(
@@ -1708,7 +2310,38 @@ class TorProcessCleanupTests(unittest.TestCase):
         ):
             tor_module.start_tor_with_retry(9150, max_retries=3, retry_wait=0)
 
-        start_process.assert_called_once_with(9150)
+        start_process.assert_called_once_with(9150, deadline=unittest.mock.ANY)
+
+    def test_retry_policy_is_capped_and_uses_one_absolute_deadline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            tor_module.start_tor_with_retry(9150, max_retries=4)
+        with self.assertRaisesRegex(ValueError, "retry_wait"):
+            tor_module.start_tor_with_retry(9150, retry_wait=5.01)
+
+        observed_deadlines: list[Deadline] = []
+        process = Mock()
+
+        def start(_: int, *, deadline: Deadline) -> Mock:
+            observed_deadlines.append(deadline)
+            if len(observed_deadlines) < 3:
+                raise RuntimeError("retry")
+            return process
+
+        with (
+            patch.object(tor_module, "_start_tor_process", side_effect=start),
+            patch("hbrowser.gallery.browser.tor.time.sleep"),
+        ):
+            result = tor_module.start_tor_with_retry(
+                9150,
+                max_retries=3,
+                retry_wait=0,
+            )
+
+        self.assertIs(result, process)
+        self.assertEqual(len(observed_deadlines), 3)
+        self.assertTrue(
+            all(deadline is observed_deadlines[0] for deadline in observed_deadlines)
+        )
 
     def test_failed_bootstrap_retains_exact_process_cleanup_for_atexit(
         self,
@@ -1763,7 +2396,10 @@ class TorProcessCleanupTests(unittest.TestCase):
 
             self.assertEqual(
                 terminate_process.call_args_list,
-                [call(process), call(process)],
+                [
+                    call(process, deadline=unittest.mock.ANY),
+                    call(process, deadline=None),
+                ],
             )
 
     def test_two_normal_generations_each_release_their_atexit_cleanup(self) -> None:

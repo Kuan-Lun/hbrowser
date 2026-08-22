@@ -13,13 +13,15 @@ from ...exceptions import (
     LoginTokenInjectionOutcomeUnknownError,
 )
 from ..browser.flaresolverr import FlareSolverrError
-from ..utils import wait_for_zendriver
+from ..challenge_policy import validate_turnstile_tabs
+from ..utils import Deadline, wait_for_zendriver
 from ..utils.mutation import wait_for_zendriver_mutation
+from .constants import MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
 from .detector import CaptchaDetector
 from .models import Kind
 
 _TOKEN_READ_TIMEOUT_SECONDS = 3.0
-_TOKEN_MUTATION_TIMEOUT_SECONDS = 15.0
+_TOKEN_MUTATION_TIMEOUT_SECONDS = 5.0
 
 
 class TurnstileSolver(Protocol):
@@ -65,10 +67,14 @@ class LoginChallengeHandler:
         turnstile_tabs: int,
         automatic_solver: TurnstileSolver | None,
     ) -> None:
-        if manual_timeout <= 0:
-            raise ValueError("manual_timeout must be greater than zero")
-        if turnstile_tabs < 1:
-            raise ValueError("turnstile_tabs must be at least 1")
+        if isinstance(manual_timeout, bool) or not (
+            0 < manual_timeout <= MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "manual_timeout must be in (0, "
+                f"{MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS:g}]"
+            )
+        turnstile_tabs = validate_turnstile_tabs(turnstile_tabs)
 
         self._detector = detector
         self._logger = logger
@@ -154,13 +160,25 @@ class LoginChallengeHandler:
             spec.label,
             self._manual_timeout,
         )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._manual_timeout
-        while loop.time() < deadline:
-            if await self._read_response_token(page, spec.response_selector):
-                self._logger.info("%s completed by user", spec.label)
-                return
-            await asyncio.sleep(1)
+        deadline = Deadline.after(self._manual_timeout)
+        while not deadline.expired:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                break
+            token = await self._read_response_token(
+                page,
+                spec.response_selector,
+                timeout=min(_TOKEN_READ_TIMEOUT_SECONDS, remaining),
+            )
+            remaining = deadline.remaining()
+            if token:
+                if remaining > 0:
+                    self._logger.info("%s completed by user", spec.label)
+                    return
+                break
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(1.0, remaining))
 
         raise LoginFailedException(
             f"{spec.label} was not completed within "
@@ -168,7 +186,14 @@ class LoginChallengeHandler:
         )
 
     @staticmethod
-    async def _read_response_token(page: Any, selector: str) -> str:
+    async def _read_response_token(
+        page: Any,
+        selector: str,
+        *,
+        timeout: float = _TOKEN_READ_TIMEOUT_SECONDS,
+    ) -> str:
+        if timeout <= 0:
+            return ""
         selector_json = json.dumps(selector)
         value = await wait_for_zendriver(
             page.evaluate(
@@ -178,7 +203,7 @@ class LoginChallengeHandler:
                 "? element.value : '';"
                 "})()"
             ),
-            timeout=_TOKEN_READ_TIMEOUT_SECONDS,
+            timeout=min(_TOKEN_READ_TIMEOUT_SECONDS, timeout),
             owner=page,
         )
         return value if isinstance(value, str) else ""

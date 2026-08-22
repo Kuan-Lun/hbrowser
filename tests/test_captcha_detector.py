@@ -19,11 +19,13 @@ class _Page:
         self.html = html
         self.selections: dict[str, _Element] = {}
 
-    async def evaluate(self, expression: str) -> str:
-        if expression == "window.location.href":
-            return self.url
-        if expression == "document.title":
-            return self.title
+    async def evaluate(self, expression: str) -> Any:
+        if "document.documentElement.outerHTML" in expression:
+            return {
+                "url": self.url,
+                "title": self.title,
+                "html": self.html,
+            }
         raise AssertionError(f"Unexpected evaluate expression: {expression}")
 
     async def get_content(self) -> str:
@@ -31,13 +33,17 @@ class _Page:
 
     async def select(self, selector: str, timeout: float) -> _Element:
         del timeout
-        try:
-            return self.selections[selector]
-        except KeyError:
-            raise LookupError(selector) from None
+        for configured_selector, element in self.selections.items():
+            if configured_selector in selector:
+                return element
+        raise LookupError(selector)
 
 
 class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detection_timeout_is_capped_at_five_seconds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot exceed 5 seconds"):
+            await CaptchaDetector().detect(_Page("<html></html>"), timeout=5.01)
+
     async def test_detects_static_turnstile_without_iframe(self) -> None:
         page = _Page("""
             <div class="cf-turnstile"
@@ -97,24 +103,13 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(detection.kind, "turnstile_widget")
 
-    async def test_dynamic_turnstile_timeout_is_terminal(self) -> None:
+    async def test_dynamic_widget_timeout_is_terminal(self) -> None:
         timeout = ZendriverOperationTimeout(timeout_seconds=2)
         page = _Page("<html></html>")
         page.select = AsyncMock(side_effect=timeout)  # type: ignore[method-assign]
 
         with self.assertRaises(ZendriverOperationTimeout) as raised:
-            await CaptchaDetector()._find_turnstile_widget(page, page.html, 0)
-
-        self.assertIs(raised.exception, timeout)
-        page.select.assert_awaited_once()
-
-    async def test_dynamic_recaptcha_timeout_is_terminal(self) -> None:
-        timeout = ZendriverOperationTimeout(timeout_seconds=2)
-        page = _Page("<html></html>")
-        page.select = AsyncMock(side_effect=timeout)  # type: ignore[method-assign]
-
-        with self.assertRaises(ZendriverOperationTimeout) as raised:
-            await CaptchaDetector()._find_recaptcha_div(page, 0)
+            await CaptchaDetector().detect(page, timeout=1)
 
         self.assertIs(raised.exception, timeout)
         page.select.assert_awaited_once()

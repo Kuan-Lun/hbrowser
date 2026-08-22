@@ -93,7 +93,17 @@ def _terminate_posix_target(
     *,
     force_requested: threading.Event,
 ) -> None:
-    _assert_target_group_identity(target)
+    target_exited = _target_exited_without_reaping(target)
+    if target_exited and not any(
+        pid != target.pid for pid in _process_group_members(target.pid)
+    ):
+        # A normally exiting target is still our unreaped child. Verify that
+        # its process group is empty, then reap it without requiring a live
+        # getpgid identity.
+        target.wait()
+        return
+    if not target_exited:
+        _assert_target_group_identity(target)
     if not force_requested.is_set():
         try:
             os.killpg(target.pid, signal.SIGTERM)
@@ -101,8 +111,15 @@ def _terminate_posix_target(
             pass
         deadline = time.monotonic() + _TERM_GRACE_SECONDS
         while time.monotonic() < deadline:
-            if force_requested.is_set() or _target_exited_without_reaping(target):
+            if force_requested.is_set():
                 break
+            target_exited = _target_exited_without_reaping(target)
+            descendants = tuple(
+                pid for pid in _process_group_members(target.pid) if pid != target.pid
+            )
+            if target_exited and not descendants:
+                target.wait()
+                return
             time.sleep(_POLL_SECONDS)
     try:
         os.killpg(target.pid, signal.SIGKILL)

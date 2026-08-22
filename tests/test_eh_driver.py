@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import multiprocessing
-import os
 import unittest
 from collections import defaultdict, deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, call, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from h2h_galleryinfo_parser import GalleryURLParser
@@ -38,17 +36,14 @@ from hbrowser import (
     SearchRequest,
 )
 from hbrowser.gallery.eh_driver import (
-    _SEARCH_DIAGNOSTIC_FILE_LIMIT,
-    _SEARCH_DIAGNOSTIC_FILENAME_PATTERN,
     _SEARCH_PAGE_SNAPSHOT_SCRIPT,
-    MAX_DOWNLOAD_RETRIES,
     EHDriver,
-    _locked_search_diagnostic_directory,
     _NextPageState,
     _parse_search_page,
 )
 from hbrowser.gallery.exh_driver import ExHDriver
 from hbrowser.gallery.utils import (
+    Deadline,
     ZendriverOperationTimeout,
     is_browser_generation_error,
 )
@@ -63,6 +58,33 @@ SCOPE_GALLERY = "https://exhentai.org/g/10/scope00000/"
 GID_349189_GALLERY = "https://exhentai.org/g/349189/f1bcce529e/"
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _DEFAULT_QUERY = object()
+
+
+class _ScriptedDeadline:
+    def __init__(self, *remaining: float) -> None:
+        self._remaining = deque(remaining)
+
+    def remaining(self) -> float:
+        return self._remaining.popleft() if self._remaining else 0.0
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+
+def _popup_after_mutation(
+    new_tab: object | None,
+) -> Callable[..., Awaitable[tuple[object, object | None]]]:
+    async def invoke(
+        _browser: object,
+        _existing_tabs: object,
+        mutation: Callable[[], Awaitable[object]],
+        **_kwargs: object,
+    ) -> tuple[object, object | None]:
+        result = await mutation()
+        return result, new_tab
+
+    return invoke
 
 
 async def _assert_generation_rejects_new_work(
@@ -102,16 +124,6 @@ class DriverDomainBoundaryTests(unittest.TestCase):
 def _search_url(query: str, **extra: str) -> str:
     parameters = [("f_search", query), ("f_cats", "0"), *extra.items()]
     return f"{EXH_HOME}?{urlencode(parameters)}"
-
-
-def _managed_diagnostic_paths(log_dir: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in log_dir.iterdir()
-        if _SEARCH_DIAGNOSTIC_FILENAME_PATTERN.fullmatch(path.name)
-        and path.is_file()
-        and not path.is_symlink()
-    )
 
 
 def _result_page(
@@ -255,12 +267,14 @@ class _HarnessExHDriver(ExHDriver):
         self.routes: defaultdict[str, deque[_Document]] = defaultdict(deque)
         self.get_failures: defaultdict[str, deque[BaseException]] = defaultdict(deque)
         self.get_urls = list[str]()
+        self.get_deadlines = list[Deadline | None]()
 
     def add_route(self, url: str, *documents: _Document) -> None:
         self.routes[url].extend(documents)
 
-    async def get(self, url: str) -> None:
+    async def get(self, url: str, *, deadline: Deadline | None = None) -> None:
         self.get_urls.append(url)
+        self.get_deadlines.append(deadline)
         if self.get_failures[url]:
             raise self.get_failures[url].popleft()
         if not self.routes[url]:
@@ -304,8 +318,10 @@ class PublicSearchContractTests(unittest.TestCase):
             {"scope_url": EXH_HOME, "query": 1},
             {"scope_url": EXH_HOME, "query": "gid:1", "max_pages": 0},
             {"scope_url": EXH_HOME, "query": "gid:1", "max_pages": True},
+            {"scope_url": EXH_HOME, "query": "gid:1", "max_pages": 101},
             {"scope_url": EXH_HOME, "query": "gid:1", "max_results": 0},
             {"scope_url": EXH_HOME, "query": "gid:1", "max_results": False},
+            {"scope_url": EXH_HOME, "query": "gid:1", "max_results": 5_001},
         )
 
         for arguments in invalid_arguments:
@@ -465,6 +481,23 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.sleep_patch.stop()
 
+    async def test_snapshot_completed_after_deadline_is_rejected(self) -> None:
+        driver = _HarnessExHDriver()
+        driver.page.evaluate = AsyncMock(
+            return_value={
+                "url": EXH_HOME,
+                "title": "Home",
+                "readyState": "complete",
+                "html": "<html></html>",
+                "query": None,
+            }
+        )
+        deadline = Mock()
+        deadline.remaining.side_effect = (1.0, 0.0)
+
+        with self.assertRaisesRegex(TimeoutError, "completed after"):
+            await driver._read_raw_page_snapshot(deadline=deadline)
+
     async def test_gid_349189_waits_for_new_loader_and_complete_snapshot(
         self,
     ) -> None:
@@ -497,7 +530,10 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             [349189],
         )
         self.assertEqual(driver.get_urls, [EXH_HOME, search_url])
-        self.assertEqual(driver.page.snapshot_reads_while_navigation_pending, 0)
+        # The harness overrides Driver.get and therefore does not emit the
+        # production lifecycle receipt. The atomic loader guard discards this
+        # one pre-navigation snapshot before returning the final document.
+        self.assertEqual(driver.page.snapshot_reads_while_navigation_pending, 1)
         self.assertGreaterEqual(
             driver.page.loader_observations.count("loader-1"),
             2,
@@ -557,15 +593,9 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             html_reads=(html,),
             ready_state_reads=("loading",),
         )
-        fake_loop = Mock()
-        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
         diagnostic_path = Path("/tmp/search-error.html")
 
         with (
-            patch(
-                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
-                return_value=fake_loop,
-            ),
             patch.object(
                 driver,
                 "_save_search_diagnostic",
@@ -573,7 +603,11 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             ) as save_diagnostic,
             self.assertRaises(SearchNavigationError) as raised,
         ):
-            await driver._read_stable_search_page(search_url, query)
+            await driver._read_stable_search_page(
+                search_url,
+                query,
+                deadline=_ScriptedDeadline(*([1.0] * 7), 0.0),  # type: ignore[arg-type]
+            )
 
         save_diagnostic.assert_awaited_once_with(html)
         self.assertEqual(raised.exception.url, search_url)
@@ -581,29 +615,19 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.diagnostic_path,
             str(diagnostic_path),
         )
-        self.assertIn("last readyState='loading'", raised.exception.reason)
-        self.assertIn(
-            "stable main-frame loader=True",
-            raised.exception.reason,
-        )
+        self.assertIn("did not become stable", raised.exception.reason)
+        self.assertIn("readyState='loading'", raised.exception.reason)
         self.assertIn(f"actual url={search_url!r}", raised.exception.reason)
         self.assertIn("title='Search results'", raised.exception.reason)
         self.assertIn(f"query={query!r}", raised.exception.reason)
         self.assertIn("loader before='loader-0'", raised.exception.reason)
-        self.assertIn("loader after='loader-0'", raised.exception.reason)
-        self.assertTrue(is_browser_generation_error(raised.exception))
-        self.assertIsInstance(
-            raised.exception.__cause__,
-            BrowserMutationOutcomeUnknownError,
-        )
-        await _assert_generation_rejects_new_work(
-            self,
-            browser=browser,
-            owner=driver.page,
-            exact_connection=driver.page,
-        )
+        self.assertFalse(is_browser_generation_error(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE, None)
+        if lifecycle is not None:
+            self.assertFalse(lifecycle.retired)
 
-    async def test_loading_timeout_diagnostic_failure_still_retires_page(
+    async def test_loading_timeout_diagnostic_failure_keeps_page_healthy(
         self,
     ) -> None:
         query = "gid:349189"
@@ -619,14 +643,7 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             html_reads=(_result_page(query, GID_349189_GALLERY),),
             ready_state_reads=("loading",),
         )
-        fake_loop = Mock()
-        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
-
         with (
-            patch(
-                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
-                return_value=fake_loop,
-            ),
             patch.object(
                 driver,
                 "_save_search_diagnostic",
@@ -634,25 +651,23 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(SearchNavigationError) as raised,
         ):
-            await driver._read_stable_search_page(search_url, query)
+            await driver._read_stable_search_page(
+                search_url,
+                query,
+                deadline=_ScriptedDeadline(*([1.0] * 7), 0.0),  # type: ignore[arg-type]
+            )
 
-        self.assertTrue(is_browser_generation_error(raised.exception))
-        self.assertIsInstance(
-            raised.exception.__cause__,
-            BrowserMutationOutcomeUnknownError,
-        )
+        self.assertFalse(is_browser_generation_error(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
         self.assertIn(
-            "could not save timeout diagnostic: OSError",
+            "could not save diagnostic: OSError",
             raised.exception.reason,
         )
-        await _assert_generation_rejects_new_work(
-            self,
-            browser=browser,
-            owner=driver.page,
-            exact_connection=driver.page,
-        )
+        lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE, None)
+        if lifecycle is not None:
+            self.assertFalse(lifecycle.retired)
 
-    async def test_loader_timeout_saves_the_actual_gallery_page(self) -> None:
+    async def test_stable_snapshot_preserves_the_actual_gallery_page(self) -> None:
         target_url = _search_url("gid:349189")
         gallery_html = "<html><head><title>Gallery</title></head></html>"
         driver = _HarnessExHDriver()
@@ -667,45 +682,16 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
             title="Gallery",
             live_query=None,
         )
-        fake_loop = Mock()
-        fake_loop.time.side_effect = (0.0, 0.0, 11.0)
-        diagnostic_path = Path("/tmp/gallery-timeout.html")
+        snapshot = await driver._read_stable_search_page(
+            target_url,
+            "gid:349189",
+            deadline=Deadline.after(1),
+        )
 
-        with (
-            patch(
-                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
-                return_value=fake_loop,
-            ),
-            patch.object(
-                driver,
-                "_save_search_diagnostic",
-                new=AsyncMock(return_value=diagnostic_path),
-            ) as save_diagnostic,
-            self.assertRaises(SearchNavigationError) as raised,
-        ):
-            await driver._wait_for_new_loader("loader-0", target_url)
-
-        save_diagnostic.assert_awaited_once_with(gallery_html)
-        self.assertEqual(raised.exception.diagnostic_path, str(diagnostic_path))
-        self.assertIn(
-            f"actual url={GID_349189_GALLERY!r}",
-            raised.exception.reason,
-        )
-        self.assertIn("title='Gallery'", raised.exception.reason)
-        self.assertIn("query=None", raised.exception.reason)
-        self.assertIn("capture loader before='loader-0'", raised.exception.reason)
-        self.assertIn("capture loader after='loader-0'", raised.exception.reason)
-        self.assertTrue(is_browser_generation_error(raised.exception))
-        self.assertIsInstance(
-            raised.exception.__cause__,
-            BrowserMutationOutcomeUnknownError,
-        )
-        await _assert_generation_rejects_new_work(
-            self,
-            browser=browser,
-            owner=driver.page,
-            exact_connection=driver.page,
-        )
+        self.assertEqual(snapshot.url, GID_349189_GALLERY)
+        self.assertEqual(snapshot.title, "Gallery")
+        self.assertIsNone(snapshot.query_value)
+        self.assertEqual(snapshot.html, gallery_html)
 
     async def test_snapshot_is_discarded_when_loader_changes_during_read(
         self,
@@ -1054,252 +1040,21 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SearchDiagnosticTests(unittest.IsolatedAsyncioTestCase):
-    async def test_search_diagnostics_keep_only_the_newest_files(self) -> None:
+    async def test_search_diagnostic_uses_shared_bounded_pipeline(self) -> None:
         driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            existing_paths = list[Path]()
-            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT + 2):
-                path = log_dir / f"search_error_{index:032x}.html"
-                path.write_text(f"old-{index}")
-                timestamp = index + 1
-                os.utime(path, ns=(timestamp, timestamp))
-                existing_paths.append(path)
+        expected_path = Path("search-error.html")
+        with patch.object(
+            driver,
+            "save_page_diagnostic",
+            new=AsyncMock(return_value=expected_path),
+        ) as save_page_diagnostic:
+            result = await driver._save_search_diagnostic("<html>failure</html>")
 
-            manual_path = log_dir / "search_error_manual_notes.html"
-            manual_path.write_text("keep me")
-            ignored_directory = log_dir / f"search_error_{'e' * 32}.html"
-            ignored_directory.mkdir()
-            ignored_symlink = log_dir / f"search_error_{'f' * 32}.html"
-            ignored_symlink.symlink_to(manual_path)
-
-            with patch(
-                "hbrowser.gallery.eh_driver.get_log_dir",
-                return_value=log_dir,
-            ):
-                created_path = await driver._save_search_diagnostic("new")
-
-            self.assertIsNotNone(created_path)
-            assert created_path is not None
-            remaining_paths = _managed_diagnostic_paths(log_dir)
-            self.assertEqual(
-                len(remaining_paths),
-                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
-            )
-            self.assertIn(created_path, remaining_paths)
-            self.assertEqual(created_path.read_text(), "new")
-            for path in existing_paths[:3]:
-                self.assertFalse(path.exists())
-            self.assertTrue(manual_path.exists())
-            self.assertTrue(ignored_directory.is_dir())
-            self.assertTrue(ignored_symlink.is_symlink())
-            self.assertEqual(created_path.stat().st_mode & 0o777, 0o600)
-            lock_path = log_dir / ".hbrowser-search-diagnostics.lock"
-            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
-
-    async def test_concurrent_writers_keep_both_new_diagnostics(self) -> None:
-        driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT - 1):
-                path = log_dir / f"search_error_{index:032x}.html"
-                path.write_text("old")
-                os.utime(path, ns=(10**18, 10**18))
-
-            with patch(
-                "hbrowser.gallery.eh_driver.get_log_dir",
-                return_value=log_dir,
-            ):
-                first_path, second_path = await asyncio.gather(
-                    driver._save_search_diagnostic("first"),
-                    driver._save_search_diagnostic("second"),
-                )
-
-            self.assertIsNotNone(first_path)
-            self.assertIsNotNone(second_path)
-            assert first_path is not None
-            assert second_path is not None
-            self.assertNotEqual(first_path, second_path)
-            self.assertTrue(first_path.exists())
-            self.assertTrue(second_path.exists())
-            self.assertEqual(
-                {first_path.read_text(), second_path.read_text()},
-                {"first", "second"},
-            )
-            self.assertEqual(
-                len(_managed_diagnostic_paths(log_dir)),
-                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
-            )
-
-    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
-    def test_fork_child_does_not_inherit_a_stuck_thread_lock(self) -> None:
-        context = multiprocessing.get_context("fork")
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            receive_connection, send_connection = context.Pipe(duplex=False)
-
-            def write_in_child() -> None:
-                receive_connection.close()
-                try:
-                    path = EHDriver._write_search_diagnostic(log_dir, "child")
-                except BaseException as error:
-                    send_connection.send((False, repr(error)))
-                else:
-                    send_connection.send((True, str(path)))
-                finally:
-                    send_connection.close()
-
-            with _locked_search_diagnostic_directory(log_dir):
-                process = context.Process(target=write_in_child)
-                process.start()
-
-            send_connection.close()
-            process.join(timeout=5)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-                self.fail("fork child remained blocked by the inherited lock")
-
-            self.assertEqual(process.exitcode, 0)
-            succeeded, detail = receive_connection.recv()
-            receive_connection.close()
-            process.close()
-            self.assertTrue(succeeded, detail)
-            self.assertTrue(Path(detail).exists())
-
-    async def test_search_diagnostics_obey_total_byte_budget(self) -> None:
-        driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            existing_paths = list[Path]()
-            for index in range(3):
-                path = log_dir / f"search_error_{index:032x}.html"
-                path.write_bytes(b"old!")
-                os.utime(path, ns=(index + 1, index + 1))
-                existing_paths.append(path)
-
-            with (
-                patch(
-                    "hbrowser.gallery.eh_driver.get_log_dir",
-                    return_value=log_dir,
-                ),
-                patch(
-                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_TOTAL_BYTES",
-                    12,
-                ),
-                patch(
-                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_MAX_FILE_BYTES",
-                    12,
-                ),
-            ):
-                created_path = await driver._save_search_diagnostic("new!!")
-
-            self.assertIsNotNone(created_path)
-            assert created_path is not None
-            remaining_paths = _managed_diagnostic_paths(log_dir)
-            self.assertLessEqual(
-                sum(path.stat().st_size for path in remaining_paths),
-                12,
-            )
-            self.assertFalse(existing_paths[0].exists())
-            self.assertFalse(existing_paths[1].exists())
-            self.assertTrue(existing_paths[2].exists())
-
-    async def test_oversized_search_diagnostic_is_truncated(self) -> None:
-        driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            with (
-                patch(
-                    "hbrowser.gallery.eh_driver.get_log_dir",
-                    return_value=log_dir,
-                ),
-                patch(
-                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_MAX_FILE_BYTES",
-                    256,
-                ),
-                patch(
-                    "hbrowser.gallery.eh_driver._SEARCH_DIAGNOSTIC_TOTAL_BYTES",
-                    512,
-                ),
-            ):
-                created_path = await driver._save_search_diagnostic("x" * 1000)
-
-            self.assertIsNotNone(created_path)
-            assert created_path is not None
-            content = created_path.read_bytes()
-            self.assertLessEqual(len(content), 256)
-            self.assertIn(b"hbrowser search diagnostic truncated", content)
-
-    async def test_partial_write_is_removed(self) -> None:
-        class _FailingWriter:
-            def __init__(self, descriptor: int) -> None:
-                self.descriptor = descriptor
-
-            def __enter__(self) -> _FailingWriter:
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                del args
-                os.close(self.descriptor)
-
-            def write(self, content: bytes) -> int:
-                os.write(self.descriptor, content[:1])
-                raise OSError("simulated partial write")
-
-        driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-
-            with (
-                patch(
-                    "hbrowser.gallery.eh_driver.get_log_dir",
-                    return_value=log_dir,
-                ),
-                patch(
-                    "hbrowser.gallery.eh_driver.os.fdopen",
-                    side_effect=lambda descriptor, mode: _FailingWriter(descriptor),
-                ),
-            ):
-                created_path = await driver._save_search_diagnostic("content")
-
-            self.assertIsNone(created_path)
-            self.assertEqual(_managed_diagnostic_paths(log_dir), [])
-
-    async def test_prune_failure_does_not_add_another_file(self) -> None:
-        driver = _HarnessExHDriver()
-        with TemporaryDirectory() as temp_dir:
-            log_dir = Path(temp_dir)
-            existing_paths = list[Path]()
-            for index in range(_SEARCH_DIAGNOSTIC_FILE_LIMIT):
-                path = log_dir / f"search_error_{index:032x}.html"
-                path.write_text("old")
-                os.utime(path, ns=(index + 1, index + 1))
-                existing_paths.append(path)
-
-            original_unlink = Path.unlink
-
-            def fail_oldest_unlink(path: Path, missing_ok: bool = False) -> None:
-                if path == existing_paths[0]:
-                    raise PermissionError("simulated retention failure")
-                original_unlink(path, missing_ok=missing_ok)
-
-            with (
-                patch(
-                    "hbrowser.gallery.eh_driver.get_log_dir",
-                    return_value=log_dir,
-                ),
-                patch.object(
-                    Path, "unlink", autospec=True, side_effect=fail_oldest_unlink
-                ),
-            ):
-                created_path = await driver._save_search_diagnostic("new")
-
-            self.assertIsNone(created_path)
-            self.assertEqual(
-                len(_managed_diagnostic_paths(log_dir)),
-                _SEARCH_DIAGNOSTIC_FILE_LIMIT,
-            )
+        self.assertEqual(result, expected_path)
+        save_page_diagnostic.assert_awaited_once_with(
+            "search_error",
+            "<html>failure</html>",
+        )
 
 
 class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -1627,6 +1382,14 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
             driver.get_urls,
             [EXH_HOME, search_url, EXH_HOME, search_url],
         )
+        lookup_deadlines = [
+            deadline for deadline in driver.get_deadlines if deadline is not None
+        ]
+        self.assertEqual(len(lookup_deadlines), 4)
+        self.assertEqual(
+            {deadline.expires_at for deadline in lookup_deadlines},
+            {lookup_deadlines[0].expires_at},
+        )
         result_loader_ids = driver.page.completed_navigation_loaders[1::2]
         self.assertEqual(len(result_loader_ids), 2)
         self.assertEqual(len(set(result_loader_ids)), 2)
@@ -1815,7 +1578,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             downloaded = await driver.download(gallery)
 
         self.assertTrue(downloaded)
-        self.assertEqual(driver.myget.await_count, 2)
+        self.assertEqual(driver.myget.await_count, 1)
         self.assertEqual(gallery_page.xpath.await_count, 4)
         gallery_page.close.assert_not_awaited()
         archive_link.click.assert_awaited_once()
@@ -1905,10 +1668,15 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver.browser = browser
         driver.myget = AsyncMock()
 
+        async def save_retired_diagnostic(kind: str, html: str) -> None:
+            self.assertEqual((kind, html), ("download_timeout", ""))
+            lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE)
+            self.assertTrue(lifecycle.retired)
+
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(side_effect=[first_archive_page, second_archive_page]),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(first_archive_page)),
             ),
             patch(
                 "hbrowser.gallery.eh_driver.asyncio.sleep",
@@ -1917,8 +1685,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 driver,
                 "save_page_diagnostic",
-                new=AsyncMock(return_value=None),
-            ),
+                new=AsyncMock(side_effect=save_retired_diagnostic),
+            ) as save_diagnostic,
         ):
             with self.assertRaises(ArchiveDownloadOutcomeUnknownError):
                 await driver.download(gallery)
@@ -1930,6 +1698,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         second_archive_page.close.assert_not_awaited()
         gallery_page.activate.assert_not_awaited()
         self.assertIs(driver.page, first_archive_page)
+        first_archive_page.get_content.assert_awaited_once_with()
+        save_diagnostic.assert_awaited_once_with("download_timeout", "")
         await _assert_generation_rejects_new_work(
             self,
             browser=browser,
@@ -1963,8 +1733,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(return_value=archive_page),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
             ),
             patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
             patch.object(
@@ -1982,7 +1752,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             await driver.download(gallery)
 
         self.assertIs(raised.exception, timeout)
-        driver.get.assert_awaited_once_with(gallery.url)
+        driver.get.assert_awaited_once_with(gallery.url, deadline=ANY)
         archive_link.click.assert_awaited_once_with()
         archive_page.get_content.assert_awaited_once_with()
         save_diagnostic.assert_not_awaited()
@@ -2017,8 +1787,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(return_value=archive_page),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
             ),
             patch.object(
                 driver,
@@ -2067,8 +1837,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(return_value=archive_page),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
             ),
             patch.object(
                 driver,
@@ -2129,13 +1899,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             await driver.download(gallery)
 
         archive_link.click.assert_awaited_once_with()
-        driver.myget.assert_awaited_once_with(gallery.url)
-        await _assert_generation_rejects_new_work(
-            self,
-            browser=browser,
-            owner=gallery_page,
-            exact_connection=gallery_page,
-        )
+        driver.myget.assert_awaited_once_with(gallery.url, deadline=ANY)
 
     async def test_archive_generic_click_failure_is_not_replayed(self) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
@@ -2176,7 +1940,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(raised.exception.__cause__)
         self.assertIsNone(raised.exception.__context__)
         archive_link.click.assert_awaited_once_with()
-        driver.myget.assert_awaited_once_with(gallery.url)
+        driver.myget.assert_awaited_once_with(gallery.url, deadline=ANY)
 
     async def test_missing_archive_tab_after_click_is_not_replayed(self) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
@@ -2211,8 +1975,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(return_value=None),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(None)),
             ),
             patch("hbrowser.gallery.eh_driver.asyncio.sleep", new=AsyncMock()),
             self.assertRaises(ArchiveDownloadOutcomeUnknownError),
@@ -2220,13 +1984,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             await driver.download(gallery)
 
         archive_link.click.assert_awaited_once_with()
-        driver.myget.assert_awaited_once_with(gallery.url)
-        await _assert_generation_rejects_new_work(
-            self,
-            browser=browser,
-            owner=gallery_page,
-            exact_connection=gallery_page,
-        )
+        driver.myget.assert_awaited_once_with(gallery.url, deadline=ANY)
+        lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE, None)
+        if lifecycle is not None:
+            self.assertFalse(lifecycle.retired)
 
     async def test_client_offline_cleanup_activation_failure_is_terminal(self) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
@@ -2267,8 +2028,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.wait_for_new_tab",
-                new=AsyncMock(return_value=archive_page),
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
             ),
             patch(
                 "hbrowser.gallery.eh_driver.asyncio.sleep",
@@ -2344,18 +2105,22 @@ class GalleryDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):
         driver.browser = SimpleNamespace(tabs=[])
         driver.myget = AsyncMock()
 
-        with self.assertRaises(RuntimeError) as raised:
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.wait_for_xpath",
+                new=AsyncMock(side_effect=TimeoutError),
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
             await driver.download(gallery)
 
-        self.assertIn(f"after {MAX_DOWNLOAD_RETRIES} attempts", str(raised.exception))
+        self.assertIn("did not become ready", str(raised.exception))
         self.assertIn("gid=7654321", str(raised.exception))
         driver.logger.warning.assert_any_call(
-            "Archive Download control unavailable; retrying: "
-            "gid=%d attempt=%d/%d error_type=%s",
+            "Archive Download control did not become ready before its "
+            "shared deadline: gid=%d error_type=%s",
             gallery.gid,
-            1,
-            MAX_DOWNLOAD_RETRIES,
-            "RuntimeError",
+            "TimeoutError",
         )
         self.assertNotIn(sentinel, repr(driver.logger.method_calls))
         self.assertNotIn(sentinel, str(raised.exception))

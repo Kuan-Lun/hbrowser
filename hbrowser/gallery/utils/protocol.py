@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 
 _LIFECYCLE_ATTRIBUTE = "_hbrowser_zendriver_lifecycle"
 _OPERATION_DRAIN_TIMEOUT_SECONDS = 2.0
+MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS = 5.0
 # Only cancellation-resistant tasks enter this set, after retirement has made
 # them ineligible for normal lifecycle ownership. asyncio keeps weak references
 # to tasks, so a strong reference is required until each orphan finally exits.
@@ -51,6 +52,7 @@ class _ZendriverLifecycle:
     operations: dict[asyncio.Future[Any], Any | None] = field(default_factory=dict)
     operation_owners: dict[asyncio.Future[Any], Any] = field(default_factory=dict)
     shutdown_task: asyncio.Task[None] | None = None
+    shutdown_deadline_expires_at: float | None = None
     browser_stop_task: asyncio.Future[Any] | None = None
     tor_stop_task: asyncio.Future[Any] | None = None
     shutdown_connections: list[Any] = field(default_factory=list)
@@ -383,6 +385,24 @@ class _ZendriverRetirement:
             raise RuntimeError("Zendriver browser shutdown is already bound")
         self.lifecycle.shutdown_task = task
 
+    def bind_shutdown_deadline(self, expires_at: float) -> float:
+        """Bind one absolute cleanup deadline to this browser generation."""
+
+        existing = self.lifecycle.shutdown_deadline_expires_at
+        if existing is None:
+            self.lifecycle.shutdown_deadline_expires_at = expires_at
+            return expires_at
+        return existing
+
+    def replace_shutdown_deadline(self, expires_at: float) -> float:
+        """Start one explicit fallback attempt after a completed failed task."""
+
+        task = self.lifecycle.shutdown_task
+        if task is None or not task.done() or self.lifecycle.shutdown_complete:
+            raise RuntimeError("Zendriver shutdown deadline is not replaceable")
+        self.lifecycle.shutdown_deadline_expires_at = expires_at
+        return expires_at
+
     def replace_completed_shutdown_task(self, task: asyncio.Task[None]) -> None:
         existing = self.lifecycle.shutdown_task
         if existing is None or not existing.done():
@@ -668,6 +688,12 @@ def _validate_zendriver_operation(
 
     try:
         timeout_seconds = _validated_timeout(timeout)
+        if timeout_seconds > MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS:
+            raise ValueError(
+                "Zendriver command watchdogs must not exceed "
+                f"{MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS:g} seconds; use a "
+                "separate monotonic semantic deadline for multi-phase waits"
+            )
         browser, connection = _resolve_owner(owner)
         lifecycle = _lifecycle_for(browser, create=True)
         assert lifecycle is not None
@@ -714,7 +740,7 @@ async def wait_for_zendriver[T](
 ) -> T:
     """Bound a protocol await without cancelling its live transaction.
 
-    Zendriver 0.15 leaves cancelled Transactions in its response mapper. A late
+    Zendriver 0.16 leaves cancelled Transactions in its response mapper. A late
     Chrome reply then calls ``set_result`` on the cancelled Future and kills the
     connection listener. This watchdog therefore retains timed-out work under
     its exact browser generation and transport until a response arrives or the

@@ -1,5 +1,8 @@
 """Strict boundary for state-changing Zendriver operations."""
 
+import asyncio
+import inspect
+import math
 from collections.abc import Awaitable
 from typing import Any
 
@@ -18,6 +21,7 @@ async def wait_for_zendriver_mutation[ResultT](
     timeout: float,
     owner: Any,
     operation: str,
+    completion_deadline_expires_at: float | None = None,
 ) -> ResultT:
     """Run one mutation and make an unclassified failure generation-terminal.
 
@@ -25,8 +29,24 @@ async def wait_for_zendriver_mutation[ResultT](
     been invoked.  Protocol/lifecycle failures retain their exact type.  Any
     other failure cannot prove whether the remote mutation took effect, so it
     is converted to the common outcome-unknown marker without retaining a
-    possibly sensitive protocol payload.
+    possibly sensitive protocol payload.  When an absolute completion deadline
+    is supplied, an acknowledgement delivered at or after that boundary is
+    likewise outcome-unknown and retires the captured browser generation.
     """
+    try:
+        if completion_deadline_expires_at is not None and (
+            isinstance(completion_deadline_expires_at, bool)
+            or not isinstance(completion_deadline_expires_at, int | float)
+            or not math.isfinite(completion_deadline_expires_at)
+        ):
+            raise ValueError(
+                "completion_deadline_expires_at must be a finite monotonic time"
+            )
+    except Exception:
+        if inspect.iscoroutine(awaitable):
+            awaitable.close()
+        raise
+
     # Keep caller/owner validation outside the mutation-failure branch. Invalid
     # local arguments reject and dispose an unscheduled coroutine without
     # retiring a browser generation that never accepted the operation.
@@ -37,11 +57,19 @@ async def wait_for_zendriver_mutation[ResultT](
     )
 
     try:
-        return await wait_for_zendriver(
+        result = await wait_for_zendriver(
             awaitable,
             timeout=timeout,
             owner=owner,
         )
+        if (
+            completion_deadline_expires_at is not None
+            and asyncio.get_running_loop().time() >= completion_deadline_expires_at
+        ):
+            raise TimeoutError(
+                f"{operation} acknowledgement arrived after its semantic deadline"
+            )
+        return result
     except Exception as error:
         # Once a valid mutation awaitable has run, every failure that does not
         # prove a clean result makes this exact owner generation unusable.

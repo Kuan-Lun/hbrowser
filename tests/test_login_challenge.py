@@ -42,6 +42,19 @@ class _Page:
         return result
 
 
+class _ScriptedDeadline:
+    def __init__(self, *, expired: list[bool], remaining: list[float]) -> None:
+        self._expired = deque(expired)
+        self._remaining = deque(remaining)
+
+    @property
+    def expired(self) -> bool:
+        return self._expired.popleft()
+
+    def remaining(self) -> float:
+        return self._remaining.popleft()
+
+
 class _Solver:
     def __init__(
         self,
@@ -83,6 +96,29 @@ def _handler(
 
 
 class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def test_turnstile_tab_count_is_a_bounded_integer(self) -> None:
+        for invalid in (0, True, 1.5, float("inf"), 31, 10**9):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                LoginChallengeHandler(
+                    detector=_Detector("none"),
+                    logger=logging.getLogger("test-login-challenge"),
+                    headless=False,
+                    manual_timeout=30,
+                    turnstile_tabs=invalid,  # type: ignore[arg-type]
+                    automatic_solver=None,
+                )
+
+    def test_manual_timeout_cannot_exceed_human_wait_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\(0, 180\]"):
+            LoginChallengeHandler(
+                detector=_Detector("none"),
+                logger=logging.getLogger("test-login-challenge"),
+                headless=False,
+                manual_timeout=181,
+                turnstile_tabs=15,
+                automatic_solver=None,
+            )
+
     async def test_auto_turnstile_token_is_injected(self) -> None:
         page = _Page("", True)
         solver = _Solver(token="generated-token")
@@ -223,3 +259,75 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "#g-recaptcha-response" in expression for expression in page.expressions
             )
         )
+
+    async def test_expired_manual_deadline_does_not_read_token_again(self) -> None:
+        page = _Page()
+        handler = _handler("recaptcha_v2", solver=None)
+        read_token = AsyncMock(return_value="")
+
+        with (
+            patch.object(handler, "_read_response_token", read_token),
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.Deadline.after",
+                return_value=_ScriptedDeadline(expired=[True], remaining=[]),
+            ),
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler.resolve(page)
+
+        read_token.assert_awaited_once()
+        sleep.assert_not_awaited()
+
+    async def test_near_manual_deadline_bounds_token_read_and_sleep(self) -> None:
+        page = _Page()
+        handler = _handler("recaptcha_v2", solver=None)
+        read_token = AsyncMock(return_value="")
+        deadline = _ScriptedDeadline(
+            expired=[False, True],
+            remaining=[0.25, 0.05],
+        )
+
+        with (
+            patch.object(handler, "_read_response_token", read_token),
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.Deadline.after",
+                return_value=deadline,
+            ),
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler.resolve(page)
+
+        self.assertEqual(read_token.await_count, 2)
+        self.assertEqual(read_token.await_args_list[1].kwargs["timeout"], 0.25)
+        sleep.assert_awaited_once_with(0.05)
+
+    async def test_token_observed_after_manual_deadline_is_not_accepted(self) -> None:
+        page = _Page("", "late-token")
+        handler = _handler("recaptcha_v2", solver=None)
+        deadline = _ScriptedDeadline(
+            expired=[False],
+            remaining=[0.25, 0.0],
+        )
+
+        with (
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.Deadline.after",
+                return_value=deadline,
+            ),
+            patch(
+                "hbrowser.gallery.captcha.login_challenge.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaises(LoginFailedException),
+        ):
+            await handler.resolve(page)
+
+        sleep.assert_not_awaited()

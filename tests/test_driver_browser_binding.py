@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import DriverBrowserBindingError
 from hbrowser.gallery.driver_base import Driver
@@ -13,6 +13,10 @@ class _TestDriver(Driver):
 
 
 class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
+    def test_manual_captcha_timeout_is_capped_at_180_seconds(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\(0, 180\]"):
+            _TestDriver(captcha_manual_timeout=181)
+
     def test_new_driver_is_unbound_and_does_not_own_a_browser(self) -> None:
         driver = _TestDriver()
 
@@ -159,7 +163,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
             await shared.__aexit__(None, None, None)
             await owner.__aexit__(None, None, None)
 
-        stop_browser.assert_awaited_once_with(browser)
+        stop_browser.assert_awaited_once_with(browser, deadline=ANY)
 
     async def test_startup_failure_with_no_browser_has_quiet_cleanup(self) -> None:
         driver = _TestDriver()

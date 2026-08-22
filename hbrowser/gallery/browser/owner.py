@@ -15,15 +15,16 @@ from functools import partial
 from typing import Any, Self, cast
 from uuid import uuid4
 
-from ..utils.mutation import wait_for_zendriver_mutation
+from ..utils import Deadline, navigate_and_wait, open_tab_and_wait
 from .factory import create_browser, stop_browser
 
-_TAB_OPEN_TIMEOUT_SECONDS = 15.0
-_TAB_NAVIGATION_TIMEOUT_SECONDS = 15.0
+_TAB_OPEN_DEADLINE_SECONDS = 10.0
+_TAB_NAVIGATION_DEADLINE_SECONDS = 10.0
 _COMMAND_DRAIN_TIMEOUT_SECONDS = 5.0
+_OWNER_CLOSE_DEADLINE_SECONDS = 15.0
 
 type BrowserFactory[BrowserT, TabT] = Callable[[], Awaitable[tuple[BrowserT, TabT]]]
-type BrowserCloser[BrowserT] = Callable[[BrowserT], Awaitable[None]]
+type BrowserCloser[BrowserT] = Callable[[BrowserT, Deadline], Awaitable[None]]
 type TabFactory[BrowserT, TabT] = Callable[[BrowserT], Awaitable[TabT]]
 type TabNavigator[TabT] = Callable[[TabT, str], Awaitable[None]]
 type TargetIdGetter[TabT] = Callable[[TabT], str]
@@ -31,6 +32,10 @@ type TargetIdGetter[TabT] = Callable[[TabT], str]
 
 class BrowserOwnershipError(RuntimeError):
     """Base error for browser ownership and tab binding failures."""
+
+
+class _BrowserCloserCompletedAfterDeadline(BrowserOwnershipError):
+    """The closer proved release, but only after its caller deadline."""
 
 
 class BrowserOwnerStateError(BrowserOwnershipError):
@@ -64,21 +69,24 @@ class TabHandle:
 
 
 async def _open_zendriver_tab(browser: Any) -> Any:
-    return await wait_for_zendriver_mutation(
-        browser.get("about:blank", new_tab=True),
-        timeout=_TAB_OPEN_TIMEOUT_SECONDS,
-        owner=browser.connection,
-        operation="Browser tab creation",
+    return await open_tab_and_wait(
+        browser,
+        deadline=Deadline.after(_TAB_OPEN_DEADLINE_SECONDS),
     )
 
 
 async def _navigate_zendriver_tab(tab: Any, url: str) -> None:
-    await wait_for_zendriver_mutation(
-        tab.get(url),
-        timeout=_TAB_NAVIGATION_TIMEOUT_SECONDS,
-        owner=tab,
-        operation="Browser tab navigation",
+    await navigate_and_wait(
+        tab,
+        url,
+        deadline=Deadline.after(_TAB_NAVIGATION_DEADLINE_SECONDS),
     )
+
+
+async def _close_zendriver_browser(browser: Any, deadline: Deadline) -> None:
+    """Forward the owner's exact absolute deadline into browser retirement."""
+
+    await stop_browser(browser, deadline)
 
 
 def _get_zendriver_target_id(tab: Any) -> str:
@@ -208,7 +216,7 @@ class BrowserOwner[BrowserT, TabT]:
         )
         self._browser_closer = browser_closer or cast(
             BrowserCloser[BrowserT],
-            stop_browser,
+            _close_zendriver_browser,
         )
         self._tab_factory = tab_factory or cast(
             TabFactory[BrowserT, TabT],
@@ -231,6 +239,8 @@ class BrowserOwner[BrowserT, TabT]:
         self._tabs_by_target: dict[str, TabTransport[TabT]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._close_deadline: Deadline | None = None
+        self._browser_closer_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _validate_role(role: str) -> None:
@@ -318,8 +328,9 @@ class BrowserOwner[BrowserT, TabT]:
             except BaseException as startup_error:
                 self._state = BrowserOwnerState.CLOSING
                 if browser is not None:
+                    close_deadline = self._shared_close_deadline()
                     try:
-                        await self._browser_closer(browser)
+                        await self._run_browser_closer(browser, close_deadline)
                     except BaseException as cleanup_error:
                         startup_error.add_note(
                             "browser cleanup after startup failure also failed: "
@@ -368,7 +379,88 @@ class BrowserOwner[BrowserT, TabT]:
                 await transport.navigate(url)
             return transport
 
-    async def _finish_close(self) -> None:
+    def _shared_close_deadline(
+        self,
+        requested_deadline: Deadline | None = None,
+    ) -> Deadline:
+        close_deadline = self._close_deadline
+        if close_deadline is None:
+            close_deadline = requested_deadline or Deadline.after(
+                _OWNER_CLOSE_DEADLINE_SECONDS
+            )
+            self._close_deadline = close_deadline
+        return close_deadline
+
+    @staticmethod
+    def _observe_close_task(task: asyncio.Task[None]) -> None:
+        """Retrieve a detached caller's cleanup failure without dropping ownership."""
+
+        if not task.cancelled():
+            task.exception()
+
+    async def _run_browser_closer(
+        self,
+        browser: BrowserT,
+        deadline: Deadline,
+    ) -> None:
+        """Run or reconcile one injected closer without resetting its deadline."""
+
+        task = self._browser_closer_task
+        if task is not None and task.done():
+            self._browser_closer_task = None
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                task = None
+            except BaseException:
+                task = None
+            else:
+                if deadline.expired:
+                    raise _BrowserCloserCompletedAfterDeadline(
+                        "Browser closer completed after its shared ownership deadline"
+                    )
+                return
+
+        if task is None:
+            if deadline.expired:
+                raise BrowserOwnershipError(
+                    "Browser closer was not started after its ownership deadline"
+                )
+
+            async def invoke_closer() -> None:
+                await self._browser_closer(browser, deadline)
+
+            task = asyncio.create_task(
+                invoke_closer(),
+                name=f"browser-closer-{self._owner_id}",
+            )
+            self._browser_closer_task = task
+
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            task.cancel()
+            raise BrowserOwnershipError(
+                "Browser closer exceeded its shared ownership deadline"
+            )
+        done, _ = await asyncio.wait((task,), timeout=remaining)
+        if not done:
+            task.cancel()
+            raise BrowserOwnershipError(
+                "Browser closer exceeded its shared ownership deadline"
+            )
+        self._browser_closer_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError as error:
+            raise BrowserOwnershipError(
+                "Browser closer was cancelled before ownership was released"
+            ) from error
+        if deadline.expired:
+            raise _BrowserCloserCompletedAfterDeadline(
+                "Browser closer completed after its shared ownership deadline"
+            )
+
+    async def _finish_close(self, close_deadline: Deadline) -> None:
         errors: list[BaseException] = []
         browser_closed = self._browser is None
         browser = self._browser
@@ -377,30 +469,48 @@ class BrowserOwner[BrowserT, TabT]:
                 # Tombstone and close the browser before waiting for command
                 # locks. Closing the transports is what wakes a stuck CDP
                 # command; draining first can deadlock forever.
-                await self._browser_closer(browser)
+                await self._run_browser_closer(browser, close_deadline)
+            except _BrowserCloserCompletedAfterDeadline as error:
+                browser_closed = True
+                errors.append(error)
             except BaseException as error:
                 errors.append(error)
             else:
                 browser_closed = True
 
         if self._tabs_by_role:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        *(
-                            transport._drain()
-                            for transport in self._tabs_by_role.values()
+            drain_timeout = min(
+                _COMMAND_DRAIN_TIMEOUT_SECONDS,
+                close_deadline.remaining(),
+            )
+            if drain_timeout <= 0:
+                if any(
+                    transport._command_lock.locked()
+                    for transport in self._tabs_by_role.values()
+                ):
+                    errors.append(
+                        TimeoutError(
+                            "Browser-owner close deadline expired before tab drain"
                         )
-                    ),
-                    timeout=_COMMAND_DRAIN_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                errors.append(
-                    TimeoutError(
-                        "Browser tab commands did not drain within "
-                        f"{_COMMAND_DRAIN_TIMEOUT_SECONDS:g} seconds"
                     )
-                )
+            else:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(
+                                transport._drain()
+                                for transport in self._tabs_by_role.values()
+                            )
+                        ),
+                        timeout=drain_timeout,
+                    )
+                except TimeoutError:
+                    errors.append(
+                        TimeoutError(
+                            "Browser tab commands did not drain within the shared "
+                            f"{_OWNER_CLOSE_DEADLINE_SECONDS:g}-second close deadline"
+                        )
+                    )
 
         if browser_closed:
             self._browser = None
@@ -417,36 +527,83 @@ class BrowserOwner[BrowserT, TabT]:
                 )
             raise primary
 
-    async def close(self) -> None:
-        """Run one shared close attempt, retaining the browser after failure."""
+    async def close(self, *, deadline: Deadline | None = None) -> None:
+        """Run one shared close attempt within the first caller's deadline."""
 
-        async with self._lifecycle_lock:
+        # Capture the caller's absolute boundary before contending on the
+        # lifecycle lock. The first close owns this generation's single
+        # deadline; concurrent and retrying callers cannot reset it.
+        requested_deadline = (
+            Deadline.after(_OWNER_CLOSE_DEADLINE_SECONDS)
+            if deadline is None
+            else deadline.bounded(_OWNER_CLOSE_DEADLINE_SECONDS)
+        )
+
+        lock_timeout = requested_deadline.remaining()
+        if lock_timeout <= 0:
+            raise BrowserOwnershipError(
+                "Browser-owner close caller deadline expired before lifecycle lock"
+            )
+        try:
+            await asyncio.wait_for(
+                self._lifecycle_lock.acquire(),
+                timeout=lock_timeout,
+            )
+        except TimeoutError:
+            raise BrowserOwnershipError(
+                "Browser-owner close caller deadline expired waiting for lifecycle lock"
+            ) from None
+        try:
+            if requested_deadline.expired:
+                raise BrowserOwnershipError(
+                    "Browser-owner close caller deadline expired waiting for lifecycle lock"
+                )
             if self._close_task is not None and self._close_task.done():
                 completed_task = self._close_task
-                if not completed_task.cancelled():
-                    completed_task.exception()
+                completed_error = (
+                    None if completed_task.cancelled() else completed_task.exception()
+                )
                 self._close_task = None
+                if self._state is not BrowserOwnerState.CLOSED and (
+                    completed_task.cancelled() or completed_error is not None
+                ):
+                    # A completed failed cleanup is a finished attempt. An
+                    # explicit later close may use a new caller-owned deadline;
+                    # calls that overlap the same live task never reset it.
+                    self._close_deadline = None
             if self._close_task is not None:
                 close_task = self._close_task
             elif self._state is BrowserOwnerState.CLOSED:
                 return
+            elif requested_deadline.expired:
+                raise BrowserOwnershipError(
+                    "Browser-owner close caller deadline expired before cleanup"
+                )
             else:
                 self._state = BrowserOwnerState.CLOSING
+                close_deadline = self._shared_close_deadline(requested_deadline)
                 self._close_task = asyncio.create_task(
-                    self._finish_close(),
+                    self._finish_close(close_deadline),
                     name=f"browser-owner-close-{self._owner_id}",
                 )
                 close_task = self._close_task
+                close_task.add_done_callback(self._observe_close_task)
+        finally:
+            self._lifecycle_lock.release()
 
-        # One caller being cancelled must not cancel the shared browser cleanup.
-        try:
-            await asyncio.shield(close_task)
-        except BaseException:
-            if close_task.done():
-                async with self._lifecycle_lock:
-                    if self._close_task is close_task:
-                        self._close_task = None
-            raise
+        # One caller being cancelled or reaching its own outer boundary must
+        # not cancel the shared browser cleanup.
+        remaining = requested_deadline.remaining()
+        if remaining <= 0:
+            raise BrowserOwnershipError("Browser-owner close caller deadline expired")
+        done, _ = await asyncio.wait((close_task,), timeout=remaining)
+        if not done:
+            raise BrowserOwnershipError("Browser-owner close caller deadline expired")
+        close_task.result()
+        if requested_deadline.expired:
+            raise BrowserOwnershipError(
+                "Browser-owner close completed after its caller deadline"
+            )
 
     async def __aenter__(self) -> Self:
         return await self.start()

@@ -7,6 +7,7 @@ from hbrowser.gallery.browser import FlareSolverrResult
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.forums_auth import ForumsAuthState
 from hbrowser.gallery.utils import (
+    Deadline,
     ZendriverOperationTimeout,
 )
 from hbrowser.gallery.utils.protocol import ZendriverOwnerRetiredError
@@ -82,33 +83,34 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
         driver.logger = Mock()
         return driver
 
-    async def test_url_change_timeout_does_not_poll_or_sleep_again(self) -> None:
+    async def test_get_delegates_to_lifecycle_navigation_without_polling(self) -> None:
         driver = self._driver()
-        timeout = ZendriverOperationTimeout(timeout_seconds=5)
-        driver.page = SimpleNamespace(evaluate=AsyncMock(side_effect=timeout))
-
-        with (
-            patch(
-                "hbrowser.gallery.driver_base.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep,
-            self.assertRaises(ZendriverOperationTimeout) as raised,
-        ):
-            await driver._wait_for_url_change("https://example.test/old")
-
-        self.assertIs(raised.exception, timeout)
-        driver.page.evaluate.assert_awaited_once_with("window.location.href")
-        sleep.assert_not_awaited()
-
-    async def test_get_poll_timeout_skips_final_delay(self) -> None:
-        driver = self._driver()
-        timeout = ZendriverOperationTimeout(timeout_seconds=5)
-        driver.page = SimpleNamespace(
-            evaluate=AsyncMock(
-                side_effect=["https://example.test/old", timeout],
-            ),
-        )
+        driver.page = SimpleNamespace(evaluate=AsyncMock())
         driver.myget = AsyncMock()
+
+        await driver.get("https://example.test/new")
+
+        driver.myget.assert_awaited_once_with("https://example.test/new")
+        driver.page.evaluate.assert_not_awaited()
+
+    async def test_get_forwards_a_shared_semantic_deadline(self) -> None:
+        driver = self._driver()
+        driver.page = SimpleNamespace(evaluate=AsyncMock())
+        driver.myget = AsyncMock()
+        deadline = Deadline.after(1)
+
+        await driver.get("https://example.test/new", deadline=deadline)
+
+        driver.myget.assert_awaited_once_with(
+            "https://example.test/new",
+            deadline=deadline,
+        )
+
+    async def test_get_preserves_lifecycle_navigation_timeout(self) -> None:
+        driver = self._driver()
+        timeout = ZendriverOperationTimeout(timeout_seconds=5)
+        driver.page = SimpleNamespace(evaluate=AsyncMock())
+        driver.myget = AsyncMock(side_effect=timeout)
 
         with (
             patch(
@@ -120,79 +122,25 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
             await driver.get("https://example.test/new")
 
         self.assertIs(raised.exception, timeout)
-        self.assertEqual(driver.page.evaluate.await_count, 2)
         driver.myget.assert_awaited_once_with("https://example.test/new")
+        driver.page.evaluate.assert_not_awaited()
         sleep.assert_not_awaited()
 
-    async def test_same_url_page_wait_timeout_skips_final_delay(self) -> None:
+    async def test_get_same_url_does_not_add_page_wait_or_delay(self) -> None:
         driver = self._driver()
-        timeout = ZendriverOperationTimeout(timeout_seconds=5)
         driver.page = SimpleNamespace(
-            evaluate=AsyncMock(return_value="https://example.test/same"),
-            wait=AsyncMock(side_effect=timeout),
+            evaluate=AsyncMock(),
+            wait=AsyncMock(),
         )
         driver.myget = AsyncMock()
 
-        with (
-            patch(
-                "hbrowser.gallery.driver_base.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep,
-            self.assertRaises(ZendriverOperationTimeout) as raised,
-        ):
+        with patch(
+            "hbrowser.gallery.driver_base.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
             await driver.get("https://example.test/same")
 
-        self.assertIs(raised.exception, timeout)
-        driver.page.wait.assert_awaited_once_with(1)
-        sleep.assert_not_awaited()
-
-    async def test_wait_invokes_mutation_once_and_stops_on_any_failure(self) -> None:
-        driver = self._driver()
-        driver.page = SimpleNamespace(
-            evaluate=AsyncMock(return_value="https://example.test/old"),
-            wait=AsyncMock(),
-        )
-        mutation = AsyncMock(side_effect=RuntimeError("outcome unknown"))
-
-        with self.assertRaises(BrowserMutationOutcomeUnknownError) as raised:
-            await driver.wait(
-                mutation,
-                ischangeurl=False,
-                owner=driver.page,
-                operation_timeout=1,
-            )
-
-        mutation.assert_awaited_once_with()
-        driver.page.wait.assert_not_awaited()
-        self.assertNotIn("outcome unknown", str(raised.exception))
-        self.assertIsNone(raised.exception.__cause__)
-        self.assertIsNone(raised.exception.__context__)
-
-    async def test_wait_mutation_timeout_runs_no_page_probe_or_delay(self) -> None:
-        driver = self._driver()
-        timeout = ZendriverOperationTimeout(timeout_seconds=1)
-        driver.page = SimpleNamespace(
-            evaluate=AsyncMock(return_value="https://example.test/old"),
-            wait=AsyncMock(),
-        )
-        mutation = AsyncMock(side_effect=timeout)
-
-        with (
-            patch(
-                "hbrowser.gallery.driver_base.asyncio.sleep",
-                new=AsyncMock(),
-            ) as sleep,
-            self.assertRaises(ZendriverOperationTimeout) as raised,
-        ):
-            await driver.wait(
-                mutation,
-                ischangeurl=False,
-                owner=driver.page,
-                operation_timeout=1,
-            )
-
-        self.assertIs(raised.exception, timeout)
-        mutation.assert_awaited_once_with()
+        driver.myget.assert_awaited_once_with("https://example.test/same")
         driver.page.wait.assert_not_awaited()
         sleep.assert_not_awaited()
 
@@ -207,7 +155,6 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
                 driver.password = "private-password"
                 driver.myget = AsyncMock()
                 driver._handle_page_challenge = AsyncMock()  # type: ignore[method-assign]
-                driver._wait_for_url_change = AsyncMock()  # type: ignore[method-assign]
                 driver._handle_login_challenge = AsyncMock()  # type: ignore[method-assign]
                 driver._verify_login_succeeded = AsyncMock()  # type: ignore[method-assign]
                 driver.gohomepage = AsyncMock()  # type: ignore[method-assign]

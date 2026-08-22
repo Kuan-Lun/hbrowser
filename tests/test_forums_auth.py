@@ -19,16 +19,13 @@ class _Page:
         self.member = member
 
     async def evaluate(self, expression: str) -> object:
-        if expression != "window.location.href":
+        if "document.querySelector('#userlinksguest')" not in expression:
             raise AssertionError(f"Unexpected expression: {expression}")
-        return self.url
-
-    async def query_selector_all(self, selector: str) -> list[object]:
-        if selector == "#userlinksguest":
-            return [object()] if self.guest else []
-        if selector == "#userlinks":
-            return [object()] if self.member else []
-        raise AssertionError(f"Unexpected selector: {selector}")
+        return {
+            "url": self.url,
+            "guest": self.guest,
+            "member": self.member,
+        }
 
 
 class ForumsAuthStateTests(unittest.IsolatedAsyncioTestCase):

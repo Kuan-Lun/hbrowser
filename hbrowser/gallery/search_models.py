@@ -8,6 +8,8 @@ from ..exceptions import InvalidSearchRequestError
 
 DEFAULT_SEARCH_MAX_PAGES = 100
 DEFAULT_SEARCH_MAX_RESULTS = 5_000
+MAXIMUM_SEARCH_PAGES = DEFAULT_SEARCH_MAX_PAGES
+MAXIMUM_SEARCH_RESULTS = DEFAULT_SEARCH_MAX_RESULTS
 MINIMUM_MISSING_CONFIRMATIONS = 2
 
 
@@ -32,15 +34,19 @@ class SearchRequest:
             raise InvalidSearchRequestError("query must be a string")
         if not isinstance(self.max_pages, int) or isinstance(self.max_pages, bool):
             raise InvalidSearchRequestError("max_pages must be an integer")
-        if self.max_pages < 1:
-            raise InvalidSearchRequestError("max_pages must be at least 1")
+        if not 1 <= self.max_pages <= MAXIMUM_SEARCH_PAGES:
+            raise InvalidSearchRequestError(
+                f"max_pages must be between 1 and {MAXIMUM_SEARCH_PAGES}"
+            )
         if not isinstance(self.max_results, int) or isinstance(
             self.max_results,
             bool,
         ):
             raise InvalidSearchRequestError("max_results must be an integer")
-        if self.max_results < 1:
-            raise InvalidSearchRequestError("max_results must be at least 1")
+        if not 1 <= self.max_results <= MAXIMUM_SEARCH_RESULTS:
+            raise InvalidSearchRequestError(
+                f"max_results must be between 1 and {MAXIMUM_SEARCH_RESULTS}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -168,7 +168,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         )
         events = list[str]()
 
-        async def get(_url: str) -> None:
+        async def get(_url: str, **_kwargs: object) -> None:
             events.append("get")
 
         async def get_content(**_kwargs: object) -> str:
@@ -177,7 +177,6 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
 
         driver = EHDriver(headless=True)
         driver.get = AsyncMock(side_effect=get)  # type: ignore[method-assign]
-        driver.wait = AsyncMock()  # type: ignore[method-assign]
         driver.page = SimpleNamespace(
             reload=AsyncMock(),
         )
@@ -190,7 +189,6 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, RandomEncounterFound)
         self.assertEqual(events, ["get", "content"])
-        driver.wait.assert_not_awaited()
         driver.logger.info.assert_any_call("Daily check-in found a random encounter")
         self.assertNotIn(ENCOUNTER, str(driver.logger.mock_calls))
 
@@ -200,19 +198,10 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         ).read_text(encoding="utf-8")
         events = list[str]()
 
-        async def get(_url: str) -> None:
+        async def get(_url: str, **_kwargs: object) -> None:
             events.append("get")
 
-        async def wait(
-            _function: object,
-            *,
-            ischangeurl: bool,
-            owner: object,
-            operation_timeout: float,
-        ) -> None:
-            self.assertFalse(ischangeurl)
-            self.assertIs(owner, driver.page)
-            self.assertEqual(operation_timeout, 15.0)
+        async def reload() -> None:
             events.append("reload")
 
         async def get_content(**_kwargs: object) -> str:
@@ -225,9 +214,8 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
 
         driver = EHDriver(headless=True)
         driver.get = AsyncMock(side_effect=get)  # type: ignore[method-assign]
-        driver.wait = AsyncMock(side_effect=wait)  # type: ignore[method-assign]
         driver.page = SimpleNamespace(
-            reload=AsyncMock(),
+            reload=AsyncMock(side_effect=reload),
         )
         driver._read_stable_punchin_document = AsyncMock(  # type: ignore[method-assign]
             side_effect=get_content
@@ -244,8 +232,11 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             driver._read_stable_punchin_document.await_args_list,
             [
-                unittest.mock.call(),
-                unittest.mock.call(previous_loader_id="initial-loader"),
+                unittest.mock.call(deadline=unittest.mock.ANY),
+                unittest.mock.call(
+                    previous_loader_id="initial-loader",
+                    deadline=unittest.mock.ANY,
+                ),
             ],
         )
         driver.logger.info.assert_any_call(
@@ -258,7 +249,6 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         reloaded_content = _event_page(ENCOUNTER_URL)
         driver = EHDriver(headless=True)
         driver.get = AsyncMock()  # type: ignore[method-assign]
-        driver.wait = AsyncMock()  # type: ignore[method-assign]
         driver.page = SimpleNamespace(
             reload=AsyncMock(),
         )
@@ -290,7 +280,6 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_event_returns_a_typed_completed_outcome(self) -> None:
         driver = EHDriver(headless=True)
         driver.get = AsyncMock()  # type: ignore[method-assign]
-        driver.wait = AsyncMock()  # type: ignore[method-assign]
         driver.page = SimpleNamespace(
             reload=AsyncMock(),
         )
@@ -313,7 +302,6 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_string_page_content_is_rejected(self) -> None:
         driver = EHDriver(headless=True)
         driver.get = AsyncMock()  # type: ignore[method-assign]
-        driver.wait = AsyncMock()  # type: ignore[method-assign]
         driver.page = SimpleNamespace(
             reload=AsyncMock(),
         )
@@ -327,64 +315,38 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PunchInDocumentReadinessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_waits_for_a_new_dom_ready_loader_after_reload(self) -> None:
+    async def test_rejects_previous_loader_without_polling(self) -> None:
         driver = EHDriver(headless=True)
         driver._current_loader_id = AsyncMock(  # type: ignore[method-assign]
-            side_effect=["old", "new", "new", "new", "new"],
+            return_value="old",
         )
-        driver._read_raw_page_snapshot = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[
-                _RawPageSnapshot(
-                    url="https://e-hentai.org/news.php",
-                    title="",
-                    ready_state="loading",
-                    html="<html><body>Loading</body></html>",
-                    query_value=None,
-                ),
-                _RawPageSnapshot(
-                    url="https://e-hentai.org/news.php",
-                    title="",
-                    ready_state="complete",
-                    html="<html><body>Ready</body></html>",
-                    query_value=None,
-                ),
-            ]
-        )
+        driver._read_raw_page_snapshot = AsyncMock()  # type: ignore[method-assign]
 
         with patch(
             "hbrowser.gallery.eh_driver.asyncio.sleep",
             new=AsyncMock(),
         ) as sleep:
-            result = await driver._read_stable_punchin_document(
-                previous_loader_id="old",
-            )
+            with self.assertRaisesRegex(RuntimeError, "lifecycle-confirmed"):
+                await driver._read_stable_punchin_document(
+                    previous_loader_id="old",
+                )
 
-        self.assertEqual(result, "<html><body>Ready</body></html>")
-        self.assertEqual(sleep.await_count, 2)
-        self.assertEqual(driver._read_raw_page_snapshot.await_count, 2)
+        sleep.assert_not_awaited()
+        driver._read_raw_page_snapshot.assert_not_awaited()
 
-    async def test_retries_when_loader_changes_during_snapshot(self) -> None:
+    async def test_accepts_one_lifecycle_confirmed_stable_snapshot(self) -> None:
         driver = EHDriver(headless=True)
         driver._current_loader_id = AsyncMock(  # type: ignore[method-assign]
-            side_effect=["first", "second", "second", "second"],
+            side_effect=["stable", "stable"],
         )
         driver._read_raw_page_snapshot = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[
-                _RawPageSnapshot(
-                    url="https://e-hentai.org/news.php",
-                    title="",
-                    ready_state="complete",
-                    html="<html><body>Unstable</body></html>",
-                    query_value=None,
-                ),
-                _RawPageSnapshot(
-                    url="https://e-hentai.org/news.php",
-                    title="",
-                    ready_state="complete",
-                    html="<html><body>Stable</body></html>",
-                    query_value=None,
-                ),
-            ]
+            return_value=_RawPageSnapshot(
+                url="https://e-hentai.org/news.php",
+                title="",
+                ready_state="complete",
+                html="<html><body>Stable</body></html>",
+                query_value=None,
+            ),
         )
 
         with patch(
@@ -394,34 +356,32 @@ class PunchInDocumentReadinessTests(unittest.IsolatedAsyncioTestCase):
             result = await driver._read_stable_punchin_document()
 
         self.assertEqual(result, "<html><body>Stable</body></html>")
-        sleep.assert_awaited_once()
+        sleep.assert_not_awaited()
+        driver._read_raw_page_snapshot.assert_awaited_once_with(deadline=None)
 
-    async def test_times_out_if_reload_keeps_the_previous_loader(self) -> None:
+    async def test_loader_change_during_snapshot_is_not_polled(self) -> None:
         driver = EHDriver(headless=True)
         driver._current_loader_id = AsyncMock(  # type: ignore[method-assign]
-            return_value="old",
+            side_effect=["first", "second"],
         )
-        driver._read_raw_page_snapshot = AsyncMock()  # type: ignore[method-assign]
-        loop = Mock()
-        loop.time.side_effect = [0.0, 0.0, 1.0]
+        driver._read_raw_page_snapshot = AsyncMock(  # type: ignore[method-assign]
+            return_value=_RawPageSnapshot(
+                url="https://e-hentai.org/news.php",
+                title="",
+                ready_state="complete",
+                html="<html><body>Unstable</body></html>",
+                query_value=None,
+            )
+        )
 
         with (
             patch(
-                "hbrowser.gallery.eh_driver.asyncio.get_running_loop",
-                return_value=loop,
-            ),
-            patch(
-                "hbrowser.gallery.eh_driver.PUNCHIN_PAGE_TIMEOUT_SECONDS",
-                0.5,
-            ),
-            patch(
                 "hbrowser.gallery.eh_driver.asyncio.sleep",
                 new=AsyncMock(),
-            ),
-            self.assertRaisesRegex(RuntimeError, "stable DOM-ready document"),
+            ) as sleep,
+            self.assertRaisesRegex(RuntimeError, "changed after lifecycle"),
         ):
-            await driver._read_stable_punchin_document(
-                previous_loader_id="old",
-            )
+            await driver._read_stable_punchin_document()
 
-        driver._read_raw_page_snapshot.assert_not_awaited()
+        sleep.assert_not_awaited()
+        driver._read_raw_page_snapshot.assert_awaited_once()

@@ -1,6 +1,7 @@
 """Tor 進程管理"""
 
 import atexit
+import math
 import os
 import platform
 import re
@@ -12,7 +13,7 @@ from collections import deque
 from pathlib import Path
 from types import MappingProxyType
 
-from ..utils import setup_logger
+from ..utils import Deadline, setup_logger
 from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
 
 logger = setup_logger(__name__)
@@ -20,6 +21,9 @@ logger = setup_logger(__name__)
 # Tor SOCKS proxy 預設端口
 TOR_SOCKS_PORT = 9150
 _TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
+_TOR_BOOTSTRAP_TIMEOUT_SECONDS = 120.0
+_TOR_MAX_RETRIES = 3
+_TOR_MAX_RETRY_WAIT_SECONDS = 5.0
 type _Process = OwnedProcess | subprocess.Popen[bytes]
 
 # Tor 執行檔路徑（使用者需自行安裝 Tor Browser）
@@ -56,23 +60,23 @@ class _TorProcessAtexitCleanup:
 
     def __call__(self) -> None:
         """Reap during interpreter shutdown without mutating atexit's registry."""
-        self._reap()
+        self._reap(None)
 
     def register(self) -> None:
         atexit.register(self)
         with self._lock:
             self._registered = True
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, deadline: Deadline | None = None) -> None:
         """Reap normally, then release the durable atexit registration."""
-        self._reap()
+        self._reap(deadline)
         self._unregister()
 
-    def _reap(self) -> None:
+    def _reap(self, deadline: Deadline | None) -> None:
         with self._lock:
             if self._tor_process is None:
                 return
-            _terminate_tor_process(self._tor_process)
+            _terminate_tor_process(self._tor_process, deadline=deadline)
             self._tor_process = None
 
     def _unregister(self) -> None:
@@ -88,12 +92,17 @@ class _TorProcessAtexitCleanup:
             logger.exception("Failed to unregister completed Tor cleanup callback")
 
 
-def _terminate_tor_process(tor_process: _Process) -> None:
+def _terminate_tor_process(
+    tor_process: _Process,
+    *,
+    deadline: Deadline | None = None,
+) -> None:
     if isinstance(tor_process, OwnedProcess):
         tor_process.shutdown(
             graceful_timeout=0,
             terminate_timeout=5,
             kill_timeout=5,
+            deadline=None if deadline is None else deadline.expires_at,
         )
         return
 
@@ -102,22 +111,30 @@ def _terminate_tor_process(tor_process: _Process) -> None:
     except ProcessLookupError:
         pass
     try:
-        tor_process.wait(timeout=5)
+        tor_process.wait(
+            timeout=5 if deadline is None else min(5, deadline.remaining())
+        )
     except subprocess.TimeoutExpired:
         try:
             tor_process.kill()
         except ProcessLookupError:
             pass
-        tor_process.wait(timeout=5)
+        tor_process.wait(
+            timeout=5 if deadline is None else min(5, deadline.remaining())
+        )
 
 
-def terminate_tor_process(tor_process: _Process) -> None:
+def terminate_tor_process(
+    tor_process: _Process,
+    *,
+    deadline: Deadline | None = None,
+) -> None:
     """終止 Tor 子程序，正常 terminate 逾時才強制 kill。"""
     process_cleanup = getattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, None)
     if isinstance(process_cleanup, _TorProcessAtexitCleanup):
-        process_cleanup.cleanup()
+        process_cleanup.cleanup(deadline=deadline)
         return
-    _terminate_tor_process(tor_process)
+    _terminate_tor_process(tor_process, deadline=deadline)
 
 
 def _find_tor_binary() -> str:
@@ -146,7 +163,11 @@ def _find_tor_binary() -> str:
     )
 
 
-def _start_tor_process(socks_port: int) -> OwnedProcess:
+def _start_tor_process(
+    socks_port: int,
+    *,
+    deadline: Deadline | None = None,
+) -> OwnedProcess:
     """
     啟動 Tor SOCKS proxy 進程
 
@@ -156,7 +177,15 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
     Returns:
         tor 進程的 Popen 物件
     """
+    operation_deadline = (
+        Deadline.after(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
+        if deadline is None
+        else deadline.bounded(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
+    )
     tor_binary = _find_tor_binary()
+    process_startup_timeout = min(10.0, operation_deadline.remaining())
+    if process_startup_timeout <= 0:
+        raise RuntimeError("Tor startup exceeded the shared browser deadline")
     data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
 
     logger.info(f"Starting Tor process on SOCKS port {socks_port}...")
@@ -171,6 +200,8 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cleanup_paths=(data_dir,),
+        startup_timeout=process_startup_timeout,
+        deadline=operation_deadline.expires_at,
     )
     process_cleanup: _TorProcessAtexitCleanup | None = None
     cleanup_registered = False
@@ -188,7 +219,7 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
 
         # 使用背景 thread 讀取 stdout（跨平台，避免 fcntl/select）
         line_queue: deque[str] = deque(maxlen=256)
-        reader_done = threading.Event()
+        line_available = threading.Event()
 
         def _reader() -> None:
             assert tor_process.stdout is not None
@@ -197,6 +228,7 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
                     line_queue.append(
                         raw_line.decode("utf-8", errors="replace").strip()
                     )
+                    line_available.set()
             finally:
                 try:
                     close_output = getattr(tor_process.stdout, "close", None)
@@ -204,28 +236,27 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
                         close_output()
                 except OSError:
                     pass
-                reader_done.set()
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
 
         # 等待 Tor bootstrap 完成
-        bootstrap_timeout = 120
-        start_time = time.time()
+        bootstrap_deadline = operation_deadline
+        start_time = time.monotonic()
         last_status_time = start_time
         last_bootstrap_pct = "0%"
 
-        while time.time() - start_time < bootstrap_timeout:
+        while not bootstrap_deadline.expired:
             if tor_process.poll() is not None:
                 raise RuntimeError(
                     f"Tor process exited unexpectedly "
                     f"with code {tor_process.returncode}"
                 )
 
-            now = time.time()
+            now = time.monotonic()
             if now - last_status_time >= 10:
                 elapsed = int(now - start_time)
-                remaining = bootstrap_timeout - elapsed
+                remaining = int(bootstrap_deadline.remaining())
                 logger.info(
                     f"Tor bootstrapping... {last_bootstrap_pct} "
                     f"({elapsed}s elapsed, {remaining}s remaining)"
@@ -239,7 +270,7 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
                     continue
 
                 if "Bootstrapped 100%" in line:
-                    elapsed = int(time.time() - start_time)
+                    elapsed = int(time.monotonic() - start_time)
                     logger.info(f"Tor bootstrap completed successfully ({elapsed}s)")
                     return tor_process
 
@@ -250,21 +281,28 @@ def _start_tor_process(socks_port: int) -> OwnedProcess:
 
                 logger.debug(f"Tor: {line}")
 
-            time.sleep(0.5)
+            sleep_remaining = bootstrap_deadline.remaining()
+            if sleep_remaining <= 0:
+                break
+            line_available.clear()
+            if line_queue:
+                continue
+            line_available.wait(min(0.5, sleep_remaining))
 
         raise RuntimeError(
-            f"Tor failed to bootstrap within {bootstrap_timeout} seconds"
+            "Tor failed to bootstrap within its shared "
+            f"{_TOR_BOOTSTRAP_TIMEOUT_SECONDS:g}-second deadline"
         )
     except BaseException as startup_error:
         try:
             if cleanup_registered:
                 assert process_cleanup is not None
-                process_cleanup.cleanup()
+                process_cleanup.cleanup(deadline=operation_deadline)
             else:
                 # Construction, attachment, and registration are the only
                 # points before durable ownership exists. Reap the exact Popen
                 # directly when any of them fails.
-                _terminate_tor_process(tor_process)
+                _terminate_tor_process(tor_process, deadline=operation_deadline)
         except BaseException as cleanup_error:
             ownership_error = _TorProcessCleanupError(
                 "Tor bootstrap failed and its process could not be reaped"
@@ -296,22 +334,45 @@ def should_use_tor() -> bool:
 def start_tor_with_retry(
     socks_port: int,
     max_retries: int = 3,
-    retry_wait: int = 300,
+    retry_wait: float = 5.0,
+    *,
+    deadline: Deadline | None = None,
 ) -> OwnedProcess:
     """啟動 Tor 並在失敗時重試，同時註冊 atexit 清理。
 
     Args:
         socks_port: SOCKS proxy 端口
         max_retries: 最大重試次數
-        retry_wait: 重試等待秒數（預設 5 分鐘）
+        retry_wait: 重試前的本地 process pacing 秒數（預設 5 秒）
 
     Returns:
         tor 進程的 Popen 物件
     """
+    if type(max_retries) is not int or not 1 <= max_retries <= _TOR_MAX_RETRIES:
+        raise ValueError(f"max_retries must be an integer in [1, {_TOR_MAX_RETRIES}]")
+    if (
+        isinstance(retry_wait, bool)
+        or not isinstance(retry_wait, int | float)
+        or not math.isfinite(float(retry_wait))
+        or not 0 <= retry_wait <= _TOR_MAX_RETRY_WAIT_SECONDS
+    ):
+        raise ValueError(
+            "retry_wait must be finite and in [0, " f"{_TOR_MAX_RETRY_WAIT_SECONDS:g}]"
+        )
+    operation_deadline = (
+        Deadline.after(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
+        if deadline is None
+        else deadline.bounded(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
+    )
     tor_process: OwnedProcess | None = None
     for attempt in range(1, max_retries + 1):
+        if operation_deadline.expired:
+            raise RuntimeError("Tor startup exceeded the shared browser deadline")
         try:
-            tor_process = _start_tor_process(socks_port)
+            tor_process = _start_tor_process(
+                socks_port,
+                deadline=operation_deadline,
+            )
             break
         except ProcessOwnershipError:
             raise
@@ -320,9 +381,14 @@ def start_tor_with_retry(
                 raise
             logger.warning(
                 f"Tor bootstrap failed (attempt {attempt}/{max_retries}), "
-                f"retrying in {retry_wait // 60} minutes..."
+                f"retrying in {retry_wait} seconds..."
             )
-            time.sleep(retry_wait)
+            remaining = operation_deadline.remaining()
+            if remaining <= 0:
+                raise RuntimeError("Tor startup exceeded the shared browser deadline")
+            wait_seconds = min(float(retry_wait), remaining)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
 
     assert tor_process is not None
 

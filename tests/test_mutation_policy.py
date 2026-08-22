@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery import driver_base, eh_driver
-from hbrowser.gallery.browser import ban_handler, factory, owner, proxy
+from hbrowser.gallery.browser import factory
 from hbrowser.gallery.captcha import login_challenge
 from hbrowser.gallery.utils.mutation import wait_for_zendriver_mutation
+from hbrowser.gallery.utils.page_state import ZENDRIVER_COMMAND_TIMEOUT_SECONDS
 from hbrowser.gallery.utils.protocol import (
     _LIFECYCLE_ATTRIBUTE,
+    MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS,
     ZendriverOwnerRetiredError,
     _begin_zendriver_retirement,
     wait_for_zendriver,
@@ -45,20 +47,20 @@ def _called_name(call: ast.Call) -> str | None:
 
 
 class BrowserMutationBudgetTests(unittest.TestCase):
-    def test_every_fixed_browser_mutation_watchdog_is_fifteen_seconds(self) -> None:
+    def test_every_fixed_browser_mutation_watchdog_is_at_most_five_seconds(
+        self,
+    ) -> None:
         budgets = {
             "archive": eh_driver._PAGE_MUTATION_TIMEOUT_SECONDS,
-            "ban-navigation": ban_handler._PAGE_MUTATION_TIMEOUT_SECONDS,
             "browser-geolocation": factory._PAGE_SETUP_MUTATION_TIMEOUT_SECONDS,
-            "browser-tab-open": owner._TAB_OPEN_TIMEOUT_SECONDS,
-            "browser-tab-navigation": owner._TAB_NAVIGATION_TIMEOUT_SECONDS,
             "driver-identity": driver_base._IDENTITY_MUTATION_TIMEOUT_SECONDS,
             "driver-page": driver_base._PAGE_MUTATION_TIMEOUT_SECONDS,
             "login-token": login_challenge._TOKEN_MUTATION_TIMEOUT_SECONDS,
-            "proxy-navigation": proxy._PROXY_NAVIGATION_TIMEOUT_SECONDS,
+            "lifecycle-command": ZENDRIVER_COMMAND_TIMEOUT_SECONDS,
+            "protocol-invariant": MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS,
         }
 
-        self.assertEqual(budgets, dict.fromkeys(budgets, 15.0))
+        self.assertEqual(budgets, dict.fromkeys(budgets, 5.0))
 
 
 class BrowserMutationArchitectureTests(unittest.TestCase):
@@ -115,6 +117,53 @@ class BrowserMutationArchitectureTests(unittest.TestCase):
 
 
 class BrowserMutationRetirementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_acknowledgement_retires_owner_and_is_outcome_unknown(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+
+        async def acknowledged_mutation() -> str:
+            return "acknowledged"
+
+        with self.assertRaisesRegex(
+            BrowserMutationOutcomeUnknownError,
+            "outcome is unknown",
+        ):
+            await wait_for_zendriver_mutation(
+                acknowledged_mutation(),
+                timeout=1,
+                owner=browser,
+                operation="Late mutation",
+                completion_deadline_expires_at=(asyncio.get_running_loop().time() - 1),
+            )
+
+        lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+        self.assertTrue(lifecycle.retired)
+
+    async def test_invalid_completion_deadline_closes_unscheduled_mutation(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        started = False
+
+        async def mutation() -> None:
+            nonlocal started
+            started = True
+
+        coroutine = mutation()
+        with self.assertRaisesRegex(ValueError, "finite monotonic time"):
+            await wait_for_zendriver_mutation(
+                coroutine,
+                timeout=1,
+                owner=browser,
+                operation="Invalid deadline mutation",
+                completion_deadline_expires_at=float("inf"),
+            )
+
+        self.assertFalse(started)
+        self.assertEqual(inspect.getcoroutinestate(coroutine), inspect.CORO_CLOSED)
+        self.assertNotIn(_LIFECYCLE_ATTRIBUTE, vars(browser))
+
     async def test_lifecycle_attach_failure_is_local_and_closes_coroutine(
         self,
     ) -> None:

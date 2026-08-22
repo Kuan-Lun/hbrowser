@@ -134,6 +134,15 @@ class ZendriverTimeoutContractTests(unittest.TestCase):
 
 
 class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_watchdog_above_five_seconds_is_rejected(self) -> None:
+        browser = SimpleNamespace()
+        coroutine = asyncio.sleep(0)
+
+        with self.assertRaisesRegex(ValueError, "must not exceed 5 seconds"):
+            await wait_for_zendriver(coroutine, timeout=5.01, owner=browser)
+
+        self.assertEqual(inspect.getcoroutinestate(coroutine), inspect.CORO_CLOSED)
+
     async def test_none_is_not_an_owner(self) -> None:
         coroutine = asyncio.sleep(0)
         with self.assertRaises(TypeError):
@@ -193,7 +202,7 @@ class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         operation: asyncio.Future[str] = asyncio.Future()
         watchdog = asyncio.create_task(
-            wait_for_zendriver(operation, timeout=60, owner=connection)
+            wait_for_zendriver(operation, timeout=5, owner=connection)
         )
         await asyncio.sleep(0)
 
@@ -260,14 +269,14 @@ class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         connection_watchdog = asyncio.create_task(
             wait_for_zendriver(
                 operation_from_connection,
-                timeout=60,
+                timeout=5,
                 owner=connection,
             )
         )
         element_watchdog = asyncio.create_task(
             wait_for_zendriver(
                 operation_from_element,
-                timeout=60,
+                timeout=5,
                 owner=element,
             )
         )

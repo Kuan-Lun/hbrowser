@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+from hbrowser.gallery import driver_base, eh_driver, forums_auth
 from hbrowser.gallery.browser import ban_handler, proxy
 from hbrowser.gallery.browser.ban_handler import (
     _resolve_transient_blank_page,
@@ -39,58 +40,24 @@ class _TestDriver(Driver):
         return "E-Hentai"
 
 
-class _HangingElement:
-    async def click(self) -> None:
-        await asyncio.Event().wait()
-
-    async def query_selector(self, selector: str) -> Any:
-        await asyncio.Event().wait()
-
-    async def query_selector_all(self, selector: str) -> Any:
-        await asyncio.Event().wait()
-
-
 class DriverHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_gohomepage_times_out_instead_of_hanging_forever(self) -> None:
         driver = _TestDriver()
         driver.page = SimpleNamespace(evaluate=_hang)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(driver.gohomepage(), timeout=10)
+        with (
+            patch.object(driver_base, "_NAVIGATION_READ_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await driver.gohomepage()
 
     async def test_get_times_out_instead_of_hanging_forever(self) -> None:
         driver = _TestDriver()
-        driver.page = SimpleNamespace(evaluate=_hang)
-        driver.myget = AsyncMock()
+        driver.page = SimpleNamespace(evaluate=AsyncMock())
+        driver.myget = AsyncMock(side_effect=_hang)
 
         with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(driver.get("https://e-hentai.org/"), timeout=10)
-
-    async def test_wait_old_url_read_times_out_instead_of_hanging_forever(
-        self,
-    ) -> None:
-        driver = _TestDriver()
-        driver.page = SimpleNamespace(evaluate=_hang)
-
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(
-                driver.wait(
-                    AsyncMock(),
-                    ischangeurl=True,
-                    owner=driver.page,
-                    operation_timeout=5.0,
-                ),
-                timeout=10,
-            )
-
-    async def test_find_element_chain_times_out_instead_of_hanging_forever(
-        self,
-    ) -> None:
-        driver = _TestDriver()
-        driver.page = _HangingElement()
-
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(driver.find_element_chain("#a", "#b"), timeout=10)
+            await asyncio.wait_for(driver.get("https://e-hentai.org/"), timeout=0.05)
 
 
 class CaptchaDetectorHangProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -98,8 +65,14 @@ class CaptchaDetectorHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         detector = CaptchaDetector()
         page = SimpleNamespace(evaluate=_hang, get_content=_hang)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(detector.detect(page), timeout=10)
+        with (
+            patch(
+                "hbrowser.gallery.captcha.detector._DETECTION_READ_TIMEOUT_SECONDS",
+                0.05,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await detector.detect(page)
 
 
 class LoginChallengeHangProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -108,11 +81,11 @@ class LoginChallengeHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         page = SimpleNamespace(evaluate=_hang)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(
-                LoginChallengeHandler._read_response_token(page, "#token"),
-                timeout=10,
-            )
+        with (
+            patch.object(login_challenge, "_TOKEN_READ_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await LoginChallengeHandler._read_response_token(page, "#token")
 
     async def test_write_response_token_timeout_is_terminal(
         self,
@@ -138,17 +111,36 @@ class ForumsAuthHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         page = SimpleNamespace(evaluate=_hang)
 
-        with self.assertRaises(TimeoutError):
-            await asyncio.wait_for(detect_forums_auth_state(page), timeout=10)
+        with (
+            patch.object(forums_auth, "_AUTH_STATE_READ_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await detect_forums_auth_state(page)
 
 
 class BanHandlerHangProtectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_content_result_is_rejected(self) -> None:
+        deadline = Mock()
+        deadline.remaining.side_effect = (1.0, 0.0)
+        page = SimpleNamespace(get_content=AsyncMock(return_value="<html></html>"))
+
+        with self.assertRaisesRegex(TimeoutError, "completed after"):
+            await ban_handler._read_content_before(
+                page,
+                deadline=deadline,
+                description="Test read",
+            )
+
     async def test_myget_times_out_instead_of_hanging_forever(self) -> None:
         page = SimpleNamespace(get=_hang, get_content=_hang)
         myget = handle_ban_decorator(page)
 
         with (
-            patch.object(ban_handler, "_PAGE_MUTATION_TIMEOUT_SECONDS", 0.05),
+            patch.object(
+                ban_handler,
+                "_PAGE_NAVIGATION_DEADLINE_SECONDS",
+                0.05,
+            ),
             self.assertRaises(ZendriverOperationTimeout),
         ):
             await myget("https://e-hentai.org/")
@@ -159,7 +151,11 @@ class BanHandlerHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         page = SimpleNamespace(reload=_hang, get_content=_hang)
 
         with (
-            patch.object(ban_handler, "_PAGE_MUTATION_TIMEOUT_SECONDS", 0.05),
+            patch.object(
+                ban_handler,
+                "_PAGE_NAVIGATION_DEADLINE_SECONDS",
+                0.05,
+            ),
             patch(
                 "hbrowser.gallery.browser.ban_handler.asyncio.sleep",
                 new=AsyncMock(),
@@ -182,10 +178,10 @@ class ProxyHangProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "hbrowser.gallery.browser.proxy.asyncio.to_thread",
+                "hbrowser.gallery.browser.proxy._read_direct_public_ip",
                 new=AsyncMock(return_value="192.0.2.10"),
             ),
-            patch.object(proxy, "_PROXY_NAVIGATION_TIMEOUT_SECONDS", 0.05),
+            patch.object(proxy, "_PROXY_PAGE_DEADLINE_SECONDS", 0.05),
         ):
             with self.assertRaises(ZendriverOperationTimeout):
                 await verify_proxy_ip(browser, page)
@@ -205,11 +201,11 @@ class EHDriverHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         gallery = Mock()
         gallery.url = "https://e-hentai.org/g/1/deadbeef/"
 
-        with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(
-                driver.gallery2tag(gallery, "artist"),
-                timeout=10,
-            )
+        with (
+            patch.object(eh_driver, "_PAGE_READ_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await driver.gallery2tag(gallery, "artist")
         driver.get.assert_awaited_once_with(gallery.url)
         driver.page.xpath.assert_awaited_once()
 

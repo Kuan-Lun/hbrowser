@@ -3,7 +3,7 @@ import unittest
 from collections.abc import Awaitable, Callable
 from dataclasses import FrozenInstanceError, dataclass
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import (
@@ -15,7 +15,7 @@ from hbrowser.gallery.browser import (
     TabTransportUnavailableError,
 )
 from hbrowser.gallery.browser import owner as owner_module
-from hbrowser.gallery.utils import ZendriverOperationTimeout
+from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
 
 
 @dataclass(slots=True)
@@ -72,10 +72,10 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(owner.main_tab.target_id, "main-target")
 
         self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
 
         await asyncio.gather(owner.close(), owner.close())
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
 
     async def test_tab_handle_is_immutable(self) -> None:
         handle = TabHandle("owner", "isekai", "target")
@@ -207,14 +207,14 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
         self.assertFalse(first_close.done())
         with self.assertRaises(TabTransportUnavailableError):
             await owner.main_tab.execute(_return)
 
         release_command.set()
         await asyncio.gather(command_task, first_close, second_close)
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
         self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
 
     async def test_close_is_bounded_after_browser_closes_with_stuck_command(
@@ -238,11 +238,114 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await asyncio.wait_for(owner.close(), timeout=1)
 
-            browser_closer.assert_awaited_once_with(browser)
+            browser_closer.assert_awaited_once_with(browser, ANY)
             self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
         finally:
             release_command.set()
             await command_task
+
+    async def test_hung_injected_closer_uses_one_non_resetting_deadline(
+        self,
+    ) -> None:
+        owner, browser, browser_closer, _ = self._owner()
+        await owner.start()
+        closer_started = asyncio.Event()
+        release_closer = asyncio.Event()
+
+        async def ignore_cancellation(
+            observed_browser: _FakeBrowser,
+            deadline: Deadline,
+        ) -> None:
+            self.assertIs(observed_browser, browser)
+            self.assertIs(deadline, owner._close_deadline)
+            closer_started.set()
+            while not release_closer.is_set():
+                try:
+                    await release_closer.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        browser_closer.side_effect = ignore_cancellation
+        with (
+            patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
+            self.assertRaisesRegex(
+                owner_module.BrowserOwnershipError,
+                "shared ownership deadline",
+            ),
+        ):
+            await owner.close()
+        await closer_started.wait()
+
+        with (
+            patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
+            self.assertRaisesRegex(
+                owner_module.BrowserOwnershipError,
+                "shared ownership deadline",
+            ),
+        ):
+            await owner.close()
+        browser_closer.assert_awaited_once()
+
+        release_closer.set()
+        await asyncio.sleep(0)
+        # The first failed cleanup attempt is complete, so an explicit retry
+        # receives a fresh ownership deadline and may reconcile the already
+        # completed closer without invoking it again.
+        await owner.close()
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+        browser_closer.assert_awaited_once()
+
+    async def test_first_close_uses_supplied_absolute_deadline(self) -> None:
+        owner, browser, browser_closer, _ = self._owner()
+        await owner.start()
+        supplied_deadline = Deadline.after(1)
+
+        await owner.close(deadline=supplied_deadline)
+
+        browser_closer.assert_awaited_once()
+        assert browser_closer.await_args is not None
+        observed_browser, observed_deadline = browser_closer.await_args.args
+        self.assertIs(observed_browser, browser)
+        self.assertEqual(observed_deadline.expires_at, supplied_deadline.expires_at)
+        assert owner._close_deadline is not None
+        self.assertEqual(
+            owner._close_deadline.expires_at,
+            supplied_deadline.expires_at,
+        )
+
+    async def test_expired_first_close_never_starts_browser_closer(self) -> None:
+        owner, _, browser_closer, _ = self._owner()
+        await owner.start()
+
+        with self.assertRaisesRegex(
+            owner_module.BrowserOwnershipError,
+            "caller deadline expired",
+        ):
+            await owner.close(deadline=Deadline.after(0))
+
+        browser_closer.assert_not_awaited()
+        self.assertEqual(owner.state, BrowserOwnerState.OPEN)
+
+        await owner.close(deadline=Deadline.after(1))
+        browser_closer.assert_awaited_once()
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_close_deadline_includes_lifecycle_lock_wait(self) -> None:
+        owner, _, browser_closer, _ = self._owner()
+        await owner.start()
+        await owner._lifecycle_lock.acquire()
+        try:
+            with self.assertRaisesRegex(
+                owner_module.BrowserOwnershipError,
+                "waiting for lifecycle lock",
+            ):
+                await owner.close(deadline=Deadline.after(0.01))
+        finally:
+            owner._lifecycle_lock.release()
+
+        browser_closer.assert_not_awaited()
+        self.assertEqual(owner.state, BrowserOwnerState.OPEN)
+        await owner.close()
 
     async def test_failed_close_is_single_flight_and_can_be_retried(self) -> None:
         owner, browser, browser_closer, _ = self._owner()
@@ -258,7 +361,7 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, failure)
         self.assertIs(second, failure)
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
         self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
 
         browser_closer.side_effect = None
@@ -295,12 +398,16 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(owner_module, "_TAB_OPEN_TIMEOUT_SECONDS", 0),
+            patch.object(owner_module, "_TAB_OPEN_DEADLINE_SECONDS", 0.05),
             self.assertRaises(ZendriverOperationTimeout),
         ):
             await owner_module._open_zendriver_tab(browser)
         with (
-            patch.object(owner_module, "_TAB_NAVIGATION_TIMEOUT_SECONDS", 0),
+            patch.object(
+                owner_module,
+                "_TAB_NAVIGATION_DEADLINE_SECONDS",
+                0.05,
+            ),
             self.assertRaises(ZendriverOperationTimeout),
         ):
             await owner_module._navigate_zendriver_tab(tab, "https://example.test")
@@ -376,7 +483,10 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TabBindingError, "target id must not be empty"):
             await owner.start()
 
-        browser_closer.assert_awaited_once_with(browser)
+        browser_closer.assert_awaited_once_with(browser, ANY)
+        assert browser_closer.await_args is not None
+        passed_deadline = browser_closer.await_args.args[1]
+        self.assertIs(passed_deadline, owner._close_deadline)
         self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
         with self.assertRaises(BrowserOwnerStateError):
             await owner.start()

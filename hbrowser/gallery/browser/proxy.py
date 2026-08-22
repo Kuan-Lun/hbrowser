@@ -1,6 +1,7 @@
 """代理設定"""
 
 import asyncio
+import ipaddress
 import json
 import os
 import shutil
@@ -8,20 +9,87 @@ import socket
 import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen
+
+import httpx
 
 from ..utils import (
+    Deadline,
     is_browser_generation_error,
+    navigate_and_wait,
     setup_logger,
-    wait_for_zendriver,
+    wait_for_selector,
 )
-from ..utils.mutation import wait_for_zendriver_mutation
 from .process import ProcessOwnershipError
 
 logger = setup_logger(__name__)
-_PROXY_ELEMENT_WAIT_TIMEOUT_SECONDS = 10.0
-_PROXY_ELEMENT_WATCHDOG_TIMEOUT_SECONDS = 12.0
-_PROXY_NAVIGATION_TIMEOUT_SECONDS = 15.0
+_PROXY_PAGE_DEADLINE_SECONDS = 10.0
+_DIRECT_IP_REQUEST_TIMEOUT_SECONDS = 5.0
+
+
+class ProxyVerificationError(RuntimeError):
+    """Proxy availability or isolation could not be proven safely."""
+
+
+def _require_proxy_deadline(deadline: Deadline, phase: str) -> None:
+    if deadline.expired:
+        raise ProxyVerificationError(
+            f"Proxy verification deadline expired during {phase}"
+        )
+
+
+def _parse_public_ip(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        raise ProxyVerificationError(
+            "Proxy verification service returned an invalid public address"
+        ) from None
+
+
+async def _read_direct_public_ip(*, deadline: Deadline) -> str:
+    """Read the direct public address with async, cancellable transport ownership."""
+
+    remaining = deadline.remaining()
+    if remaining <= 0:
+        raise ProxyVerificationError(
+            "Proxy verification deadline expired before direct-IP preflight"
+        )
+    phase_timeout = min(_DIRECT_IP_REQUEST_TIMEOUT_SECONDS, remaining)
+    transport_timeout = httpx.Timeout(
+        remaining,
+        connect=phase_timeout,
+        write=phase_timeout,
+        pool=phase_timeout,
+        read=phase_timeout,
+    )
+
+    async def request() -> str:
+        async with httpx.AsyncClient(
+            timeout=transport_timeout,
+            trust_env=False,
+        ) as client:
+            response = await client.get("https://api.ipify.org")
+            _require_proxy_deadline(deadline, "direct-IP response")
+            response.raise_for_status()
+            _require_proxy_deadline(deadline, "direct-IP status validation")
+            public_ip = _parse_public_ip(response.text)
+            _require_proxy_deadline(deadline, "direct-IP response parsing")
+            return public_ip
+
+    try:
+        public_ip = await asyncio.wait_for(request(), timeout=remaining)
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        raise ProxyVerificationError(
+            "Direct-IP preflight exceeded the shared proxy deadline"
+        ) from None
+    except ProxyVerificationError:
+        raise
+    except httpx.HTTPError:
+        raise ProxyVerificationError("Direct-IP preflight transport failed") from None
+    _require_proxy_deadline(deadline, "direct-IP preflight completion")
+    return public_ip
 
 
 def _create_proxy_extension(
@@ -168,51 +236,49 @@ def find_available_port(start: int = 9150) -> int:
     raise RuntimeError(f"No available port found in range {start}-{start + 99}")
 
 
-async def verify_proxy_ip(browser: Any, page: Any) -> None:
+async def verify_proxy_ip(
+    browser: Any,
+    page: Any,
+    *,
+    deadline: Deadline | None = None,
+) -> None:
     """驗證代理連線的 IP 與本機 IP 不同"""
 
-    def _get_local_ip() -> str:
-        with urlopen("https://api.ipify.org", timeout=10) as response:
-            body: bytes = response.read()
-            return body.decode("utf-8").strip()
+    verification_deadline = (
+        Deadline.after(_PROXY_PAGE_DEADLINE_SECONDS)
+        if deadline is None
+        else deadline.bounded(_PROXY_PAGE_DEADLINE_SECONDS)
+    )
 
-    try:
-        local_ip = await asyncio.to_thread(_get_local_ip)
-    except Exception as error:
-        logger.warning(
-            "Could not verify proxy IP (non-fatal): error_type=%s",
-            type(error).__name__,
-        )
-        return
+    local_ip = await _read_direct_public_ip(deadline=verification_deadline)
 
-    await wait_for_zendriver_mutation(
-        page.get("https://api.ipify.org"),
-        timeout=_PROXY_NAVIGATION_TIMEOUT_SECONDS,
-        owner=page,
-        operation="Proxy verification navigation",
+    await navigate_and_wait(
+        page,
+        "https://api.ipify.org",
+        deadline=verification_deadline,
     )
 
     try:
-        body = await wait_for_zendriver(
-            page.select("body", timeout=_PROXY_ELEMENT_WAIT_TIMEOUT_SECONDS),
-            timeout=_PROXY_ELEMENT_WATCHDOG_TIMEOUT_SECONDS,
-            owner=page,
+        body = await wait_for_selector(
+            page,
+            "body",
+            deadline=verification_deadline,
         )
-        proxy_ip: str = body.text.strip()
+        _require_proxy_deadline(verification_deadline, "proxy-page DOM receipt")
+        proxy_ip = _parse_public_ip(body.text)
 
         if local_ip == proxy_ip:
-            raise RuntimeError(
+            raise ProxyVerificationError(
                 "Proxy IP safety check failed: proxy resolved to the local "
                 "public address"
             )
 
         logger.info("Proxy IP verification succeeded")
-    except RuntimeError:
+    except ProxyVerificationError:
         raise
     except Exception as error:
         if is_browser_generation_error(error):
             raise
-        logger.warning(
-            "Could not verify proxy IP (non-fatal): error_type=%s",
-            type(error).__name__,
-        )
+        raise ProxyVerificationError(
+            "Proxy page did not provide a trustworthy public address receipt"
+        ) from None
