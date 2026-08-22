@@ -32,6 +32,12 @@ _PRIVATE_CLEANUP_KILL_RESERVE_SECONDS: Final = 1.0
 _PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS: Final = 0.02
 _PRIVATE_CLEANUP_RETRY_MAX_SECONDS: Final = 0.25
 _WINDOWS_RETRYABLE_PRIVATE_CLEANUP_ERRORS: Final = frozenset({32, 33})
+_PRIVATE_CLEANUP_WORKER_DIAGNOSTIC_BYTES: Final = 1024
+# Invoke the worker as a script so a cleanup deadline does not pay for importing
+# hbrowser's public package graph before the start gate can be serviced.
+_PRIVATE_CLEANUP_WORKER_PATH: Final = (
+    Path(__file__).with_name("_directory_cleanup_worker.py").resolve()
+)
 _OUTPUT_RING_BYTES: Final = 256 * 1024
 _SUPERVISOR_READY_PREFIX: Final = "ready "
 _SUPERVISOR_ERROR_PREFIX: Final = "error "
@@ -1214,6 +1220,7 @@ class _ActivePrivateDirectoryCleanup:
     process: subprocess.Popen[bytes] | None = None
     windows_job: _WindowsJob | None = None
     windows_job_assigned: bool = False
+    worker_diagnostic: str | None = None
 
 
 _PRIVATE_DIRECTORY_CLEANUP_LOCK = threading.Lock()
@@ -1287,6 +1294,30 @@ def _close_cleanup_control_pipe(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _capture_private_directory_cleanup_diagnostic(
+    active: _ActivePrivateDirectoryCleanup,
+) -> None:
+    process = active.process
+    if process is None:
+        return
+    error_pipe = getattr(process, "stderr", None)
+    if error_pipe is None:
+        return
+    try:
+        payload = error_pipe.read(_PRIVATE_CLEANUP_WORKER_DIAGNOSTIC_BYTES)
+    except AttributeError, OSError, TypeError, ValueError:
+        return
+    finally:
+        try:
+            error_pipe.close()
+        except AttributeError, OSError, ValueError:
+            pass
+    if isinstance(payload, bytes):
+        diagnostic = payload.decode("utf-8", errors="replace").strip()
+        if diagnostic:
+            active.worker_diagnostic = diagnostic
+
+
 def _release_reaped_private_directory_cleanup(
     active: _ActivePrivateDirectoryCleanup,
     *,
@@ -1301,6 +1332,8 @@ def _release_reaped_private_directory_cleanup(
         windows_job.wait_empty(timeout=remaining)
         windows_job.close()
         active.windows_job = None
+    if process is not None:
+        _capture_private_directory_cleanup_diagnostic(active)
     _release_active_private_directory_cleanup(active)
 
 
@@ -1363,8 +1396,7 @@ def _spawn_private_directory_cleanup(
         process = subprocess.Popen(
             [
                 executable,
-                "-m",
-                "hbrowser.gallery.browser._directory_cleanup_worker",
+                str(_PRIVATE_CLEANUP_WORKER_PATH),
                 str(guard.path),
                 str(guard.device),
                 str(guard.inode),
@@ -1373,7 +1405,7 @@ def _spawn_private_directory_cleanup(
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             close_fds=True,
             env=environment,
             **_supervisor_creation_options(),
@@ -1478,6 +1510,8 @@ def _remove_private_directory_owned(
                 "Private directory cleanup worker ownership was not published"
             )
         returncode: int | None = None
+        worker_started = False
+        worker_timeout: subprocess.TimeoutExpired | None = None
         try:
             if time.monotonic() >= work_deadline:
                 raise subprocess.TimeoutExpired(
@@ -1485,8 +1519,10 @@ def _remove_private_directory_owned(
                     0,
                 )
             _start_private_directory_cleanup(active)
+            worker_started = True
             process.wait(timeout=max(0.0, work_deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as error:
+            worker_timeout = error
             _force_reap_private_directory_cleanup(
                 active,
                 deadline=absolute_deadline,
@@ -1513,10 +1549,33 @@ def _remove_private_directory_owned(
                 "Private directory cleanup completed after its ownership deadline"
             )
         if not removed:
-            raise ProcessOwnershipError(
+            if worker_timeout is not None:
+                phase = (
+                    "during filesystem cleanup"
+                    if worker_started
+                    else "before its start gate could be opened"
+                )
+                timeout_error = ProcessOwnershipError(
+                    "Private directory cleanup worker exceeded its work deadline "
+                    f"{phase}"
+                )
+                timeout_error.add_note(
+                    f"Forced worker exit code after reaping: {returncode}"
+                )
+                if active.worker_diagnostic is not None:
+                    timeout_error.add_note(
+                        f"Cleanup worker diagnostic: {active.worker_diagnostic}"
+                    )
+                raise timeout_error from worker_timeout
+            worker_error = ProcessOwnershipError(
                 "Private directory cleanup worker exited without removing its exact "
                 f"owned directory (exit_code={returncode})"
             )
+            if active.worker_diagnostic is not None:
+                worker_error.add_note(
+                    f"Cleanup worker diagnostic: {active.worker_diagnostic}"
+                )
+            raise worker_error
     finally:
         operation_lock.release()
 

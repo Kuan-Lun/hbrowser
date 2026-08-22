@@ -8,8 +8,44 @@ import sys
 import threading
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .process import _PrivateDirectory
+# Production executes this file directly to keep startup dependency-light;
+# tests import it through the package so both module contexts are intentional.
+if TYPE_CHECKING:
+    from .process import _PrivateDirectory
+elif __package__:
+    from .process import _PrivateDirectory
+else:
+    from process import _PrivateDirectory
+
+
+_DIAGNOSTIC_LIMIT = 768
+
+
+def _single_line(value: object, *, limit: int) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ")[:limit]
+
+
+def _report_failure(stage: str, error: BaseException) -> None:
+    notes = " | ".join(
+        _single_line(note, limit=160) for note in getattr(error, "__notes__", ())
+    )
+    diagnostic = (
+        f"stage={stage} error={type(error).__name__} "
+        f"errno={getattr(error, 'errno', None)} "
+        f"winerror={getattr(error, 'winerror', None)} "
+        f"message={_single_line(error, limit=320)}"
+    )
+    if notes:
+        diagnostic = f"{diagnostic} notes={notes}"
+    payload = (diagnostic + "\n").encode("ascii", errors="backslashreplace")
+    if len(payload) > _DIAGNOSTIC_LIMIT:
+        payload = payload[: _DIAGNOSTIC_LIMIT - 1] + b"\n"
+    try:
+        os.write(sys.stderr.fileno(), payload)
+    except AttributeError, OSError, ValueError:
+        pass
 
 
 def _parse_arguments(arguments: Sequence[str]) -> tuple[_PrivateDirectory, float]:
@@ -63,10 +99,12 @@ def _exit_when_parent_channel_closes(file_descriptor: int) -> None:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
+    stage = "argument-parsing"
     try:
         guard, deadline = _parse_arguments(
             tuple(sys.argv[1:] if arguments is None else arguments)
         )
+        stage = "start-gate"
         if _read_start_gate(sys.stdin.fileno()) != b"start\n":
             return 4
         threading.Thread(
@@ -75,8 +113,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
             name="hbrowser-private-cleanup-parent-watch",
             daemon=True,
         ).start()
+        stage = "directory-removal"
         guard._remove_inline(deadline=deadline)
-    except BaseException:
+    except BaseException as error:
+        _report_failure(stage, error)
         return 1
     return 0
 

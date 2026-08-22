@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from unittest.mock import ANY, Mock, call, patch
 
 import zendriver as zd
@@ -310,6 +310,66 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
 
         exit_process.assert_called_once_with(5)
 
+    def test_worker_failure_diagnostic_is_byte_bounded(self) -> None:
+        with tempfile.TemporaryFile() as diagnostic_file:
+            with patch.object(sys, "stderr", diagnostic_file):
+                cleanup_worker_module._report_failure(
+                    "directory-removal",
+                    RuntimeError("鎖定" * 1000),
+                )
+            diagnostic_file.seek(0)
+            diagnostic = diagnostic_file.read()
+
+        self.assertLessEqual(
+            len(diagnostic),
+            cleanup_worker_module._DIAGNOSTIC_LIMIT,
+        )
+        self.assertTrue(diagnostic.endswith(b"\n"))
+        self.assertIn(b"stage=directory-removal", diagnostic)
+        self.assertTrue(diagnostic.isascii())
+
+    def test_worker_failure_reports_stage_from_direct_script(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-worker-error-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            error_pipe = Mock()
+            error_pipe.read.return_value = (
+                b"stage=directory-removal error=PermissionError winerror=5\n"
+            )
+            process = Mock(
+                args=["cleanup-worker"],
+                stdin=Mock(),
+                stderr=error_pipe,
+                returncode=1,
+            )
+            process.wait.return_value = 1
+            try:
+                with (
+                    patch.object(
+                        process_module,
+                        "_ownership_platform",
+                        return_value="posix",
+                    ),
+                    patch.object(subprocess, "Popen", return_value=process) as popen,
+                    self.assertRaises(process_module.ProcessOwnershipError) as raised,
+                ):
+                    guard.remove(deadline=time.monotonic() + 2)
+
+                command = popen.call_args.args[0]
+                self.assertEqual(
+                    command[1],
+                    str(process_module._PRIVATE_CLEANUP_WORKER_PATH),
+                )
+                self.assertNotIn("-m", command)
+                self.assertIn(
+                    "stage=directory-removal error=PermissionError winerror=5",
+                    "\n".join(raised.exception.__notes__),
+                )
+                error_pipe.close.assert_called_once_with()
+            finally:
+                process_module._release_pending_private_directory(guard)
+
     def test_worker_assignment_failure_kills_ungated_exact_process(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-worker-assign-") as directory:
             private_directory = Path(directory) / "profile"
@@ -362,6 +422,59 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     process_module._private_directory_key(guard),
                     process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
                 )
+
+    def test_worker_diagnostic_is_collected_only_after_job_release(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-worker-diagnostic-"
+        ) as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            error_pipe = Mock()
+            error_pipe.read.return_value = b"stage=directory-removal error=OSError\n"
+            process = Mock(stdin=Mock(), stderr=error_pipe)
+            job = Mock()
+            job.close.side_effect = [OSError("close failed"), None]
+            active = process_module._ActivePrivateDirectoryCleanup(
+                guard=guard,
+                process=process,
+                windows_job=job,
+                windows_job_assigned=True,
+            )
+            process_module._register_active_private_directory_cleanup(active)
+            try:
+                with self.assertRaisesRegex(OSError, "close failed"):
+                    process_module._release_reaped_private_directory_cleanup(
+                        active,
+                        deadline=time.monotonic() + 1,
+                    )
+
+                error_pipe.read.assert_not_called()
+                self.assertIs(
+                    process_module._active_private_directory_cleanup(guard),
+                    active,
+                )
+
+                process_module._release_reaped_private_directory_cleanup(
+                    active,
+                    deadline=time.monotonic() + 1,
+                )
+
+                error_pipe.read.assert_called_once_with(
+                    process_module._PRIVATE_CLEANUP_WORKER_DIAGNOSTIC_BYTES
+                )
+                error_pipe.close.assert_called_once_with()
+                self.assertEqual(
+                    active.worker_diagnostic,
+                    "stage=directory-removal error=OSError",
+                )
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                self.assertEqual(job.wait_empty.call_count, 2)
+                self.assertEqual(job.close.call_count, 2)
+            finally:
+                process_module._release_active_private_directory_cleanup(active)
 
     def test_timeout_reaps_worker_before_background_mutation_can_continue(
         self,
@@ -419,10 +532,18 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             slow_process = SlowProcess()
             try:
                 with (
+                    patch.object(
+                        process_module,
+                        "_ownership_platform",
+                        return_value="posix",
+                    ),
                     patch.object(subprocess, "Popen", return_value=slow_process),
-                    self.assertRaises(process_module.ProcessOwnershipError),
+                    self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError,
+                        "exceeded its work deadline during filesystem cleanup",
+                    ),
                 ):
-                    guard.remove(deadline=time.monotonic() + 0.1)
+                    guard.remove(deadline=time.monotonic() + 2)
 
                 assert mutation_thread is not None
                 self.assertFalse(mutation_thread.is_alive())
@@ -431,6 +552,16 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 current = marker.read_text(encoding="utf-8") if marker.exists() else ""
                 self.assertEqual(current, observed)
                 self.assertEqual(slow_process.returncode, -9)
+                key = process_module._private_directory_key(guard)
+                with process_module._PRIVATE_DIRECTORY_CLEANUP_LOCK:
+                    self.assertNotIn(
+                        key,
+                        process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
+                    )
+                    self.assertIn(
+                        key,
+                        process_module._PENDING_PRIVATE_DIRECTORIES,
+                    )
             finally:
                 stop.set()
                 if mutation_thread is not None:
@@ -903,7 +1034,14 @@ class ProcessPolicyTests(unittest.TestCase):
             finally:
                 owner._shutdown_lock.release()
 
-            owner.wait(timeout=1)
+            with patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: guard._remove_inline(
+                    deadline=deadline
+                ),
+            ):
+                owner.wait(timeout=1)
 
     def test_supervisor_protocol_contains_no_parent_pid(self) -> None:
         status_path, command = supervisor_module._parse_arguments(
@@ -1265,7 +1403,14 @@ class ProcessPolicyTests(unittest.TestCase):
             self.assertTrue(status_directory.is_dir())
             job.close.assert_not_called()
 
-            owner.wait(timeout=1)
+            with patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: guard._remove_inline(
+                    deadline=deadline
+                ),
+            ):
+                owner.wait(timeout=1)
             self.assertFalse(private_directory.exists())
             self.assertFalse(status_directory.exists())
             job.close.assert_called_once_with()
@@ -1753,94 +1898,68 @@ class WindowsPrivateDirectoryIntegrationTests(unittest.TestCase):
     def test_owned_job_releases_real_message_database_lock_before_profile(
         self,
     ) -> None:
-        from ctypes import wintypes
-
-        win_dll = getattr(ctypes, "WinDLL")
-        kernel32 = cast(Any, win_dll)("kernel32", use_last_error=True)
-        kernel32.CreateFileW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ]
-        kernel32.CreateFileW.restype = wintypes.HANDLE
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        generic_read = 0x80000000
-        share_read_write = 0x00000001 | 0x00000002
-        open_existing = 3
-        normal_attributes = 0x00000080
-        invalid_handle = ctypes.c_void_p(-1).value
-
         with tempfile.TemporaryDirectory(prefix="hbrowser-windows-lock-") as directory:
-            profile = Path(directory) / "profile"
+            root = Path(directory)
+            profile = root / "profile"
             message_database = profile / "Default" / "Collaboration" / "MessageDB"
             message_database.parent.mkdir(parents=True)
             message_database.write_bytes(b"locked")
+            lock_ready = root / "message-db-lock-ready"
+            lock_script = r"""
+import ctypes
+import pathlib
+import sys
+import time
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+kernel32.CreateFileW.restype = wintypes.HANDLE
+handle = kernel32.CreateFileW(
+    sys.argv[1],
+    0x80000000,
+    0x00000001 | 0x00000002,
+    None,
+    3,
+    0x00000080,
+    None,
+)
+if handle in (None, ctypes.c_void_p(-1).value):
+    raise ctypes.WinError(ctypes.get_last_error())
+pathlib.Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+time.sleep(30)
+"""
             base_executable = cast(str, getattr(sys, "_base_executable"))
             owner = process_module.start_owned_process(
                 base_executable,
-                ["-c", "pass"],
+                [
+                    "-c",
+                    lock_script,
+                    str(message_database),
+                    str(lock_ready),
+                ],
                 cleanup_paths=(profile,),
             )
-            handle = kernel32.CreateFileW(
-                str(message_database),
-                generic_read,
-                share_read_write,
-                None,
-                open_existing,
-                normal_attributes,
-                None,
-            )
-            self.assertNotIn(handle, (None, invalid_handle))
-
-            sharing_violation_observed = threading.Event()
-            release_handle_requested = threading.Event()
-            handle_closed = threading.Event()
-
-            def release_handle() -> None:
-                if not release_handle_requested.wait(timeout=2):
-                    return
-                if not kernel32.CloseHandle(handle):
-                    win_error = cast(Any, getattr(ctypes, "WinError"))
-                    get_last_error = cast(Any, getattr(ctypes, "get_last_error"))
-                    raise win_error(get_last_error())
-                handle_closed.set()
-
-            releaser = threading.Thread(target=release_handle, daemon=True)
-            releaser.start()
-            original_rmtree = shutil.rmtree
-
-            def observe_real_rmtree(path: Path) -> None:
-                try:
-                    original_rmtree(path)
-                except OSError as error:
-                    if getattr(error, "winerror", None) == 32:
-                        sharing_violation_observed.set()
-                        release_handle_requested.set()
-                    raise
-
             try:
-                with patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=observe_real_rmtree,
-                ):
-                    owner.shutdown(
-                        graceful_timeout=3,
-                        terminate_timeout=3,
-                        kill_timeout=3,
-                        cleanup_timeout=3,
-                    )
+                ready_deadline = time.monotonic() + 3
+                while not lock_ready.is_file() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(lock_ready.is_file())
+                with self.assertRaises(OSError) as locked:
+                    message_database.unlink()
+                self.assertEqual(getattr(locked.exception, "winerror", None), 32)
+
+                owner.kill()
+                owner.wait(timeout=3)
             finally:
-                release_handle_requested.set()
-                releaser.join(timeout=2)
-                if not handle_closed.is_set():
-                    kernel32.CloseHandle(handle)
                 if not owner._closed:
                     owner.shutdown(
                         graceful_timeout=0,
@@ -1849,8 +1968,6 @@ class WindowsPrivateDirectoryIntegrationTests(unittest.TestCase):
                         cleanup_timeout=3,
                     )
 
-            self.assertTrue(sharing_violation_observed.is_set())
-            self.assertTrue(handle_closed.is_set())
             self.assertFalse(profile.exists())
             self.assertTrue(owner._closed)
             self.assertIsNone(owner._windows_job)
