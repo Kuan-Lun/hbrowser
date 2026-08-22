@@ -14,6 +14,12 @@ interactive challenges fall back to manual interaction in GUI mode.
 
 - Claude 必須以繁體中文回答所有對話內容，不論使用者以何種語言提問；程式碼、指令、檔名、專有名詞等仍維持原文。
 
+## Git Workflow
+
+- Do not create or switch to a development branch.
+- Perform all development work directly on the repository's primary branch
+  (`master`).
+
 ## Build & Development Commands
 
 ```bash
