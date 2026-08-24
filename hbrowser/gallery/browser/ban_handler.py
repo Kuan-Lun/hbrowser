@@ -1,6 +1,7 @@
 """IP ban 處理邏輯"""
 
 import asyncio
+import logging
 import re
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -11,11 +12,10 @@ from ..utils import (
     Deadline,
     navigate_and_wait,
     reload_and_wait,
-    setup_logger,
     wait_for_zendriver,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _BAN_MESSAGE = "Your IP address has been temporarily banned"
 _BLANK_PAGE = "<html><head></head><body></body></html>"

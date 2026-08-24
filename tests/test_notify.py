@@ -8,6 +8,9 @@ from unittest.mock import Mock, patch
 
 beep_module = importlib.import_module("hbrowser.beep")
 notify_module = importlib.import_module("hbrowser.notify")
+child_environment_module = importlib.import_module(
+    "hbrowser.gallery.utils._child_environment"
+)
 
 
 class NotificationTests(unittest.TestCase):
@@ -15,6 +18,11 @@ class NotificationTests(unittest.TestCase):
         with (
             patch.object(notify_module.sys, "platform", "linux"),
             patch.object(notify_module.subprocess, "run") as run,
+            patch.object(
+                notify_module,
+                "environment_without_logging_capabilities",
+                return_value={"PATH": "/commands"},
+            ),
             patch.object(notify_module, "beep_os_independent") as beep,
         ):
             notify_module.notify("title", "message")
@@ -23,6 +31,7 @@ class NotificationTests(unittest.TestCase):
             ["notify-send", "title", "message"],
             check=True,
             capture_output=True,
+            env={"PATH": "/commands"},
             timeout=notify_module._NOTIFICATION_TIMEOUT_SECONDS,
         )
         beep.assert_not_called()
@@ -51,17 +60,38 @@ class NotificationTests(unittest.TestCase):
 
 
 class BeepTests(unittest.TestCase):
+    def test_external_command_environment_strips_only_log_ownership(self) -> None:
+        environment = {
+            "DBUS_SESSION_BUS_ADDRESS": "preserved",
+            "hbrowser_log_dir": "removed-case-insensitively",
+            "HBROWSER_PROCESS_LOG_FILE": "removed",
+            "HBROWSER_LOG_FORWARD_ENDPOINT": "removed",
+            "HBROWSER_LOG_FORWARD_TOKEN": "removed",
+        }
+
+        sanitized = child_environment_module.environment_without_logging_capabilities(
+            environment
+        )
+
+        self.assertEqual(sanitized, {"DBUS_SESSION_BUS_ADDRESS": "preserved"})
+
     def test_macos_say_has_a_timeout(self) -> None:
         completed = Mock(returncode=0)
         with (
             patch.object(beep_module.sys, "platform", "darwin"),
             patch.object(beep_module.subprocess, "run", return_value=completed) as run,
+            patch.object(
+                beep_module,
+                "environment_without_logging_capabilities",
+                return_value={"PATH": "/commands"},
+            ),
         ):
             beep_module.beep_os_independent()
 
         run.assert_called_once_with(
             ["say", "-v", "Alex", "Warning"],
             capture_output=True,
+            env={"PATH": "/commands"},
             timeout=beep_module._BEEP_TIMEOUT_SECONDS,
         )
 

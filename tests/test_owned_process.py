@@ -47,6 +47,122 @@ def _windows_cleanup_error(code: int) -> PermissionError:
 
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
 class PosixOwnedProcessTests(unittest.TestCase):
+    def test_target_inherits_sanitized_supervisor_environment(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-environment-test-"
+        ) as directory:
+            environment_path = Path(directory) / "environment"
+            script = (
+                "import os,pathlib,sys;"
+                "keys=('HBROWSER_PROCESS_LOG_FILE','HBROWSER_LOG_DIR',"
+                "'HBROWSER_TEST_SENTINEL','AWS_SECRET_ACCESS_KEY',"
+                "'BATTLE_SECRET','EH_COOKIE','HBROWSER_LOG_FORWARD_TOKEN');"
+                "pathlib.Path(sys.argv[1]).write_text("
+                "'|'.join(os.environ.get(key,'missing') for key in keys),"
+                "encoding='utf-8')"
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "HBROWSER_PROCESS_LOG_FILE": "/tmp/legacy.log",
+                    "HBROWSER_LOG_DIR": "/tmp/logs",
+                    "HBROWSER_TEST_SENTINEL": "retained",
+                    "AWS_SECRET_ACCESS_KEY": "credential",
+                    "BATTLE_SECRET": "control",
+                    "EH_COOKIE": "cookie",
+                    "HBROWSER_LOG_FORWARD_TOKEN": "capability",
+                },
+            ):
+                process = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", script, str(environment_path)],
+                )
+                self.assertEqual(process.wait(timeout=5), 0)
+
+            self.assertEqual(
+                environment_path.read_text(encoding="utf-8"),
+                "missing|missing|missing|missing|missing|missing|missing",
+            )
+
+    def test_unavailable_forwarding_capability_does_not_block_child_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-forward-fallback-test-"
+        ) as directory:
+            marker = Path(directory) / "business-result"
+            script = (
+                "import os,pathlib,sys,time;"
+                "assert 'HBROWSER_LOG_FORWARD_ENDPOINT' not in os.environ;"
+                "assert 'HBROWSER_LOG_FORWARD_TOKEN' not in os.environ;"
+                "pathlib.Path(sys.argv[1]).write_text('completed',encoding='utf-8');"
+                "time.sleep(0.2)"
+            )
+            with patch.object(
+                process_module,
+                "_forwarding_environment_for_owned_child",
+                return_value={},
+            ) as forwarding_environment:
+                process = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", script, str(marker)],
+                    forward_logging=True,
+                )
+                self.assertEqual(process.wait(timeout=5), 0)
+
+            forwarding_environment.assert_called_once_with()
+            self.assertEqual(marker.read_text(encoding="utf-8"), "completed")
+
+    def test_forwarding_capability_reaches_only_explicitly_opted_in_child(
+        self,
+    ) -> None:
+        capability = {
+            "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:43210",
+            "HBROWSER_LOG_FORWARD_TOKEN": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-forward-capability-test-"
+        ) as directory:
+            root = Path(directory)
+            ordinary_marker = root / "ordinary"
+            forwarded_marker = root / "forwarded"
+            script = (
+                "import os,pathlib,sys,time;"
+                "pathlib.Path(sys.argv[1]).write_text("
+                "os.environ.get('HBROWSER_LOG_FORWARD_ENDPOINT','missing')+'|' +"
+                "os.environ.get('HBROWSER_LOG_FORWARD_TOKEN','missing'),"
+                "encoding='utf-8');time.sleep(0.2)"
+            )
+            with patch.object(
+                process_module,
+                "_forwarding_environment_for_owned_child",
+                return_value=capability,
+            ) as forwarding_environment:
+                ordinary = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", script, str(ordinary_marker)],
+                )
+                forwarded = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", script, str(forwarded_marker)],
+                    environment={
+                        "HBROWSER_LOG_FORWARD_ENDPOINT": "caller-value",
+                        "HBROWSER_LOG_FORWARD_TOKEN": "caller-value",
+                    },
+                    forward_logging=True,
+                )
+                self.assertEqual(ordinary.wait(timeout=5), 0)
+                self.assertEqual(forwarded.wait(timeout=5), 0)
+
+            forwarding_environment.assert_called_once_with()
+            self.assertEqual(
+                ordinary_marker.read_text(encoding="utf-8"), "missing|missing"
+            )
+            self.assertEqual(
+                forwarded_marker.read_text(encoding="utf-8"),
+                "127.0.0.1:43210|" + ("a" * 64),
+            )
+
     def test_supervisor_and_target_have_distinct_owned_groups(self) -> None:
         process = process_module.start_owned_process(
             sys.executable,
@@ -1053,6 +1169,24 @@ class ProcessPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid supervisor arguments"):
             supervisor_module._parse_arguments(("status", "123", "--", "browser"))
 
+    def test_supervisor_consumes_forwarding_capability_for_target_only(self) -> None:
+        capability = {
+            "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:43210",
+            "HBROWSER_LOG_FORWARD_TOKEN": "a" * 64,
+        }
+        with patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", **capability},
+            clear=True,
+        ):
+            target_environment = supervisor_module._take_target_environment()
+
+            self.assertEqual(os.environ, {"PATH": "/usr/bin:/bin"})
+            self.assertEqual(
+                target_environment,
+                {"PATH": "/usr/bin:/bin", **capability},
+            )
+
     def test_windows_venv_supervisor_bypasses_python_redirector(self) -> None:
         venv_python = r"C:\workspace\.venv\Scripts\python.exe"
         base_python = r"C:\Python314\python.exe"
@@ -1062,7 +1196,11 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(Path, "is_file", return_value=True),
             patch.dict(
                 os.environ,
-                {"HBROWSER_TEST_SENTINEL": "retained"},
+                {
+                    "HBROWSER_PROCESS_LOG_FILE": r"C:\logs\legacy.log",
+                    "HBROWSER_LOG_DIR": r"C:\logs",
+                    "HBROWSER_TEST_SENTINEL": "retained",
+                },
                 clear=True,
             ),
         ):
@@ -1071,10 +1209,7 @@ class ProcessPolicyTests(unittest.TestCase):
         self.assertEqual(executable, base_python)
         self.assertEqual(
             environment,
-            {
-                "HBROWSER_TEST_SENTINEL": "retained",
-                "__PYVENV_LAUNCHER__": venv_python,
-            },
+            {"__PYVENV_LAUNCHER__": venv_python},
         )
 
     def test_windows_non_venv_supervisor_uses_current_interpreter(self) -> None:
@@ -1082,11 +1217,122 @@ class ProcessPolicyTests(unittest.TestCase):
         with (
             patch.object(sys, "executable", executable_path),
             patch.object(sys, "_base_executable", r"c:\python314\PYTHON.EXE"),
+            patch.dict(
+                os.environ,
+                {
+                    "HBROWSER_PROCESS_LOG_FILE": r"C:\logs\legacy.log",
+                    "HBROWSER_LOG_DIR": r"C:\logs",
+                    "HBROWSER_TEST_SENTINEL": "retained",
+                },
+                clear=True,
+            ),
         ):
             executable, environment = process_module._supervisor_launch_context("nt")
 
         self.assertEqual(executable, executable_path)
-        self.assertIsNone(environment)
+        self.assertEqual(environment, {})
+
+    def test_posix_supervisor_uses_explicit_sanitized_environment(self) -> None:
+        with (
+            patch.object(sys, "executable", "/usr/bin/python3"),
+            patch.dict(
+                os.environ,
+                {
+                    "HBROWSER_PROCESS_LOG_FILE": "/tmp/legacy.log",
+                    "HBROWSER_LOG_DIR": "/tmp/logs",
+                    "HBROWSER_TEST_SENTINEL": "retained",
+                },
+                clear=True,
+            ),
+        ):
+            executable, environment = process_module._supervisor_launch_context("posix")
+
+        self.assertEqual(executable, "/usr/bin/python3")
+        self.assertEqual(environment, {})
+
+    def test_environment_allowlist_and_explicit_overlay_strip_reserved_keys(
+        self,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/runtime/bin",
+                "HOME": "/profile",
+                "LC_ALL": "C.UTF-8",
+                "XDG_CACHE_HOME": "/cache",
+                "AWS_SECRET_ACCESS_KEY": "credential",
+                "ARBITRARY_SENTINEL": "sentinel",
+                "BATTLE_COOKIE": "control",
+                "EH_PASSWORD": "control",
+                "HBROWSER_LOG_DIR": "/private/log",
+                "HBROWSER_LOG_FORWARD_TOKEN": "inherited-capability",
+            },
+            clear=True,
+        ):
+            environment = process_module._build_child_environment(
+                "posix",
+                explicit_environment={
+                    "APPLICATION_MODE": "worker",
+                    "BATTLE_EXPLICIT": "removed",
+                    "EH_EXPLICIT": "removed",
+                    "HBROWSER_LOG_FORWARD_ENDPOINT": "removed",
+                },
+            )
+
+        self.assertEqual(
+            environment,
+            {
+                "PATH": "/runtime/bin",
+                "HOME": "/profile",
+                "LC_ALL": "C.UTF-8",
+                "XDG_CACHE_HOME": "/cache",
+                "APPLICATION_MODE": "worker",
+            },
+        )
+
+    def test_forwarding_capability_is_injected_only_after_sanitization(self) -> None:
+        with (
+            patch.object(sys, "executable", "/usr/bin/python3"),
+            patch.dict(
+                os.environ,
+                {"HBROWSER_LOG_FORWARD_TOKEN": "inherited", "PATH": "/bin"},
+                clear=True,
+            ),
+        ):
+            _, ordinary = process_module._supervisor_launch_context("posix")
+            _, forwarded = process_module._supervisor_launch_context(
+                "posix",
+                environment={
+                    "HBROWSER_LOG_FORWARD_ENDPOINT": "caller",
+                    "HBROWSER_LOG_FORWARD_TOKEN": "caller",
+                },
+                forwarding_environment={
+                    "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:43210",
+                    "HBROWSER_LOG_FORWARD_TOKEN": "a" * 64,
+                },
+            )
+
+        self.assertEqual(ordinary, {"PATH": "/bin"})
+        self.assertEqual(
+            forwarded,
+            {
+                "PATH": "/bin",
+                "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:43210",
+                "HBROWSER_LOG_FORWARD_TOKEN": "a" * 64,
+            },
+        )
+
+    def test_child_environment_rejects_invalid_entries(self) -> None:
+        for environment in (
+            {"BAD=KEY": "value"},
+            {"BAD\0KEY": "value"},
+            {"KEY": "bad\0value"},
+        ):
+            with self.subTest(environment=environment), self.assertRaises(ValueError):
+                process_module._build_child_environment(
+                    "posix",
+                    explicit_environment=environment,
+                )
 
     def test_missing_windows_base_interpreter_fails_closed(self) -> None:
         with (
@@ -1109,6 +1355,23 @@ class ProcessPolicyTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "Unsupported"),
         ):
             process_module._supervisor_creation_options()
+
+    def test_browser_process_wrapper_cannot_receive_logging_capability(self) -> None:
+        owner = Mock()
+        with patch.object(
+            process_module,
+            "start_owned_process",
+            return_value=owner,
+        ) as start_process:
+            result = process_module.start_owned_browser_process(
+                "chrome",
+                ["--headless"],
+            )
+
+        self.assertIs(result, owner)
+        _, keyword_arguments = start_process.call_args
+        self.assertNotIn("environment", keyword_arguments)
+        self.assertNotIn("forward_logging", keyword_arguments)
 
     def test_windows_job_assignment_precedes_start_gate(self) -> None:
         events: list[str] = []

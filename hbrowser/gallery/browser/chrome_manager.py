@@ -2,6 +2,7 @@
 
 import errno
 import json
+import logging
 import os
 import platform
 import shutil
@@ -20,10 +21,10 @@ from ..utils import (
     Deadline,
     get_chrome_executable_name,
     get_platform,
-    setup_logger,
 )
+from ..utils._child_environment import environment_without_logging_capabilities
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 CHROME_FOR_TESTING_API = (
     "https://googlechromelabs.github.io/chrome-for-testing/"
@@ -339,6 +340,7 @@ def _download_and_extract(
                 subprocess.run(
                     ["ditto", "-xk", str(zip_path), str(tmp_dir)],
                     check=True,
+                    env=environment_without_logging_capabilities(),
                     timeout=_require_install_budget(deadline, "extraction"),
                 )
             except subprocess.TimeoutExpired:
@@ -400,6 +402,7 @@ def _remove_quarantine(path: Path, *, deadline: Deadline) -> None:
             ["xattr", "-dr", "com.apple.quarantine", str(path)],
             check=False,
             capture_output=True,
+            env=environment_without_logging_capabilities(),
             timeout=_require_install_budget(deadline, "quarantine cleanup"),
         )
     except subprocess.TimeoutExpired:

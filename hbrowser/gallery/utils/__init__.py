@@ -3,13 +3,21 @@
 from .browser_generation import is_browser_generation_error
 from .deadline import Deadline
 from .log import (
+    LogForwardingReceiver,
+    LoggingHealth,
     LogLevel,
     LogPersistenceError,
+    close_forwarded_logging,
+    close_logging,
+    configure_forwarded_logging,
     configure_logging,
     get_log_dir,
     log_context,
     log_to_process_file,
+    logging_health,
+    raise_for_log_persistence_failure,
     setup_logger,
+    start_log_forwarding_receiver,
 )
 from .page_state import (
     NavigationReceipt,
@@ -34,15 +42,23 @@ from .window import mutate_and_wait_for_new_tab
 
 __all__ = [
     "get_chrome_executable_name",
+    "close_logging",
+    "close_forwarded_logging",
+    "configure_forwarded_logging",
     "configure_logging",
     "get_log_dir",
     "get_platform",
     "is_browser_generation_error",
     "LogLevel",
+    "LogForwardingReceiver",
     "LogPersistenceError",
+    "LoggingHealth",
     "log_to_process_file",
     "log_context",
+    "logging_health",
+    "raise_for_log_persistence_failure",
     "setup_logger",
+    "start_log_forwarding_receiver",
     "ZendriverOperationTimeout",
     "Deadline",
     "NavigationReceipt",

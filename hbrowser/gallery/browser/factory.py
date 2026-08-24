@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 import os
 import platform
@@ -20,7 +21,6 @@ from ..utils import (
     Deadline,
     is_browser_generation_error,
     log_context,
-    setup_logger,
 )
 from ..utils.mutation import wait_for_zendriver_mutation
 from ..utils.protocol import (
@@ -54,7 +54,7 @@ from .tor import (
     terminate_tor_process,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 MAIN_TAB_WAIT_TIMEOUT = 5.0
 MAIN_TAB_POLL_INTERVAL = 0.1

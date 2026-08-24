@@ -3,6 +3,10 @@ __all__ = ["beep_os_independent"]
 import subprocess
 import sys
 
+from .gallery.utils._child_environment import (
+    environment_without_logging_capabilities,
+)
+
 _BEEP_TIMEOUT_SECONDS = 5.0
 
 
@@ -33,6 +37,7 @@ def beep_os_independent() -> None:
             result = subprocess.run(
                 ["say", "-v", "Alex", "Warning"],
                 capture_output=True,
+                env=environment_without_logging_capabilities(),
                 timeout=_BEEP_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
@@ -50,6 +55,7 @@ def beep_os_independent() -> None:
         try:
             subprocess.run(
                 ["printf", "\a"],
+                env=environment_without_logging_capabilities(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=_BEEP_TIMEOUT_SECONDS,

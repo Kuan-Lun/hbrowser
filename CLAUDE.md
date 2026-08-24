@@ -46,8 +46,15 @@ uv run black .
 ## Environment Variables
 
 - `EH_USERNAME` / `EH_PASSWORD` - Login credentials for E-Hentai
-- `HBROWSER_PROCESS_LOG_FILE` - Optional private rotating application-log path;
-  configure independent console/file thresholds with `configure_logging()`
+- `HBROWSER_LOG_DIR` - Private diagnostics and append-only
+  `events-NNNNNN.jsonl` segments; the application selects the exact run
+  directory before its one explicit `configure_logging()` lifecycle. Use
+  `require_file_sink=False` only when trace loss may be reported as degraded
+  through `logging_health()` rather than treated as a startup failure
+- `HBROWSER_LOG_FORWARD_ENDPOINT` / `HBROWSER_LOG_FORWARD_TOKEN` are internal,
+  one-purpose child capabilities. They are injected only by
+  `start_owned_process(..., forward_logging=True)` and consumed by
+  `configure_forwarded_logging()`; users must not configure them directly.
 - `FLARESOLVERR_URL` - Optional: FlareSolverr 3.5.0+ endpoint (e.g. `http://127.0.0.1:8191/v1`) for automated Cloudflare challenge solving; unset disables it. For local testing, run `docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr` and set this to `http://127.0.0.1:8191/v1`
 
 ## Architecture
@@ -63,6 +70,21 @@ uv run black .
   - `gallery/browser/` - Browser factory built on `zendriver`; also owns proxy/Tor rotation, persistent FlareSolverr sessions, and ban detection. Use `find hbrowser/gallery/browser -name '*.py'` for the current file list rather than relying on this doc.
 
 ### Key Patterns
+
+**Logging composition**: Library modules use `logging.getLogger(__name__)`.
+Only the explicit parent composition lifecycle configures the `hbrowser`,
+`battle`, `hvbrowser`, and `hvbattle` namespaces and owns append-only segments. Opted-in
+Python children enqueue bounded authenticated JSON for a dedicated sender to
+forward to the parent; ordinary logger calls perform no file or socket I/O.
+Chrome, Tor, and short-lived external helpers never inherit that capability.
+Forwarding and optional trace failures are reported through `logging_health()`
+without stopping business work; explicit terminal and close boundaries wait
+only for their documented bounded drain deadlines.
+
+**Child environments**: Owned processes inherit only the documented OS,
+profile/temp, locale/display/XDG, and Python-runtime allowlists. Credentials,
+battle/EH control variables, log-directory variables, and arbitrary inherited
+state are excluded; reserved values are also stripped from explicit overlays.
 
 **Driver Inheritance**: `Driver` (ABC) → `EHDriver` → `ExHDriver`
 

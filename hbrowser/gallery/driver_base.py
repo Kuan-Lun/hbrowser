@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -41,7 +42,6 @@ from .utils import (
     log_context,
     matchurl,
     mutate_and_wait_for_navigation,
-    setup_logger,
     wait_for_selector,
     wait_for_zendriver,
 )
@@ -152,7 +152,7 @@ class Driver(ABC):
             url["Forums"] = "https://forums.e-hentai.org/"
             return url
 
-        self.logger = setup_logger(__name__)
+        self.logger = logging.getLogger(__name__)
         self.username = os.getenv("EH_USERNAME")
         self.password = os.getenv("EH_PASSWORD")
         self.url = seturl()

@@ -3,6 +3,7 @@
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import shutil
 import socket
@@ -16,12 +17,11 @@ from ..utils import (
     Deadline,
     is_browser_generation_error,
     navigate_and_wait,
-    setup_logger,
     wait_for_selector,
 )
 from .process import ProcessOwnershipError
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 _PROXY_PAGE_DEADLINE_SECONDS = 10.0
 _DIRECT_IP_REQUEST_TIMEOUT_SECONDS = 5.0
 

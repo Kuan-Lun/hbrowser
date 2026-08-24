@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -14,11 +15,11 @@ import httpx
 from zendriver import cdp
 
 from ..challenge_policy import validate_turnstile_tabs
-from ..utils import Deadline, setup_logger
+from ..utils import Deadline
 from .proxy import has_residential_proxy
 from .tor import should_use_tor
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _SAME_SITE_MAP = {
     "Strict": cdp.network.CookieSameSite.STRICT,

@@ -1,6 +1,7 @@
 """Tor 進程管理"""
 
 import atexit
+import logging
 import math
 import os
 import platform
@@ -13,10 +14,10 @@ from collections import deque
 from pathlib import Path
 from types import MappingProxyType
 
-from ..utils import Deadline, setup_logger
+from ..utils import Deadline
 from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Tor SOCKS proxy 預設端口
 TOR_SOCKS_PORT = 9150

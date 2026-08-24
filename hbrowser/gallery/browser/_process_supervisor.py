@@ -14,6 +14,10 @@ from pathlib import Path
 _POLL_SECONDS = 0.05
 _TERM_GRACE_SECONDS = 2.0
 _KILL_PROOF_SECONDS = 2.0
+_TARGET_ONLY_ENVIRONMENT_KEYS = (
+    "HBROWSER_LOG_FORWARD_ENDPOINT",
+    "HBROWSER_LOG_FORWARD_TOKEN",
+)
 
 
 def _write_status(status_path: Path, value: str) -> None:
@@ -173,6 +177,19 @@ def _read_start_gate(file_descriptor: int) -> bytes:
     return bytes(command)
 
 
+def _take_target_environment() -> dict[str, str]:
+    """Consume target-only capabilities before the supervisor spawns helpers."""
+
+    target_only: dict[str, str] = {}
+    for key in _TARGET_ONLY_ENVIRONMENT_KEYS:
+        value = os.environ.pop(key, None)
+        if value is not None:
+            target_only[key] = value
+    target_environment = os.environ.copy()
+    target_environment.update(target_only)
+    return target_environment
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     try:
         status_path, command = _parse_arguments(
@@ -180,6 +197,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
     except OSError, ValueError:
         return 4
+
+    target_environment = _take_target_environment()
 
     control_file_descriptor = sys.stdin.fileno()
     start_command = _read_start_gate(control_file_descriptor)
@@ -199,19 +218,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 4
 
     try:
-        if os.name == "posix":
-            target = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                close_fds=True,
-                process_group=0,
-            )
-        else:
-            target = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                close_fds=True,
-            )
+        try:
+            if os.name == "posix":
+                target = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                    env=target_environment,
+                    process_group=0,
+                )
+            else:
+                target = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                    env=target_environment,
+                )
+        finally:
+            target_environment.clear()
     except OSError as error:
         _write_status(status_path, f"error {type(error).__name__}")
         return 4

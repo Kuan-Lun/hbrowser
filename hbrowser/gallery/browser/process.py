@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +41,89 @@ _PRIVATE_CLEANUP_WORKER_PATH: Final = (
 _OUTPUT_RING_BYTES: Final = 256 * 1024
 _SUPERVISOR_READY_PREFIX: Final = "ready "
 _SUPERVISOR_ERROR_PREFIX: Final = "error "
+_POSIX_INHERITED_ENVIRONMENT_KEYS: Final = frozenset(
+    {
+        "COLORTERM",
+        "DISPLAY",
+        "HOME",
+        "LANG",
+        "LANGUAGE",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+    }
+)
+_WINDOWS_INHERITED_ENVIRONMENT_KEYS: Final = frozenset(
+    {
+        "ALLUSERSPROFILE",
+        "APPDATA",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "COMMONPROGRAMW6432",
+        "COMPUTERNAME",
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "PATH",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "PUBLIC",
+        "SESSIONNAME",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERDOMAIN",
+        "USERNAME",
+        "USERPROFILE",
+        "WINDIR",
+    }
+)
+_PYTHON_RUNTIME_ENVIRONMENT_KEYS: Final = frozenset(
+    {
+        "PYTHONEXECUTABLE",
+        "PYTHONFAULTHANDLER",
+        "PYTHONHASHSEED",
+        "PYTHONHOME",
+        "PYTHONIOENCODING",
+        "PYTHONMALLOC",
+        "PYTHONPATH",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONUNBUFFERED",
+        "PYTHONUSERBASE",
+        "PYTHONUTF8",
+        "PYTHONWARNINGS",
+    }
+)
+_RESERVED_CHILD_ENVIRONMENT_KEYS: Final = frozenset(
+    {
+        "HBROWSER_LOG_DIR",
+        "HBROWSER_PROCESS_LOG_FILE",
+        "HBROWSER_LOG_FORWARD_ENDPOINT",
+        "HBROWSER_LOG_FORWARD_TOKEN",
+    }
+)
 
 
 class ProcessOwnershipError(RuntimeError):
@@ -1178,16 +1261,111 @@ def _supervisor_creation_options() -> dict[str, Any]:
     raise AssertionError("unreachable process ownership platform")
 
 
+def _is_reserved_child_environment_key(key: str) -> bool:
+    normalized = key.upper()
+    return (
+        normalized in _RESERVED_CHILD_ENVIRONMENT_KEYS
+        or normalized.startswith("BATTLE_")
+        or normalized.startswith("EH_")
+    )
+
+
+def _validate_child_environment_entry(key: object, value: object) -> tuple[str, str]:
+    if not isinstance(key, str) or not key or "=" in key or "\0" in key:
+        raise ValueError("Child environment keys must be non-empty strings")
+    if not isinstance(value, str) or "\0" in value:
+        raise ValueError("Child environment values must be strings without NUL")
+    return key, value
+
+
+def _inherited_environment_key_allowed(key: str, platform_name: str) -> bool:
+    if _is_reserved_child_environment_key(key):
+        return False
+    normalized = key.upper() if platform_name == "nt" else key
+    if normalized in _PYTHON_RUNTIME_ENVIRONMENT_KEYS:
+        return True
+    if platform_name == "nt":
+        return normalized in _WINDOWS_INHERITED_ENVIRONMENT_KEYS
+    return (
+        normalized in _POSIX_INHERITED_ENVIRONMENT_KEYS
+        or normalized.startswith("LC_")
+        or normalized.startswith("XDG_")
+    )
+
+
+def _build_child_environment(
+    platform_name: str,
+    *,
+    explicit_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a minimal target environment from documented runtime allowlists.
+
+    Inherited values are limited to OS, profile, locale/display, temporary,
+    XDG, and Python-runtime keys. Credentials and unrelated caller state are
+    therefore absent by default. An explicit mapping may add application keys,
+    but logging capabilities and battle/EH control keys are always stripped.
+    """
+    if platform_name not in {"nt", "posix"}:
+        raise RuntimeError(f"Unsupported process ownership platform: {platform_name}")
+
+    environment: dict[str, str] = {}
+    identities: dict[str, str] = {}
+
+    def add(key: object, value: object) -> None:
+        valid_key, valid_value = _validate_child_environment_entry(key, value)
+        if _is_reserved_child_environment_key(valid_key):
+            return
+        identity = valid_key.upper() if platform_name == "nt" else valid_key
+        previous_key = identities.get(identity)
+        if previous_key is not None and previous_key != valid_key:
+            environment.pop(previous_key, None)
+        identities[identity] = valid_key
+        environment[valid_key] = valid_value
+
+    for key, value in os.environ.items():
+        if _inherited_environment_key_allowed(key, platform_name):
+            add(key, value)
+    if explicit_environment is not None:
+        if not isinstance(explicit_environment, Mapping):
+            raise TypeError("environment must be a mapping of strings")
+        for key, value in explicit_environment.items():
+            add(key, value)
+    return environment
+
+
+def _forwarding_environment_for_owned_child() -> dict[str, str]:
+    from ..utils.log import _log_forwarding_environment_for_child
+
+    return _log_forwarding_environment_for_child()
+
+
 def _supervisor_launch_context(
     platform_name: str,
-) -> tuple[str, dict[str, str] | None]:
+    *,
+    environment: Mapping[str, str] | None = None,
+    forwarding_environment: Mapping[str, str] | None = None,
+) -> tuple[str, dict[str, str]]:
     """Select an interpreter whose process identity can be owned directly."""
 
     executable = sys.executable
     if not isinstance(executable, str) or not executable:
         raise ProcessOwnershipError("Python did not expose its executable path")
+    child_environment = _build_child_environment(
+        platform_name,
+        explicit_environment=environment,
+    )
+    if forwarding_environment is not None:
+        expected_keys = {
+            "HBROWSER_LOG_FORWARD_ENDPOINT",
+            "HBROWSER_LOG_FORWARD_TOKEN",
+        }
+        if forwarding_environment and set(forwarding_environment) != expected_keys:
+            raise ValueError("Forwarding environment schema is invalid")
+        for key, value in forwarding_environment.items():
+            valid_key, valid_value = _validate_child_environment_entry(key, value)
+            child_environment[valid_key] = valid_value
     if platform_name != "nt":
-        return executable, None
+        return executable, child_environment
 
     base_executable = getattr(sys, "_base_executable", None)
     if not isinstance(base_executable, str) or not base_executable:
@@ -1197,7 +1375,7 @@ def _supervisor_launch_context(
     executable_identity = ntpath.normcase(ntpath.normpath(executable))
     base_identity = ntpath.normcase(ntpath.normpath(base_executable))
     if executable_identity == base_identity:
-        return executable, None
+        return executable, child_environment
 
     # A Windows venv's python.exe is a redirector process. Launching it would
     # make Popen and the Job own that short-lived redirector rather than the
@@ -1207,9 +1385,8 @@ def _supervisor_launch_context(
             "Windows Python base executable is unavailable for process ownership"
         )
 
-    environment = os.environ.copy()
-    environment["__PYVENV_LAUNCHER__"] = executable
-    return base_executable, environment
+    child_environment["__PYVENV_LAUNCHER__"] = executable
+    return base_executable, child_environment
 
 
 @dataclass(slots=True)
@@ -1664,15 +1841,18 @@ def start_owned_process(
     stderr: int | None = subprocess.PIPE,
     drain_output: bool = False,
     cleanup_paths: Sequence[str | Path] = (),
+    environment: Mapping[str, str] | None = None,
+    forward_logging: bool = False,
     startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
     deadline: float | None = None,
 ) -> OwnedProcess:
     """Start one target under one absolute startup-and-cleanup deadline.
 
     ``startup_timeout`` caps the supervisor READY phase. ``deadline`` is a
-    monotonic caller deadline shared with every failure-cleanup phase. When no
-    caller deadline is supplied, ``startup_timeout`` is the complete operation
-    budget and half (at most five seconds) is reserved for ownership proof.
+    monotonic caller deadline shared with every failure-cleanup phase. The
+    target receives only the runtime allowlist plus explicit ``environment``;
+    reserved control/logging keys are stripped. ``forward_logging`` injects the
+    active parent's one-purpose logging capability after sanitization.
     """
 
     if (
@@ -1682,6 +1862,11 @@ def start_owned_process(
         or startup_timeout <= 0
     ):
         raise ValueError("process startup timeout must be finite and positive")
+    if not isinstance(forward_logging, bool):
+        raise TypeError("forward_logging must be a bool")
+    forwarding_environment = (
+        _forwarding_environment_for_owned_child() if forward_logging else None
+    )
     effective_startup_timeout = min(
         _STARTUP_TIMEOUT_SECONDS,
         float(startup_timeout),
@@ -1728,7 +1913,9 @@ def start_owned_process(
             cleanup_guard_list.append(_PrivateDirectory.capture(Path(path)))
         cleanup_guards = tuple(cleanup_guard_list)
         supervisor_executable, supervisor_environment = _supervisor_launch_context(
-            platform_name
+            platform_name,
+            environment=environment,
+            forwarding_environment=forwarding_environment,
         )
         command = [
             supervisor_executable,

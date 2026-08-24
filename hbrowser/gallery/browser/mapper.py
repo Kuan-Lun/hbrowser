@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 from zendriver.core.connection import EventTransaction
 
-from ..utils import setup_logger
-
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 ZENDRIVER_MAPPER_CLEANUP_INTERVAL_SECONDS = 60.0
 _JANITOR_TASK_ATTRIBUTE = "_hbrowser_zendriver_mapper_janitor_task"

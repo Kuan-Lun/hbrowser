@@ -13,10 +13,18 @@ __all__ = [
     "GallerySearchResult",
     "InvalidSearchRequestError",
     "LogLevel",
+    "LogForwardingReceiver",
     "LogPersistenceError",
+    "LoggingHealth",
     "MalformedSearchPageError",
+    "close_logging",
+    "close_forwarded_logging",
+    "configure_forwarded_logging",
     "configure_logging",
     "log_to_process_file",
+    "logging_health",
+    "raise_for_log_persistence_failure",
+    "start_log_forwarding_receiver",
     "notify",
     "PunchInComplete",
     "PunchInResult",
@@ -65,9 +73,17 @@ from .gallery import (
 )
 from .gallery.browser.process import ProcessOwnershipError
 from .gallery.utils import (
+    LogForwardingReceiver,
+    LoggingHealth,
     LogLevel,
     LogPersistenceError,
+    close_forwarded_logging,
+    close_logging,
+    configure_forwarded_logging,
     configure_logging,
     log_to_process_file,
+    logging_health,
+    raise_for_log_persistence_failure,
+    start_log_forwarding_receiver,
 )
 from .notify import notify

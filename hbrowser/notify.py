@@ -4,6 +4,9 @@ import subprocess
 import sys
 
 from .beep import beep_os_independent
+from .gallery.utils._child_environment import (
+    environment_without_logging_capabilities,
+)
 
 _NOTIFICATION_TIMEOUT_SECONDS = 5.0
 
@@ -56,6 +59,7 @@ def notify(title: str, message: str) -> None:
             command,
             check=True,
             capture_output=True,
+            env=environment_without_logging_capabilities(),
             timeout=_NOTIFICATION_TIMEOUT_SECONDS,
         )
         return
