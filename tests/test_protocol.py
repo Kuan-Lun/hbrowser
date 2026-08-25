@@ -77,6 +77,9 @@ class ZendriverTimeoutContractTests(unittest.TestCase):
         )
 
     def test_timeout_error_rejects_invalid_arguments(self) -> None:
+        with self.assertRaises(TypeError):
+            ZendriverOperationTimeout(2.5)  # type: ignore[call-arg]
+
         invalid_values: tuple[Any, ...] = (None, "slow", True)
         for invalid_value in invalid_values:
             with self.subTest(value=invalid_value), self.assertRaises(TypeError):

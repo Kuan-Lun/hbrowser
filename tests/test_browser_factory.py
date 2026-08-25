@@ -2162,8 +2162,14 @@ class TorProcessCleanupTests(unittest.TestCase):
         data_directory.start()
         self.addCleanup(data_directory.stop)
 
+    @staticmethod
+    def _owned_process(*, stdout: object) -> Mock:
+        process = Mock(spec=OwnedProcess)
+        process.stdout = stdout
+        return process
+
     def test_tor_process_is_launched_outside_the_terminal_group(self) -> None:
-        process = Mock(stdout=[b"Bootstrapped 100%: Done\n"])
+        process = self._owned_process(stdout=[b"Bootstrapped 100%: Done\n"])
         process.poll.return_value = None
         with (
             patch.object(
@@ -2183,18 +2189,27 @@ class TorProcessCleanupTests(unittest.TestCase):
         self.assertEqual(len(start_process.call_args.kwargs["cleanup_paths"]), 1)
         terminate_tor_process(process)
 
-    def test_cleanup_attachment_failure_reaps_exact_process_and_preserves_error(
-        self,
-    ) -> None:
-        class _UnattachableProcess:
-            __slots__ = ("stdout", "terminate", "wait")
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=None,
+        )
 
-            def __init__(self) -> None:
-                self.stdout: list[bytes] = []
-                self.terminate = Mock()
-                self.wait = Mock()
+    def test_owned_tor_uses_bounded_shutdown_policy(self) -> None:
+        process = self._owned_process(stdout=None)
 
-        process = _UnattachableProcess()
+        terminate_tor_process(process)
+
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=None,
+        )
+
+    def test_cleanup_registration_failure_releases_exact_owner(self) -> None:
+        process = self._owned_process(stdout=[])
         with (
             patch.object(
                 tor_module,
@@ -2203,34 +2218,26 @@ class TorProcessCleanupTests(unittest.TestCase):
             ),
             patch(
                 "hbrowser.gallery.browser.tor.atexit.register",
-            ) as register_cleanup,
-            self.assertRaises(AttributeError) as raised,
+                side_effect=RuntimeError("registration failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "registration failed"),
         ):
             tor_module._start_tor_process(9150)
 
-        self.assertIn("_hbrowser_tor_process_cleanup", str(raised.exception))
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
-        register_cleanup.assert_not_called()
-
-    def test_force_killed_tor_is_always_reaped(self) -> None:
-        process = Mock()
-        process.wait.side_effect = [
-            subprocess.TimeoutExpired(cmd="tor", timeout=5),
-            0,
-        ]
-
-        terminate_tor_process(process)
-
-        process.terminate.assert_called_once_with()
-        process.kill.assert_called_once_with()
-        self.assertEqual(
-            process.wait.call_args_list,
-            [call(timeout=5), call(timeout=5)],
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=unittest.mock.ANY,
         )
+        process_cleanup = getattr(
+            process,
+            tor_module._TOR_PROCESS_CLEANUP_ATTRIBUTE,
+        )
+        self.assertIsNone(process_cleanup._tor_process)
 
     def test_missing_stdout_reaps_unowned_bootstrap_process(self) -> None:
-        process = Mock(stdout=None)
+        process = self._owned_process(stdout=None)
         with (
             patch.object(
                 tor_module,
@@ -2241,11 +2248,15 @@ class TorProcessCleanupTests(unittest.TestCase):
         ):
             tor_module._start_tor_process(9150)
 
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=unittest.mock.ANY,
+        )
 
     def test_early_bootstrap_exit_is_reaped_before_error(self) -> None:
-        process = Mock(stdout=[])
+        process = self._owned_process(stdout=[])
         process.poll.return_value = 7
         process.returncode = 7
         with (
@@ -2258,11 +2269,15 @@ class TorProcessCleanupTests(unittest.TestCase):
         ):
             tor_module._start_tor_process(9150)
 
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=unittest.mock.ANY,
+        )
 
     def test_bootstrap_timeout_terminates_and_reaps_process(self) -> None:
-        process = Mock(stdout=[])
+        process = self._owned_process(stdout=[])
         process.poll.return_value = None
         deadline = Mock(
             expires_at=time.monotonic() + 1.0,
@@ -2283,8 +2298,12 @@ class TorProcessCleanupTests(unittest.TestCase):
         ):
             tor_module._start_tor_process(9150)
 
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=1.0)
+        process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=deadline.expires_at,
+        )
 
     def test_expired_shared_deadline_does_not_start_tor(self) -> None:
         with (
@@ -2346,7 +2365,7 @@ class TorProcessCleanupTests(unittest.TestCase):
     def test_failed_bootstrap_retains_exact_process_cleanup_for_atexit(
         self,
     ) -> None:
-        process = Mock(stdout=None)
+        process = self._owned_process(stdout=None)
         retained_cleanups: list[tor_module._TorProcessAtexitCleanup] = []
 
         def retain_cleanup(
@@ -2403,8 +2422,8 @@ class TorProcessCleanupTests(unittest.TestCase):
             )
 
     def test_two_normal_generations_each_release_their_atexit_cleanup(self) -> None:
-        first_process = Mock(stdout=[b"Bootstrapped 100%: Done\n"])
-        second_process = Mock(stdout=[b"Bootstrapped 100%: Done\n"])
+        first_process = self._owned_process(stdout=[b"Bootstrapped 100%: Done\n"])
+        second_process = self._owned_process(stdout=[b"Bootstrapped 100%: Done\n"])
         first_process.poll.return_value = None
         second_process.poll.return_value = None
 
@@ -2462,7 +2481,15 @@ class TorProcessCleanupTests(unittest.TestCase):
             unregister_cleanup.call_args_list,
             [call(first_cleanup), call(second_cleanup)],
         )
-        first_process.terminate.assert_called_once_with()
-        first_process.wait.assert_called_once_with(timeout=5)
-        second_process.terminate.assert_called_once_with()
-        second_process.wait.assert_called_once_with(timeout=5)
+        first_process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=None,
+        )
+        second_process.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=None,
+        )

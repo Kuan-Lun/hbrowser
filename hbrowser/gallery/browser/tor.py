@@ -25,7 +25,6 @@ _TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
 _TOR_BOOTSTRAP_TIMEOUT_SECONDS = 120.0
 _TOR_MAX_RETRIES = 3
 _TOR_MAX_RETRY_WAIT_SECONDS = 5.0
-type _Process = OwnedProcess | subprocess.Popen[bytes]
 
 # Tor 執行檔路徑（使用者需自行安裝 Tor Browser）
 _TOR_BINARY_CANDIDATES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
@@ -54,8 +53,8 @@ class _TorProcessCleanupError(ProcessOwnershipError):
 class _TorProcessAtexitCleanup:
     """Retain exact Tor process ownership until it has been proven reaped."""
 
-    def __init__(self, tor_process: _Process) -> None:
-        self._tor_process: _Process | None = tor_process
+    def __init__(self, tor_process: OwnedProcess) -> None:
+        self._tor_process: OwnedProcess | None = tor_process
         self._registered = False
         self._lock = threading.Lock()
 
@@ -94,39 +93,20 @@ class _TorProcessAtexitCleanup:
 
 
 def _terminate_tor_process(
-    tor_process: _Process,
+    tor_process: OwnedProcess,
     *,
     deadline: Deadline | None = None,
 ) -> None:
-    if isinstance(tor_process, OwnedProcess):
-        tor_process.shutdown(
-            graceful_timeout=0,
-            terminate_timeout=5,
-            kill_timeout=5,
-            deadline=None if deadline is None else deadline.expires_at,
-        )
-        return
-
-    try:
-        tor_process.terminate()
-    except ProcessLookupError:
-        pass
-    try:
-        tor_process.wait(
-            timeout=5 if deadline is None else min(5, deadline.remaining())
-        )
-    except subprocess.TimeoutExpired:
-        try:
-            tor_process.kill()
-        except ProcessLookupError:
-            pass
-        tor_process.wait(
-            timeout=5 if deadline is None else min(5, deadline.remaining())
-        )
+    tor_process.shutdown(
+        graceful_timeout=0,
+        terminate_timeout=5,
+        kill_timeout=5,
+        deadline=None if deadline is None else deadline.expires_at,
+    )
 
 
 def terminate_tor_process(
-    tor_process: _Process,
+    tor_process: OwnedProcess,
     *,
     deadline: Deadline | None = None,
 ) -> None:
@@ -176,7 +156,7 @@ def _start_tor_process(
         socks_port: SOCKS proxy 端口
 
     Returns:
-        tor 進程的 Popen 物件
+        擁有 Tor 進程生命週期的 owner
     """
     operation_deadline = (
         Deadline.after(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
@@ -205,7 +185,6 @@ def _start_tor_process(
         deadline=operation_deadline.expires_at,
     )
     process_cleanup: _TorProcessAtexitCleanup | None = None
-    cleanup_registered = False
     try:
         process_cleanup = _TorProcessAtexitCleanup(tor_process)
         setattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, process_cleanup)
@@ -213,7 +192,6 @@ def _start_tor_process(
         # Register before bootstrap can fail. The retained callable stays retryable
         # when synchronous cleanup cannot prove that this exact process was reaped.
         process_cleanup.register()
-        cleanup_registered = True
 
         if tor_process.stdout is None:
             raise RuntimeError("Failed to capture Tor process output")
@@ -296,13 +274,11 @@ def _start_tor_process(
         )
     except BaseException as startup_error:
         try:
-            if cleanup_registered:
-                assert process_cleanup is not None
+            if process_cleanup is not None:
                 process_cleanup.cleanup(deadline=operation_deadline)
             else:
-                # Construction, attachment, and registration are the only
-                # points before durable ownership exists. Reap the exact Popen
-                # directly when any of them fails.
+                # Cleanup construction is the only point before a retryable
+                # callable retains the owner. Shut it down directly if that fails.
                 _terminate_tor_process(tor_process, deadline=operation_deadline)
         except BaseException as cleanup_error:
             ownership_error = _TorProcessCleanupError(
@@ -347,7 +323,7 @@ def start_tor_with_retry(
         retry_wait: 重試前的本地 process pacing 秒數（預設 5 秒）
 
     Returns:
-        tor 進程的 Popen 物件
+        擁有 Tor 進程生命週期的 owner
     """
     if type(max_retries) is not int or not 1 <= max_retries <= _TOR_MAX_RETRIES:
         raise ValueError(f"max_retries must be an integer in [1, {_TOR_MAX_RETRIES}]")
