@@ -129,28 +129,6 @@ class ChromeCachePublicationTests(unittest.TestCase):
             )
             self.assertFalse(staging_root.exists())
 
-    def test_legacy_orphan_is_removed_under_the_next_install_lock(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-chrome-orphan-") as directory:
-            cache_dir = Path(directory)
-            chrome = _create_complete_install(cache_dir)
-            orphan = cache_dir / ".123.0.0.staging-interrupted"
-            orphan.mkdir()
-            (orphan / "partial-download").write_text("partial", encoding="utf-8")
-            patches = self._patch_platform(cache_dir)
-            with (
-                patches[0],
-                patches[1],
-                patches[2],
-                patches[3],
-                patches[4],
-            ):
-                result = chrome_manager.ensure_chrome_installed(
-                    deadline=Deadline.after(1)
-                )
-
-            self.assertEqual(Path(result.chrome), chrome)
-            self.assertFalse(orphan.exists())
-
     def test_failed_staging_does_not_replace_previous_complete_generation(
         self,
     ) -> None:

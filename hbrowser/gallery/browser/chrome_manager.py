@@ -96,27 +96,6 @@ def _validate_chrome_install_staging_root(
     return candidate
 
 
-def _remove_legacy_staging_roots(
-    cache_dir: Path,
-    *,
-    version: str,
-    deadline: Deadline,
-) -> None:
-    """Remove pre-owner staging left by older workers while holding the cache lock."""
-
-    for candidate in cache_dir.glob(f".{version}.staging-*"):
-        _require_install_budget(deadline, "legacy staging cleanup")
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISDIR(metadata.st_mode):
-            logger.warning("Ignoring non-directory Chrome staging path: %s", candidate)
-            continue
-        shutil.rmtree(candidate)
-        _require_install_budget(deadline, "legacy staging cleanup")
-
-
 def _network_timeout(deadline: Deadline) -> float:
     remaining = deadline.remaining()
     if remaining <= 0:
@@ -479,11 +458,6 @@ def ensure_chrome_installed(
     chrome_path = version_dir / chrome_folder / chrome_exe_name
 
     with _locked_chrome_cache(cache_dir, deadline=install_deadline):
-        _remove_legacy_staging_roots(
-            cache_dir,
-            version=version,
-            deadline=install_deadline,
-        )
         backup_dir = cache_dir / f".{version}.previous"
         backup_chrome_path = backup_dir / chrome_folder / chrome_exe_name
         final_complete = _installation_is_complete(
