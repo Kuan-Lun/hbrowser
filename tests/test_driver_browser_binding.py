@@ -113,7 +113,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(driver.is_browser_bound)
 
-    def test_legacy_partial_assignment_cannot_be_silently_replaced(self) -> None:
+    def test_partial_assignment_cannot_be_silently_replaced(self) -> None:
         driver = _TestDriver()
         driver.page = object()
 
