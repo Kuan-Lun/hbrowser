@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-26T08:39:26+00:00",
+  "checked_at": "2026-08-26T09:18:04+00:00",
   "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.42.8",
+  "project_version": "0.42.9",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every build, runtime, dev, and Node direct dependency against global registry latest and available release notes; no latest release is outside a declared upper bound, all latest Python distributions declare CPython 3.14 support, Zendriver remains at the verified 0.16.0 lifecycle cohort, and the clean 3.14.1 full gate passed 523 tests with 2 documented skips plus wheel smoke.",
+    "note": "Reviewed every build, runtime, dev, and Node direct dependency against the global registry latest and available official release notes; no dependency manifest changed since 0.42.8, no latest release falls outside a declared upper bound, all latest Python distributions declare CPython 3.14 support, and Zendriver remains on the verified 0.16.0 lifecycle cohort.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
