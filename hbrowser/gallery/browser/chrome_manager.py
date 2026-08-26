@@ -14,7 +14,7 @@ import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from urllib.request import urlopen
 
 from ..utils import (
@@ -132,13 +132,14 @@ def _lock_cache_descriptor(descriptor: int, *, deadline: Deadline) -> None:
     if os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(Any, msvcrt)
         os.lseek(descriptor, 0, os.SEEK_SET)
         while True:
             remaining = _require_install_budget(deadline, "cache lock acquisition")
             try:
-                getattr(msvcrt, "locking")(
+                windows_locking.locking(
                     descriptor,
-                    getattr(msvcrt, "LK_NBLCK"),
+                    windows_locking.LK_NBLCK,
                     1,
                 )
                 return
@@ -158,8 +159,9 @@ def _unlock_cache_descriptor(descriptor: int) -> None:
     if os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(Any, msvcrt)
         os.lseek(descriptor, 0, os.SEEK_SET)
-        getattr(msvcrt, "locking")(descriptor, getattr(msvcrt, "LK_UNLCK"), 1)
+        windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
         return
     raise RuntimeError(f"Unsupported Chrome cache lock platform: {os.name}")
 

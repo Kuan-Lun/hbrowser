@@ -556,7 +556,8 @@ class BrowserOwner[BrowserT, TabT]:
         try:
             if requested_deadline.expired:
                 raise BrowserOwnershipError(
-                    "Browser-owner close caller deadline expired waiting for lifecycle lock"
+                    "Browser-owner close caller deadline expired "
+                    "waiting for lifecycle lock"
                 )
             if self._close_task is not None and self._close_task.done():
                 completed_task = self._close_task

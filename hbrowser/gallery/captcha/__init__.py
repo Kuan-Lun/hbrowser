@@ -10,9 +10,9 @@ from .models import ChallengeDetection, Kind
 from .page_challenge import PageChallengeHandler
 
 __all__ = [
+    "CaptchaDetector",
     "ChallengeDetection",
     "Kind",
-    "CaptchaDetector",
     "LoginChallengeHandler",
     "PageChallengeHandler",
     "TurnstileSolver",

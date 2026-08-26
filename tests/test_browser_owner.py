@@ -266,34 +266,42 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
                     continue
 
         browser_closer.side_effect = ignore_cancellation
-        with (
-            patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
-            self.assertRaisesRegex(
-                owner_module.BrowserOwnershipError,
-                "shared ownership deadline",
-            ),
-        ):
-            await owner.close()
-        await closer_started.wait()
+        try:
+            with (
+                patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
+                self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError,
+                    "shared ownership deadline",
+                ),
+            ):
+                await asyncio.wait_for(owner.close(), timeout=1)
+            await asyncio.wait_for(closer_started.wait(), timeout=1)
 
-        with (
-            patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
-            self.assertRaisesRegex(
-                owner_module.BrowserOwnershipError,
-                "shared ownership deadline",
-            ),
-        ):
-            await owner.close()
-        browser_closer.assert_awaited_once()
+            with (
+                patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
+                self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError,
+                    "shared ownership deadline",
+                ),
+            ):
+                await asyncio.wait_for(owner.close(), timeout=1)
+            browser_closer.assert_awaited_once()
 
-        release_closer.set()
-        await asyncio.sleep(0)
-        # The first failed cleanup attempt is complete, so an explicit retry
-        # receives a fresh ownership deadline and may reconcile the already
-        # completed closer without invoking it again.
-        await owner.close()
-        self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
-        browser_closer.assert_awaited_once()
+            release_closer.set()
+            # The first failed cleanup attempt is complete, so an explicit retry
+            # receives a fresh ownership deadline and may reconcile the already
+            # completed closer without invoking it again.
+            await asyncio.wait_for(owner.close(), timeout=1)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+            browser_closer.assert_awaited_once()
+        finally:
+            # This fixture deliberately ignores cancellation. Always release and
+            # join it so an assertion failure is reported instead of deadlocking
+            # IsolatedAsyncioTestCase while it cancels leftover tasks.
+            release_closer.set()
+            closer_task = owner._browser_closer_task
+            if closer_task is not None and not closer_task.done():
+                await asyncio.wait_for(asyncio.shield(closer_task), timeout=1)
 
     async def test_first_close_uses_supplied_absolute_deadline(self) -> None:
         owner, browser, browser_closer, _ = self._owner()

@@ -343,7 +343,8 @@ class _ZendriverLifecycle:
                 )
             )
         if not self.safe_to_cancel_operations:
-            errors.insert(
+            # Concurrent transport retirement may revoke cancellation safety.
+            errors.insert(  # type: ignore[unreachable]
                 0,
                 _ZendriverQuiescenceChanged(
                     "Zendriver operation retirement gained a new transport"

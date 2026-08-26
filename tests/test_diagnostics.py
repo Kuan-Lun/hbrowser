@@ -431,12 +431,14 @@ class PageDiagnosticTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
-            with patch(
-                "hbrowser.gallery.utils.diagnostic.os.fdopen",
-                side_effect=lambda descriptor, mode: _FailingWriter(descriptor),
+            with (
+                patch(
+                    "hbrowser.gallery.utils.diagnostic.os.fdopen",
+                    side_effect=lambda descriptor, mode: _FailingWriter(descriptor),
+                ),
+                self.assertRaisesRegex(OSError, "simulated partial write"),
             ):
-                with self.assertRaisesRegex(OSError, "simulated partial write"):
-                    write_page_diagnostic(directory, "search_error", "content")
+                write_page_diagnostic(directory, "search_error", "content")
 
             self.assertEqual(_managed_page_diagnostic_paths(directory), [])
 
@@ -488,9 +490,7 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "schema": 1,
                     "nonce": self._NONCE,
-                    "filename": (
-                        "driver_error_0000000000000000_" f"{self._NONCE}.html"
-                    ),
+                    "filename": (f"driver_error_0000000000000000_{self._NONCE}.html"),
                 }
             ).encode()
             + b"\n"
@@ -1046,8 +1046,7 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.driver.page.get_content.side_effect = returns_late
         with (
             patch(
-                "hbrowser.gallery.driver_base."
-                "_PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
+                "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
                 0.001,
             ),
             self.assertRaises(ZendriverOperationTimeout),
@@ -1080,12 +1079,14 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.driver.page.get_content.side_effect = fails_late
         loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
         try:
-            with patch(
-                "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
-                0.001,
+            with (
+                patch(
+                    "hbrowser.gallery.driver_base._PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS",
+                    0.001,
+                ),
+                self.assertRaises(ZendriverOperationTimeout),
             ):
-                with self.assertRaises(ZendriverOperationTimeout):
-                    await self.driver.save_page_diagnostic("driver_error")
+                await self.driver.save_page_diagnostic("driver_error")
 
             release.set()
             await asyncio.wait_for(finished.wait(), timeout=1)
@@ -1097,12 +1098,14 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_browser_close_failure_is_visible(self) -> None:
         close_error = RuntimeError("process did not exit")
-        with patch(
-            "hbrowser.gallery.driver_base.stop_browser",
-            new=AsyncMock(side_effect=close_error),
+        with (
+            patch(
+                "hbrowser.gallery.driver_base.stop_browser",
+                new=AsyncMock(side_effect=close_error),
+            ),
+            self.assertRaisesRegex(RuntimeError, "process did not exit"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "process did not exit"):
-                await self.driver.__aexit__(None, None, None)
+            await self.driver.__aexit__(None, None, None)
 
         self.logger.warning.assert_called_once_with(
             "Failed to close browser cleanly: error_type=%s",

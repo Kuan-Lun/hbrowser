@@ -762,7 +762,7 @@ class OwnedProcess:
             else:
                 # OwnedProcess is only constructed with Popen pipes in
                 # production. This branch keeps structural test doubles useful.
-                control_pipe.write(command)
+                control_pipe.write(command)  # type: ignore[unreachable]
                 control_pipe.flush()
         except OSError:
             # A failed control channel provides no safe basis for signalling a
@@ -838,8 +838,7 @@ class OwnedProcess:
                 and not allow_expired_immediate_check
             ):
                 raise ProcessOwnershipError(
-                    "Process ownership deadline expired while joining shutdown "
-                    "attempt"
+                    "Process ownership deadline expired while joining shutdown attempt"
                 )
             attempt_deadline = self._shutdown_attempt_deadline
             if attempt_deadline is None:
@@ -1263,10 +1262,8 @@ def _supervisor_creation_options() -> dict[str, Any]:
 
 def _is_reserved_child_environment_key(key: str) -> bool:
     normalized = key.upper()
-    return (
-        normalized in _RESERVED_CHILD_ENVIRONMENT_KEYS
-        or normalized.startswith("BATTLE_")
-        or normalized.startswith("EH_")
+    return normalized in _RESERVED_CHILD_ENVIRONMENT_KEYS or normalized.startswith(
+        ("BATTLE_", "EH_")
     )
 
 
@@ -1286,10 +1283,8 @@ def _inherited_environment_key_allowed(key: str, platform_name: str) -> bool:
         return True
     if platform_name == "nt":
         return normalized in _WINDOWS_INHERITED_ENVIRONMENT_KEYS
-    return (
-        normalized in _POSIX_INHERITED_ENVIRONMENT_KEYS
-        or normalized.startswith("LC_")
-        or normalized.startswith("XDG_")
+    return normalized in _POSIX_INHERITED_ENVIRONMENT_KEYS or normalized.startswith(
+        ("LC_", "XDG_")
     )
 
 
@@ -1979,11 +1974,12 @@ def start_owned_process(
             ) from None
         target_pid = startup_status.target_pid
         owner.bind_target_process_group(target_pid)
-        if platform_name == "posix":
-            if os.getpgid(target_pid) != target_pid:
-                raise RuntimeError("Target process group ownership was not established")
-            if os.getsid(target_pid) != supervisor.pid:
-                raise RuntimeError("Target process escaped its owned session")
+        # POSIX ownership is established inside the trusted start-gated
+        # supervisor: Popen(process_group=0) either creates the target group or
+        # reports launch failure, and the supervisor itself was launched with
+        # start_new_session=True. Re-querying the target here introduces a race
+        # with a valid short-lived target that exits immediately after READY.
+        # The supervisor retains the authoritative child/tree cleanup receipt.
 
         if drain_output:
             owner.begin_output_draining()
@@ -2008,7 +2004,7 @@ def start_owned_process(
                     "Process startup failed and target ownership remains unresolved"
                 )
                 ownership_error.add_note(
-                    "Startup failure type: " f"{type(startup_error).__name__}"
+                    f"Startup failure type: {type(startup_error).__name__}"
                 )
                 raise ownership_error from owner_cleanup_error
             raise
@@ -2024,7 +2020,7 @@ def start_owned_process(
                     "start-gated supervisor remains unresolved"
                 )
                 ownership_error.add_note(
-                    "Startup failure type: " f"{type(startup_error).__name__}"
+                    f"Startup failure type: {type(startup_error).__name__}"
                 )
                 raise ownership_error from provisional_cleanup_error
             raise
@@ -2077,7 +2073,7 @@ def start_owned_process(
                     private_cleanup_error = error
                 else:
                     private_cleanup_error.add_note(
-                        "Additional private cleanup failure: " f"{type(error).__name__}"
+                        f"Additional private cleanup failure: {type(error).__name__}"
                     )
         if private_cleanup_error is not None:
             ownership_error = ProcessOwnershipError(
@@ -2085,7 +2081,7 @@ def start_owned_process(
                 "could not be completed"
             )
             ownership_error.add_note(
-                "Startup failure type: " f"{type(startup_error).__name__}"
+                f"Startup failure type: {type(startup_error).__name__}"
             )
             raise ownership_error from private_cleanup_error
         raise

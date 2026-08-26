@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory as _SystemTemporaryDirectory
 from threading import Event, Thread
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 from hbrowser.gallery.browser.process import start_owned_process
@@ -49,7 +50,7 @@ from hbrowser.gallery.utils.log import (
 
 
 @contextmanager
-def TemporaryDirectory() -> Iterator[str]:  # noqa: N802
+def TemporaryDirectory() -> Iterator[str]:
     """Close the process sink before Windows removes the temporary directory."""
     with _SystemTemporaryDirectory() as directory_name:
         try:
@@ -556,7 +557,14 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                 else:
                     handler.close_forwarding()
 
-                self.assertTrue(_wait_until(lambda: failure_callback.call_count == 1))
+                current_failure_callback = failure_callback
+
+                def failure_was_reported(
+                    callback: Mock = current_failure_callback,
+                ) -> bool:
+                    return callback.call_count == 1
+
+                self.assertTrue(_wait_until(failure_was_reported))
                 failure_callback.assert_called_once()
                 self.assertEqual(failure_callback.call_args.args[0], expected_stage)
                 handler.close_forwarding()
@@ -581,7 +589,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
         )
         encode_entered = Event()
         encode_release = Event()
-        original_payload = handler._record_payload  # noqa: SLF001
+        original_payload = handler._record_payload
 
         def blocked_payload(record: logging.LogRecord) -> dict[str, object]:
             encode_entered.set()
@@ -600,7 +608,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
             emitter.join(timeout=2)
 
         self.assertFalse(emitter.is_alive())
-        self.assertTrue(handler._queue.empty())  # noqa: SLF001
+        self.assertTrue(handler._queue.empty())
         receiver.close()
         self.assertEqual(delivered, [])
         receiver_failure.assert_not_called()
@@ -894,7 +902,7 @@ close_forwarded_logging()
             release.set()
             failure_release.set()
             connection.close()
-        self.assertTrue(_wait_until(lambda: not receiver._clients))  # noqa: SLF001
+        self.assertTrue(_wait_until(lambda: not receiver._clients))
 
     def test_receiver_drain_failure_is_secondary_to_segment_close(self) -> None:
         with TemporaryDirectory() as directory_name:
@@ -913,8 +921,8 @@ close_forwarded_logging()
                 ):
                     close_logging()
                 health = logging_health()
-                self.assertTrue(handler._abandoned_until_process_exit)  # noqa: SLF001
-                self.assertIsNotNone(handler._stream)  # noqa: SLF001
+                self.assertTrue(handler._abandoned_until_process_exit)
+                self.assertIsNotNone(handler._stream)
                 handler.close_sink()
 
         self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
@@ -1064,8 +1072,8 @@ close_forwarded_logging()
     def test_forwarding_emergency_record_is_first_only_and_bounded(self) -> None:
         adversarial_type = type("Bad/型" + ("X" * 256), (OSError,), {})
         cause = adversarial_type()
-        setattr(cause, "errno", 1 << 200)
-        setattr(cause, "winerror", -1)
+        cause.errno = 1 << 200
+        cause.winerror = -1
         emergency_write = Mock(return_value=0)
         with (
             patch("hbrowser.gallery.utils.log.os.write", emergency_write),
@@ -1584,7 +1592,7 @@ class PersistenceHealthTests(IsolatedLoggingTestCase):
                 logger = self._configure(directory_name)
                 handler = log_module._PROCESS_LOG_HANDLER
                 assert handler is not None
-                original_set = handler._idle.set  # noqa: SLF001
+                original_set = handler._idle.set
                 set_calls = 0
 
                 def blocked_first_set() -> None:
@@ -1596,7 +1604,7 @@ class PersistenceHealthTests(IsolatedLoggingTestCase):
                     original_set()
 
                 with patch.object(
-                    handler._idle,  # noqa: SLF001
+                    handler._idle,
                     "set",
                     side_effect=blocked_first_set,
                 ):
@@ -1644,11 +1652,11 @@ class PersistenceHealthTests(IsolatedLoggingTestCase):
                         close_logging()
                     elapsed = time.monotonic() - started
                     release.set()
-                    self.assertTrue(handler._stopped.wait(timeout=2))  # noqa: SLF001
+                    self.assertTrue(handler._stopped.wait(timeout=2))
 
         self.assertLess(elapsed, 3.0)
         self.assertEqual(error_info.exception.operation, "segment-close")
-        self.assertTrue(handler._abandoned_until_process_exit)  # noqa: SLF001
+        self.assertTrue(handler._abandoned_until_process_exit)
 
     def test_ordinary_write_failure_is_sticky_sanitized_and_non_raising(self) -> None:
         with TemporaryDirectory() as directory_name:
@@ -1658,7 +1666,7 @@ class PersistenceHealthTests(IsolatedLoggingTestCase):
                 self.assertIsNotNone(handler)
                 assert handler is not None
                 failure = PermissionError(errno.EACCES, "secret", "/private/path")
-                setattr(failure, "winerror", 32)
+                cast(Any, failure).winerror = 32
                 with patch.object(
                     handler,
                     "_write_bytes",
@@ -2014,8 +2022,8 @@ class PersistenceHealthTests(IsolatedLoggingTestCase):
     def test_public_and_emergency_health_fields_are_strictly_bounded(self) -> None:
         adversarial_type = type("Bad/型" + ("X" * 256), (OSError,), {})
         cause = adversarial_type()
-        setattr(cause, "errno", 1 << 200)
-        setattr(cause, "winerror", -1)
+        cause.errno = 1 << 200
+        cause.winerror = -1
         failure = LogPersistenceError(
             "segment-write",
             cause,

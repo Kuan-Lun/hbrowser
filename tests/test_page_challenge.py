@@ -453,13 +453,17 @@ class PageChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         for kind in ("turnstile_widget", "recaptcha_v2"):
             with self.subTest(kind=kind):
                 events: list[str] = []
+                current_events = events
                 page = object()
                 detector = _Detector([kind, "none"], events)
                 solver = _Solver(events, receipt=_receipt(1))
 
-                async def save_diagnostic(actual: str) -> None:
+                async def save_diagnostic(
+                    actual: str,
+                    event_log: list[str] = current_events,
+                ) -> None:
                     self.assertEqual(actual, "challenge_page")
-                    events.append("save_diagnostic")
+                    event_log.append("save_diagnostic")
 
                 navigate = AsyncMock(side_effect=_unexpected_callback)
                 handler = PageChallengeHandler(

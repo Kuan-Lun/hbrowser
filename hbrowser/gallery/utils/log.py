@@ -287,9 +287,10 @@ class _LogContext:
     scope: str | None = None
 
 
+_EMPTY_LOG_CONTEXT = _LogContext()
 _CURRENT_LOG_CONTEXT: ContextVar[_LogContext] = ContextVar(
     "hbrowser_log_context",
-    default=_LogContext(),
+    default=_EMPTY_LOG_CONTEXT,
 )
 
 
@@ -711,7 +712,7 @@ class _AppendOnlyJsonlHandler(logging.Handler):
             or cls._is_reparse_point(directory_stat)
         ):
             raise OSError(
-                "Process log directory must be a non-reparse directory: " f"{directory}"
+                f"Process log directory must be a non-reparse directory: {directory}"
             )
         return directory_stat
 
@@ -1272,7 +1273,8 @@ class _AppendOnlyJsonlHandler(logging.Handler):
             data = self._encode_record(record)
             with self._enqueue_lock:
                 if not self._enabled:
-                    return
+                    # Another thread may close the handler after the outer check.
+                    return  # type: ignore[unreachable]
                 self._idle.clear()
                 self._write_queue.put_nowait(data)
         except queue.Full as error:
@@ -1925,7 +1927,8 @@ def _isolated_logging_state_for_testing() -> Iterator[None]:
             current_receiver = _LOG_FORWARDING_RECEIVER
             current_names = set(_NAMESPACE_LOGGER_NAMES) | set(_MANAGED_LOGGER_NAMES)
             if current_receiver is not None:
-                try:
+                # The yielded test body may configure a receiver.
+                try:  # type: ignore[unreachable]
                     current_receiver.close()
                 except Exception:
                     current_receiver._discard_after_fork()
@@ -1943,9 +1946,11 @@ def _isolated_logging_state_for_testing() -> Iterator[None]:
                     )
                 ]
             if current_forwarding_handler is not None:
-                current_forwarding_handler.close_forwarding()
+                # The yielded test body may configure forwarding.
+                current_forwarding_handler.close_forwarding()  # type: ignore[unreachable]
             if current_handler is not None:
-                current_handler.close()
+                # The yielded test body may configure the process handler.
+                current_handler.close()  # type: ignore[unreachable]
             _LOGGING_CONFIGURATION = previous_configuration
             _LOGGING_CONFIGURED = previous_configured
             _LOGGING_CLOSED = previous_closed

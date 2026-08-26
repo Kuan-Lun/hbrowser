@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import zendriver as zd
@@ -217,14 +217,8 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
             setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
 
             async def connected() -> bool:
-                setattr(
-                    browser,
-                    "info",
-                    SimpleNamespace(
-                        webSocketDebuggerUrl=(
-                            "ws://127.0.0.1:9222/devtools/browser/test"
-                        )
-                    ),
+                cast(Any, browser).info = SimpleNamespace(
+                    webSocketDebuggerUrl="ws://127.0.0.1:9222/devtools/browser/test"
                 )
                 return True
 
@@ -1297,7 +1291,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         await factory.stop_browser(browser, caller_deadline)
 
-        lifecycle = getattr(browser, "_hbrowser_zendriver_lifecycle")
+        lifecycle = cast(Any, browser)._hbrowser_zendriver_lifecycle
         self.assertEqual(
             lifecycle.shutdown_deadline_expires_at,
             caller_deadline.expires_at,
@@ -1387,7 +1381,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
             with self.assertRaises(ProcessOwnershipError):
                 await factory.stop_browser(browser)
-            lifecycle = getattr(browser, "_hbrowser_zendriver_lifecycle")
+            lifecycle = cast(Any, browser)._hbrowser_zendriver_lifecycle
             first_deadline = lifecycle.shutdown_deadline_expires_at
             lifecycle.shutdown_deadline_expires_at = 0.0
 
@@ -2179,7 +2173,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
         _bind_browser_process_owner(browser)
         janitor = asyncio.create_task(stubborn_janitor())
-        setattr(browser, "_hbrowser_zendriver_mapper_janitor_task", janitor)
+        browser._hbrowser_zendriver_mapper_janitor_task = janitor
         await asyncio.sleep(0)
         with patch.object(factory, "_JANITOR_STOP_TIMEOUT_SECONDS", 0.01):
             for _ in range(2):

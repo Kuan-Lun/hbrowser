@@ -690,7 +690,8 @@ class EHDriver(Driver):
                         reason=f"the atomic page snapshot was malformed: {error}",
                     ) from error
                 elif isinstance(error, TimeoutError) and deadline.expired:
-                    break
+                    # The navigation attempt can expire the shared deadline.
+                    break  # type: ignore[unreachable]
                 else:
                     raise SearchNavigationError(
                         url=target_url,
@@ -714,9 +715,7 @@ class EHDriver(Driver):
         if snapshot is None:
             reason = "the navigated document never produced an atomic snapshot"
             if last_transient_error is not None:
-                reason += (
-                    "; last read failure: " f"{type(last_transient_error).__name__}"
-                )
+                reason += f"; last read failure: {type(last_transient_error).__name__}"
             raise SearchNavigationError(url=target_url, reason=reason)
 
         reason = "the lifecycle-confirmed document did not become stable"
@@ -734,7 +733,7 @@ class EHDriver(Driver):
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            reason += "; could not save diagnostic: " f"{type(error).__name__}"
+            reason += f"; could not save diagnostic: {type(error).__name__}"
         raise SearchNavigationError(
             url=target_url,
             reason=reason,
@@ -1093,9 +1092,9 @@ class EHDriver(Driver):
             owner=header_row,
         )
         _require_active_deadline(h2h_deadline, "H@H columns read")
-        status_index = [
+        status_index = next(
             index for index, th in enumerate(headers) if th.text == "Status"
-        ][0]
+        )
         read_timeout = min(_PAGE_READ_TIMEOUT_SECONDS, h2h_deadline.remaining())
         if read_timeout <= 0:
             raise TimeoutError("H@H status deadline expired before rows read")
@@ -1582,8 +1581,7 @@ class EHDriver(Driver):
                     terminal_cleanup_error = cleanup_error
                 else:
                     operation_error.add_note(
-                        "Archive cleanup also failed: "
-                        f"{type(cleanup_error).__name__}"
+                        f"Archive cleanup also failed: {type(cleanup_error).__name__}"
                     )
                     deferred_operation_error = operation_error
             else:
@@ -1610,9 +1608,9 @@ class EHDriver(Driver):
         except ZendriverOperationTimeout:
             raise
         except TimeoutError:
-            return list()
+            return []
 
-        tag = list()
+        tag = []
         for element in elements:
             tag.append(
                 Tag(

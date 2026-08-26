@@ -4,7 +4,8 @@
 
 ### Tor Proxy (Optional)
 
-HBrowser can route all traffic through the Tor network for IP privacy. If Tor Browser is installed, HBrowser will automatically detect and use it. To install:
+HBrowser can route all traffic through the Tor network for IP privacy. If Tor
+Browser is installed, HBrowser will automatically detect and use it. To install:
 
 1. Download and install from <https://www.torproject.org/download/>
 2. HBrowser will automatically locate the `tor` binary from the default installation path:
@@ -13,34 +14,40 @@ HBrowser can route all traffic through the Tor network for IP privacy. If Tor Br
    - **Windows**: Searches common installation paths (`Desktop`, `AppData`, `Program Files`)
 3. If Tor Browser is not installed, HBrowser will use a direct connection instead.
 4. To force disable Tor even when installed, set `USE_TOR=0`.
-5. If your Tor Browser is installed in a non-standard location, set the `TOR_BINARY_PATH` environment variable.
+5. If your Tor Browser is installed in a non-standard location, set the
+   `TOR_BINARY_PATH` environment variable.
 
 ### FlareSolverr (Optional)
 
-HBrowser can use [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to automatically
-solve both Cloudflare's page-level managed challenge and the Turnstile widget embedded in the
-Forums login form. Embedded Turnstile support requires FlareSolverr 3.5.0 or newer. Set
+HBrowser can use
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to automatically
+solve both Cloudflare's page-level managed challenge and the Turnstile widget
+embedded in the Forums login form. Embedded Turnstile support requires
+FlareSolverr 3.5.0 or newer. Set
 `FLARESOLVERR_URL` to the instance's `/v1` endpoint, for example
 `http://127.0.0.1:8191/v1`. The endpoint must be a valid HTTP or HTTPS URL;
 invalid configuration fails immediately with a sanitized configuration error.
 
-HBrowser keeps one persistent FlareSolverr browser across the managed challenge and login
-Turnstile so both steps use the same browser identity and clearance. Before that identity is
-applied to the main browser, a failed FlareSolverr request causes the failed FlareSolverr
-session to be discarded and a fresh session to be tried. The default budget is three session
-attempts and can be changed with the `flaresolverr_session_attempts` driver argument.
+HBrowser keeps one persistent FlareSolverr browser across the managed challenge
+and login Turnstile so both steps use the same browser identity and clearance.
+Before that identity is applied to the main browser, a failed FlareSolverr
+request causes the failed FlareSolverr session to be discarded and a fresh
+session to be tried. The default budget is three session attempts and can be
+changed with the `flaresolverr_session_attempts` driver argument.
 
-Once a FlareSolverr identity has been applied, HBrowser does not silently replace its solver
-session: a new session would no longer match the identity already installed in the main
-browser. In a visible browser, a runtime solver failure falls back to manual resolution in that
-same browser window. In headless mode, it fails immediately with a login error because no
-manual interaction is possible.
+Once a FlareSolverr identity has been applied, HBrowser does not silently
+replace its solver session: a new session would no longer match the identity
+already installed in the main browser. In a visible browser, a runtime solver
+failure falls back to manual resolution in that same browser window. In
+headless mode, it fails immediately with a login error because no manual
+interaction is possible.
 
-Restarting Chrome is not a proxy or IP rotation, so challenge recovery never restarts the main
-browser and never reports a route change. A direct connection has no route-rotation capability.
-The FlareSolverr identity must share the main browser's public route, so HBrowser disables
-FlareSolverr when Tor or a residential proxy is active; those configurations currently have no
-shared sticky-route integration.
+Restarting Chrome is not a proxy or IP rotation, so challenge recovery never
+restarts the main browser and never reports a route change. A direct connection
+has no route-rotation capability. The FlareSolverr identity must share the main
+browser's public route, so HBrowser disables FlareSolverr when Tor or a
+residential proxy is active; those configurations currently have no shared
+sticky-route integration.
 
 HBrowser 0.36 removes the `proxy_rotator` and `max_captcha_retries` driver
 arguments. They coupled challenge handling to a Chrome restart that could not
@@ -61,9 +68,13 @@ HBrowser requires the following environment variables:
   `on` to save the initial and, when needed, reloaded daily check-in documents
   in `HBROWSER_LOG_DIR`. Encounter query values are redacted, but the remaining
   HTML is account-specific and must be kept private
-- `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor Browser is installed. Default: auto-detect
-- `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not installed in the default location
-- `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used to auto-solve Cloudflare managed challenges and the Forums login Turnstile. Ignored when Tor or a residential proxy is active
+- `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor
+  Browser is installed. Default: auto-detect
+- `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not
+  installed in the default location
+- `FLARESOLVERR_URL` (optional): FlareSolverr 3.5.0+ `/v1` endpoint used
+  to auto-solve Cloudflare managed challenges and the Forums login Turnstile.
+  Ignored when Tor or a residential proxy is active
 
 Set the environment variables before running the script:
 
@@ -400,3 +411,7 @@ if __name__ == "__main__":
 
 HentaiVerse automation is provided separately by
 [HVBrowser](https://github.com/Kuan-Lun/hvbrowser).
+
+## License
+
+This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).

@@ -35,8 +35,7 @@ class _DisposableAwaitable:
         self.closed = False
 
     def __await__(self) -> Generator[None]:
-        if False:
-            yield None
+        yield from ()
         return None
 
     def cancel(self) -> None:

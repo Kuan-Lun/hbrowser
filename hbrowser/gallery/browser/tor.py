@@ -285,7 +285,7 @@ def _start_tor_process(
                 "Tor bootstrap failed and its process could not be reaped"
             )
             ownership_error.add_note(
-                "Bootstrap failure type: " f"{type(startup_error).__name__}"
+                f"Bootstrap failure type: {type(startup_error).__name__}"
             )
             raise ownership_error from cleanup_error
         raise
@@ -334,7 +334,7 @@ def start_tor_with_retry(
         or not 0 <= retry_wait <= _TOR_MAX_RETRY_WAIT_SECONDS
     ):
         raise ValueError(
-            "retry_wait must be finite and in [0, " f"{_TOR_MAX_RETRY_WAIT_SECONDS:g}]"
+            f"retry_wait must be finite and in [0, {_TOR_MAX_RETRY_WAIT_SECONDS:g}]"
         )
     operation_deadline = (
         Deadline.after(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)

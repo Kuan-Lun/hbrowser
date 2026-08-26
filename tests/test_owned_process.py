@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Any, ClassVar, cast
 from unittest.mock import ANY, Mock, call, patch
 
 import zendriver as zd
@@ -41,12 +41,29 @@ def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
 
 def _windows_cleanup_error(code: int) -> PermissionError:
     error = PermissionError(f"Windows cleanup error {code}")
-    setattr(error, "winerror", code)
+    cast(Any, error).winerror = code
     return error
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
 class PosixOwnedProcessTests(unittest.TestCase):
+    def test_short_lived_target_does_not_require_parent_identity_probe(self) -> None:
+        with (
+            patch(
+                "hbrowser.gallery.browser.process.os.getpgid",
+                side_effect=AssertionError("parent must trust the READY receipt"),
+            ),
+            patch(
+                "hbrowser.gallery.browser.process.os.getsid",
+                side_effect=AssertionError("parent must trust the READY receipt"),
+            ),
+        ):
+            process = process_module.start_owned_process(
+                sys.executable,
+                ["-c", "pass"],
+            )
+            self.assertEqual(process.wait(timeout=5), 0)
+
     def test_target_inherits_sanitized_supervisor_environment(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="hbrowser-environment-test-"
@@ -626,7 +643,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     pass
 
             class SlowProcess:
-                args = ["cleanup-worker"]
+                args: ClassVar[list[str]] = ["cleanup-worker"]
                 returncode: int | None = None
                 stdin = Gate()
 
@@ -2200,7 +2217,7 @@ if handle in (None, ctypes.c_void_p(-1).value):
 pathlib.Path(sys.argv[2]).write_text("ready", encoding="utf-8")
 time.sleep(30)
 """
-            base_executable = cast(str, getattr(sys, "_base_executable"))
+            base_executable = cast(str, cast(Any, sys)._base_executable)
             owner = process_module.start_owned_process(
                 base_executable,
                 [

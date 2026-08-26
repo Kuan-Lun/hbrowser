@@ -4,6 +4,7 @@ import asyncio
 import time
 import unittest
 from collections import defaultdict, deque
+from collections.abc import Coroutine
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -44,6 +45,12 @@ class _EventPage:
         self.reload_payload: dict[str, Any] | None = None
         self.selector_results: list[Any] = []
         self.selector_queries = 0
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def _schedule(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def add_handler(self, event_type: type[Any], handler: Any) -> None:
         self.handlers[event_type].append(handler)
@@ -85,7 +92,7 @@ class _EventPage:
             if self.emit_stale_while_enabling:
                 await self._emit_cross_document("stale-loader")
             if self.queue_stale_while_enabling:
-                asyncio.create_task(self._emit_cross_document("queued-stale-loader"))
+                self._schedule(self._emit_cross_document("queued-stale-loader"))
             return None
         if method == "Page.navigate":
             self.url = payload["params"]["url"]
@@ -104,7 +111,7 @@ class _EventPage:
                             ),
                         )
 
-                    asyncio.create_task(emit_same_document())
+                    self._schedule(emit_same_document())
                 else:
                     self.loader_id = loader_id
                     await self._emit_cross_document(loader_id)
@@ -126,7 +133,7 @@ class _EventPage:
         self.selector_queries += 1
         result = self.selector_results.pop(0)
         if result is None:
-            asyncio.create_task(self.emit(cdp.dom.DocumentUpdated, SimpleNamespace()))
+            self._schedule(self.emit(cdp.dom.DocumentUpdated, SimpleNamespace()))
         return result
 
 

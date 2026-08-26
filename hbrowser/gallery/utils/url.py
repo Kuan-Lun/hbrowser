@@ -15,7 +15,7 @@ def matchurl(*args: str) -> bool:
             "https://e-hentai.org"
         ) -> True
     """
-    fixargs = list()
+    fixargs = []
     for url in args:
         # 處理 None 或空字串的情況
         if not url:
