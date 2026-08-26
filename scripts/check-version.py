@@ -19,6 +19,7 @@ from typing import Any
 _VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _LEGACY_VERSION_PATTERN = re.compile(r"^(\d+)(?:\.(\d+)){3,}$")
 _IGNORED_PATHS = (
+    ".Codex/**",
     ".claude/**",
     ".github/**",
     ".githooks/**",
@@ -29,6 +30,7 @@ _IGNORED_PATHS = (
     "AGENTS.md",
     "CLAUDE.md",
     "README.md",
+    "*.md",
     "docs/**",
     "mypy.ini",
     "package.json",
