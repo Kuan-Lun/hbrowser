@@ -4,11 +4,12 @@ import inspect
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery import driver_base, eh_driver
 from hbrowser.gallery.browser import factory
+from hbrowser.gallery.browser.process import OwnedProcess
 from hbrowser.gallery.captcha import login_challenge
 from hbrowser.gallery.utils.mutation import wait_for_zendriver_mutation
 from hbrowser.gallery.utils.page_state import ZENDRIVER_COMMAND_TIMEOUT_SECONDS
@@ -365,6 +366,11 @@ class BrowserMutationRetirementTests(unittest.IsolatedAsyncioTestCase):
             targets=[],
             _tor_process=None,
             stop=AsyncMock(),
+        )
+        setattr(
+            browser,
+            factory._BROWSER_PROCESS_OWNER_ATTRIBUTE,
+            Mock(spec=OwnedProcess),
         )
         target = SimpleNamespace(
             browser=browser,

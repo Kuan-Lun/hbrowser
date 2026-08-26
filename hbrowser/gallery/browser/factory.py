@@ -89,15 +89,25 @@ _DEVTOOLS_ACTIVE_PORT_POLL_SECONDS = 0.02
 _BROWSER_SHUTDOWN_DEADLINE_SECONDS = 15.0
 
 
+def _require_browser_process_owner(browser: Any) -> OwnedProcess:
+    """Return the durable Chrome owner or fail closed on corrupt ownership."""
+
+    owner = getattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
+    if isinstance(owner, OwnedProcess):
+        return owner
+    owner_state = "missing" if owner is None else f"invalid ({type(owner).__name__})"
+    raise ProcessOwnershipError(
+        "HBrowser-created browser must retain a valid OwnedProcess owner "
+        f"(owner is {owner_state})"
+    )
+
+
 class _OwnedZendriverBrowser(zd.Browser):
     """Zendriver connection whose OS process tree is owned by hbrowser."""
 
     @property
     def stopped(self) -> bool:
-        owner = getattr(self, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
-        if isinstance(owner, OwnedProcess):
-            return owner.poll() is not None
-        return super().stopped
+        return _require_browser_process_owner(self).poll() is not None
 
 
 def _build_config(
@@ -418,15 +428,14 @@ def _select_main_tab(browser: zd.Browser) -> zd.Tab | None:
 
 
 def _describe_browser_startup_state(browser: zd.Browser) -> str:
-    process = getattr(browser, "_process", None)
-    returncode = process.poll() if process is not None else None
+    returncode = _require_browser_process_owner(browser).poll()
     targets = [
         f"{type(target).__name__}(type={target.type_!r}, url={target.url!r})"
         for target in browser.targets
     ]
     return (
-        f"stopped={browser.stopped}, "
-        f"process_returncode={returncode!r}, "
+        f"stopped={returncode is not None}, "
+        f"process_owner_returncode={returncode!r}, "
         f"targets=[{', '.join(targets)}]"
     )
 
@@ -1074,6 +1083,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             startup_deadline=browser_startup_work_deadline,
         )
         private_paths_are_owned = True
+        _require_browser_process_owner(browser)
     except BaseException as construction_error:
         private_paths = (
             ()
@@ -1470,62 +1480,25 @@ async def _await_browser_stop_task(
 
 
 def _terminate_browser_process(browser: Any, *, deadline: Deadline) -> None:
-    """Synchronously retire every process owner and its private material."""
+    """Synchronously retire the HBrowser-owned process and private material."""
 
-    owner = getattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
-    process = getattr(browser, "_process", None)
-    if owner is None and process is None:
-        return
+    owner = _require_browser_process_owner(browser)
     if deadline.expired:
         raise ProcessOwnershipError(
             "Browser process cleanup was not started after its deadline"
         )
-    if isinstance(owner, OwnedProcess):
-        try:
-            owner.shutdown(
-                graceful_timeout=_BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
-                terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
-                kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
-                cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
-                deadline=deadline.expires_at,
-            )
-        except BaseException as cleanup_error:
-            raise ProcessOwnershipError(
-                "Browser process/private-material cleanup remains unresolved"
-            ) from cleanup_error
-        setattr(browser, _BROWSER_PROCESS_OWNER_ATTRIBUTE, None)
-
-    if process is None:
-        return
     try:
-        process.terminate()
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(
-            timeout=min(
-                _BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
-                deadline.remaining(),
-            )
+        owner.shutdown(
+            graceful_timeout=_BROWSER_PROCESS_NATURAL_EXIT_SECONDS,
+            terminate_timeout=_BROWSER_PROCESS_TERMINATE_WAIT_SECONDS,
+            kill_timeout=_BROWSER_PROCESS_KILL_WAIT_SECONDS,
+            cleanup_timeout=_BROWSER_PRIVATE_RELEASE_TIMEOUT_SECONDS,
+            deadline=deadline.expires_at,
         )
-    except subprocess.TimeoutExpired:
-        if deadline.expired:
-            raise ProcessOwnershipError(
-                "Browser process termination exhausted the shutdown deadline"
-            )
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        process.wait(
-            timeout=min(
-                _BROWSER_PROCESS_KILL_WAIT_SECONDS,
-                deadline.remaining(),
-            )
-        )
-    browser._process = None
-    if hasattr(browser, "_process_pid"):
-        browser._process_pid = None
+    except BaseException as cleanup_error:
+        raise ProcessOwnershipError(
+            "Browser process/private-material cleanup remains unresolved"
+        ) from cleanup_error
 
 
 async def _explicit_browser_cleanup(
@@ -1534,7 +1507,7 @@ async def _explicit_browser_cleanup(
     run_blocking_cleanup: _BlockingCleanupRunner,
     deadline: Deadline,
 ) -> list[BaseException]:
-    """Finish process/profile cleanup after a repeatedly failed Browser.stop."""
+    """Finish owned-process cleanup after a repeatedly failed Browser.stop."""
 
     errors: list[BaseException] = []
     if deadline.expired:
@@ -1550,23 +1523,6 @@ async def _explicit_browser_cleanup(
             )
         except BaseException as error:
             errors.append(error)
-
-    cleanup_profile = getattr(browser, "_cleanup_temporary_profile", None)
-    if callable(cleanup_profile):
-        if deadline.expired:
-            errors.append(
-                ProcessOwnershipError(
-                    "Browser shutdown expired before profile cleanup was started"
-                )
-            )
-        else:
-            _, profile_errors = await _bounded_shutdown_awaitable(
-                cleanup_profile(),
-                timeout=_PROFILE_CLEANUP_TIMEOUT_SECONDS,
-                description="Zendriver temporary profile cleanup",
-                deadline=deadline,
-            )
-            errors.extend(profile_errors)
     return errors
 
 
@@ -1975,6 +1931,8 @@ async def _stop_browser(
 ) -> None:
     """Stop one generation using the supplied blocking-cleanup execution mode."""
 
+    _require_browser_process_owner(browser)
+
     # Tombstone synchronously before the first shutdown await. This closes the
     # race where another task could register work on a detached target while
     # connection snapshots are being closed.
@@ -2051,7 +2009,11 @@ async def stop_browser(
     browser: Any,
     deadline: Deadline | None = None,
 ) -> None:
-    """Stop one browser generation, deferring caller cancellation until clean."""
+    """Stop a browser returned by :func:`create_browser`.
+
+    The browser must retain HBrowser's durable :class:`OwnedProcess` owner.
+    Caller cancellation is deferred until the owned generation is clean.
+    """
 
     await _stop_browser(
         browser,
