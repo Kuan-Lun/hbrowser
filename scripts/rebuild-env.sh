@@ -16,7 +16,8 @@ command -v npm >/dev/null || {
 
 # Resolve only from project manifests; neither uv.lock nor package-lock.json is
 # read or generated.
-# uv reads project.requires-python and selects a compatible interpreter.
-uv venv --clear .venv
+# Request the supported minor explicitly. Dependency installation below enforces
+# the complete project.requires-python constraint, including excluded patches.
+uv venv --python 3.14 --clear .venv
 uv pip install --python .venv/bin/python --upgrade --reinstall -e '.[dev]'
 npm install --package-lock=false

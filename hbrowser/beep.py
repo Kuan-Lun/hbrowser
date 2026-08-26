@@ -23,7 +23,7 @@ def beep_os_independent() -> None:
     if sys.platform == "win32":
         try:
             # Windows 原生 API
-            import winsound  # type: ignore
+            import winsound
 
             winsound.MessageBeep()
         except Exception:
