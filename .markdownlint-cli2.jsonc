@@ -1,0 +1,25 @@
+{
+  "globs": [
+    "**/*.md",
+    "!**/.lake/**",
+    "!**/.mypy_cache/**",
+    "!**/.pytest_cache/**",
+    "!**/.ruff_cache/**",
+    "!**/.venv/**",
+    "!**/*.egg-info/**",
+    "!**/build/**",
+    "!**/dist/**",
+    "!**/node_modules/**"
+  ],
+  "config": {
+    "default": true,
+    "MD013": {
+      "line_length": 88,
+      "code_blocks": false,
+      "tables": false
+    },
+    "MD024": {
+      "siblings_only": true
+    }
+  }
+}

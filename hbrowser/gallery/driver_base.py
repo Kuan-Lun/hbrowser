@@ -119,7 +119,6 @@ class Driver(ABC):
     @abstractmethod
     def _setname(self) -> str:
         """設定網站名稱"""
-        pass
 
     def __init__(
         self,
@@ -145,7 +144,7 @@ class Driver(ABC):
         turnstile_tabs = validate_turnstile_tabs(turnstile_tabs)
 
         def seturl() -> dict[str, str]:
-            url: dict[str, str] = dict()
+            url: dict[str, str] = {}
             url["My Home"] = "https://e-hentai.org/home.php"
             url["E-Hentai"] = "https://e-hentai.org/"
             url["ExHentai"] = "https://exhentai.org/"

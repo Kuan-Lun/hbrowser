@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from typing import Any, cast
 from uuid import uuid4
 
 _PAGE_DIAGNOSTIC_FILE_LIMIT = 20
@@ -96,16 +97,17 @@ def _lock_descriptor(descriptor: int, *, deadline: float | None) -> None:
     elif os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(Any, msvcrt)
         os.lseek(descriptor, 0, os.SEEK_SET)
         if deadline is None:
-            getattr(msvcrt, "locking")(descriptor, getattr(msvcrt, "LK_LOCK"), 1)
+            windows_locking.locking(descriptor, windows_locking.LK_LOCK, 1)
             return
         while True:
             _require_budget(deadline, "inter-process lock acquisition")
             try:
-                getattr(msvcrt, "locking")(
+                windows_locking.locking(
                     descriptor,
-                    getattr(msvcrt, "LK_NBLCK"),
+                    windows_locking.LK_NBLCK,
                     1,
                 )
                 return
@@ -125,8 +127,9 @@ def _unlock_descriptor(descriptor: int) -> None:
     elif os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(Any, msvcrt)
         os.lseek(descriptor, 0, os.SEEK_SET)
-        getattr(msvcrt, "locking")(descriptor, getattr(msvcrt, "LK_UNLCK"), 1)
+        windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
 
 
 @contextmanager
@@ -191,7 +194,7 @@ def _bounded_page_diagnostic_content(content: str) -> bytes:
         return content_bytes
 
     marker = (
-        "\n<!-- hbrowser page diagnostic truncated at " f"{maximum_bytes} bytes -->\n"
+        f"\n<!-- hbrowser page diagnostic truncated at {maximum_bytes} bytes -->\n"
     ).encode()
     if len(marker) >= maximum_bytes:
         return marker[:maximum_bytes]

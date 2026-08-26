@@ -439,7 +439,8 @@ class ForwardingHandler(logging.Handler):
             )
             with self._enqueue_lock:
                 if not self._enabled:
-                    return
+                    # Another thread may close forwarding after the outer check.
+                    return  # type: ignore[unreachable]
                 self._queue.put_nowait(encoded)
         except Exception as error:
             self._fail("forward-send", error)

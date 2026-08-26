@@ -219,7 +219,8 @@ async def _wait_for_devtools_active_port_async(
                     active_port_file.read_text(encoding="utf-8")
                 )
                 if active_port_deadline.expired:
-                    break
+                    # The filesystem read can consume the remaining deadline.
+                    break  # type: ignore[unreachable]
                 return port
             except (OSError, RuntimeError) as error:
                 last_parse_error = (
@@ -480,7 +481,8 @@ async def _wait_for_main_tab(
                 break
             await asyncio.sleep(min(poll_interval, remaining))
             if browser.stopped:
-                break
+                # Browser state can change while the coroutine is suspended.
+                break  # type: ignore[unreachable]
             if loop.time() >= deadline:
                 break
             page = _select_main_tab(browser)
@@ -490,8 +492,7 @@ async def _wait_for_main_tab(
 
     state = _describe_browser_startup_state(browser)
     raise RuntimeError(
-        f"Browser failed to expose a main tab within {timeout:.1f} seconds "
-        f"({state})"
+        f"Browser failed to expose a main tab within {timeout:.1f} seconds ({state})"
     )
 
 
@@ -529,7 +530,7 @@ async def _settle_owned_startup_task[T](
     except BaseException as startup_error:
         if caller_cancellation is not None:
             caller_cancellation.add_note(
-                "Cancelled startup also failed: " f"{type(startup_error).__name__}"
+                f"Cancelled startup also failed: {type(startup_error).__name__}"
             )
             raise caller_cancellation
         raise
@@ -623,8 +624,7 @@ async def _cleanup_browser_after_startup_failure(
             )
             return
         cleanup_cancellation.add_note(
-            f"Browser {phase} was already failing with: "
-            f"{type(startup_error).__name__}"
+            f"Browser {phase} was already failing with: {type(startup_error).__name__}"
         )
         raise
     except BaseException as cleanup_error:
@@ -632,7 +632,7 @@ async def _cleanup_browser_after_startup_failure(
             f"Browser {phase} failed and generation cleanup remains unresolved"
         )
         ownership_error.add_note(
-            "Startup failure type: " f"{type(startup_error).__name__}"
+            f"Startup failure type: {type(startup_error).__name__}"
         )
         raise ownership_error from cleanup_error
 
@@ -1117,7 +1117,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
                 "could not be removed"
             )
             ownership_error.add_note(
-                "Construction failure type: " f"{type(construction_error).__name__}"
+                f"Construction failure type: {type(construction_error).__name__}"
             )
             for additional_error in private_cleanup_errors[1:]:
                 private_cleanup_errors[0].add_note(
@@ -1131,7 +1131,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
                 "remains unresolved"
             )
             ownership_error.add_note(
-                "Construction failure type: " f"{type(construction_error).__name__}"
+                f"Construction failure type: {type(construction_error).__name__}"
             )
             raise ownership_error from tor_cleanup_error
         if cleanup_cancellation is not None:
@@ -1471,7 +1471,7 @@ async def _await_browser_stop_task(
     done, _ = await asyncio.wait((task,), timeout=timeout)
     if not done:
         _detach_shutdown_task(task)
-        return TimeoutError("Zendriver browser stop exceeded " f"{timeout:g} seconds")
+        return TimeoutError(f"Zendriver browser stop exceeded {timeout:g} seconds")
     try:
         task.result()
     except BaseException as error:
@@ -1706,11 +1706,12 @@ async def _retire_protocol_operations(
             )
         )
         connections = retirement.captured_connections()
-        all_connections_closed, close_errors = (
-            await _close_and_wait_for_browser_connections(
-                connections,
-                deadline=deadline,
-            )
+        (
+            all_connections_closed,
+            close_errors,
+        ) = await _close_and_wait_for_browser_connections(
+            connections,
+            deadline=deadline,
         )
         errors.extend(close_errors)
         if not all_connections_closed:

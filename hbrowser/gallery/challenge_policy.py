@@ -10,7 +10,7 @@ def validate_turnstile_tabs(value: object) -> int:
 
     if type(value) is not int or not 1 <= value <= MAX_TURNSTILE_TABS:
         raise ValueError(
-            "turnstile_tabs must be an integer in " f"[1, {MAX_TURNSTILE_TABS}]"
+            f"turnstile_tabs must be an integer in [1, {MAX_TURNSTILE_TABS}]"
         )
     return value
 

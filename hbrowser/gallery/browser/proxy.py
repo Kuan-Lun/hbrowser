@@ -175,7 +175,7 @@ chrome.webRequest.onAuthRequired.addListener(
                 "could not be removed"
             )
             private_error.add_note(
-                "Creation failure type: " f"{type(creation_error).__name__}"
+                f"Creation failure type: {type(creation_error).__name__}"
             )
             raise private_error from cleanup_error
         raise

@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING
 
 # Production executes this file directly to keep startup dependency-light;
 # tests import it through the package so both module contexts are intentional.
-if TYPE_CHECKING:
-    from .process import _PrivateDirectory
-elif __package__:
+if TYPE_CHECKING or __package__:
     from .process import _PrivateDirectory
 else:
     from process import _PrivateDirectory

@@ -21,7 +21,7 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
 ENCOUNTER = (
     "MzU5ODcxOS0xNzg1OTk0MDc4LTk5NjEyYzIzNWY2YTgwNmE0OTk3YjgzN2ZhOWQyNzM5NWJmYzkyZGY="
 )
-ENCOUNTER_URL = "https://hentaiverse.org/?s=Battle&ss=ba&encounter=" f"{ENCOUNTER}"
+ENCOUNTER_URL = f"https://hentaiverse.org/?s=Battle&ss=ba&encounter={ENCOUNTER}"
 
 
 def _event_page(*hrefs: str) -> str:
@@ -34,7 +34,7 @@ def _event_page(*hrefs: str) -> str:
 class RandomEncounterURLTests(unittest.TestCase):
     def test_accepts_and_canonicalizes_the_expected_url(self) -> None:
         result = _normalize_random_encounter_url(
-            "HTTPS://HENTAIVERSE.ORG/?encounter=" f"{ENCOUNTER}&ss=ba&s=Battle"
+            f"HTTPS://HENTAIVERSE.ORG/?encounter={ENCOUNTER}&ss=ba&s=Battle"
         )
 
         self.assertIsNotNone(result)
@@ -56,22 +56,20 @@ class RandomEncounterURLTests(unittest.TestCase):
                 f"http://hentaiverse.org/?s=Battle&ss=ba&encounter={ENCOUNTER}"
             ),
             "lookalike host": (
-                "https://hentaiverse.org.example/?s=Battle&ss=ba&encounter="
-                f"{ENCOUNTER}"
+                f"https://hentaiverse.org.example/?s=Battle&ss=ba&encounter={ENCOUNTER}"
             ),
             "credentials": (
-                "https://user@hentaiverse.org/?s=Battle&ss=ba&encounter=" f"{ENCOUNTER}"
+                f"https://user@hentaiverse.org/?s=Battle&ss=ba&encounter={ENCOUNTER}"
             ),
             "explicit port": (
-                "https://hentaiverse.org:443/?s=Battle&ss=ba&encounter=" f"{ENCOUNTER}"
+                f"https://hentaiverse.org:443/?s=Battle&ss=ba&encounter={ENCOUNTER}"
             ),
             "invalid port": (
                 "https://hentaiverse.org:not-a-port/?s=Battle&ss=ba&encounter="
                 f"{ENCOUNTER}"
             ),
             "wrong path": (
-                "https://hentaiverse.org/battle?s=Battle&ss=ba&encounter="
-                f"{ENCOUNTER}"
+                f"https://hentaiverse.org/battle?s=Battle&ss=ba&encounter={ENCOUNTER}"
             ),
             "fragment": f"{ENCOUNTER_URL}#battle",
             "extra query field": f"{ENCOUNTER_URL}&next=unsafe",
@@ -322,14 +320,16 @@ class PunchInDocumentReadinessTests(unittest.IsolatedAsyncioTestCase):
         )
         driver._read_raw_page_snapshot = AsyncMock()  # type: ignore[method-assign]
 
-        with patch(
-            "hbrowser.gallery.eh_driver.asyncio.sleep",
-            new=AsyncMock(),
-        ) as sleep:
-            with self.assertRaisesRegex(RuntimeError, "lifecycle-confirmed"):
-                await driver._read_stable_punchin_document(
-                    previous_loader_id="old",
-                )
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep,
+            self.assertRaisesRegex(RuntimeError, "lifecycle-confirmed"),
+        ):
+            await driver._read_stable_punchin_document(
+                previous_loader_id="old",
+            )
 
         sleep.assert_not_awaited()
         driver._read_raw_page_snapshot.assert_not_awaited()

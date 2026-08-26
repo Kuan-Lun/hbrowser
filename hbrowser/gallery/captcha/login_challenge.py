@@ -181,8 +181,7 @@ class LoginChallengeHandler:
             await asyncio.sleep(min(1.0, remaining))
 
         raise LoginFailedException(
-            f"{spec.label} was not completed within "
-            f"{self._manual_timeout:.0f} seconds"
+            f"{spec.label} was not completed within {self._manual_timeout:.0f} seconds"
         )
 
     @staticmethod

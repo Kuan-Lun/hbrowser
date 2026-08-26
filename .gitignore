@@ -19,3 +19,12 @@ uv.lock
 
 # macOS
 .DS_Store
+
+# Repository-local policy and development tooling
+!/.githooks/
+!/.githooks/**
+!/.markdownlint-cli2.jsonc
+!/.release/
+!/.release/**
+node_modules/
+package-lock.json

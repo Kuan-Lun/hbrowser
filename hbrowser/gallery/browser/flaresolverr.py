@@ -425,8 +425,7 @@ class FlareSolverrSessionScope:
                 except FlareSolverrSessionOwnershipError as cleanup_error:
                     self._unavailable = True
                     raise FlareSolverrSessionUnavailable(
-                        "FlareSolverr session cleanup could not prove ownership "
-                        "release"
+                        "FlareSolverr session cleanup could not prove ownership release"
                     ) from cleanup_error
                 if not retry:
                     raise FlareSolverrSessionUnavailable(

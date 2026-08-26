@@ -177,7 +177,7 @@ class _Document:
     html_reads: tuple[str, ...]
     ready_state_reads: tuple[str, ...] = ("complete",)
     title: str = "Search results"
-    live_query: str | None | object = _DEFAULT_QUERY
+    live_query: str | object | None = _DEFAULT_QUERY
     loader_delay_polls: int = 0
     snapshot_errors: deque[BaseException] = field(default_factory=deque)
     snapshot_read_index: int = 0
@@ -432,7 +432,7 @@ class SearchPageParserTests(unittest.TestCase):
         )
         duplicate = no_results.replace(
             '<span id="unext">Next</span>',
-            '<span id="unext">Next</span>' '<a id="unext" href="?next=2">Next</a>',
+            '<span id="unext">Next</span><a id="unext" href="?next=2">Next</a>',
         )
         self.assertIs(
             _parse_search_page(duplicate, EXH_HOME)[3],
@@ -926,9 +926,7 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.get_urls, [requested_scope])
 
     async def test_scope_url_rejects_ambiguous_search_query_values(self) -> None:
-        scope_url = (
-            "https://exhentai.org/?f_search=artist%3Aone" "&f_search=artist%3Atwo"
-        )
+        scope_url = "https://exhentai.org/?f_search=artist%3Aone&f_search=artist%3Atwo"
         driver = _HarnessExHDriver()
         driver.add_route(
             scope_url,
@@ -1188,10 +1186,9 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             "https://exhentai.org/?f_search=artist%3Aother&next=2",
             "https://exhentai.org/?f_search=artist%3Atest&f_cats=1&next=2",
             "https://exhentai.org/?f_search=artist%3Atest&f_cats=&next=2",
-            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0" "&f_cats=0&next=2",
-            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0" "&f_cats=1&next=2",
-            "https://exhentai.org/?foo=changed&f_search=artist%3Atest"
-            "&f_cats=0&next=2",
+            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0&f_cats=0&next=2",
+            "https://exhentai.org/?f_search=artist%3Atest&f_cats=0&f_cats=1&next=2",
+            "https://exhentai.org/?foo=changed&f_search=artist%3Atest&f_cats=0&next=2",
             f"{first_url}#unexpected",
         )
 
@@ -1687,9 +1684,9 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 "save_page_diagnostic",
                 new=AsyncMock(side_effect=save_retired_diagnostic),
             ) as save_diagnostic,
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError),
         ):
-            with self.assertRaises(ArchiveDownloadOutcomeUnknownError):
-                await driver.download(gallery)
+            await driver.download(gallery)
 
         gallery_page.close.assert_not_awaited()
         first_link.click.assert_awaited_once()
@@ -2035,9 +2032,9 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 "hbrowser.gallery.eh_driver.asyncio.sleep",
                 new=AsyncMock(),
             ),
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised,
         ):
-            with self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised:
-                await driver.download(gallery)
+            await driver.download(gallery)
 
         gallery_page.close.assert_not_awaited()
         archive_page.close.assert_awaited_once()

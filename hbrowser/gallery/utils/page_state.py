@@ -327,13 +327,16 @@ async def navigate_and_wait(
         await asyncio.sleep(0)
         observer.arm()
         command_timeout = _command_timeout(operation_deadline)
-        frame_id, loader_id, error_text, is_download = (
-            await wait_for_zendriver_mutation(
-                page.send(cdp.page.navigate(url)),
-                timeout=command_timeout,
-                owner=page,
-                operation="Page navigation",
-            )
+        (
+            frame_id,
+            loader_id,
+            error_text,
+            is_download,
+        ) = await wait_for_zendriver_mutation(
+            page.send(cdp.page.navigate(url)),
+            timeout=command_timeout,
+            owner=page,
+            operation="Page navigation",
         )
         if error_text:
             raise RuntimeError("Chrome rejected page navigation")
@@ -736,9 +739,9 @@ async def wait_for_xpath(
 
 __all__ = [
     "DEFAULT_NAVIGATION_DEADLINE_SECONDS",
+    "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
     "NavigationReceipt",
     "PageStateTimeout",
-    "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
     "mutate_and_wait_for_navigation",
     "navigate_and_wait",
     "open_tab_and_wait",
