@@ -615,6 +615,8 @@ def _target_group_identity(
         return _TargetGroupIdentity.EXITED_PINNED
     if process_group != target.pid or session != os.getsid(0):
         raise _OwnershipProofInvalid("Owned target escaped its assigned process group")
+    if _posix_target_has_exit_receipt(target):
+        return _TargetGroupIdentity.EXITED_PINNED
     return _TargetGroupIdentity.LIVE_OWNED
 
 

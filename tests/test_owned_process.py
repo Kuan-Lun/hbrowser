@@ -1268,7 +1268,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
             patch.object(
                 supervisor_module,
                 "_posix_target_has_exit_receipt",
-                side_effect=(False, False, True),
+                side_effect=(False, False, False, True),
             ),
             patch.object(os, "getpgid", return_value=target.pid),
             patch.object(os, "getsid", return_value=os.getsid(0)),
@@ -1419,6 +1419,64 @@ class PosixOwnedProcessTests(unittest.TestCase):
         process_group_members.assert_called_once_with(target.pid, deadline_ns=ANY)
         target.wait.assert_called_once_with()
         kill_process_group.assert_not_called()
+
+    def test_target_exit_after_successful_identity_probe_is_reaped(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller()
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True, True),
+            ) as target_exited,
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ) as process_group_members,
+            patch.object(os, "killpg") as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(target_exited.call_count, 3)
+        process_group_members.assert_called_once_with(target.pid, deadline_ns=ANY)
+        target.wait.assert_called_once_with()
+        kill_process_group.assert_not_called()
+
+    def test_target_exit_after_identity_with_descendant_cleans_group(self) -> None:
+        target = Mock(pid=123)
+        actions = Mock()
+        target.wait.side_effect = actions.wait
+        controller = _shutdown_controller()
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True, True, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                side_effect=((target.pid, 456), (target.pid,)),
+            ),
+            patch.object(os, "killpg", side_effect=actions.killpg),
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(
+            actions.mock_calls,
+            [call.killpg(target.pid, signal.SIGTERM), call.wait(timeout=ANY)],
+        )
 
     def test_target_exit_race_with_descendant_cleans_pinned_group(self) -> None:
         target = Mock(pid=123)
@@ -1823,7 +1881,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
             patch.object(
                 supervisor_module,
                 "_posix_target_has_exit_receipt",
-                side_effect=(False, False, True),
+                side_effect=(False, False, False, True),
             ),
             patch.object(os, "getpgid", return_value=target.pid),
             patch.object(os, "getsid", return_value=os.getsid(0)),
@@ -1883,7 +1941,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
             patch.object(
                 supervisor_module,
                 "_posix_target_has_exit_receipt",
-                side_effect=(False, True),
+                side_effect=(False, False, True),
             ),
             patch.object(os, "getpgid", return_value=target.pid),
             patch.object(os, "getsid", return_value=os.getsid(0)),
