@@ -1,5 +1,33 @@
 # HBrowser (hbrowser)
 
+## Supported platforms
+
+HBrowser requires Python 3.14 or newer. The declared owned-process targets are
+Windows, macOS, and Linux. A POSIX runtime must expose Python's non-reaping
+child-exit receipt primitives (`os.waitid`, `P_PID`, `WEXITED`, `WNOHANG`, and
+`WNOWAIT`) and a `ps -axo pid=,pgid=` process-group snapshot. A runtime without
+either requirement is rejected before the browser target starts;
+falling back to `Popen.poll()` would reap the child and make a cached process
+group vulnerable to PID reuse.
+
+On POSIX, the target and every descendant must remain in the process group that
+HBrowser assigns until exit. `start_owned_process()` is process ownership, not
+an OS containment sandbox, and does not support targets that call `setsid()` or
+otherwise detach descendants. The owned browser/runtime must also stop creating
+descendants after it receives termination or after its group leader exits. The
+`ps` snapshot used for final proof is not an atomic containment primitive, so a
+target that continuously or adversarially forks during shutdown is outside this
+contract. Windows ownership uses a Job object instead.
+
+## Owned-process shutdown
+
+`OwnedProcess.terminate()` requests graceful termination only. It does not
+silently escalate to a force kill after an internal timer; callers that need a
+bounded TERM-to-KILL policy should use `OwnedProcess.shutdown()`, while an
+explicit force request uses `OwnedProcess.kill()`. If a caller deadline expires,
+the supervisor retains the target identity and continues proof-only settlement
+instead of abandoning an unproven ownership set.
+
 ## Setup
 
 ### Tor Proxy (Optional)

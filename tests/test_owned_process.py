@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import math
 import os
 import shutil
 import signal
@@ -16,6 +17,7 @@ from unittest.mock import ANY, Mock, call, patch
 import zendriver as zd
 
 from hbrowser.gallery.browser import _directory_cleanup_worker as cleanup_worker_module
+from hbrowser.gallery.browser import _process_control as control_module
 from hbrowser.gallery.browser import _process_supervisor as supervisor_module
 from hbrowser.gallery.browser import process as process_module
 
@@ -45,8 +47,982 @@ def _windows_cleanup_error(code: int) -> PermissionError:
     return error
 
 
+def _shutdown_controller(
+    intent: control_module.ControlIntent = control_module.ControlIntent.TERMINATE,
+) -> supervisor_module._ShutdownController:
+    now_ns = time.monotonic_ns()
+    controller = supervisor_module._ShutdownController()
+    controller.apply(
+        control_module.ControlRequest(
+            intent=intent,
+            phase_deadline_ns=now_ns + 5_000_000_000,
+            overall_deadline_ns=now_ns + 10_000_000_000,
+        )
+    )
+    return controller
+
+
+class ProcessControlProtocolTests(unittest.TestCase):
+    def test_start_request_round_trips_exactly(self) -> None:
+        request = control_module.StartRequest(deadline_ns=123)
+
+        frame = request.encode()
+
+        self.assertLessEqual(len(frame), control_module.MAX_START_LINE_BYTES)
+        self.assertEqual(control_module.StartRequest.parse(frame), request)
+
+    def test_start_request_rejects_legacy_malformed_and_noncanonical_frames(
+        self,
+    ) -> None:
+        invalid_frames = (
+            b"start\n",
+            b"hbrowser-start-v0 1\n",
+            b"hbrowser-start-v1\n",
+            b"hbrowser-start-v1 1",
+            b"hbrowser-start-v1 01\n",
+            b"hbrowser-start-v1 -1\n",
+            b"hbrowser-start-v1 1\r\n",
+            b"hbrowser-start-v1 1\ntrailing\n",
+            b"x" * (control_module.MAX_START_LINE_BYTES + 1),
+        )
+        for frame in invalid_frames:
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                control_module.StartRequest.parse(frame)
+
+    def test_control_request_round_trips_exactly(self) -> None:
+        for request in (
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                10,
+                None,
+            ),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                20,
+                30,
+                allow_immediate=True,
+            ),
+        ):
+            frame = request.encode()
+            self.assertLessEqual(len(frame), control_module.MAX_CONTROL_LINE_BYTES)
+            self.assertEqual(control_module.ControlRequest.parse(frame), request)
+
+    def test_control_request_rejects_noncanonical_or_invalid_frames(self) -> None:
+        invalid_frames = (
+            b"terminate\n",
+            b"kill\n",
+            b"hbrowser-control-v0 terminate 1 none 0\n",
+            b"hbrowser-control-v1 stop 1 none 0\n",
+            b"hbrowser-control-v1 TERMINATE 1 none 0\n",
+            b"hbrowser-control-v1 terminate 01 none 0\n",
+            b"hbrowser-control-v1 terminate 1 none 2\n",
+            b"hbrowser-control-v1 terminate 1 none 0\r\n",
+            b"x" * (control_module.MAX_CONTROL_LINE_BYTES + 1),
+        )
+        for frame in invalid_frames:
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                control_module.ControlRequest.parse(frame)
+
+    def test_control_merge_escalates_only_and_preserves_phase_contract(self) -> None:
+        terminate = control_module.ControlRequest(
+            control_module.ControlIntent.TERMINATE,
+            10,
+            100,
+        )
+        later_terminate = control_module.ControlRequest(
+            control_module.ControlIntent.TERMINATE,
+            8,
+            90,
+        )
+        kill = control_module.ControlRequest(
+            control_module.ControlIntent.KILL,
+            40,
+            80,
+        )
+        later_kill = control_module.ControlRequest(
+            control_module.ControlIntent.KILL,
+            30,
+            70,
+        )
+
+        self.assertEqual(
+            terminate.merge(later_terminate),
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                8,
+                90,
+            ),
+        )
+        self.assertEqual(
+            terminate.merge(kill),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                40,
+                80,
+            ),
+        )
+        self.assertEqual(
+            kill.merge(later_kill),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                30,
+                70,
+            ),
+        )
+        self.assertEqual(
+            kill.merge(later_terminate),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                40,
+                80,
+            ),
+        )
+
+    def test_deadline_conversion_floors_the_exact_float(self) -> None:
+        deadline = math.nextafter(1.0, math.inf)
+        numerator, denominator = deadline.as_integer_ratio()
+        expected = numerator * 1_000_000_000 // denominator
+        self.assertEqual(
+            control_module.deadline_to_monotonic_ns(deadline),
+            expected,
+        )
+
+    def test_control_reader_accepts_fragmented_and_escalating_frames(self) -> None:
+        now_ns = time.monotonic_ns()
+        terminate = control_module.ControlRequest(
+            control_module.ControlIntent.TERMINATE,
+            now_ns + 1_000_000_000,
+            now_ns + 4_000_000_000,
+        ).encode()
+        kill = control_module.ControlRequest(
+            control_module.ControlIntent.KILL,
+            now_ns + 2_000_000_000,
+            now_ns + 3_000_000_000,
+        ).encode()
+        controller = supervisor_module._ShutdownController()
+        with patch.object(
+            os,
+            "read",
+            side_effect=(terminate[:7], terminate[7:] + kill, b""),
+        ):
+            supervisor_module._watch_control_pipe(42, controller)
+
+        request = controller.snapshot()
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        self.assertFalse(controller.protocol_failed)
+
+    def test_control_reader_rejects_truncation_oversize_and_read_error(self) -> None:
+        cases: tuple[object, ...] = (
+            (b"hbrowser-control-v1 terminate", b""),
+            (b"x" * (control_module.MAX_CONTROL_LINE_BYTES + 1),),
+            (OSError("control read failed"),),
+        )
+        for side_effect in cases:
+            with self.subTest(side_effect=side_effect):
+                controller = supervisor_module._ShutdownController()
+                with patch.object(os, "read", side_effect=side_effect):
+                    supervisor_module._watch_control_pipe(42, controller)
+                self.assertTrue(controller.protocol_failed)
+                request = controller.snapshot()
+                assert request is not None
+                self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+
+    def test_expired_direct_terminate_parks_until_explicit_kill(self) -> None:
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                0,
+                None,
+            )
+        )
+        now_ns = time.monotonic_ns()
+
+        def deliver_kill(
+            _: supervisor_module._ControllerState,
+            __: float,
+        ) -> supervisor_module._ControllerState:
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.KILL,
+                    now_ns + 1_000_000_000,
+                    now_ns + 2_000_000_000,
+                )
+            )
+            return controller.state()
+
+        with (
+            patch.object(
+                controller,
+                "wait_for_change",
+                side_effect=deliver_kill,
+            ) as wait,
+            patch.object(
+                controller,
+                "promote_planned_kill",
+                wraps=controller.promote_planned_kill,
+            ) as promote,
+        ):
+            kill_state = supervisor_module._wait_for_kill_request(controller)
+
+        assert kill_state is not None
+        request = kill_state.request
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        wait.assert_called_once_with(ANY, supervisor_module._POLL_SECONDS)
+        promote.assert_called_once_with()
+
+    def test_finite_terminate_plan_promotes_to_kill_without_parent_round_trip(
+        self,
+    ) -> None:
+        now_ns = time.monotonic_ns()
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                0,
+                now_ns + 1_000_000_000,
+                allow_immediate=True,
+            )
+        )
+
+        kill_state = supervisor_module._wait_for_kill_request(controller)
+
+        assert kill_state is not None
+        request = kill_state.request
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        self.assertEqual(request.phase_deadline_ns, now_ns + 1_000_000_000)
+        self.assertFalse(request.allow_immediate)
+
+    def test_zero_kill_budget_promotes_with_one_immediate_force_action(self) -> None:
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                0,
+                0,
+            )
+        )
+
+        kill_state = supervisor_module._wait_for_kill_request(controller)
+
+        assert kill_state is not None
+        request = kill_state.request
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        self.assertTrue(request.allow_immediate)
+
+    def test_expired_kill_fallback_starts_a_fresh_bounded_phase(self) -> None:
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                0,
+                0,
+            )
+        )
+        now_ns = time.monotonic_ns()
+
+        with patch.object(time, "monotonic_ns", return_value=now_ns):
+            controller.request_fallback(control_module.ControlIntent.KILL)
+
+        request = controller.snapshot()
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        self.assertGreater(request.phase_deadline_ns, now_ns)
+        self.assertEqual(request.phase_deadline_ns, request.overall_deadline_ns)
+
+    def test_owner_death_renews_a_kill_that_expires_before_consumption(self) -> None:
+        now_ns = time.monotonic_ns()
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                now_ns + 10,
+                now_ns + 10,
+            )
+        )
+        with patch.object(time, "monotonic_ns", return_value=now_ns):
+            controller.request_fallback(control_module.ControlIntent.TERMINATE)
+        pending = controller.snapshot()
+        assert pending is not None
+        self.assertEqual(pending.phase_deadline_ns, now_ns + 10)
+
+        with patch.object(time, "monotonic_ns", return_value=now_ns + 11):
+            renewed_state = supervisor_module._wait_for_kill_request(controller)
+
+        assert renewed_state is not None
+        renewed = renewed_state.request
+        assert renewed is not None
+        self.assertEqual(renewed.intent, control_module.ControlIntent.KILL)
+        self.assertGreater(renewed.phase_deadline_ns, now_ns + 11)
+
+    def test_controller_renews_only_an_exhausted_same_intent_phase(self) -> None:
+        now_ns = time.monotonic_ns()
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                now_ns + 10,
+                now_ns + 10,
+            )
+        )
+        later = control_module.ControlRequest(
+            control_module.ControlIntent.KILL,
+            now_ns + 30,
+            now_ns + 30,
+        )
+
+        with patch.object(time, "monotonic_ns", return_value=now_ns):
+            controller.apply(later)
+        active = controller.snapshot()
+        assert active is not None
+        self.assertEqual(active.phase_deadline_ns, now_ns + 10)
+
+        with patch.object(time, "monotonic_ns", return_value=now_ns + 11):
+            controller.apply(later)
+        self.assertEqual(controller.snapshot(), later)
+
+    def test_due_finite_terminate_cannot_be_downgraded_by_later_terminate(
+        self,
+    ) -> None:
+        controller = supervisor_module._ShutdownController()
+        finite_terminate = control_module.ControlRequest(
+            control_module.ControlIntent.TERMINATE,
+            10,
+            20,
+        )
+        standalone_terminate = control_module.ControlRequest(
+            control_module.ControlIntent.TERMINATE,
+            30,
+            None,
+        )
+        with patch.object(time, "monotonic_ns", return_value=0):
+            controller.apply(finite_terminate)
+        with patch.object(time, "monotonic_ns", return_value=11):
+            controller.apply(standalone_terminate)
+            request = controller.snapshot()
+
+        assert request is not None
+        self.assertEqual(request.intent, control_module.ControlIntent.KILL)
+        self.assertEqual(request.phase_deadline_ns, 20)
+        self.assertEqual(request.overall_deadline_ns, 20)
+
+    def test_fresh_kill_renews_an_exhausted_finite_terminate_plan(self) -> None:
+        controller = supervisor_module._ShutdownController()
+        with patch.object(time, "monotonic_ns", return_value=0):
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.TERMINATE,
+                    10,
+                    20,
+                )
+            )
+        fresh_kill = control_module.ControlRequest(
+            control_module.ControlIntent.KILL,
+            40,
+            40,
+        )
+        with patch.object(time, "monotonic_ns", return_value=21):
+            controller.apply(fresh_kill)
+            request = controller.snapshot()
+
+        self.assertEqual(request, fresh_kill)
+
+    def test_pending_immediate_kill_survives_same_intent_replacement(self) -> None:
+        controller = supervisor_module._ShutdownController()
+        with patch.object(time, "monotonic_ns", return_value=1):
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.KILL,
+                    0,
+                    0,
+                    allow_immediate=True,
+                )
+            )
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.KILL,
+                    0,
+                    0,
+                )
+            )
+            request = controller.snapshot()
+
+        assert request is not None
+        self.assertTrue(request.allow_immediate)
+
+    def test_wait_for_change_does_not_sleep_after_an_already_applied_request(
+        self,
+    ) -> None:
+        controller = supervisor_module._ShutdownController()
+        observed = controller.state()
+        now_ns = time.monotonic_ns()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                now_ns + 1_000_000_000,
+                now_ns + 1_000_000_000,
+            )
+        )
+
+        with patch.object(controller._condition, "wait_for") as wait_for:
+            changed = controller.wait_for_change(observed, 1)
+
+        wait_for.assert_not_called()
+        self.assertGreater(changed.revision, observed.revision)
+
+    def test_start_barrier_rejects_exact_deadline_and_queued_control(self) -> None:
+        deadline_ns = 100
+        for request in (
+            None,
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                200,
+                None,
+            ),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                200,
+                200,
+            ),
+        ):
+            with self.subTest(request=request):
+                controller = supervisor_module._ShutdownController()
+                if request is not None:
+                    with patch.object(time, "monotonic_ns", return_value=0):
+                        controller.apply(request)
+                start = Mock()
+                now_ns = deadline_ns if request is None else 99
+                with patch.object(time, "monotonic_ns", return_value=now_ns):
+                    target, error = controller.start_target_if_authorized(
+                        deadline_ns=deadline_ns,
+                        action=start,
+                    )
+
+                self.assertIsNone(target)
+                self.assertEqual(
+                    error,
+                    (
+                        "StartupDeadlineExpired"
+                        if request is None
+                        else "StartupCancelled"
+                    ),
+                )
+                start.assert_not_called()
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
 class PosixOwnedProcessTests(unittest.TestCase):
+    def test_start_reader_leaves_same_write_control_tail_for_cancel_barrier(
+        self,
+    ) -> None:
+        deadline_ns = time.monotonic_ns() + 5_000_000_000
+        start_frame = control_module.StartRequest(deadline_ns).encode()
+        requests = (
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                deadline_ns,
+                None,
+            ),
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                deadline_ns,
+                deadline_ns,
+            ),
+            None,
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                read_descriptor, write_descriptor = os.pipe()
+                controller = supervisor_module._ShutdownController()
+                try:
+                    tail = b"" if request is None else request.encode()
+                    os.write(write_descriptor, start_frame + tail)
+                    if request is None:
+                        os.close(write_descriptor)
+                        write_descriptor = -1
+
+                    self.assertEqual(
+                        supervisor_module._read_start_gate(read_descriptor),
+                        start_frame,
+                    )
+                    drained = supervisor_module._start_control_watcher(
+                        read_descriptor,
+                        controller,
+                    )
+                    self.assertTrue(drained.wait(timeout=1))
+                    start = Mock()
+                    target, error = controller.start_target_if_authorized(
+                        deadline_ns=deadline_ns,
+                        action=start,
+                    )
+
+                    self.assertIsNone(target)
+                    self.assertEqual(error, "StartupCancelled")
+                    start.assert_not_called()
+                finally:
+                    if write_descriptor >= 0:
+                        os.close(write_descriptor)
+                    os.close(read_descriptor)
+
+    def test_waitid_preflight_requires_callable_runtime_support(self) -> None:
+        with patch.object(os, "waitid", None):
+            self.assertFalse(supervisor_module._posix_exit_receipts_supported())
+        with (
+            patch.object(os, "fork", return_value=123),
+            patch.object(os, "waitid", side_effect=OSError("unsupported")),
+            patch.object(os, "kill") as kill,
+            patch.object(os, "waitpid", side_effect=((0, 0), (123, 0))) as waitpid,
+        ):
+            self.assertFalse(supervisor_module._posix_exit_receipts_supported())
+        kill.assert_called_once_with(123, signal.SIGKILL)
+        self.assertEqual(
+            waitpid.call_args_list,
+            [call(123, os.WNOHANG), call(123, 0)],
+        )
+        with (
+            patch.object(os, "fork", return_value=123),
+            patch.object(
+                os,
+                "waitid",
+                side_effect=(Mock(si_pid=123), Mock(si_pid=123)),
+            ) as waitid,
+            patch.object(os, "waitpid", return_value=(123, 0)) as waitpid,
+        ):
+            self.assertTrue(supervisor_module._posix_exit_receipts_supported())
+        self.assertEqual(waitid.call_count, 2)
+        waitpid.assert_called_once_with(123, 0)
+
+    def test_waitid_preflight_never_signals_after_identity_may_be_reaped(
+        self,
+    ) -> None:
+        with (
+            patch.object(os, "fork", return_value=123),
+            patch.object(
+                os,
+                "waitid",
+                side_effect=(Mock(si_pid=123), ChildProcessError()),
+            ),
+            patch.object(os, "waitpid", side_effect=ChildProcessError) as waitpid,
+            patch.object(os, "kill") as kill,
+        ):
+            self.assertFalse(supervisor_module._posix_exit_receipts_supported())
+
+        waitpid.assert_called_once_with(123, os.WNOHANG)
+        kill.assert_not_called()
+
+    def test_preflight_cannot_inherit_target_only_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-preflight-capability-test-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            initial_drain = threading.Event()
+            initial_drain.set()
+            target = Mock(pid=123)
+            target_environment: dict[str, str] = {}
+            forwarding_token = f"test-{time.monotonic_ns()}"
+
+            def assert_sanitized_preflight() -> bool:
+                self.assertNotIn("HBROWSER_LOG_FORWARD_ENDPOINT", os.environ)
+                self.assertNotIn("HBROWSER_LOG_FORWARD_TOKEN", os.environ)
+                return True
+
+            def launch_target(*_: object, **options: object) -> Mock:
+                environment = cast(dict[str, str], options["env"])
+                target_environment.update(environment)
+                return target
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "HBROWSER_LOG_FORWARD_ENDPOINT": "local-endpoint",
+                        "HBROWSER_LOG_FORWARD_TOKEN": forwarding_token,
+                    },
+                ),
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest((1 << 63) - 1).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    side_effect=assert_sanitized_preflight,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_process_group_snapshots_supported",
+                    side_effect=assert_sanitized_preflight,
+                ),
+                patch.object(signal, "signal"),
+                patch.object(
+                    supervisor_module,
+                    "_start_control_watcher",
+                    return_value=initial_drain,
+                ),
+                patch.object(subprocess, "Popen", side_effect=launch_target),
+                patch.object(
+                    supervisor_module,
+                    "_posix_target_has_exit_receipt",
+                    return_value=True,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_complete_posix_cleanup",
+                    return_value=False,
+                ),
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                target_environment["HBROWSER_LOG_FORWARD_ENDPOINT"],
+                "local-endpoint",
+            )
+            self.assertEqual(
+                target_environment["HBROWSER_LOG_FORWARD_TOKEN"],
+                forwarding_token,
+            )
+
+    def test_preflight_failure_clears_retained_target_environment(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-preflight-environment-clear-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            forwarding_token = f"test-{time.monotonic_ns()}"
+            retained_environment = {
+                "HBROWSER_LOG_FORWARD_ENDPOINT": "local-endpoint",
+                "HBROWSER_LOG_FORWARD_TOKEN": forwarding_token,
+            }
+            with (
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest((1 << 63) - 1).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_take_target_environment",
+                    return_value=retained_environment,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    return_value=False,
+                ),
+                patch.object(signal, "signal"),
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(
+                result,
+                control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+            )
+            self.assertEqual(retained_environment, {})
+
+    def test_malformed_ps_output_never_proves_a_group_clean(self) -> None:
+        result = Mock(stdout="123 123\nmalformed\n", returncode=0)
+        with (
+            patch.object(subprocess, "run", return_value=result) as run,
+            self.assertRaisesRegex(
+                supervisor_module._PhaseDeadlineExpired,
+                "malformed output",
+            ),
+        ):
+            supervisor_module._process_group_members(
+                123,
+                deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            )
+        run.assert_called_once_with(
+            [supervisor_module._POSIX_PS_EXECUTABLE, "-axo", "pid=,pgid="],
+            check=True,
+            capture_output=True,
+            env={"LC_ALL": "C", "PATH": os.defpath},
+            text=True,
+            timeout=ANY,
+        )
+
+    def test_incomplete_ps_snapshot_never_proves_target_cleanup(self) -> None:
+        target = Mock(pid=123)
+        for members in ((), (999,), (123, 123)):
+            self.assertFalse(
+                supervisor_module._snapshot_proves_pinned_group(
+                    members,
+                    target.pid,
+                )
+            )
+            with (
+                self.subTest(members=members),
+                patch.object(
+                    supervisor_module,
+                    "_posix_target_has_exit_receipt",
+                    return_value=True,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_process_group_members",
+                    return_value=members,
+                ),
+            ):
+                self.assertFalse(supervisor_module._try_settle_posix_target(target))
+        self.assertTrue(
+            supervisor_module._snapshot_proves_pinned_group(
+                (target.pid,),
+                target.pid,
+            )
+        )
+        target.wait.assert_not_called()
+
+    def test_missing_waitid_primitive_fails_before_target_popen(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-posix-preflight-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            with (
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest((1 << 63) - 1).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    return_value=False,
+                ),
+                patch.object(subprocess, "Popen") as popen,
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(
+                result,
+                control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+            )
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                "error UnsupportedOwnershipPrimitive\n",
+            )
+            popen.assert_not_called()
+
+    def test_missing_trusted_ps_fails_before_target_popen(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-posix-ps-preflight-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            with (
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest((1 << 63) - 1).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    return_value=True,
+                ),
+                patch.object(supervisor_module, "_POSIX_PS_EXECUTABLE", None),
+                patch.object(subprocess, "Popen") as popen,
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(
+                result,
+                control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+            )
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                "error UnsupportedOwnershipPrimitive\n",
+            )
+            popen.assert_not_called()
+
+    def test_unusable_ps_fails_before_target_popen(self) -> None:
+        failures: tuple[object, ...] = (
+            subprocess.CalledProcessError(1, ["ps"]),
+            Mock(stdout="123 123\nmalformed\n", returncode=0),
+        )
+        for failure in failures:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory(
+                    prefix="hbrowser-posix-ps-functional-preflight-"
+                ) as directory,
+            ):
+                status_path = Path(directory) / "status"
+                standard_input = Mock()
+                standard_input.fileno.return_value = 42
+                run_effect: object
+                if isinstance(failure, BaseException):
+                    run_effect = failure
+                else:
+                    run_effect = None
+                with (
+                    patch.object(sys, "stdin", standard_input),
+                    patch.object(
+                        supervisor_module,
+                        "_read_start_gate",
+                        return_value=control_module.StartRequest(
+                            (1 << 63) - 1
+                        ).encode(),
+                    ),
+                    patch.object(
+                        supervisor_module,
+                        "_posix_exit_receipts_supported",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        subprocess,
+                        "run",
+                        return_value=(None if run_effect is not None else failure),
+                        side_effect=run_effect,
+                    ),
+                    patch.object(subprocess, "Popen") as popen,
+                ):
+                    result = supervisor_module.main(
+                        (str(status_path), "--", sys.executable, "-c", "pass")
+                    )
+
+                self.assertEqual(
+                    result,
+                    control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+                )
+                self.assertEqual(
+                    status_path.read_text(encoding="utf-8"),
+                    "error UnsupportedOwnershipPrimitive\n",
+                )
+                popen.assert_not_called()
+
+    def test_main_body_failure_returns_only_after_posix_cleanup_proof(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-posix-main-containment-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            target = Mock(pid=123)
+            initial_drain = threading.Event()
+            initial_drain.set()
+            with (
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest((1 << 63) - 1).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    return_value=True,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_process_group_snapshots_supported",
+                    return_value=True,
+                ),
+                patch.object(signal, "signal"),
+                patch.object(
+                    supervisor_module,
+                    "_start_control_watcher",
+                    return_value=initial_drain,
+                ),
+                patch.object(subprocess, "Popen", return_value=target),
+                patch.object(
+                    supervisor_module,
+                    "_write_status",
+                    side_effect=RuntimeError("READY publication failed"),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_complete_posix_cleanup",
+                    return_value=False,
+                ) as cleanup,
+                patch.object(supervisor_module, "_report_cleanup_failure") as report,
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(
+                result,
+                control_module.PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+            )
+            cleanup.assert_called_once_with(target, controller=ANY)
+            report.assert_called_once()
+
+    def test_slow_preflight_crossing_start_deadline_never_calls_target_popen(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-start-deadline-preflight-"
+        ) as directory:
+            status_path = Path(directory) / "status"
+            standard_input = Mock()
+            standard_input.fileno.return_value = 42
+            clock = [9]
+
+            def finish_slow_preflight() -> bool:
+                clock[0] = 10
+                return True
+
+            with (
+                patch.object(sys, "stdin", standard_input),
+                patch.object(
+                    supervisor_module,
+                    "_read_start_gate",
+                    return_value=control_module.StartRequest(10).encode(),
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_exit_receipts_supported",
+                    side_effect=finish_slow_preflight,
+                ),
+                patch.object(
+                    supervisor_module,
+                    "_posix_process_group_snapshots_supported",
+                    return_value=True,
+                ),
+                patch.object(time, "monotonic_ns", side_effect=lambda: clock[0]),
+                patch.object(signal, "signal"),
+                patch.object(supervisor_module, "_start_control_watcher") as watcher,
+                patch.object(subprocess, "Popen") as popen,
+            ):
+                result = supervisor_module.main(
+                    (str(status_path), "--", sys.executable, "-c", "pass")
+                )
+
+            self.assertEqual(
+                result,
+                control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+            )
+            self.assertEqual(
+                status_path.read_text(encoding="utf-8"),
+                "error StartupDeadlineExpired\n",
+            )
+            watcher.assert_not_called()
+            popen.assert_not_called()
+
     def test_short_lived_target_does_not_require_parent_identity_probe(self) -> None:
         with (
             patch(
@@ -196,6 +1172,153 @@ class PosixOwnedProcessTests(unittest.TestCase):
             process.terminate()
             process.wait(timeout=5)
 
+    def test_direct_terminate_reaps_a_target_that_exits_after_its_phase(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-late-term-exit-"
+        ) as directory:
+            ready_path = Path(directory) / "ready"
+            term_path = Path(directory) / "term"
+            release_path = Path(directory) / "release"
+            exited_path = Path(directory) / "exited"
+            script = (
+                "import pathlib,signal,sys,time;"
+                "ready=pathlib.Path(sys.argv[1]);"
+                "term=pathlib.Path(sys.argv[2]);"
+                "release=pathlib.Path(sys.argv[3]);"
+                "exited=pathlib.Path(sys.argv[4])\n"
+                "def finish(*_):\n"
+                " term.write_text('received',encoding='utf-8')\n"
+                " while not release.is_file(): time.sleep(0.01)\n"
+                " exited.write_text('clean',encoding='utf-8')\n"
+                " raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM,finish);"
+                "ready.write_text('ready',encoding='utf-8');"
+                "time.sleep(30)"
+            )
+            process = process_module.start_owned_process(
+                sys.executable,
+                [
+                    "-c",
+                    script,
+                    str(ready_path),
+                    str(term_path),
+                    str(release_path),
+                    str(exited_path),
+                ],
+            )
+            try:
+                ready_deadline = time.monotonic() + 2
+                while not ready_path.is_file() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready_path.is_file())
+
+                terminate_deadline = time.monotonic() + 0.5
+                process.terminate(deadline=terminate_deadline)
+                term_deadline = time.monotonic() + 2
+                while not term_path.is_file() and time.monotonic() < term_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(term_path.is_file())
+                while time.monotonic() <= terminate_deadline:
+                    time.sleep(0.01)
+                release_path.write_text("release", encoding="utf-8")
+
+                self.assertEqual(process.wait(timeout=2), 0)
+                self.assertEqual(
+                    exited_path.read_text(encoding="utf-8"),
+                    "clean",
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill(deadline=time.monotonic() + 2)
+                    process.wait(timeout=2)
+
+    def test_fresh_standalone_terminate_revision_sends_term_again(self) -> None:
+        target = Mock(pid=123)
+        controller = supervisor_module._ShutdownController()
+        now_ns = time.monotonic_ns()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.TERMINATE,
+                now_ns + 1_000_000_000,
+                None,
+            )
+        )
+        delivered_fresh_term = False
+
+        def deliver_fresh_term(
+            _: supervisor_module._ControllerState,
+            __: float,
+        ) -> supervisor_module._ControllerState:
+            nonlocal delivered_fresh_term
+            self.assertFalse(delivered_fresh_term)
+            delivered_fresh_term = True
+            fresh_now_ns = time.monotonic_ns()
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.TERMINATE,
+                    fresh_now_ns + 1_000_000_000,
+                    None,
+                )
+            )
+            return controller.state()
+
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch.object(
+                controller,
+                "wait_for_change",
+                side_effect=deliver_fresh_term,
+            ) as wait_for_change,
+            patch.object(os, "killpg") as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(
+            kill_process_group.call_args_list,
+            [
+                call(target.pid, signal.SIGTERM),
+                call(target.pid, signal.SIGTERM),
+            ],
+        )
+        wait_for_change.assert_called_once_with(ANY, ANY)
+        target.wait.assert_called_once_with(timeout=ANY)
+
+    def test_malformed_control_frame_reports_error_after_tree_proof(self) -> None:
+        process = process_module.start_owned_process(
+            sys.executable,
+            ["-c", "import time; time.sleep(30)"],
+        )
+        try:
+            control_pipe = process._supervisor.stdin
+            assert control_pipe is not None
+            control_pipe.write(b"terminate\n")
+            control_pipe.flush()
+
+            self.assertEqual(
+                process.wait(timeout=5),
+                control_module.PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+            )
+        finally:
+            if process.poll() is None:
+                process.kill(deadline=time.monotonic() + 2)
+                process.wait(timeout=2)
+
     def test_tree_cleanup_kills_descendant_without_touching_unrelated_process(
         self,
     ) -> None:
@@ -267,11 +1390,12 @@ class PosixOwnedProcessTests(unittest.TestCase):
 
     def test_target_exit_between_waitid_and_identity_probe_is_reaped(self) -> None:
         target = Mock(pid=123)
+        controller = _shutdown_controller()
         with (
             patch.object(
                 supervisor_module,
-                "_target_exited_without_reaping",
-                side_effect=(False, True),
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True, True),
             ) as target_exited,
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.getpgid",
@@ -288,11 +1412,11 @@ class PosixOwnedProcessTests(unittest.TestCase):
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
-        self.assertEqual(target_exited.call_count, 2)
-        process_group_members.assert_called_once_with(target.pid)
+        self.assertEqual(target_exited.call_count, 3)
+        process_group_members.assert_called_once_with(target.pid, deadline_ns=ANY)
         target.wait.assert_called_once_with()
         kill_process_group.assert_not_called()
 
@@ -300,11 +1424,12 @@ class PosixOwnedProcessTests(unittest.TestCase):
         target = Mock(pid=123)
         actions = Mock()
         target.wait.side_effect = actions.wait
+        controller = _shutdown_controller()
         with (
             patch.object(
                 supervisor_module,
-                "_target_exited_without_reaping",
-                side_effect=(False, True, True),
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True, True, True),
             ),
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.getpgid",
@@ -322,27 +1447,30 @@ class PosixOwnedProcessTests(unittest.TestCase):
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
         self.assertEqual(
             actions.mock_calls,
-            [call.killpg(target.pid, signal.SIGTERM), call.wait()],
+            [call.killpg(target.pid, signal.SIGTERM), call.wait(timeout=ANY)],
         )
 
-    def test_missing_identity_without_exit_proof_fails_closed(self) -> None:
+    def test_missing_identity_after_deadline_retains_until_exit_proof(self) -> None:
         target = Mock(pid=123)
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                intent=control_module.ControlIntent.KILL,
+                phase_deadline_ns=0,
+                overall_deadline_ns=0,
+            )
+        )
         with (
             patch.object(
                 supervisor_module,
-                "_target_exited_without_reaping",
-                return_value=False,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True, True),
             ),
-            patch.object(
-                supervisor_module,
-                "_wait_for_target_exit_proof",
-                return_value=False,
-            ) as wait_for_exit_proof,
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.getpgid",
                 side_effect=ProcessLookupError,
@@ -350,29 +1478,35 @@ class PosixOwnedProcessTests(unittest.TestCase):
             patch.object(
                 supervisor_module,
                 "_process_group_members",
+                return_value=(target.pid,),
             ) as process_group_members,
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.killpg"
             ) as kill_process_group,
-            self.assertRaisesRegex(RuntimeError, "identity disappeared"),
+            patch.object(
+                controller,
+                "wait_for_change",
+                return_value=controller.state(),
+            ) as wait,
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
-        process_group_members.assert_not_called()
-        wait_for_exit_proof.assert_called_once_with(target)
-        target.wait.assert_not_called()
+        wait.assert_called_once_with(ANY, supervisor_module._POLL_SECONDS)
+        process_group_members.assert_called_once_with(target.pid, deadline_ns=ANY)
+        target.wait.assert_called_once_with()
         kill_process_group.assert_not_called()
 
     def test_identity_lookup_waits_for_delayed_exit_proof(self) -> None:
         target = Mock(pid=123)
+        controller = _shutdown_controller()
         with (
             patch.object(
                 supervisor_module,
-                "_target_exited_without_reaping",
-                side_effect=(False, False, True),
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True, True),
             ) as target_exited,
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.getpgid",
@@ -383,19 +1517,24 @@ class PosixOwnedProcessTests(unittest.TestCase):
                 "_process_group_members",
                 return_value=(target.pid,),
             ),
-            patch("hbrowser.gallery.browser._process_supervisor.time.sleep") as sleep,
+            patch.object(
+                controller,
+                "wait_for_change",
+                return_value=controller.state(),
+            ) as wait,
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
-        self.assertEqual(target_exited.call_count, 3)
-        sleep.assert_called_once_with(supervisor_module._POLL_SECONDS)
+        self.assertEqual(target_exited.call_count, 4)
+        wait.assert_called_once_with(ANY, supervisor_module._POLL_SECONDS)
         target.wait.assert_called_once_with()
 
     def test_reaped_identity_after_lookup_race_fails_closed(self) -> None:
         target = Mock(pid=123)
+        controller = _shutdown_controller()
         with (
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.waitid",
@@ -416,7 +1555,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
         process_group_members.assert_not_called()
@@ -425,11 +1564,12 @@ class PosixOwnedProcessTests(unittest.TestCase):
 
     def test_session_lookup_exit_race_is_reaped(self) -> None:
         target = Mock(pid=123)
+        controller = _shutdown_controller()
         with (
             patch.object(
                 supervisor_module,
-                "_target_exited_without_reaping",
-                side_effect=(False, True),
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True, True),
             ),
             patch(
                 "hbrowser.gallery.browser._process_supervisor.os.getpgid",
@@ -450,11 +1590,418 @@ class PosixOwnedProcessTests(unittest.TestCase):
         ):
             supervisor_module._terminate_posix_target(
                 target,
-                force_requested=threading.Event(),
+                controller=controller,
             )
 
         target.wait.assert_called_once_with()
         kill_process_group.assert_not_called()
+
+    def test_wrong_process_group_or_session_never_signals(self) -> None:
+        supervisor_session = os.getsid(0)
+        for process_group, session_id in ((999, supervisor_session), (123, 999)):
+            with self.subTest(process_group=process_group, session_id=session_id):
+                target = Mock(pid=123)
+                controller = _shutdown_controller(control_module.ControlIntent.KILL)
+
+                def session_for_pid(
+                    pid: int,
+                    expected_session: int = session_id,
+                    target_pid: int = target.pid,
+                ) -> int:
+                    return expected_session if pid == target_pid else supervisor_session
+
+                with (
+                    patch.object(
+                        supervisor_module,
+                        "_posix_target_has_exit_receipt",
+                        return_value=False,
+                    ),
+                    patch.object(os, "getpgid", return_value=process_group),
+                    patch.object(
+                        os,
+                        "getsid",
+                        side_effect=session_for_pid,
+                    ),
+                    patch.object(os, "killpg") as kill_process_group,
+                    self.assertRaisesRegex(RuntimeError, "escaped"),
+                ):
+                    supervisor_module._terminate_posix_target(
+                        target,
+                        controller=controller,
+                    )
+
+                kill_process_group.assert_not_called()
+                target.wait.assert_not_called()
+
+    def test_force_request_uses_only_sigkill_after_identity_proof(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch.object(os, "killpg") as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        kill_process_group.assert_called_once_with(target.pid, signal.SIGKILL)
+        target.wait.assert_called_once_with()
+
+    def test_denied_kill_retries_only_after_a_fresh_request(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+
+        def deliver_fresh_kill(
+            _: supervisor_module._ControllerState,
+            __: float,
+        ) -> supervisor_module._ControllerState:
+            now_ns = time.monotonic_ns()
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.KILL,
+                    now_ns + 1_000_000_000,
+                    now_ns + 1_000_000_000,
+                )
+            )
+            return controller.state()
+
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                return_value=False,
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_try_settle_posix_target",
+                side_effect=(False, True),
+            ) as settle,
+            patch.object(
+                controller,
+                "wait_for_change",
+                side_effect=deliver_fresh_kill,
+            ) as wait_for_change,
+            patch.object(
+                os,
+                "killpg",
+                side_effect=(PermissionError, None),
+            ) as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(kill_process_group.call_count, 2)
+        wait_for_change.assert_called_once_with(ANY, ANY)
+        self.assertEqual(settle.call_count, 2)
+
+    def test_absent_group_enters_proof_only_settlement(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                return_value=False,
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_try_settle_posix_target",
+                return_value=True,
+            ) as settle,
+            patch.object(os, "killpg", side_effect=ProcessLookupError) as kill_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        kill_group.assert_called_once_with(target.pid, signal.SIGKILL)
+        settle.assert_called_once_with(target)
+
+    def test_cleanup_exception_returns_only_after_independent_proof(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+        with (
+            patch.object(
+                supervisor_module,
+                "_terminate_posix_target",
+                side_effect=OSError("cleanup probe failed"),
+            ),
+            patch.object(
+                supervisor_module,
+                "_try_settle_posix_target",
+                return_value=True,
+            ) as settle,
+            patch.object(supervisor_module, "_report_cleanup_failure") as report,
+        ):
+            cleanup_failed = supervisor_module._complete_posix_cleanup(
+                target,
+                controller=controller,
+            )
+
+        self.assertTrue(cleanup_failed)
+        settle.assert_called_once_with(target)
+        report.assert_called_once()
+
+    def test_invalid_identity_parks_without_fallback_signalling(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+
+        class Parked(Exception):
+            pass
+
+        ownership_error = supervisor_module._OwnershipProofInvalid("escaped")
+        with (
+            patch.object(
+                supervisor_module,
+                "_terminate_posix_target",
+                side_effect=ownership_error,
+            ),
+            patch.object(
+                supervisor_module,
+                "_park_unresolved_posix_cleanup",
+                side_effect=Parked,
+            ) as park,
+            patch.object(os, "killpg") as kill_group,
+            self.assertRaises(Parked),
+        ):
+            supervisor_module._complete_posix_cleanup(
+                target,
+                controller=controller,
+            )
+
+        park.assert_called_once_with(controller, ownership_error)
+        kill_group.assert_not_called()
+
+    def test_expired_force_request_waits_for_a_fresh_kill_phase(self) -> None:
+        target = Mock(pid=123)
+        actions = Mock()
+        target.wait.side_effect = actions.wait
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                0,
+                0,
+            )
+        )
+
+        def renew_kill(
+            _: supervisor_module._ControllerState,
+            __: float,
+        ) -> supervisor_module._ControllerState:
+            actions.control_wait()
+            now_ns = time.monotonic_ns()
+            controller.apply(
+                control_module.ControlRequest(
+                    control_module.ControlIntent.KILL,
+                    now_ns + 1_000_000_000,
+                    now_ns + 1_000_000_000,
+                )
+            )
+            return controller.state()
+
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch.object(os, "killpg", side_effect=actions.killpg),
+            patch.object(controller, "wait_for_change", side_effect=renew_kill),
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(
+            actions.mock_calls,
+            [
+                call.control_wait(),
+                call.killpg(target.pid, signal.SIGKILL),
+                call.wait(),
+            ],
+        )
+
+    def test_kill_deadline_shrink_before_signal_reenters_pending_state(self) -> None:
+        target = Mock(pid=123)
+        controller = _shutdown_controller(control_module.ControlIntent.KILL)
+        calls = 0
+
+        def next_kill_request(
+            *_: object,
+            **__: object,
+        ) -> supervisor_module._ControllerState:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                stale = controller.state()
+                controller.apply(
+                    control_module.ControlRequest(
+                        control_module.ControlIntent.KILL,
+                        0,
+                        0,
+                    )
+                )
+                return stale
+            now_ns = time.monotonic_ns()
+            fresh = control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                now_ns + 1_000_000_000,
+                now_ns + 1_000_000_000,
+            )
+            controller.apply(fresh)
+            return controller.state()
+
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch.object(
+                supervisor_module,
+                "_wait_for_posix_control_request",
+                side_effect=next_kill_request,
+            ),
+            patch.object(os, "killpg") as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        self.assertEqual(calls, 2)
+        kill_process_group.assert_called_once_with(target.pid, signal.SIGKILL)
+        target.wait.assert_called_once_with()
+
+    def test_zero_budget_force_retains_ownership_until_proof(self) -> None:
+        target = Mock(pid=123)
+        controller = supervisor_module._ShutdownController()
+        controller.apply(
+            control_module.ControlRequest(
+                control_module.ControlIntent.KILL,
+                0,
+                0,
+                allow_immediate=True,
+            )
+        )
+        with (
+            patch.object(
+                supervisor_module,
+                "_posix_target_has_exit_receipt",
+                side_effect=(False, False, True),
+            ),
+            patch.object(os, "getpgid", return_value=target.pid),
+            patch.object(os, "getsid", return_value=os.getsid(0)),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch.object(os, "killpg") as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                controller=controller,
+            )
+
+        kill_process_group.assert_called_once_with(target.pid, signal.SIGKILL)
+        target.wait.assert_called_once_with()
+
+    def test_real_child_exit_between_probe_and_identity_is_reaped_safely(
+        self,
+    ) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        target = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; os.read(int(sys.argv[1]), 1)",
+                str(read_descriptor),
+            ],
+            close_fds=True,
+            pass_fds=(read_descriptor,),
+            process_group=0,
+        )
+        os.close(read_descriptor)
+        controller = _shutdown_controller()
+        real_receipt = supervisor_module._posix_target_has_exit_receipt
+        real_getpgid = os.getpgid
+        first_probe = True
+
+        def race_probe(process: subprocess.Popen[bytes]) -> bool:
+            nonlocal first_probe
+            if first_probe:
+                first_probe = False
+                os.write(write_descriptor, b"x")
+                os.close(write_descriptor)
+                return False
+            return real_receipt(process)
+
+        def identity_after_exit(pid: int) -> int:
+            deadline = time.monotonic() + 2
+            while not real_receipt(target) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return real_getpgid(pid)
+
+        try:
+            with (
+                patch.object(
+                    supervisor_module,
+                    "_posix_target_has_exit_receipt",
+                    side_effect=race_probe,
+                ),
+                patch.object(os, "getpgid", side_effect=identity_after_exit),
+                patch.object(os, "killpg") as kill_process_group,
+            ):
+                supervisor_module._terminate_posix_target(
+                    target,
+                    controller=controller,
+                )
+            self.assertEqual(target.returncode, 0)
+            kill_process_group.assert_not_called()
+        finally:
+            try:
+                os.close(write_descriptor)
+            except OSError:
+                pass
+            if target.poll() is None:
+                target.kill()
+                target.wait(timeout=2)
 
     def test_zendriver_global_launcher_is_never_modified(self) -> None:
         original = zd.util._start_process
@@ -498,6 +2045,130 @@ class PosixOwnedProcessTests(unittest.TestCase):
                 owner.wait(timeout=1)
             self.assertTrue(private_directory.is_dir())
             self.assertTrue(status_directory.is_dir())
+
+    def test_proven_protocol_failure_releases_owned_private_directories(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-protocol-proof-test-"
+        ) as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            returncode = control_module.PROVEN_PROTOCOL_FAILURE_EXIT_CODE
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=returncode,
+            )
+            supervisor.wait.return_value = returncode
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+
+            self.assertEqual(owner.wait(timeout=1), returncode)
+            self.assertFalse(private_directory.exists())
+            self.assertFalse(status_directory.exists())
+
+    def test_proven_cleanup_failure_releases_owned_private_directories(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-cleanup-proof-test-"
+        ) as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            returncode = control_module.PROVEN_CLEANUP_FAILURE_EXIT_CODE
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=returncode,
+            )
+            supervisor.wait.return_value = returncode
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+
+            self.assertEqual(owner.wait(timeout=1), returncode)
+            self.assertFalse(private_directory.exists())
+            self.assertFalse(status_directory.exists())
+
+    def test_proven_cleanup_failure_releases_unbound_owner_after_ready_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-unbound-cleanup-proof-test-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            returncode = control_module.PROVEN_CLEANUP_FAILURE_EXIT_CODE
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=returncode,
+            )
+            supervisor.wait.return_value = returncode
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=None,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+
+            self.assertEqual(owner.wait(timeout=1), returncode)
+            self.assertFalse(status_directory.exists())
+
+    def test_target_not_started_receipt_releases_owner_without_status_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-unbound-not-started-proof-test-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            returncode = control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=returncode,
+            )
+            supervisor.wait.return_value = returncode
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=None,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+
+            self.assertEqual(owner.wait(timeout=1), returncode)
+            self.assertFalse(status_directory.exists())
 
     def test_terminal_group_sigint_reaches_harness_but_not_owned_target(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-signal-test-") as directory:
@@ -1168,6 +2839,42 @@ class ProcessPolicyTests(unittest.TestCase):
                 0,
             )
 
+    def test_zero_cleanup_budget_rejects_uncached_private_release(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-zero-private-release-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=0,
+            )
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+            owner._supervisor_reaped = True
+            owner._supervisor_returncode = 0
+            owner._tree_reaped = True
+
+            with self.assertRaises(process_module.ProcessOwnershipError):
+                owner.shutdown(
+                    graceful_timeout=0,
+                    terminate_timeout=0,
+                    kill_timeout=0,
+                    cleanup_timeout=0,
+                )
+
+            self.assertTrue(status_directory.is_dir())
+
     def test_stalled_control_write_does_not_hold_state_past_wait_deadline(
         self,
     ) -> None:
@@ -1219,6 +2926,84 @@ class ProcessPolicyTests(unittest.TestCase):
             self.assertFalse(terminate_thread.is_alive())
             self.assertLess(elapsed, 0.25)
 
+    def test_direct_terminate_control_lock_obeys_its_explicit_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-control-lock-deadline-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            control_pipe = Mock()
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+            owner._control_write_lock.acquire()
+            started_at = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "control writer",
+                ):
+                    owner.terminate(deadline=started_at + 0.05)
+            finally:
+                owner._control_write_lock.release()
+
+            self.assertLess(time.monotonic() - started_at, 0.25)
+
+    def test_immediate_control_backpressure_never_sleeps_past_zero_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-zero-control-write-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            control_pipe = Mock()
+            control_pipe.fileno.return_value = 42
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+
+            with (
+                patch.object(os, "set_blocking"),
+                patch.object(os, "write", side_effect=BlockingIOError),
+                patch.object(time, "sleep") as sleep,
+            ):
+                owner._request_supervisor_shutdown(
+                    control_module.ControlIntent.KILL,
+                    phase_deadline=0,
+                    overall_deadline=0,
+                    allow_immediate=True,
+                )
+
+            sleep.assert_not_called()
+            control_pipe.close.assert_called_once_with()
+
     def test_real_control_descriptor_is_written_nonblocking(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="hbrowser-control-write-nonblocking-"
@@ -1250,14 +3035,126 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     os,
                     "write",
-                    side_effect=BlockingIOError("pipe full"),
+                    side_effect=lambda _, data: len(data),
                 ) as write,
             ):
                 owner.terminate()
 
             set_blocking.assert_called_once_with(42, False)
-            write.assert_called_once_with(42, b"terminate\n")
+            frame = write.call_args.args[1]
+            self.assertEqual(write.call_args.args[0], 42)
+            self.assertEqual(
+                control_module.ControlRequest.parse(frame).intent,
+                control_module.ControlIntent.TERMINATE,
+            )
             control_pipe.write.assert_not_called()
+
+    def test_partial_control_write_failure_closes_the_control_pipe(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-control-write-partial-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            control_pipe = Mock()
+            control_pipe.fileno.return_value = 42
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+
+            with (
+                patch.object(os, "set_blocking"),
+                patch.object(os, "write", side_effect=(3, OSError("closed"))) as write,
+            ):
+                owner.terminate()
+
+            self.assertEqual(write.call_count, 2)
+            first_frame = write.call_args_list[0].args[1]
+            second_fragment = write.call_args_list[1].args[1]
+            self.assertEqual(second_fragment, first_frame[3:])
+            control_pipe.close.assert_called_once_with()
+
+    def test_private_release_serializes_control_pipe_close_with_writer(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-control-close-race-"
+        ) as directory:
+            status_directory = Path(directory) / "status"
+            status_directory.mkdir()
+            write_started = threading.Event()
+            release_write = threading.Event()
+            errors: list[BaseException] = []
+
+            def blocked_write(data: bytes) -> int:
+                write_started.set()
+                self.assertTrue(release_write.wait(timeout=1))
+                return len(data)
+
+            control_pipe = Mock()
+            control_pipe.fileno.return_value = Mock()
+            control_pipe.write.side_effect = blocked_write
+            supervisor = Mock(
+                pid=100,
+                stdin=control_pipe,
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(),
+            )
+            owner._tree_reaped = True
+
+            def write_control() -> None:
+                try:
+                    deadline = time.monotonic() + 1
+                    owner._request_supervisor_shutdown(
+                        control_module.ControlIntent.KILL,
+                        phase_deadline=deadline,
+                        overall_deadline=deadline,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            def release_owner() -> None:
+                try:
+                    owner._release_ownership(deadline=time.monotonic() + 1)
+                except BaseException as error:
+                    errors.append(error)
+
+            writer = threading.Thread(target=write_control, daemon=True)
+            releaser = threading.Thread(target=release_owner, daemon=True)
+            writer.start()
+            self.assertTrue(write_started.wait(timeout=0.5))
+            releaser.start()
+            time.sleep(0.05)
+            control_pipe.close.assert_not_called()
+
+            release_write.set()
+            writer.join(timeout=1)
+            releaser.join(timeout=1)
+
+            self.assertFalse(writer.is_alive())
+            self.assertFalse(releaser.is_alive())
+            self.assertEqual(errors, [])
+            control_pipe.close.assert_called_once_with()
 
     def test_supervisor_ready_receipt_after_absolute_deadline_is_rejected(
         self,
@@ -1633,7 +3530,7 @@ class ProcessPolicyTests(unittest.TestCase):
                 process_module,
                 "_read_supervisor_status",
                 side_effect=report_ready,
-            ),
+            ) as read_status,
             patch.object(
                 process_module,
                 "_remove_private_directory_owned",
@@ -1659,10 +3556,25 @@ class ProcessPolicyTests(unittest.TestCase):
             options["env"],
             {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
         )
-        self.assertEqual(
-            supervisor.stdin.write.call_args_list,
-            [call(b"start\n"), call(b"terminate\n")],
+        start_request = control_module.StartRequest.parse(
+            supervisor.stdin.write.call_args_list[0].args[0]
         )
+        ready_deadline = cast(
+            float,
+            read_status.call_args.kwargs["deadline"],
+        )
+        self.assertEqual(
+            start_request.deadline_ns,
+            control_module.deadline_to_monotonic_ns(ready_deadline),
+        )
+        terminate_request = control_module.ControlRequest.parse(
+            supervisor.stdin.write.call_args_list[1].args[0]
+        )
+        self.assertEqual(
+            terminate_request.intent,
+            control_module.ControlIntent.TERMINATE,
+        )
+        self.assertIsNone(terminate_request.overall_deadline_ns)
         job.terminate.assert_not_called()
         job.wait_empty.assert_called_once_with(timeout=ANY)
         job.close.assert_called_once_with()
@@ -1752,6 +3664,64 @@ class ProcessPolicyTests(unittest.TestCase):
         self.assertLessEqual(shutdown_kwargs["terminate_timeout"], 2.0)
         self.assertLessEqual(shutdown_kwargs["kill_timeout"], 2.0)
         self.assertLessEqual(shutdown_kwargs["cleanup_timeout"], 2.0)
+
+    def test_startup_timeout_consumes_late_not_started_receipt_and_preserves_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-late-not-started-receipt-"
+        ) as directory:
+            status_directory = Path(directory)
+            returncode = control_module.PROVEN_TARGET_NOT_STARTED_EXIT_CODE
+            supervisor = Mock(
+                pid=101,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.return_value = returncode
+            ready_timeout = TimeoutError("READY timed out")
+            expires_at = time.monotonic() + 2.0
+            with (
+                patch.object(tempfile, "mkdtemp", return_value=directory),
+                patch.object(
+                    process_module,
+                    "_ownership_platform",
+                    return_value="posix",
+                ),
+                patch.object(
+                    process_module,
+                    "_supervisor_creation_options",
+                    return_value={},
+                ),
+                patch.object(subprocess, "Popen", return_value=supervisor),
+                patch.object(atexit, "register"),
+                patch.object(
+                    process_module,
+                    "_read_supervisor_status",
+                    side_effect=ready_timeout,
+                ),
+                patch.object(
+                    process_module,
+                    "_remove_private_directory_owned",
+                    side_effect=lambda guard, *, deadline: guard._remove_inline(
+                        deadline=deadline
+                    ),
+                ),
+                self.assertRaises(TimeoutError) as raised,
+            ):
+                process_module.start_owned_process(
+                    "browser",
+                    [],
+                    startup_timeout=1.0,
+                    deadline=expires_at,
+                )
+
+            self.assertIs(raised.exception, ready_timeout)
+            self.assertFalse(status_directory.exists())
+            supervisor.wait.assert_called_once_with(timeout=ANY)
+            supervisor.stdin.close.assert_called_once_with()
 
     def test_pre_transfer_cleanup_failure_remains_in_durable_registry(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1972,7 +3942,14 @@ class ProcessPolicyTests(unittest.TestCase):
             )
 
             self.assertEqual(supervisor.wait.call_count, 2)
-            supervisor.stdin.write.assert_called_once_with(b"terminate\n")
+            terminate_request = control_module.ControlRequest.parse(
+                supervisor.stdin.write.call_args.args[0]
+            )
+            self.assertEqual(
+                terminate_request.intent,
+                control_module.ControlIntent.TERMINATE,
+            )
+            self.assertIsNotNone(terminate_request.overall_deadline_ns)
             job.terminate.assert_not_called()
             job.close.assert_called_once_with()
 
@@ -2013,7 +3990,61 @@ class ProcessPolicyTests(unittest.TestCase):
             )
 
             self.assertEqual(supervisor.wait.call_count, 3)
-            supervisor.stdin.write.assert_called_once_with(b"terminate\n")
+            terminate_request = control_module.ControlRequest.parse(
+                supervisor.stdin.write.call_args.args[0]
+            )
+            self.assertEqual(
+                terminate_request.intent,
+                control_module.ControlIntent.TERMINATE,
+            )
+            self.assertIsNotNone(terminate_request.overall_deadline_ns)
+            job.terminate.assert_called_once_with()
+            job.wait_empty.assert_called_once_with(timeout=ANY)
+            job.close.assert_called_once_with()
+
+    def test_zero_kill_budget_performs_one_immediate_windows_job_action(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-zero-windows-kill-"
+        ) as directory:
+            root = Path(directory)
+            status_directory = root / "status"
+            private_directory = root / "private"
+            status_directory.mkdir()
+            private_directory.mkdir()
+            supervisor = Mock(
+                pid=100,
+                stdin=Mock(),
+                stdout=None,
+                stderr=None,
+                returncode=None,
+            )
+            supervisor.wait.side_effect = (
+                subprocess.TimeoutExpired("supervisor", 0),
+                subprocess.TimeoutExpired("supervisor", 0),
+                0,
+            )
+            job = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=200,
+                windows_job=job,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=status_directory,
+                cleanup_paths=(private_directory,),
+            )
+
+            result = owner.shutdown(
+                graceful_timeout=0,
+                terminate_timeout=0,
+                kill_timeout=0,
+                cleanup_timeout=1,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(supervisor.wait.call_count, 3)
             job.terminate.assert_called_once_with()
             job.wait_empty.assert_called_once_with(timeout=ANY)
             job.close.assert_called_once_with()

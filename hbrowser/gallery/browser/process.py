@@ -8,7 +8,6 @@ import math
 import ntpath
 import os
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -20,7 +19,31 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Final, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
+
+# The private cleanup worker intentionally imports this module as a top-level
+# script dependency, while ordinary runtime imports use the package context.
+if TYPE_CHECKING or __package__:
+    from ._process_control import (
+        PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+        PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+        PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+        ControlIntent,
+        ControlRequest,
+        StartRequest,
+        deadline_to_monotonic_ns,
+    )
+else:
+    # Direct-script cleanup workers resolve sibling modules from this directory.
+    from _process_control import (  # type: ignore[import-not-found]
+        PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+        PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+        PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+        ControlIntent,
+        ControlRequest,
+        StartRequest,
+        deadline_to_monotonic_ns,
+    )
 
 _STARTUP_TIMEOUT_SECONDS: Final = 10.0
 _PROCESS_WAIT_TIMEOUT_SECONDS: Final = 15.0
@@ -583,7 +606,12 @@ atexit.register(_cleanup_provisional_owners_at_exit)
 
 
 class OwnedProcess:
-    """A minimal Popen-compatible facade that owns the complete target tree."""
+    """A Popen facade owning one POSIX process group or Windows Job.
+
+    POSIX targets must keep every descendant in the assigned group and stop
+    creating descendants after termination or leader exit. Snapshot proof is
+    not containment and does not support adversarial concurrent forking.
+    """
 
     def __init__(
         self,
@@ -615,6 +643,7 @@ class OwnedProcess:
             for path in cleanup_paths
         ]
         self._state_lock = threading.RLock()
+        self._control_write_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_attempt_lock = threading.Lock()
         self._shutdown_attempt_deadline: float | None = None
@@ -733,19 +762,38 @@ class OwnedProcess:
 
     def _request_supervisor_shutdown(
         self,
-        command: bytes,
+        intent: ControlIntent,
         *,
-        deadline: float,
+        phase_deadline: float,
+        overall_deadline: float | None,
+        allow_immediate: bool = False,
     ) -> None:
-        if time.monotonic() >= deadline:
+        request = ControlRequest(
+            intent=intent,
+            phase_deadline_ns=deadline_to_monotonic_ns(
+                phase_deadline
+                if overall_deadline is None
+                else min(phase_deadline, overall_deadline)
+            ),
+            overall_deadline_ns=(
+                None
+                if overall_deadline is None
+                else deadline_to_monotonic_ns(overall_deadline)
+            ),
+            allow_immediate=allow_immediate,
+        )
+        command = request.encode()
+        write_deadline = phase_deadline
+        if time.monotonic() >= write_deadline and not allow_immediate:
             raise ProcessOwnershipError(
                 "Process shutdown deadline expired before supervisor control write"
             )
         returncode = self._supervisor.returncode
         if returncode is not None:
             with self._state_before(
-                deadline=deadline,
+                deadline=write_deadline,
                 phase="supervisor exit receipt",
+                allow_expired_immediate_check=allow_immediate,
             ):
                 self._supervisor_reaped = True
                 self._supervisor_returncode = returncode
@@ -753,69 +801,155 @@ class OwnedProcess:
         control_pipe = self._supervisor.stdin
         if control_pipe is None:
             return
+        remaining = max(0.0, write_deadline - time.monotonic())
+        acquired = self._control_write_lock.acquire(timeout=remaining)
+        if not acquired:
+            raise ProcessOwnershipError(
+                "Process shutdown deadline expired waiting for the control writer"
+            )
+        frame_complete = False
         try:
-            descriptor = control_pipe.fileno()
-            if isinstance(descriptor, int):
-                os.set_blocking(descriptor, False)
-                if os.write(descriptor, command) != len(command):
-                    raise BlockingIOError("partial supervisor control write")
-            else:
-                # OwnedProcess is only constructed with Popen pipes in
-                # production. This branch keeps structural test doubles useful.
-                control_pipe.write(command)  # type: ignore[unreachable]
+            offset = 0
+            descriptor = cast(object, control_pipe.fileno())
+            immediate_write_available = allow_immediate
+            while offset < len(command):
+                remaining = write_deadline - time.monotonic()
+                if remaining <= 0 and not immediate_write_available:
+                    raise ProcessOwnershipError(
+                        "Process shutdown deadline expired during control write"
+                    )
+                immediate_write_available = False
+                try:
+                    if isinstance(descriptor, int):
+                        os.set_blocking(descriptor, False)
+                        written = os.write(descriptor, command[offset:])
+                    else:
+                        # Production always has an integer Popen descriptor.
+                        # Structural doubles may expose write() directly.
+                        result = control_pipe.write(command[offset:])
+                        written = result if isinstance(result, int) else len(command)
+                except BlockingIOError:
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(_STATUS_POLL_SECONDS, remaining))
+                    continue
+                if written <= 0 or written > len(command) - offset:
+                    raise BlockingIOError("supervisor control write made no progress")
+                offset += written
+            if not isinstance(descriptor, int):
                 control_pipe.flush()
-        except OSError:
+            frame_complete = True
+        except OSError, ValueError:
             # A failed control channel provides no safe basis for signalling a
-            # cached numeric PID. wait() will either obtain the supervisor's
-            # proof or fail closed while retaining private material.
+            # cached numeric PID. Closing our only writer turns an incomplete
+            # frame into a protocol failure and otherwise invokes the
+            # supervisor's bounded owner-death cleanup.
+            try:
+                control_pipe.close()
+            except OSError, ValueError:
+                pass
             return
-        if time.monotonic() >= deadline:
+        except BaseException:
+            if not frame_complete:
+                try:
+                    control_pipe.close()
+                except OSError, ValueError:
+                    pass
+            raise
+        finally:
+            self._control_write_lock.release()
+        if time.monotonic() >= write_deadline and not allow_immediate:
             raise ProcessOwnershipError(
                 "Supervisor control receipt arrived after the shutdown deadline"
             )
 
-    def terminate(self, *, deadline: float | None = None) -> None:
-        control_deadline = (
-            time.monotonic() + _SHUTDOWN_PHASE_TIMEOUT_SECONDS
-            if deadline is None
-            else deadline
+    def _terminate_with_deadlines(
+        self,
+        *,
+        phase_deadline: float,
+        overall_deadline: float | None,
+        allow_immediate: bool = False,
+    ) -> None:
+        state_deadline = (
+            phase_deadline if overall_deadline is None else overall_deadline
         )
         with self._state_before(
-            deadline=control_deadline,
+            deadline=state_deadline,
             phase="terminate",
+            allow_expired_immediate_check=allow_immediate,
         ):
             if self._closed or self._tree_reaped:
                 return
         # Never hold the owner state lock across a potentially backpressured
         # control channel. The real Popen descriptor is always nonblocking.
         self._request_supervisor_shutdown(
-            b"terminate\n",
-            deadline=control_deadline,
+            ControlIntent.TERMINATE,
+            phase_deadline=phase_deadline,
+            overall_deadline=overall_deadline,
+            allow_immediate=allow_immediate,
         )
 
-    def kill(self, *, deadline: float | None = None) -> None:
+    def terminate(self, *, deadline: float | None = None) -> None:
+        """Request graceful target-tree termination without force escalation."""
+
         control_deadline = (
             time.monotonic() + _SHUTDOWN_PHASE_TIMEOUT_SECONDS
             if deadline is None
             else deadline
         )
+        self._terminate_with_deadlines(
+            phase_deadline=control_deadline,
+            overall_deadline=None,
+        )
+
+    def _kill_with_deadlines(
+        self,
+        *,
+        phase_deadline: float,
+        overall_deadline: float,
+        allow_immediate: bool = False,
+    ) -> None:
         with self._state_before(
-            deadline=control_deadline,
+            deadline=overall_deadline,
             phase="kill",
+            allow_expired_immediate_check=allow_immediate,
         ):
             if self._closed or self._tree_reaped:
                 return
             windows_job = self._windows_job
         if windows_job is not None:
-            windows_job.terminate()
-            if time.monotonic() >= control_deadline:
+            started_before_phase_deadline = time.monotonic() < phase_deadline
+            if not started_before_phase_deadline and not allow_immediate:
                 raise ProcessOwnershipError(
-                    "Windows Job termination completed after the shutdown deadline"
+                    "Windows Job kill phase expired before termination"
+                )
+            windows_job.terminate()
+            if not allow_immediate and (
+                (started_before_phase_deadline and time.monotonic() >= phase_deadline)
+                or time.monotonic() >= overall_deadline
+            ):
+                raise ProcessOwnershipError(
+                    "Windows Job termination completed after its kill deadline"
                 )
             return
         self._request_supervisor_shutdown(
-            b"kill\n",
-            deadline=control_deadline,
+            ControlIntent.KILL,
+            phase_deadline=phase_deadline,
+            overall_deadline=overall_deadline,
+            allow_immediate=allow_immediate,
+        )
+
+    def kill(self, *, deadline: float | None = None) -> None:
+        """Request immediate force termination of the owned target tree."""
+
+        control_deadline = (
+            time.monotonic() + _SHUTDOWN_PHASE_TIMEOUT_SECONDS
+            if deadline is None
+            else deadline
+        )
+        self._kill_with_deadlines(
+            phase_deadline=control_deadline,
+            overall_deadline=control_deadline,
         )
 
     def _join_shutdown_attempt(
@@ -996,10 +1130,27 @@ class OwnedProcess:
                     "Windows Job exit receipt arrived after its phase deadline"
                 )
         elif target_process_group is not None:
-            if returncode != 0:
+            # This dedicated nonzero code is emitted only after the bound
+            # target tree was proven clean; it preserves the protocol
+            # diagnostic without misclassifying ownership as unresolved.
+            if returncode not in {
+                0,
+                PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+                PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+            }:
                 raise ProcessOwnershipError(
                     "Process supervisor did not prove target-tree cleanup"
                 )
+        elif returncode == PROVEN_CLEANUP_FAILURE_EXIT_CODE:
+            # This code is emitted only after a target was started and its
+            # ownership set was independently proven clean. It remains valid
+            # when READY publication failed before the parent bound the PID.
+            pass
+        elif returncode == PROVEN_TARGET_NOT_STARTED_EXIT_CODE:
+            # The versioned start gate can expire or be cancelled before READY
+            # is observed. This dedicated supervisor receipt proves Popen was
+            # never crossed even when the status file arrived too late.
+            pass
         elif not target_not_started:
             raise ProcessOwnershipError(
                 "Process supervisor exited before target cleanup was proven"
@@ -1049,7 +1200,11 @@ class OwnedProcess:
                 f"{_SHUTDOWN_PHASE_TIMEOUT_SECONDS:g}]"
             )
         started_at = time.monotonic()
-        policy_deadline = started_at + min(
+        tree_policy_deadline = started_at + min(
+            _SHUTDOWN_TOTAL_TIMEOUT_SECONDS,
+            sum(float(timeout) for timeout in timeouts[:3]),
+        )
+        ownership_policy_deadline = started_at + min(
             _SHUTDOWN_TOTAL_TIMEOUT_SECONDS,
             sum(float(timeout) for timeout in timeouts),
         )
@@ -1058,21 +1213,26 @@ class OwnedProcess:
                 raise TypeError("Process shutdown deadline must be a real number")
             if not math.isfinite(float(deadline)):
                 raise ValueError("Process shutdown deadline must be finite")
-            policy_deadline = min(policy_deadline, float(deadline))
+            tree_policy_deadline = min(tree_policy_deadline, float(deadline))
+            ownership_policy_deadline = min(
+                ownership_policy_deadline,
+                float(deadline),
+            )
         immediate_check = not any(timeout > 0 for timeout in timeouts)
         deadline = self._join_shutdown_attempt(
-            policy_deadline,
+            ownership_policy_deadline,
             allow_expired_immediate_check=immediate_check,
         )
+        tree_deadline = min(tree_policy_deadline, deadline)
 
-        def phase_deadline(timeout: float) -> float:
+        def phase_deadline(timeout: float, *, cap: float) -> float:
             candidate = time.monotonic() + timeout
-            return min(candidate, deadline)
+            return min(candidate, cap)
 
-        def require_overall_budget(phase: str) -> None:
-            if time.monotonic() >= deadline:
+        def require_tree_budget(phase: str, *, allow_immediate: bool) -> None:
+            if time.monotonic() >= tree_deadline and not allow_immediate:
                 raise ProcessOwnershipError(
-                    f"Process shutdown deadline expired before {phase}"
+                    f"Process tree deadline expired before {phase}"
                 )
 
         acquired = False
@@ -1091,8 +1251,8 @@ class OwnedProcess:
                     return self._supervisor_returncode or 0
                 tree_reaped = self._tree_reaped
 
-            if time.monotonic() >= deadline and any(
-                timeout > 0 for timeout in timeouts
+            if time.monotonic() >= tree_deadline and any(
+                timeout > 0 for timeout in timeouts[:3]
             ):
                 raise ProcessOwnershipError(
                     "Process shutdown deadline expired before process-tree proof"
@@ -1101,24 +1261,49 @@ class OwnedProcess:
             if not tree_reaped:
                 try:
                     returncode = self._wait_for_process_tree(
-                        deadline=phase_deadline(graceful_timeout),
+                        deadline=phase_deadline(
+                            graceful_timeout,
+                            cap=tree_deadline,
+                        ),
                         state_deadline=deadline,
                         allow_expired_immediate_check=graceful_timeout == 0,
                     )
                 except subprocess.TimeoutExpired, TimeoutError:
-                    require_overall_budget("terminate")
-                    self.terminate(deadline=deadline)
+                    require_tree_budget(
+                        "terminate",
+                        allow_immediate=terminate_timeout == 0,
+                    )
+                    terminate_deadline = phase_deadline(
+                        terminate_timeout,
+                        cap=tree_deadline,
+                    )
+                    self._terminate_with_deadlines(
+                        phase_deadline=terminate_deadline,
+                        overall_deadline=tree_deadline,
+                        allow_immediate=terminate_timeout == 0,
+                    )
                     try:
                         returncode = self._wait_for_process_tree(
-                            deadline=phase_deadline(terminate_timeout),
+                            deadline=terminate_deadline,
                             state_deadline=deadline,
                             allow_expired_immediate_check=terminate_timeout == 0,
                         )
                     except subprocess.TimeoutExpired, TimeoutError:
-                        require_overall_budget("kill")
-                        self.kill(deadline=deadline)
+                        require_tree_budget(
+                            "kill",
+                            allow_immediate=kill_timeout == 0,
+                        )
+                        kill_deadline = phase_deadline(
+                            kill_timeout,
+                            cap=tree_deadline,
+                        )
+                        self._kill_with_deadlines(
+                            phase_deadline=kill_deadline,
+                            overall_deadline=tree_deadline,
+                            allow_immediate=kill_timeout == 0,
+                        )
                         returncode = self._wait_for_process_tree(
-                            deadline=phase_deadline(kill_timeout),
+                            deadline=kill_deadline,
                             state_deadline=deadline,
                             allow_expired_immediate_check=kill_timeout == 0,
                         )
@@ -1134,12 +1319,17 @@ class OwnedProcess:
                     )
                 returncode = known_returncode
 
-            # A zero-second cleanup phase still permits one immediate,
-            # non-waiting ownership reconciliation.  Positive cleanup work
-            # must not begin after the shared overall deadline.
+            # A zero-second cleanup phase permits only an already-cached closed
+            # result; any remaining private-release work fails closed. Positive
+            # cleanup work must not begin after the shared overall deadline.
             if cleanup_timeout > 0:
-                require_overall_budget("private cleanup")
-            self._release_ownership(deadline=phase_deadline(cleanup_timeout))
+                if time.monotonic() >= deadline:
+                    raise ProcessOwnershipError(
+                        "Process shutdown deadline expired before private cleanup"
+                    )
+            self._release_ownership(
+                deadline=phase_deadline(cleanup_timeout, cap=deadline)
+            )
             if not immediate_check and time.monotonic() >= deadline:
                 raise ProcessOwnershipError(
                     "Process ownership was released after the shutdown deadline"
@@ -1163,11 +1353,20 @@ class OwnedProcess:
                 raise ProcessOwnershipError(
                     "Private material cannot be released before process-tree cleanup"
                 )
+        remaining = max(0.0, deadline - time.monotonic())
+        control_acquired = self._control_write_lock.acquire(timeout=remaining)
+        if not control_acquired:
+            raise ProcessOwnershipError(
+                "Process ownership deadline expired closing the control writer"
+            )
         try:
-            if self._supervisor.stdin is not None:
-                self._supervisor.stdin.close()
-        except OSError:
-            pass
+            try:
+                if self._supervisor.stdin is not None:
+                    self._supervisor.stdin.close()
+            except OSError, ValueError:
+                pass
+        finally:
+            self._control_write_lock.release()
         with self._state_before(
             deadline=deadline,
             phase="status-directory snapshot",
@@ -1847,7 +2046,12 @@ def start_owned_process(
     monotonic caller deadline shared with every failure-cleanup phase. The
     target receives only the runtime allowlist plus explicit ``environment``;
     reserved control/logging keys are stripped. ``forward_logging`` injects the
-    active parent's one-purpose logging capability after sanitization.
+    active parent's one-purpose logging capability after sanitization. On
+    POSIX, the target and all descendants must remain in the assigned process
+    group; daemonizing or otherwise detaching descendants is unsupported. The
+    target must stop creating descendants once termination is linearized or its
+    group leader exits; continuous or adversarial shutdown-time forking is not
+    supported by snapshot-based ownership proof.
     """
 
     if (
@@ -1895,7 +2099,6 @@ def start_owned_process(
     status_path = status_directory / "status"
     windows_job: _WindowsJob | None = None
     supervisor: subprocess.Popen[bytes] | None = None
-    target_pid: int | None = None
     owner: OwnedProcess | None = None
     provisional_owner: _ProvisionalProcessOwner | None = None
     platform_name = _ownership_platform()
@@ -1955,12 +2158,19 @@ def start_owned_process(
         _release_provisional_owner(provisional_owner)
         provisional_owner = None
         windows_job = None
-        supervisor.stdin.write(b"start\n")
-        supervisor.stdin.flush()
         ready_deadline = min(
             overall_deadline,
             time.monotonic() + startup_phase_timeout(),
         )
+        if time.monotonic() >= ready_deadline:
+            raise TimeoutError("Process supervisor READY deadline already expired")
+        start_frame = StartRequest(
+            deadline_ns=deadline_to_monotonic_ns(ready_deadline)
+        ).encode()
+        written = supervisor.stdin.write(start_frame)
+        if isinstance(written, int) and written != len(start_frame):
+            raise BlockingIOError("partial process supervisor start-gate write")
+        supervisor.stdin.flush()
         startup_status = _read_supervisor_status(
             owner,
             status_path,
@@ -1972,8 +2182,7 @@ def start_owned_process(
                 "Process supervisor could not launch target: "
                 f"{startup_status.error_type}"
             ) from None
-        target_pid = startup_status.target_pid
-        owner.bind_target_process_group(target_pid)
+        owner.bind_target_process_group(startup_status.target_pid)
         # POSIX ownership is established inside the trusted start-gated
         # supervisor: Popen(process_group=0) either creates the target group or
         # reports launch failure, and the supervisor itself was launched with
@@ -2030,11 +2239,9 @@ def start_owned_process(
             except BaseException:
                 pass
         if supervisor is not None:
-            if platform_name == "posix" and target_pid is not None:
-                try:
-                    os.killpg(target_pid, signal.SIGTERM)
-                except PermissionError, ProcessLookupError:
-                    pass
+            # Any supervisor that could cross the start gate is already held by
+            # OwnedProcess or the provisional registry above. This raw fallback
+            # is pre-gate and must never signal a cached numeric target PID.
             try:
                 supervisor.terminate()
             except ProcessLookupError:
@@ -2042,11 +2249,6 @@ def start_owned_process(
             try:
                 supervisor.wait(timeout=remaining())
             except subprocess.TimeoutExpired, ProcessLookupError:
-                if platform_name == "posix" and target_pid is not None:
-                    try:
-                        os.killpg(target_pid, signal.SIGKILL)
-                    except PermissionError, ProcessLookupError:
-                        pass
                 try:
                     supervisor.kill()
                 except ProcessLookupError:
