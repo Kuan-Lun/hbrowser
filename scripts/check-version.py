@@ -21,6 +21,7 @@ _LEGACY_VERSION_PATTERN = re.compile(r"^(\d+)(?:\.(\d+)){3,}$")
 _IGNORED_PATHS = (
     ".Codex/**",
     ".claude/**",
+    ".gitattributes",
     ".github/**",
     ".githooks/**",
     ".gitignore",
