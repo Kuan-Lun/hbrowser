@@ -9,15 +9,22 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from enum import Enum, auto
 from pathlib import Path
 
 _POLL_SECONDS = 0.05
 _TERM_GRACE_SECONDS = 2.0
 _KILL_PROOF_SECONDS = 2.0
+_EXIT_PROOF_RECONCILIATION_SECONDS = 1.0
 _TARGET_ONLY_ENVIRONMENT_KEYS = (
     "HBROWSER_LOG_FORWARD_ENDPOINT",
     "HBROWSER_LOG_FORWARD_TOKEN",
 )
+
+
+class _TargetGroupIdentity(Enum):
+    LIVE_OWNED = auto()
+    EXITED_PINNED = auto()
 
 
 def _write_status(status_path: Path, value: str) -> None:
@@ -38,6 +45,19 @@ def _target_exited_without_reaping(target: subprocess.Popen[bytes]) -> bool:
     except ChildProcessError:
         raise RuntimeError("Owned target identity was reaped unexpectedly") from None
     return result is not None
+
+
+def _wait_for_target_exit_proof(target: subprocess.Popen[bytes]) -> bool:
+    """Boundedly reconcile an ESRCH identity lookup with a WNOWAIT receipt."""
+
+    deadline = time.monotonic() + _EXIT_PROOF_RECONCILIATION_SECONDS
+    while True:
+        if _target_exited_without_reaping(target):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_POLL_SECONDS, remaining))
 
 
 def _process_group_members(process_group: int) -> tuple[int, ...]:
@@ -80,16 +100,27 @@ def _wait_for_killed_target_group(target: subprocess.Popen[bytes]) -> None:
     )
 
 
-def _assert_target_group_identity(target: subprocess.Popen[bytes]) -> None:
+def _target_group_identity(
+    target: subprocess.Popen[bytes],
+) -> _TargetGroupIdentity:
+    """Validate a live target or return its pinned post-exit identity state."""
+
     try:
         process_group = os.getpgid(target.pid)
         session = os.getsid(target.pid)
     except ProcessLookupError as error:
+        # The target can exit after the caller's waitid(WNOWAIT) probe but
+        # before either identity lookup.  Because it remains our unreaped
+        # child, a positive second probe pins the PID and makes the cached
+        # process-group identity safe to inspect during cleanup.
+        if _wait_for_target_exit_proof(target):
+            return _TargetGroupIdentity.EXITED_PINNED
         raise RuntimeError(
             "Owned target identity disappeared before cleanup"
         ) from error
     if process_group != target.pid or session != os.getsid(0):
         raise RuntimeError("Owned target escaped its assigned process group")
+    return _TargetGroupIdentity.LIVE_OWNED
 
 
 def _terminate_posix_target(
@@ -98,6 +129,10 @@ def _terminate_posix_target(
     force_requested: threading.Event,
 ) -> None:
     target_exited = _target_exited_without_reaping(target)
+    if not target_exited:
+        target_exited = (
+            _target_group_identity(target) is _TargetGroupIdentity.EXITED_PINNED
+        )
     if target_exited and not any(
         pid != target.pid for pid in _process_group_members(target.pid)
     ):
@@ -106,8 +141,6 @@ def _terminate_posix_target(
         # getpgid identity.
         target.wait()
         return
-    if not target_exited:
-        _assert_target_group_identity(target)
     if not force_requested.is_set():
         try:
             os.killpg(target.pid, signal.SIGTERM)

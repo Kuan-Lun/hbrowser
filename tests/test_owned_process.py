@@ -265,6 +265,197 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=5)
 
+    def test_target_exit_between_waitid_and_identity_probe_is_reaped(self) -> None:
+        target = Mock(pid=123)
+        with (
+            patch.object(
+                supervisor_module,
+                "_target_exited_without_reaping",
+                side_effect=(False, True),
+            ) as target_exited,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ) as process_group_members,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.killpg"
+            ) as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        self.assertEqual(target_exited.call_count, 2)
+        process_group_members.assert_called_once_with(target.pid)
+        target.wait.assert_called_once_with()
+        kill_process_group.assert_not_called()
+
+    def test_target_exit_race_with_descendant_cleans_pinned_group(self) -> None:
+        target = Mock(pid=123)
+        actions = Mock()
+        target.wait.side_effect = actions.wait
+        with (
+            patch.object(
+                supervisor_module,
+                "_target_exited_without_reaping",
+                side_effect=(False, True, True),
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                side_effect=((target.pid, 456), (target.pid,)),
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.killpg",
+                side_effect=actions.killpg,
+            ),
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        self.assertEqual(
+            actions.mock_calls,
+            [call.killpg(target.pid, signal.SIGTERM), call.wait()],
+        )
+
+    def test_missing_identity_without_exit_proof_fails_closed(self) -> None:
+        target = Mock(pid=123)
+        with (
+            patch.object(
+                supervisor_module,
+                "_target_exited_without_reaping",
+                return_value=False,
+            ),
+            patch.object(
+                supervisor_module,
+                "_wait_for_target_exit_proof",
+                return_value=False,
+            ) as wait_for_exit_proof,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+            ) as process_group_members,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.killpg"
+            ) as kill_process_group,
+            self.assertRaisesRegex(RuntimeError, "identity disappeared"),
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        process_group_members.assert_not_called()
+        wait_for_exit_proof.assert_called_once_with(target)
+        target.wait.assert_not_called()
+        kill_process_group.assert_not_called()
+
+    def test_identity_lookup_waits_for_delayed_exit_proof(self) -> None:
+        target = Mock(pid=123)
+        with (
+            patch.object(
+                supervisor_module,
+                "_target_exited_without_reaping",
+                side_effect=(False, False, True),
+            ) as target_exited,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch("hbrowser.gallery.browser._process_supervisor.time.sleep") as sleep,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        self.assertEqual(target_exited.call_count, 3)
+        sleep.assert_called_once_with(supervisor_module._POLL_SECONDS)
+        target.wait.assert_called_once_with()
+
+    def test_reaped_identity_after_lookup_race_fails_closed(self) -> None:
+        target = Mock(pid=123)
+        with (
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.waitid",
+                side_effect=(None, ChildProcessError),
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+            ) as process_group_members,
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.killpg"
+            ) as kill_process_group,
+            self.assertRaisesRegex(RuntimeError, "reaped unexpectedly"),
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        process_group_members.assert_not_called()
+        target.wait.assert_not_called()
+        kill_process_group.assert_not_called()
+
+    def test_session_lookup_exit_race_is_reaped(self) -> None:
+        target = Mock(pid=123)
+        with (
+            patch.object(
+                supervisor_module,
+                "_target_exited_without_reaping",
+                side_effect=(False, True),
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getpgid",
+                return_value=target.pid,
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.getsid",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(
+                supervisor_module,
+                "_process_group_members",
+                return_value=(target.pid,),
+            ),
+            patch(
+                "hbrowser.gallery.browser._process_supervisor.os.killpg"
+            ) as kill_process_group,
+        ):
+            supervisor_module._terminate_posix_target(
+                target,
+                force_requested=threading.Event(),
+            )
+
+        target.wait.assert_called_once_with()
+        kill_process_group.assert_not_called()
+
     def test_zendriver_global_launcher_is_never_modified(self) -> None:
         original = zd.util._start_process
         process = process_module.start_owned_process(
