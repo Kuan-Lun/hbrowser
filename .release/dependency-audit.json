@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-26T09:18:04+00:00",
+  "checked_at": "2026-08-31T13:56:08+00:00",
   "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.42.9",
+  "project_version": "0.42.10",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -70,7 +70,7 @@
     {
       "declared": "websockets>=17.0.1",
       "group": "runtime",
-      "latest": "17.0.1",
+      "latest": "17.1",
       "latest_satisfies": true,
       "name": "websockets",
       "python_3_14": true,
@@ -92,7 +92,7 @@
     {
       "declared": "build>=1.3.0",
       "group": "optional:dev",
-      "latest": "1.5.0",
+      "latest": "1.6.0",
       "latest_satisfies": true,
       "name": "build",
       "python_3_14": true,
@@ -147,7 +147,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.4",
+      "latest": "0.16.5",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every build, runtime, dev, and Node direct dependency against the global registry latest and available official release notes; no dependency manifest changed since 0.42.8, no latest release falls outside a declared upper bound, all latest Python distributions declare CPython 3.14 support, and Zendriver remains on the verified 0.16.0 lifecycle cohort.",
+    "note": "Reviewed every build, runtime, development, and Node direct dependency against current registries for the 0.42.10 POSIX ownership fix; the dependency manifest is unchanged, every registry latest satisfies its declared range and supports CPython 3.14, and Zendriver remains on the verified latest 0.16.0 lifecycle cohort.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
