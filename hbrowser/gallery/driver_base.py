@@ -569,20 +569,25 @@ class Driver(ABC):
             )
 
     async def login(self) -> None:
-        """Log in, sharing one FlareSolverr browser across both challenges."""
+        """Authenticate on Forums without choosing a post-login destination.
+
+        Higher-level domain sessions use this boundary when they must own and
+        verify the first navigation after authentication.
+        """
+
         with log_context(activity="Login"):
             flaresolverr_url = get_flaresolverr_url()
             if not flaresolverr_url or not should_use_flaresolverr():
-                await self._login(None)
+                await self._authenticate(None)
                 return
 
             async with FlareSolverrClient(flaresolverr_url) as client:
                 async with client.session(
                     max_attempts=self.flaresolverr_session_attempts
                 ) as session:
-                    await self._login(session)
+                    await self._authenticate(session)
 
-    async def _login(
+    async def _authenticate(
         self,
         flaresolverr_session: FlareSolverrSessionScope | None,
     ) -> None:
@@ -592,7 +597,7 @@ class Driver(ABC):
         1. 進入 Forums 首頁（Cloudflare 驗證在此發生）
         2. 點擊 "Log In" 連結進入登入頁面
         3. 輸入帳號密碼並點擊 "Log me in"
-        4. 驗證登入成功後前往主頁
+        4. 驗證登入成功並停留在可信 Forums 頁面
         """
         self.logger.info("Signing in")
 
@@ -605,7 +610,6 @@ class Driver(ABC):
         auth_state = await detect_forums_auth_state(self.page)
         if auth_state is ForumsAuthState.AUTHENTICATED:
             self.logger.info("Already signed in")
-            await self.gohomepage()
             return
         if auth_state is not ForumsAuthState.GUEST:
             raise LoginFailedException(
@@ -682,8 +686,6 @@ class Driver(ABC):
 
         await self._verify_login_succeeded(flaresolverr_session)
         self.logger.info("Signed in")
-
-        await self.gohomepage()
 
     async def _verify_login_succeeded(
         self,

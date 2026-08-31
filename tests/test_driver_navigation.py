@@ -76,6 +76,43 @@ class DriverHomepageNavigationTests(unittest.IsolatedAsyncioTestCase):
         logger.info.assert_not_called()
         get.assert_not_awaited()
 
+    async def test_login_authenticates_without_choosing_a_destination(
+        self,
+    ) -> None:
+        driver = _TestDriver()
+        authentication = AsyncMock()
+        driver._authenticate = authentication  # type: ignore[method-assign]
+        driver.gohomepage = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch(
+                "hbrowser.gallery.driver_base.get_flaresolverr_url",
+                return_value=None,
+            ),
+            patch("hbrowser.gallery.driver_base.should_use_flaresolverr") as eligible,
+        ):
+            await driver.login()
+
+        authentication.assert_awaited_once_with(None)
+        eligible.assert_not_called()
+        driver.gohomepage.assert_not_awaited()
+
+    async def test_authentication_stays_on_trusted_forums_page(self) -> None:
+        driver = _TestDriver()
+        driver.logger = Mock()
+        driver.myget = AsyncMock()
+        driver._handle_page_challenge = AsyncMock()  # type: ignore[method-assign]
+        driver.gohomepage = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "hbrowser.gallery.driver_base.detect_forums_auth_state",
+            new=AsyncMock(return_value=ForumsAuthState.AUTHENTICATED),
+        ):
+            await driver._authenticate(None)
+
+        driver.myget.assert_awaited_once_with(driver.url["Forums"])
+        driver.gohomepage.assert_not_awaited()
+
 
 class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
     def _driver(self) -> _TestDriver:
@@ -144,7 +181,7 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
         driver.page.wait.assert_not_awaited()
         sleep.assert_not_awaited()
 
-    async def test_login_mutation_failures_are_terminal_and_never_advance(
+    async def test_authentication_mutation_failures_are_terminal_and_never_advance(
         self,
     ) -> None:
         stages = ("login_link", "username", "password", "submit")
@@ -185,7 +222,7 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     self.assertRaises(BrowserMutationOutcomeUnknownError) as raised,
                 ):
-                    await driver._login(None)
+                    await driver._authenticate(None)
 
                 mutation.assert_awaited_once()
                 self.assertNotIn("sensitive", str(raised.exception))

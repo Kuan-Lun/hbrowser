@@ -153,6 +153,12 @@ challenges and Turnstile widgets when it is configured and route-compatible. Wit
 completion. With `headless=True`, an unresolved challenge raises a login error immediately;
 HBrowser does not restart Chrome or claim that a proxy was rotated.
 
+`Driver.login()` owns only the bounded Forums authentication phase and remains
+on the verified Forums page. The driver context manager then performs exactly
+one homepage navigation. Higher-level domain sessions that initialize the
+browser themselves likewise own their first post-login destination, so they can
+verify it before any later navigation.
+
 ## Logging
 
 HBrowser uses Python's built-in `logging` module with independent console and

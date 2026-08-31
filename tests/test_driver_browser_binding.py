@@ -190,6 +190,27 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
         stop_browser.assert_not_awaited()
         driver.logger.info.assert_not_called()
 
+    async def test_context_entry_owns_exactly_one_post_login_home_navigation(
+        self,
+    ) -> None:
+        driver = _TestDriver()
+        events: list[str] = []
+        driver._init_browser = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda: events.append("browser")
+        )
+        driver.login = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda: events.append("login")
+        )
+        driver.gohomepage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda: events.append("home")
+        )
+
+        entered = await driver.__aenter__()
+
+        self.assertIs(entered, driver)
+        self.assertEqual(events, ["browser", "login", "home"])
+        driver.gohomepage.assert_awaited_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

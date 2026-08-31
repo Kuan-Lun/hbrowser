@@ -102,12 +102,12 @@ class _TurnstileScope:
 
 
 class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_login_owns_bounded_scope_and_passes_it_to_login_flow(
+    async def test_authentication_owns_bounded_scope_and_passes_it_to_flow(
         self,
     ) -> None:
         driver = _TestDriver(flaresolverr_session_attempts=3)
-        login_flow = AsyncMock()
-        driver._login = login_flow  # type: ignore[method-assign]
+        authentication_flow = AsyncMock()
+        driver._authenticate = authentication_flow  # type: ignore[method-assign]
         scope = Mock(spec=FlareSolverrSessionScope)
 
         session_context = MagicMock()
@@ -146,7 +146,7 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
 
         client_type.assert_called_once_with("http://127.0.0.1:8191/v1")
         client.session.assert_called_once_with(max_attempts=3)
-        login_flow.assert_awaited_once_with(scope)
+        authentication_flow.assert_awaited_once_with(scope)
         session_context.__aenter__.assert_awaited_once_with()
         session_context.__aexit__.assert_awaited_once_with(None, None, None)
         client.__aenter__.assert_awaited_once_with()
@@ -154,12 +154,12 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
         client.create_session.assert_not_awaited()
         client.destroy_session.assert_not_awaited()
 
-    async def test_login_without_endpoint_passes_none_without_building_client(
+    async def test_authentication_without_endpoint_uses_no_solver_client(
         self,
     ) -> None:
         driver = _TestDriver()
-        login_flow = AsyncMock()
-        driver._login = login_flow  # type: ignore[method-assign]
+        authentication_flow = AsyncMock()
+        driver._authenticate = authentication_flow  # type: ignore[method-assign]
         client_type = Mock(side_effect=AssertionError("Client must stay disabled"))
 
         with (
@@ -180,7 +180,7 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await driver.login()
 
-        login_flow.assert_awaited_once_with(None)
+        authentication_flow.assert_awaited_once_with(None)
         eligibility.assert_not_called()
         client_type.assert_not_called()
 
@@ -188,8 +188,8 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         driver = _TestDriver()
-        login_flow = AsyncMock()
-        driver._login = login_flow  # type: ignore[method-assign]
+        authentication_flow = AsyncMock()
+        driver._authenticate = authentication_flow  # type: ignore[method-assign]
         client_type = Mock(side_effect=AssertionError("Client must stay disabled"))
 
         with (
@@ -211,7 +211,7 @@ class DriverFlareSolverrCompositionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await driver.login()
 
-        login_flow.assert_awaited_once_with(None)
+        authentication_flow.assert_awaited_once_with(None)
         client_type.assert_not_called()
 
 
