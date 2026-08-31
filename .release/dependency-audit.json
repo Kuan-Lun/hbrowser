@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-31T19:15:50+00:00",
+  "checked_at": "2026-08-31T20:43:07+00:00",
   "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.43.1",
+  "project_version": "0.44.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed build, runtime, optional-development, and Node direct dependencies for 0.43.1; current releases remain within the declared constraints, the Linux WNOWAIT zombie identity reconciliation does not alter the dependency manifest, and Zendriver remains pinned to the verified 0.16.0 lifecycle cohort.",
+    "note": "Reviewed all build, runtime, development, and Node direct dependencies for 0.44.0; the breaking authentication/navigation ownership split does not change dependency needs, and Zendriver remains pinned to the verified 0.16.0 lifecycle cohort.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
