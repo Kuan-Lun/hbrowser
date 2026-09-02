@@ -30,14 +30,24 @@
 
 - 唯讀分析不建立 branch。
 - 凡會修改 tracked files 的任務，使用
-  `scripts/detect-primary-branch.sh` 判定 primary，並建立專用 task branch。
+  `scripts/detect-primary-branch.sh` 判定 primary，並在首次 tracked file 修改前
+  建立專用 task branch；不得為尚未開始修改的下游或預備工作預先建立 branch。
 - 不得 stash、reset、clean、覆寫或混入既有使用者修改。
 - 工作樹不乾淨時，從 committed primary 建立獨立 worktree。
 - task branch 可包含多個邏輯 Conventional Commits。避免巨大 commit；小而
   內聚的任務仍可只有一個 commit。
-- 任務完成後執行 `scripts/git-flow-merge.sh`。該腳本負責完整 gate、
-  `--no-ff` merge、安全移除 task worktree，以及以 `git branch -d` 刪除
-  已合併的本機 branch。
+- 任務完成後從 task branch 執行 `scripts/git-flow-merge.sh`。若 task branch
+  含有 primary 尚未包含的 commit，該腳本負責完整 gate、`--no-ff` merge、
+  安全移除 task worktree，以及以 `git branch -d` 刪除已合併的本機 branch。
+- 若且唯若 task tip 已由本機 primary 包含（`git merge-base --is-ancestor`
+  成功），`scripts/git-flow-merge.sh` 執行 no-op cleanup：不得執行 gate或merge、
+  建立空 commit或空 merge commit；必須先確認涉及的 worktree clean、沒有進行中
+  的 Git operation、task與primary refs仍為已驗證的commit，再切回 primary或安全
+  移除 task worktree，最後以 `git branch -d` 刪除本機 task branch。
+- 任務取消時只可使用 `scripts/git-flow-merge.sh --cleanup-only`；若 task tip
+  未由 primary 包含，或任何 safety check失敗，腳本必須 fail closed並保留 task
+  branch及仍存在的worktree。no-op cleanup不得使用force、建立或刪除remote ref，
+  亦不得 fetch、pull或push。
 - merge conflict 或 gate failure 時必須 abort merge並保留 task branch。
 - merge 後收到的任何 follow-up 都建立新的 task branch。
 - 本機 task branch、commit、`--no-ff` merge與 `branch -d` 已獲預先授權。
@@ -143,6 +153,8 @@
 - commits與完整檢查結果。
 - primary branch與 merge commit。
 - branch/worktree是否已清除。
+- 本次任務建立的 task branch/worktree之整合或 no-op cleanup結果；未清除時列出
+  精確 ref/path與原因。
 - 是否仍未 push、publish或 deploy。
 
 ## Repository-specific policy
