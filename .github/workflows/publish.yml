@@ -10,6 +10,7 @@ on:
       - hbrowser/**
       - pyproject.toml
       - scripts/check-process-ownership.sh
+      - scripts/install-ci-dependencies.py
       - tests/**
 
 jobs:
@@ -64,7 +65,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install version checker
-        run: python -m pip install packaging
+        run: python scripts/install-ci-dependencies.py packaging
 
       - name: Check whether this version is unpublished
         id: version
@@ -96,7 +97,9 @@ jobs:
 
       - name: Build
         if: steps.version.outputs.publish == 'true'
-        run: pip install build && python -m build
+        run: |
+          python scripts/install-ci-dependencies.py build
+          python -m build
 
       - name: Publish
         if: steps.version.outputs.publish == 'true'
