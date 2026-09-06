@@ -110,6 +110,24 @@ class _OwnedZendriverBrowser(zd.Browser):
         return _require_browser_process_owner(self).poll() is not None
 
 
+def _configured_chrome_executable() -> str | None:
+    """Validate an optional caller-managed Chrome before startup side effects."""
+
+    configured = os.environ.get("HBROWSER_CHROME_EXECUTABLE")
+    if configured is None:
+        return None
+    executable = Path(configured)
+    if (
+        not executable.is_absolute()
+        or not executable.is_file()
+        or not os.access(executable, os.X_OK)
+    ):
+        raise ValueError(
+            "HBROWSER_CHROME_EXECUTABLE must name an absolute executable regular file"
+        )
+    return configured
+
+
 def _build_config(
     headless: bool,
     proxy_extension: str | None,
@@ -118,10 +136,10 @@ def _build_config(
     socks_port: int | None = None,
     chrome_path: str | None = None,
 ) -> zd.Config:
-    config = zd.Config(user_data_dir=user_data_directory)
-
-    if chrome_path:
-        config.browser_executable_path = chrome_path
+    config = zd.Config(
+        user_data_dir=user_data_directory,
+        browser_executable_path=chrome_path,
+    )
 
     config.headless = headless
     config.disable_webrtc = True
@@ -1016,6 +1034,7 @@ def _release_browser_atexit(browser: Any) -> None:
 
 
 async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
+    chrome_executable = _configured_chrome_executable()
     mode = "headless" if headless else "windowed"
     logger.info("Starting browser")
     # This semantic deadline covers external Tor bootstrap, Chrome metadata /
@@ -1058,10 +1077,12 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             connection = "Tor"
         else:
             connection = "direct"
-        chrome_paths = await _install_chrome_in_owned_worker(
-            work_deadline=browser_startup_work_deadline,
-            cleanup_deadline=browser_startup_deadline,
-        )
+        if chrome_executable is None:
+            chrome_paths = await _install_chrome_in_owned_worker(
+                work_deadline=browser_startup_work_deadline,
+                cleanup_deadline=browser_startup_deadline,
+            )
+            chrome_executable = chrome_paths.chrome
         profile_directory = tempfile.mkdtemp(prefix="hbrowser-profile-")
         config = _build_config(
             headless,
@@ -1069,7 +1090,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             profile_directory,
             use_tor,
             socks_port,
-            chrome_paths.chrome,
+            chrome_executable,
         )
 
         logger.debug("Initializing browser")

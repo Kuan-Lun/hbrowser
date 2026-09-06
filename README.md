@@ -96,6 +96,13 @@ HBrowser requires the following environment variables:
   `on` to save the initial and, when needed, reloaded daily check-in documents
   in `HBROWSER_LOG_DIR`. Encounter query values are redacted, but the remaining
   HTML is account-specific and must be kept private
+- `HBROWSER_CHROME_EXECUTABLE` (optional): Absolute path to a preinstalled Chrome
+  executable managed by the application or container image. A package-manager
+  symlink to an executable regular file is accepted. When set, HBrowser skips
+  Chrome for Testing installation and metadata requests; it still owns the
+  browser process, temporary profile, and cleanup. An empty, relative, missing,
+  or non-executable path fails before browser or proxy startup. When unset,
+  HBrowser keeps its automatic Chrome for Testing installation behavior
 - `USE_TOR` (optional): Set to `0` to disable Tor proxy even when Tor
   Browser is installed. Default: auto-detect
 - `TOR_BINARY_PATH` (optional): Custom path to the `tor` binary if not
