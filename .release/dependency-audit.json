@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-31T20:43:07+00:00",
+  "checked_at": "2026-09-06T16:43:53+00:00",
   "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.44.0",
+  "project_version": "0.44.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -147,7 +147,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.5",
+      "latest": "0.16.6",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build, runtime, development, and Node direct dependencies for 0.44.0; the breaking authentication/navigation ownership split does not change dependency needs, and Zendriver remains pinned to the verified 0.16.0 lifecycle cohort.",
+    "note": "Reviewed every direct Python build, runtime, development and Node dependency against the prior receipt and registry latest, including releases outside current bounds. All runtime/build dependencies and Node markdownlint-cli2 remain at the same latest releases and satisfy the declared bounds; zendriver stays at the explicitly verified 0.16.0 cohort. Ruff is the only newer dependency, from 0.16.5 to 0.16.6: reviewed https://github.com/astral-sh/ruff/releases/tag/0.16.6 and installed it in the rebuilt Python 3.14 environment. The complete fast gate passes without rule exceptions or configuration changes. Seventy-five existing browser factory/Chrome installer tests and sixteen new configured-executable tests pass, including package-manager symlinks, unchanged unset installation, no host executable auto-discovery, early invalid-configuration rejection and owned process cleanup on startup failure. This optional environment contract preserves existing defaults and introduces no runtime dependency change. The official full merge gate separately validates the complete offline suite and built wheel.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
