@@ -40,6 +40,10 @@
 - 工作樹不乾淨時，從 committed primary 建立獨立 worktree。
 - task branch 可包含多個邏輯 Conventional Commits。避免巨大 commit；小而
   內聚的任務仍可只有一個 commit。
+- Primary 不得 rebase；`pre-rebase` hook 必須拒絕目前或明確指定的 primary。
+  `scripts/install-git-hooks.sh` 設定 `pull.rebase=false`、primary 的
+  `branch.<primary>.rebase=false` 與 `pull.ff=only`；pull 只可 fast-forward，
+  分歧時停止並明確處理。Task 整合仍使用 `--no-ff` 保留 merge commit。
 - 任務完成後從 task branch 執行 `scripts/git-flow-merge.sh`。若 task branch
   含有 primary 尚未包含的 commit，該腳本負責完整 gate、`--no-ff` merge、
   安全移除 task worktree，以及以 `git branch -d` 刪除已合併的本機 branch。
