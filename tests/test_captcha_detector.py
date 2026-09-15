@@ -1,11 +1,13 @@
 import asyncio
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hbrowser.gallery.captcha import CaptchaDetector
 from hbrowser.gallery.utils import ZendriverOperationTimeout, wait_for_zendriver
+from hbrowser.gallery.utils import deadline as deadline_module
 
 
 @dataclass
@@ -44,10 +46,13 @@ class _AbsentDynamicWidgetPage(_Page):
     def __init__(self) -> None:
         super().__init__("<html></html>")
         self.query_count = 0
+        self.now = 0.0
 
     async def query_selector(self, _selector: str) -> None:
         self.query_count += 1
-        await asyncio.sleep(0.03)
+        # Expire the semantic deadline only after a healthy query has started.
+        # Host scheduling must not decide whether this query is issued.
+        self.now += 3.0
         return None
 
 
@@ -129,14 +134,19 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_absent_dynamic_widget_is_not_a_generation_failure(self) -> None:
         page = _AbsentDynamicWidgetPage()
 
-        detection = await CaptchaDetector().detect(page, timeout=0.02)
+        with patch.object(
+            deadline_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: page.now),
+        ):
+            detection = await CaptchaDetector().detect(page, timeout=2)
 
         self.assertEqual(detection.kind, "none")
         self.assertEqual(detection.url, page.url)
         self.assertEqual(page.query_count, 1)
         result = await wait_for_zendriver(
             asyncio.sleep(0, result="healthy"),
-            timeout=0.05,
+            timeout=2,
             owner=page,
         )
         self.assertEqual(result, "healthy")
