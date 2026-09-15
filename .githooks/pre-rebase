@@ -6,13 +6,10 @@ repository_root="$(git rev-parse --show-toplevel)"
 cd "$repository_root"
 
 primary="$(scripts/detect-primary-branch.sh)"
-if [[ -n "${2:-}" ]]; then
-    target_ref="$(git rev-parse --symbolic-full-name "$2")"
-else
-    target_ref="$(git symbolic-ref --quiet HEAD || true)"
-fi
+rebased_branch="${2:-$(git symbolic-ref --quiet HEAD || true)}"
+rebased_branch="${rebased_branch#refs/heads/}"
 
-if [[ "$target_ref" == "refs/heads/$primary" ]]; then
+if [[ "$rebased_branch" == "$primary" ]]; then
     printf 'Rebasing primary is not allowed: %s; preserve merge history.\n' \
         "$primary" >&2
     exit 1

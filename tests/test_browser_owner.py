@@ -16,6 +16,7 @@ from hbrowser.gallery.browser import (
 )
 from hbrowser.gallery.browser import owner as owner_module
 from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
+from hbrowser.gallery.utils import deadline as deadline_module
 
 
 @dataclass(slots=True)
@@ -251,6 +252,36 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         await owner.start()
         closer_started = asyncio.Event()
         release_closer = asyncio.Event()
+        expire_closer = asyncio.Event()
+        overlapping_callers = asyncio.Event()
+        now = 0.0
+        caller_wait_count = 0
+        callers: list[asyncio.Task[None]] = []
+        original_wait = asyncio.wait
+
+        async def ordered_wait(
+            tasks: tuple[asyncio.Task[None], ...],
+            *,
+            timeout: float,
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            nonlocal now, caller_wait_count
+            (task,) = tasks
+            if task is owner._browser_closer_task:
+                close_deadline = owner._close_deadline
+                self.assertIsNotNone(close_deadline)
+                assert close_deadline is not None
+                self.assertEqual(timeout, close_deadline.remaining())
+                await closer_started.wait()
+                await expire_closer.wait()
+                now = close_deadline.expires_at
+                return set(), {task}
+            self.assertIs(task, owner._close_task)
+            caller_wait_count += 1
+            if caller_wait_count == 2:
+                overlapping_callers.set()
+            # Both waits share one expiry. Deliver the closer's timeout first
+            # so host scheduling cannot select the outer caller timeout instead.
+            return await original_wait(tasks)
 
         async def ignore_cancellation(
             observed_browser: _FakeBrowser,
@@ -266,42 +297,58 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
                     continue
 
         browser_closer.side_effect = ignore_cancellation
-        try:
-            with (
-                patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
-                self.assertRaisesRegex(
-                    owner_module.BrowserOwnershipError,
-                    "shared ownership deadline",
-                ),
-            ):
-                await asyncio.wait_for(owner.close(), timeout=1)
-            await asyncio.wait_for(closer_started.wait(), timeout=1)
+        with (
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ),
+            patch.object(
+                owner_module,
+                "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": ordered_wait})),
+            ),
+        ):
+            try:
+                callers.append(asyncio.create_task(owner.close()))
+                await asyncio.wait_for(closer_started.wait(), timeout=1)
+                shared_deadline = owner._close_deadline
+                now += 1.0
+                callers.append(asyncio.create_task(owner.close()))
+                await asyncio.wait_for(overlapping_callers.wait(), timeout=1)
+                self.assertIs(owner._close_deadline, shared_deadline)
+                expire_closer.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*callers, return_exceptions=True), timeout=1
+                )
+                for result in results:
+                    self.assertIsInstance(result, owner_module.BrowserOwnershipError)
+                    self.assertIn("shared ownership deadline", str(result))
+                self.assertIs(results[0], results[1])
 
-            with (
-                patch.object(owner_module, "_OWNER_CLOSE_DEADLINE_SECONDS", 0.02),
-                self.assertRaisesRegex(
-                    owner_module.BrowserOwnershipError,
-                    "shared ownership deadline",
-                ),
-            ):
-                await asyncio.wait_for(owner.close(), timeout=1)
-            browser_closer.assert_awaited_once()
+                with self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError, "shared ownership deadline"
+                ):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                browser_closer.assert_awaited_once()
 
-            release_closer.set()
-            # The first failed cleanup attempt is complete, so an explicit retry
-            # receives a fresh ownership deadline and may reconcile the already
-            # completed closer without invoking it again.
-            await asyncio.wait_for(owner.close(), timeout=1)
-            self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
-            browser_closer.assert_awaited_once()
-        finally:
-            # This fixture deliberately ignores cancellation. Always release and
-            # join it so an assertion failure is reported instead of deadlocking
-            # IsolatedAsyncioTestCase while it cancels leftover tasks.
-            release_closer.set()
-            closer_task = owner._browser_closer_task
-            if closer_task is not None and not closer_task.done():
+                release_closer.set()
+                closer_task = owner._browser_closer_task
+                assert closer_task is not None
                 await asyncio.wait_for(asyncio.shield(closer_task), timeout=1)
+                # A completed failed attempt permits a fresh deadline on retry,
+                # while reconciliation must not invoke the closer again.
+                await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                browser_closer.assert_awaited_once()
+            finally:
+                # Release every fixture-owned task even when an assertion fails.
+                expire_closer.set()
+                release_closer.set()
+                await asyncio.wait_for(
+                    asyncio.gather(*callers, return_exceptions=True), timeout=1
+                )
+                closer_task = owner._browser_closer_task
+                if closer_task is not None and not closer_task.done():
+                    await asyncio.wait_for(asyncio.shield(closer_task), timeout=1)
 
     async def test_first_close_uses_supplied_absolute_deadline(self) -> None:
         owner, browser, browser_closer, _ = self._owner()

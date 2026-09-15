@@ -441,11 +441,15 @@ def test_pull_rejects_divergence_without_changing_local_merge(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("target", [None, "main", "refs/heads/main"])
+@pytest.mark.parametrize("tag_shadow", [False, True])
 def test_rebase_rejects_current_and_explicit_primary(
     tmp_path: Path,
     target: str | None,
+    tag_shadow: bool,
 ) -> None:
     repository, _, merge_line = _initialize_merged_repository(tmp_path)
+    if tag_shadow:
+        _git(repository, "tag", "main")
     if target is not None:
         _git(repository, "switch", "-c", "task/second")
     original_branch = _git_stdout(repository, "symbolic-ref", "HEAD")
@@ -463,7 +467,9 @@ def test_rebase_rejects_current_and_explicit_primary(
     assert "Rebasing primary is not allowed: main" in result.stderr
     assert _git_stdout(repository, "symbolic-ref", "HEAD") == original_branch
     assert (
-        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        _git_stdout(
+            repository, "rev-list", "--parents", "-n", "1", "refs/heads/main"
+        ).split()
         == merge_line
     )
 
