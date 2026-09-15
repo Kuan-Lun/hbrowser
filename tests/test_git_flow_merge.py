@@ -14,6 +14,8 @@ import pytest
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MERGE_SCRIPT = _PROJECT_ROOT / "scripts" / "git-flow-merge.sh"
 _PRIMARY_SCRIPT = _PROJECT_ROOT / "scripts" / "detect-primary-branch.sh"
+_INSTALL_SCRIPT = _PROJECT_ROOT / "scripts" / "install-git-hooks.sh"
+_REBASE_HOOK = _PROJECT_ROOT / ".githooks" / "pre-rebase"
 _TASK_BRANCH = "task/example"
 _GIT_LOCAL_ENVIRONMENT_VARIABLES = frozenset(
     subprocess.run(
@@ -77,9 +79,11 @@ def _initialize_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     scripts.mkdir()
     shutil.copy2(_MERGE_SCRIPT, scripts / _MERGE_SCRIPT.name)
     shutil.copy2(_PRIMARY_SCRIPT, scripts / _PRIMARY_SCRIPT.name)
+    shutil.copy2(_INSTALL_SCRIPT, scripts / _INSTALL_SCRIPT.name)
 
     hooks = repository / ".githooks"
     hooks.mkdir()
+    shutil.copy2(_REBASE_HOOK, hooks / _REBASE_HOOK.name)
     _write_executable(
         hooks / "pre-merge-commit",
         """#!/usr/bin/env bash
@@ -105,6 +109,7 @@ fi
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", "test: initial state")
     initial_oid = _git_stdout(repository, "rev-parse", "HEAD")
+    _run(repository, "scripts/install-git-hooks.sh")
     return repository, initial_oid, tmp_path / "gate.log"
 
 
@@ -374,3 +379,171 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
     assert (repository / "payload.txt").read_text() == "task change\n"
     _assert_branch_missing(repository, _TASK_BRANCH)
     assert gate_log.read_text() == "gate-called\n"
+
+
+def _initialize_merged_repository(tmp_path: Path) -> tuple[Path, Path, list[str]]:
+    repository, _, gate_log = _initialize_repository(tmp_path)
+    upstream = tmp_path / "upstream.git"
+    _git(tmp_path, "clone", "--bare", str(repository), str(upstream))
+    _git(repository, "remote", "add", "origin", str(upstream))
+    _git(repository, "config", "branch.main.remote", "origin")
+    _git(repository, "config", "branch.main.merge", "refs/heads/main")
+    _git(repository, "switch", "-c", _TASK_BRANCH)
+    (repository / "feature.txt").write_text("task feature\n")
+    _git(repository, "add", "feature.txt")
+    _git(repository, "commit", "-m", "test: task feature")
+    result = _run_merge_script(repository, gate_log)
+    assert result.returncode == 0, result.stderr
+    merge_line = _git_stdout(
+        repository, "rev-list", "--parents", "-n", "1", "main"
+    ).split()
+    assert len(merge_line) == 3
+    return repository, upstream, merge_line
+
+
+def test_pull_preserves_exact_local_merge_commit_and_parents(tmp_path: Path) -> None:
+    repository, _, merge_line = _initialize_merged_repository(tmp_path)
+
+    _git(repository, "pull")
+
+    assert (
+        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        == merge_line
+    )
+
+
+def test_pull_rejects_divergence_without_changing_local_merge(tmp_path: Path) -> None:
+    repository, upstream, merge_line = _initialize_merged_repository(tmp_path)
+    remote_oid = _git_stdout(
+        upstream,
+        "-c",
+        "user.name=Git Flow Test",
+        "-c",
+        "user.email=git-flow@example.invalid",
+        "commit-tree",
+        f"{merge_line[1]}^{{tree}}",
+        "-p",
+        merge_line[1],
+        "-m",
+        "test: independent upstream change",
+    )
+    _git(upstream, "update-ref", "refs/heads/main", remote_oid)
+
+    result = _git(repository, "pull", check=False)
+
+    assert result.returncode != 0
+    assert (
+        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        == merge_line
+    )
+    assert not (repository / ".git" / "MERGE_HEAD").exists()
+    assert not (repository / ".git" / "rebase-merge").exists()
+
+
+@pytest.mark.parametrize("target", [None, "main", "refs/heads/main"])
+def test_rebase_rejects_current_and_explicit_primary(
+    tmp_path: Path,
+    target: str | None,
+) -> None:
+    repository, _, merge_line = _initialize_merged_repository(tmp_path)
+    if target is not None:
+        _git(repository, "switch", "-c", "task/second")
+    original_branch = _git_stdout(repository, "symbolic-ref", "HEAD")
+
+    result = _git(
+        repository,
+        "rebase",
+        "--force-rebase",
+        merge_line[1],
+        *([] if target is None else [target]),
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Rebasing primary is not allowed: main" in result.stderr
+    assert _git_stdout(repository, "symbolic-ref", "HEAD") == original_branch
+    assert (
+        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        == merge_line
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        ("pull", "--rebase"),
+        (
+            "-c",
+            "pull.rebase=true",
+            "-c",
+            "branch.main.rebase=true",
+            "-c",
+            "pull.ff=true",
+            "pull",
+        ),
+    ],
+)
+def test_pull_rebase_override_cannot_flatten_primary_merge(
+    tmp_path: Path,
+    override: tuple[str, ...],
+) -> None:
+    repository, _, merge_line = _initialize_merged_repository(tmp_path)
+
+    result = _git(repository, *override, check=False)
+
+    assert result.returncode != 0
+    assert "Rebasing primary is not allowed: main" in result.stderr
+    assert (
+        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        == merge_line
+    )
+
+
+def test_rebase_still_allows_task_branch(tmp_path: Path) -> None:
+    repository, _, merge_line = _initialize_merged_repository(tmp_path)
+    _git(repository, "switch", "-c", "task/second", merge_line[1])
+    (repository / "second.txt").write_text("second task\n")
+    _git(repository, "add", "second.txt")
+    _git(repository, "commit", "-m", "test: second task")
+    original_task = _git_stdout(repository, "rev-parse", "HEAD")
+
+    _git(repository, "rebase", "main")
+
+    assert _git_stdout(repository, "branch", "--show-current") == "task/second"
+    assert _git_stdout(repository, "rev-parse", "HEAD") != original_task
+    assert _git_stdout(repository, "rev-parse", "HEAD^") == merge_line[0]
+    assert (repository / "feature.txt").read_text() == "task feature\n"
+    assert (repository / "second.txt").read_text() == "second task\n"
+    assert (
+        _git_stdout(repository, "rev-list", "--parents", "-n", "1", "main").split()
+        == merge_line
+    )
+
+
+@pytest.mark.parametrize("primary", ["main", "master", "release/stable"])
+def test_hook_installation_repairs_unsafe_settings_idempotently(
+    tmp_path: Path,
+    primary: str,
+) -> None:
+    repository, initial_oid, _ = _initialize_repository(tmp_path)
+    if primary != "main":
+        _git(repository, "branch", "-m", primary)
+    _git(repository, "config", "workflow.primaryBranch", primary)
+    _git(repository, "config", "pull.rebase", "true")
+    _git(repository, "config", f"branch.{primary}.rebase", "merges")
+    _git(repository, "config", "pull.ff", "false")
+    _git(repository, "config", f"branch.{primary}.mergeOptions", "--ff")
+    _git(repository, "config", "core.hooksPath", "unused-hooks")
+
+    for _ in range(2):
+        _run(repository, "scripts/install-git-hooks.sh")
+
+        assert _git_stdout(repository, "config", "pull.rebase") == "false"
+        assert _git_stdout(repository, "config", f"branch.{primary}.rebase") == "false"
+        assert _git_stdout(repository, "config", "pull.ff") == "only"
+        assert (
+            _git_stdout(repository, "config", f"branch.{primary}.mergeOptions")
+            == "--no-ff"
+        )
+        assert _git_stdout(repository, "config", "core.hooksPath") == ".githooks"
+        assert _git_stdout(repository, "rev-parse", primary) == initial_oid
