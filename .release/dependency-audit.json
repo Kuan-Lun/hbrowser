@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-06T16:43:53+00:00",
+  "checked_at": "2026-09-17T14:25:40+00:00",
   "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.44.1",
+  "project_version": "0.44.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -92,7 +92,7 @@
     {
       "declared": "build>=1.3.0",
       "group": "optional:dev",
-      "latest": "1.6.0",
+      "latest": "1.6.1",
       "latest_satisfies": true,
       "name": "build",
       "python_3_14": true,
@@ -147,7 +147,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.6",
+      "latest": "0.16.8",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct Python build, runtime, development and Node dependency against the prior receipt and registry latest, including releases outside current bounds. All runtime/build dependencies and Node markdownlint-cli2 remain at the same latest releases and satisfy the declared bounds; zendriver stays at the explicitly verified 0.16.0 cohort. Ruff is the only newer dependency, from 0.16.5 to 0.16.6: reviewed https://github.com/astral-sh/ruff/releases/tag/0.16.6 and installed it in the rebuilt Python 3.14 environment. The complete fast gate passes without rule exceptions or configuration changes. Seventy-five existing browser factory/Chrome installer tests and sixteen new configured-executable tests pass, including package-manager symlinks, unchanged unset installation, no host executable auto-discovery, early invalid-configuration rejection and owned process cleanup on startup failure. This optional environment contract preserves existing defaults and introduces no runtime dependency change. The official full merge gate separately validates the complete offline suite and built wheel.",
+    "note": "Reviewed all 13 direct Python dependency entries (build, runtime, development, including the shared hatchling requirement) and the Node markdownlint-cli2 dependency against a fresh PyPI/npm registry discovery, including candidates outside declared bounds. All candidates satisfy the existing constraints and support Python 3.14. All runtime dependencies and Node remain unchanged, including the explicitly verified zendriver 0.16.0 cohort. Relative to the prior receipt, build advanced from 1.6.0 to 1.6.1 and Ruff from 0.16.6 to 0.16.8. Reviewed https://build.pypa.io/en/stable/changelog.html (the 1.6.1 Windows symlink-detection regression fix) and https://github.com/astral-sh/ruff/releases/tag/0.16.7 plus https://github.com/astral-sh/ruff/releases/tag/0.16.8 (lint/fixer and Python-version-aware rule corrections). Installed both candidates in the repository-local Python 3.14 environment. The complete fast gate passes with Ruff 0.16.8 without rule/configuration exceptions, and build 1.6.1 successfully builds the project sdist and its wheel. uv pip check and Node dependency inspection pass. All 255 focused existing browser/challenge/DOM/forwarding/diagnostic/version-contract tests pass in the environment that permits their offline localhost/shared-memory resources. Changes are equivalent pattern-matching dispatch refactors; exported API, protocol validation, side-effect ordering, data formats, and dependency constraints are unchanged. The official full merge gate separately validates the complete offline suite and built-wheel import.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
