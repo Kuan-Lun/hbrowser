@@ -81,50 +81,52 @@ class _EventPage:
     async def send(self, command: Any) -> Any:
         payload = next(command)
         method = payload["method"]
-        if method == "Page.getFrameTree":
-            return SimpleNamespace(
-                frame=SimpleNamespace(
-                    id_="main-frame",
-                    loader_id=self.loader_id,
+        match method:
+            case "Page.getFrameTree":
+                return SimpleNamespace(
+                    frame=SimpleNamespace(
+                        id_="main-frame",
+                        loader_id=self.loader_id,
+                    )
                 )
-            )
-        if method == "Page.setLifecycleEventsEnabled":
-            if self.emit_stale_while_enabling:
-                await self._emit_cross_document("stale-loader")
-            if self.queue_stale_while_enabling:
-                self._schedule(self._emit_cross_document("queued-stale-loader"))
-            return None
-        if method == "Page.navigate":
-            self.url = payload["params"]["url"]
-            loader_id = self.navigation_loader
-            if self.emit_navigation:
-                if loader_id is None:
+            case "Page.setLifecycleEventsEnabled":
+                if self.emit_stale_while_enabling:
+                    await self._emit_cross_document("stale-loader")
+                if self.queue_stale_while_enabling:
+                    self._schedule(self._emit_cross_document("queued-stale-loader"))
+                return None
+            case "Page.navigate":
+                self.url = payload["params"]["url"]
+                loader_id = self.navigation_loader
+                if self.emit_navigation:
+                    if loader_id is None:
 
-                    async def emit_same_document() -> None:
-                        if self.delay_same_document:
-                            await asyncio.sleep(self.delay_same_document)
-                        await self.emit(
-                            cdp.page.NavigatedWithinDocument,
-                            SimpleNamespace(
-                                frame_id="main-frame",
-                                url=self.url,
-                            ),
-                        )
+                        async def emit_same_document() -> None:
+                            if self.delay_same_document:
+                                await asyncio.sleep(self.delay_same_document)
+                            await self.emit(
+                                cdp.page.NavigatedWithinDocument,
+                                SimpleNamespace(
+                                    frame_id="main-frame",
+                                    url=self.url,
+                                ),
+                            )
 
-                    self._schedule(emit_same_document())
-                else:
-                    self.loader_id = loader_id
-                    await self._emit_cross_document(loader_id)
-            return "main-frame", loader_id, None, False
-        if method == "Page.reload":
-            self.reload_payload = payload
-            if self.emit_navigation:
-                self.loader_id = "reload-loader"
-                await self._emit_cross_document(self.loader_id)
-            return None
-        if method == "DOM.enable":
-            return None
-        raise AssertionError(f"Unexpected CDP method: {method}")
+                        self._schedule(emit_same_document())
+                    else:
+                        self.loader_id = loader_id
+                        await self._emit_cross_document(loader_id)
+                return "main-frame", loader_id, None, False
+            case "Page.reload":
+                self.reload_payload = payload
+                if self.emit_navigation:
+                    self.loader_id = "reload-loader"
+                    await self._emit_cross_document(self.loader_id)
+                return None
+            case "DOM.enable":
+                return None
+            case _:
+                raise AssertionError(f"Unexpected CDP method: {method}")
 
     async def evaluate(self, _script: str) -> dict[str, str]:
         return {"url": self.url, "readyState": self.ready_state}

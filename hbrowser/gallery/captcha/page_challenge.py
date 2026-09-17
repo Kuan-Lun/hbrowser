@@ -79,16 +79,16 @@ class PageChallengeHandler:
         detect_timeout: float = 3.0,
     ) -> None:
         detection = await self._detector.detect(page, timeout=detect_timeout)
-        if detection.kind == "none":
-            return
-
-        if detection.kind == "cf_managed_challenge":
-            self._logger.info("Cloudflare verification detected")
-        else:
-            self._logger.info(
-                "Browser verification detected (kind=%s)",
-                detection.kind,
-            )
+        match detection.kind:
+            case "none":
+                return
+            case "cf_managed_challenge":
+                self._logger.info("Cloudflare verification detected")
+            case _:
+                self._logger.info(
+                    "Browser verification detected (kind=%s)",
+                    detection.kind,
+                )
         solver = self._automatic_solver
         if detection.kind == "cf_managed_challenge" and solver is not None:
             self._logger.info("Solving Cloudflare verification automatically")

@@ -90,12 +90,13 @@ class FlareSolverrRequestError(FlareSolverrError):
         self.status_code = status_code
         self.transport_type = transport_type
 
-        if kind == "http_status":
-            message = f"FlareSolverr request failed with HTTP status {status_code}"
-        elif kind == "transport":
-            message = "FlareSolverr transport request failed"
-        else:
-            message = "FlareSolverr service rejected the request"
+        match kind:
+            case "http_status":
+                message = f"FlareSolverr request failed with HTTP status {status_code}"
+            case "transport":
+                message = "FlareSolverr transport request failed"
+            case _:
+                message = "FlareSolverr service rejected the request"
         super().__init__(message)
 
 

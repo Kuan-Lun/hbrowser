@@ -659,19 +659,27 @@ class LogForwardingReceiver:
             if _canonical_json(decoded) != payload:
                 raise ForwardingProtocolError("forwarding JSON is not canonical")
             frame_type = decoded.get("type")
-            if frame_type == "hello":
-                if set(decoded) != {"token", "type"}:
-                    raise ForwardingProtocolError("forwarding hello schema is invalid")
-                return True, "hello", None
-            if frame_type == "close":
-                if set(decoded) != {"token", "type"}:
-                    raise ForwardingProtocolError("forwarding close schema is invalid")
-                return True, "close", None
-            if frame_type == "record":
-                if set(decoded) != {"record", "token", "type"}:
-                    raise ForwardingProtocolError("forwarding frame schema is invalid")
-                return True, "record", _decode_record(decoded["record"])
-            raise ForwardingProtocolError("forwarding frame type is invalid")
+            match frame_type:
+                case "hello":
+                    if set(decoded) != {"token", "type"}:
+                        raise ForwardingProtocolError(
+                            "forwarding hello schema is invalid"
+                        )
+                    return True, "hello", None
+                case "close":
+                    if set(decoded) != {"token", "type"}:
+                        raise ForwardingProtocolError(
+                            "forwarding close schema is invalid"
+                        )
+                    return True, "close", None
+                case "record":
+                    if set(decoded) != {"record", "token", "type"}:
+                        raise ForwardingProtocolError(
+                            "forwarding frame schema is invalid"
+                        )
+                    return True, "record", _decode_record(decoded["record"])
+                case _:
+                    raise ForwardingProtocolError("forwarding frame type is invalid")
         except (TypeError, ValueError, RecursionError, OverflowError) as error:
             if isinstance(error, ForwardingProtocolError):
                 raise
@@ -698,17 +706,20 @@ class LogForwardingReceiver:
                     )
                     if not authenticated:
                         return
-                    if frame_type == "close":
-                        client.graceful_close = True
-                        return
-                    if frame_type == "hello":
-                        try:
-                            client.connection.sendall(_encode_frame({"type": "ready"}))
-                        except Exception as error:
-                            raise ForwardingReceiveError(
-                                "forwarding ready receipt could not be sent"
-                            ) from error
-                        continue
+                    match frame_type:
+                        case "close":
+                            client.graceful_close = True
+                            return
+                        case "hello":
+                            try:
+                                client.connection.sendall(
+                                    _encode_frame({"type": "ready"})
+                                )
+                            except Exception as error:
+                                raise ForwardingReceiveError(
+                                    "forwarding ready receipt could not be sent"
+                                ) from error
+                            continue
                     if record is None:
                         raise ForwardingProtocolError(
                             "forwarding record frame is empty"

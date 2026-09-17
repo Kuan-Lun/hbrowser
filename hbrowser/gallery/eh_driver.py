@@ -356,30 +356,33 @@ def _parse_search_page(
     query_value = input_value if isinstance(input_value, str) else None
 
     next_elements = soup.select("#unext")
-    if not next_elements:
-        next_state = _NextPageState.END if has_no_results else _NextPageState.MISSING
-        next_href = None
-    elif len(next_elements) != 1:
-        next_state = _NextPageState.INVALID
-        next_href = None
-    else:
-        next_element = next_elements[0]
-        if (
-            next_element.name == "span"
-            and next_element.get("href") is None
-            and next_element.select_one("a[href]") is None
-        ):
-            next_state = _NextPageState.END
+    match len(next_elements):
+        case 0:
+            next_state = (
+                _NextPageState.END if has_no_results else _NextPageState.MISSING
+            )
             next_href = None
-        elif next_element.name == "a":
-            href = next_element.get("href")
-            if isinstance(href, str) and href.strip():
-                next_state = _NextPageState.NEXT
-                next_href = href
-            else:
-                next_state = _NextPageState.INVALID
-                next_href = None
-        else:
+        case 1:
+            next_element = next_elements[0]
+            match next_element.name:
+                case "span" if (
+                    next_element.get("href") is None
+                    and next_element.select_one("a[href]") is None
+                ):
+                    next_state = _NextPageState.END
+                    next_href = None
+                case "a":
+                    href = next_element.get("href")
+                    if isinstance(href, str) and href.strip():
+                        next_state = _NextPageState.NEXT
+                        next_href = href
+                    else:
+                        next_state = _NextPageState.INVALID
+                        next_href = None
+                case _:
+                    next_state = _NextPageState.INVALID
+                    next_href = None
+        case _:
             next_state = _NextPageState.INVALID
             next_href = None
 

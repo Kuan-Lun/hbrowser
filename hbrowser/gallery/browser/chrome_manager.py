@@ -113,57 +113,61 @@ def _require_install_budget(deadline: Deadline, phase: str) -> float:
 
 
 def _lock_cache_descriptor(descriptor: int, *, deadline: Deadline) -> None:
-    if os.name == "posix":
-        import fcntl
+    match os.name:
+        case "posix":
+            import fcntl
 
-        while True:
-            remaining = _require_install_budget(deadline, "cache lock acquisition")
-            try:
-                fcntl.lockf(
-                    descriptor,
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    0,
-                    0,
-                    os.SEEK_SET,
-                )
-                return
-            except BlockingIOError:
-                time.sleep(min(_CACHE_LOCK_POLL_SECONDS, remaining))
-    if os.name == "nt":
-        import msvcrt
+            while True:
+                remaining = _require_install_budget(deadline, "cache lock acquisition")
+                try:
+                    fcntl.lockf(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        0,
+                        0,
+                        os.SEEK_SET,
+                    )
+                    return
+                except BlockingIOError:
+                    time.sleep(min(_CACHE_LOCK_POLL_SECONDS, remaining))
+        case "nt":
+            import msvcrt
 
-        windows_locking = cast(Any, msvcrt)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        while True:
-            remaining = _require_install_budget(deadline, "cache lock acquisition")
-            try:
-                windows_locking.locking(
-                    descriptor,
-                    windows_locking.LK_NBLCK,
-                    1,
-                )
-                return
-            except OSError as error:
-                if error.errno not in {errno.EACCES, errno.EDEADLK}:
-                    raise
-                time.sleep(min(_CACHE_LOCK_POLL_SECONDS, remaining))
-    raise RuntimeError(f"Unsupported Chrome cache lock platform: {os.name}")
+            windows_locking = cast(Any, msvcrt)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                remaining = _require_install_budget(deadline, "cache lock acquisition")
+                try:
+                    windows_locking.locking(
+                        descriptor,
+                        windows_locking.LK_NBLCK,
+                        1,
+                    )
+                    return
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    time.sleep(min(_CACHE_LOCK_POLL_SECONDS, remaining))
+        case _:
+            raise RuntimeError(f"Unsupported Chrome cache lock platform: {os.name}")
 
 
 def _unlock_cache_descriptor(descriptor: int) -> None:
-    if os.name == "posix":
-        import fcntl
+    match os.name:
+        case "posix":
+            import fcntl
 
-        fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
-        return
-    if os.name == "nt":
-        import msvcrt
+            fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
+            return
+        case "nt":
+            import msvcrt
 
-        windows_locking = cast(Any, msvcrt)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
-        return
-    raise RuntimeError(f"Unsupported Chrome cache lock platform: {os.name}")
+            windows_locking = cast(Any, msvcrt)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
+            return
+        case _:
+            raise RuntimeError(f"Unsupported Chrome cache lock platform: {os.name}")
 
 
 @contextmanager

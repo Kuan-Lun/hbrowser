@@ -1075,28 +1075,29 @@ def main(arguments: Sequence[str] | None = None) -> int:
     target_environment = _take_target_environment()
     platform_name = os.name
     controller = _ShutdownController()
-    if platform_name == "posix":
-        signal.signal(
-            signal.SIGINT,
-            lambda *_: controller.request_fallback(ControlIntent.TERMINATE),
-        )
-        signal.signal(
-            signal.SIGTERM,
-            lambda *_: controller.request_fallback(ControlIntent.TERMINATE),
-        )
-        if (
-            not _posix_exit_receipts_supported()
-            or not _posix_process_group_snapshots_supported()
-        ):
+    match platform_name:
+        case "posix":
+            signal.signal(
+                signal.SIGINT,
+                lambda *_: controller.request_fallback(ControlIntent.TERMINATE),
+            )
+            signal.signal(
+                signal.SIGTERM,
+                lambda *_: controller.request_fallback(ControlIntent.TERMINATE),
+            )
+            if (
+                not _posix_exit_receipts_supported()
+                or not _posix_process_group_snapshots_supported()
+            ):
+                target_environment.clear()
+                _write_status(status_path, "error UnsupportedOwnershipPrimitive")
+                return PROVEN_TARGET_NOT_STARTED_EXIT_CODE
+        case "nt":
+            pass
+        case _:
             target_environment.clear()
-            _write_status(status_path, "error UnsupportedOwnershipPrimitive")
+            _write_status(status_path, "error UnsupportedPlatform")
             return PROVEN_TARGET_NOT_STARTED_EXIT_CODE
-    elif platform_name == "nt":
-        pass
-    else:
-        target_environment.clear()
-        _write_status(status_path, "error UnsupportedPlatform")
-        return PROVEN_TARGET_NOT_STARTED_EXIT_CODE
 
     if time.monotonic_ns() >= start_request.deadline_ns:
         target_environment.clear()
