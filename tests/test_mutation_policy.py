@@ -40,11 +40,13 @@ _OUTCOME_UNKNOWN_MARKERS = frozenset(
 
 def _called_name(call: ast.Call) -> str | None:
     function = call.func
-    if isinstance(function, ast.Name):
-        return function.id
-    if isinstance(function, ast.Attribute):
-        return function.attr
-    return None
+    match function:
+        case ast.Name():
+            return function.id
+        case ast.Attribute():
+            return function.attr
+        case _:
+            return None
 
 
 class BrowserMutationBudgetTests(unittest.TestCase):

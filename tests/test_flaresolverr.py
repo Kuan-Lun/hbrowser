@@ -92,22 +92,26 @@ class _HTTP:
         if not self.responses:
             raise AssertionError("Unexpected HTTP request")
         response = self.responses.popleft()
-        if isinstance(response, httpx.HTTPError):
-            raise response
-        if isinstance(response, _Response):
-            return response
-        if isinstance(response, _Created):
-            if json.get("cmd") != "sessions.create":
-                raise AssertionError("Created response used for a non-create request")
-            session_id = self.create_session_ids[-1]
-            self.session_labels[session_id] = response.label
-            return _Response({"status": "ok", "session": session_id})
-        if isinstance(response, _ListedLatestCreate):
-            if json.get("cmd") != "sessions.list":
-                raise AssertionError("List response used for a non-list request")
-            sessions = [self.create_session_ids[-1]] if response.present else []
-            return _Response({"status": "ok", "sessions": sessions})
-        return _Response(response)
+        match response:
+            case httpx.HTTPError():
+                raise response
+            case _Response():
+                return response
+            case _Created():
+                if json.get("cmd") != "sessions.create":
+                    raise AssertionError(
+                        "Created response used for a non-create request"
+                    )
+                session_id = self.create_session_ids[-1]
+                self.session_labels[session_id] = response.label
+                return _Response({"status": "ok", "session": session_id})
+            case _ListedLatestCreate():
+                if json.get("cmd") != "sessions.list":
+                    raise AssertionError("List response used for a non-list request")
+                sessions = [self.create_session_ids[-1]] if response.present else []
+                return _Response({"status": "ok", "sessions": sessions})
+            case _:
+                return _Response(response)
 
 
 class _Clock:

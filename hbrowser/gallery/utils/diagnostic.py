@@ -73,63 +73,65 @@ def _require_budget(deadline: float | None, phase: str) -> None:
 
 
 def _lock_descriptor(descriptor: int, *, deadline: float | None) -> None:
-    if os.name == "posix":
-        import fcntl
+    match os.name:
+        case "posix":
+            import fcntl
 
-        if deadline is None:
-            fcntl.lockf(descriptor, fcntl.LOCK_EX, 0, 0, os.SEEK_SET)
-            return
-        while True:
-            _require_budget(deadline, "inter-process lock acquisition")
-            try:
-                fcntl.lockf(
-                    descriptor,
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    0,
-                    0,
-                    os.SEEK_SET,
-                )
+            if deadline is None:
+                fcntl.lockf(descriptor, fcntl.LOCK_EX, 0, 0, os.SEEK_SET)
                 return
-            except BlockingIOError:
-                remaining = _remaining(deadline)
-                assert remaining is not None
-                time.sleep(min(_PAGE_DIAGNOSTIC_LOCK_POLL_SECONDS, remaining))
-    elif os.name == "nt":
-        import msvcrt
+            while True:
+                _require_budget(deadline, "inter-process lock acquisition")
+                try:
+                    fcntl.lockf(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        0,
+                        0,
+                        os.SEEK_SET,
+                    )
+                    return
+                except BlockingIOError:
+                    remaining = _remaining(deadline)
+                    assert remaining is not None
+                    time.sleep(min(_PAGE_DIAGNOSTIC_LOCK_POLL_SECONDS, remaining))
+        case "nt":
+            import msvcrt
 
-        windows_locking = cast(Any, msvcrt)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        if deadline is None:
-            windows_locking.locking(descriptor, windows_locking.LK_LOCK, 1)
-            return
-        while True:
-            _require_budget(deadline, "inter-process lock acquisition")
-            try:
-                windows_locking.locking(
-                    descriptor,
-                    windows_locking.LK_NBLCK,
-                    1,
-                )
+            windows_locking = cast(Any, msvcrt)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if deadline is None:
+                windows_locking.locking(descriptor, windows_locking.LK_LOCK, 1)
                 return
-            except OSError as error:
-                if error.errno not in {errno.EACCES, errno.EDEADLK}:
-                    raise
-                remaining = _remaining(deadline)
-                assert remaining is not None
-                time.sleep(min(_PAGE_DIAGNOSTIC_LOCK_POLL_SECONDS, remaining))
+            while True:
+                _require_budget(deadline, "inter-process lock acquisition")
+                try:
+                    windows_locking.locking(
+                        descriptor,
+                        windows_locking.LK_NBLCK,
+                        1,
+                    )
+                    return
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    remaining = _remaining(deadline)
+                    assert remaining is not None
+                    time.sleep(min(_PAGE_DIAGNOSTIC_LOCK_POLL_SECONDS, remaining))
 
 
 def _unlock_descriptor(descriptor: int) -> None:
-    if os.name == "posix":
-        import fcntl
+    match os.name:
+        case "posix":
+            import fcntl
 
-        fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
-    elif os.name == "nt":
-        import msvcrt
+            fcntl.lockf(descriptor, fcntl.LOCK_UN, 0, 0, os.SEEK_SET)
+        case "nt":
+            import msvcrt
 
-        windows_locking = cast(Any, msvcrt)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
+            windows_locking = cast(Any, msvcrt)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
 
 
 @contextmanager

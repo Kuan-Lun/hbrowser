@@ -670,11 +670,14 @@ async def _wait_for_dom_query(
                 deadline=deadline,
                 description=description,
             )
-            if isinstance(element, list):
-                if element:
-                    return element[0]
-            elif element is not None:
-                return element
+            match element:
+                case list():
+                    if element:
+                        return element[0]
+                case None:
+                    pass
+                case _:
+                    return element
 
             remaining = deadline.remaining()
             if remaining <= 0:

@@ -1449,14 +1449,16 @@ def _ownership_platform() -> str:
 
 def _supervisor_creation_options() -> dict[str, Any]:
     platform_name = _ownership_platform()
-    if platform_name == "posix":
-        return {"start_new_session": True}
-    if platform_name == "nt":
-        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", None)
-        if not isinstance(creation_flag, int) or creation_flag <= 0:
-            raise RuntimeError("Windows process-group isolation is unavailable")
-        return {"creationflags": creation_flag}
-    raise AssertionError("unreachable process ownership platform")
+    match platform_name:
+        case "posix":
+            return {"start_new_session": True}
+        case "nt":
+            creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", None)
+            if not isinstance(creation_flag, int) or creation_flag <= 0:
+                raise RuntimeError("Windows process-group isolation is unavailable")
+            return {"creationflags": creation_flag}
+        case _:
+            raise AssertionError("unreachable process ownership platform")
 
 
 def _is_reserved_child_environment_key(key: str) -> bool:
