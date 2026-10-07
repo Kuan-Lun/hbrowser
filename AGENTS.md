@@ -45,8 +45,9 @@
   `branch.<primary>.rebase=false` 與 `pull.ff=only`；pull 只可 fast-forward，
   分歧時停止並明確處理。Task 整合仍使用 `--no-ff` 保留 merge commit。
 - 任務完成後從 task branch 執行 `scripts/git-flow-merge.sh`。若 task branch
-  含有 primary 尚未包含的 commit，該腳本負責完整 gate、`--no-ff` merge、
-  安全移除 task worktree，以及以 `git branch -d` 刪除已合併的本機 branch。
+  含有 primary 尚未包含的 commit，該腳本依範圍選擇文件或完整 gate、
+  執行 `--no-ff` merge、安全移除 task worktree，以及以 `git branch -d`
+  刪除已合併的本機 branch。
 - 若且唯若 task tip 已由本機 primary 包含（`git merge-base --is-ancestor`
   成功），`scripts/git-flow-merge.sh` 執行 no-op cleanup：不得執行 gate或merge、
   建立空 commit或空 merge commit；必須先確認涉及的 worktree clean、沒有進行中
@@ -130,9 +131,25 @@
 
 - `scripts/format.sh`：明確執行會修改檔案的 formatter或 fixer。
 - `scripts/check-fast.sh`：離線、唯讀的 Ruff、format check、mypy與
-  markdownlint；每次非 merge commit執行。
+  markdownlint；非純文件的非 merge commit 執行。
 - `scripts/check-full.sh`：fast gate、完整測試、適用時的 build與wheel smoke及本
-  repository的特殊檢查；整合候選只跑一次。
+  repository的特殊檢查；非純文件的整合候選只跑一次。手動呼叫 fast／full
+  入口仍執行原本完整內容，不自行縮減檢查。
+- `scripts/check_change_scope.py --index --base HEAD` 以 Git tree 與 staged
+  index 判定 `documentation` 或 `full`。只有 `README.md`、`docs/**/*.md`、
+  `benchmarks/README.md`、`verification/README.md` 的普通非執行檔
+  （Git mode `100644`）新增、修改或刪除可視為純文件；rename 的兩端都須符合。
+  `AGENTS.md`、`CLAUDE.md`、程式、tests、scripts、hooks、設定、metadata、
+  symlink、mode 變更及未知路徑一律走原有檢查。空差異走 `full`，分類失敗則
+  阻止提交或合併，不得猜測為文件。
+- `pre-commit` 對純文件執行
+  `.venv/bin/python scripts/check-docs.py --index --base HEAD`，其餘執行 fast；
+  `pre-merge-commit` 保留 staged version check，純文件執行同一文件檢查，
+  其餘執行 full。合併分類涵蓋 primary parent 到 staged candidate 的完整差異，
+  不只看最後一個 commit。文件檢查從 exact staged tree 暫存匯出所有普通
+  Markdown 文件與設定，執行 repository-local Markdown lint 及差異 whitespace
+  check，不讀取未 stage 的內容，
+  也不執行 Ruff、mypy、pytest、build 或 online review。
 - dependency audit可連網，但 hooks只驗證本機 receipt，不在 commit過程
   連網。
 - GitHub Actions只呼叫相同 scripts，並保留 trusted publishing、平台特有
@@ -206,5 +223,5 @@ lifecycle；上層 battle策略不得下沉到本 repository。
   missing。
 - 一般pytest與merge gate完全離線。Windows process ownership等平台特有檢查
   可留在CI，但本機可重現的lint、typing、pytest與build不得複製成另一套規則。
-- full gate必須執行deterministic pytest、sdist/wheel build，以及從新建wheel
-  path import `hbrowser`的 smoke test。
+- 非純文件變更的 full gate 必須執行 deterministic pytest、sdist/wheel build，
+  以及從新建 wheel path import `hbrowser` 的 smoke test。
