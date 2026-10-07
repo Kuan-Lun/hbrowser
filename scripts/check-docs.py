@@ -77,6 +77,8 @@ def main() -> int:
             raise ChangeScopeError(f"Markdown check failed: {error}") from error
     if capture_candidate(root, arguments.candidate) != candidate:
         raise ChangeScopeError("Candidate changed while checking documentation")
+    if resolve_tree(root, arguments.base) != base:
+        raise ChangeScopeError("Base changed while checking documentation")
     print(f"Documentation checks passed for tree {candidate}")
     return 0
 

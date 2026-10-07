@@ -148,10 +148,13 @@ def main() -> int:
     add_target_arguments(parser)
     arguments = parser.parse_args()
     root = Path.cwd()
+    base = resolve_tree(root, arguments.base)
     candidate = capture_candidate(root, arguments.candidate)
-    scope = classify_changes(arguments.base, candidate, root)
+    scope = classify_changes(base, candidate, root)
     if capture_candidate(root, arguments.candidate) != candidate:
         raise ChangeScopeError("Candidate changed while classifying its scope")
+    if resolve_tree(root, arguments.base) != base:
+        raise ChangeScopeError("Base changed while classifying the candidate scope")
     print(scope)
     return 0
 

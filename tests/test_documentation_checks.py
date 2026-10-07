@@ -375,3 +375,26 @@ def test_docs_profile_does_not_trust_candidate_config_in_worktree(
         ".markdownlint-cli2.jsonc", json.dumps({"config": {"default": False}})
     )
     assert repository.scope() == "full"
+
+
+@pytest.mark.parametrize("target", ("index", "revision"))
+def test_base_change_during_lint_blocks_acceptance(
+    documentation_repository: DocumentationRepository, target: str
+) -> None:
+    repository = documentation_repository
+    repository.git("branch", "baseline")
+    repository.stage("README.md", "# Changed\n")
+    candidate_tree = repository.git("write-tree")
+    changed_base = repository.git(
+        "commit-tree", candidate_tree, "-p", "HEAD", "-m", "docs: alternate base"
+    )
+    repository.lint_stub(
+        "import subprocess\n"
+        "subprocess.run(('git', 'update-ref', 'refs/heads/baseline', "
+        f"{changed_base!r}), cwd={str(repository.root)!r}, check=True)\n"
+    )
+    arguments = ["--index"] if target == "index" else ["--candidate", candidate_tree]
+    result = repository.run(sys.executable, str(DOCS), *arguments, "--base", "baseline")
+    assert result.returncode != 0
+    assert "Base changed" in result.stderr
+    assert "Documentation checks passed" not in result.stdout
