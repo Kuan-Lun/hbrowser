@@ -1,37 +1,41 @@
 # HBrowser
 
-HBrowser is a Python library for using E-Hentai and ExHentai through an automated
-browser. It can sign in, search galleries, look up a gallery by its numeric ID,
-submit archive downloads to H@H, and perform the daily check-in.
+HBrowser 是讓 Python 程式透過瀏覽器操作 E-Hentai／ExHentai 的非同步函式庫。
+你可以用它登入帳號、搜尋圖庫、依 GID 尋找圖庫、提交 H@H 封存下載，以及每日簽到。
+它適合整合進自己的腳本或應用程式；目前沒有獨立的命令列工具。
 
-Use `EHDriver` for E-Hentai or `ExHDriver` for ExHentai. Both provide the same
-async interface and open and close their browser with `async with`. HBrowser does
-not provide a standalone command-line application.
+## 開始使用
 
-## Requirements and installation
+你需要 Python 3.14 以上版本、E-Hentai 帳號與網路連線。
+支援 Windows、macOS 與 Linux；以下範例會開啟瀏覽器視窗，因此需要圖形桌面。
+首次啟動時會自動安裝 Chrome for Testing，也可以指定已安裝的 Chrome。
 
-- Python 3.14 or newer on Windows, macOS, or Linux.
-- An E-Hentai account, with ExHentai access if you use `ExHDriver`.
-- Internet access. HBrowser installs Chrome for Testing automatically on first
-  use unless you supply an existing Chrome executable.
-- A graphical desktop when using `headless=False` to handle login challenges
-  manually. H@H archive downloads also require an available H@H client and any
-  funds required by the service.
+### 1. 安裝
 
-Install into your Python environment:
+在這份 checkout 的根目錄建立虛擬環境並安裝套件。
+
+macOS／Linux：
 
 ```bash
-python -m pip install hbrowser
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 ```
 
-To install this checkout instead, run `python -m pip install .` from its root.
+Windows PowerShell：
 
-## Set your account and connection
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install .
+```
 
-Set these variables in the environment that will run your Python script. Do not
-put account credentials in the script or commit them to a repository.
+### 2. 設定帳號
 
-Bash or Zsh:
+在執行腳本的終端機設定環境變數。請填入自己的帳號密碼，避免將密碼寫進程式碼或
+提交到版本庫。
+
+macOS／Linux：
 
 ```bash
 export EH_USERNAME='your_username'
@@ -39,7 +43,7 @@ export EH_PASSWORD='your_password'
 export USE_TOR=0
 ```
 
-PowerShell:
+Windows PowerShell：
 
 ```powershell
 $env:EH_USERNAME = 'your_username'
@@ -47,53 +51,57 @@ $env:EH_PASSWORD = 'your_password'
 $env:USE_TOR = '0'
 ```
 
-`USE_TOR=0` selects a direct connection. If the variable is unset, HBrowser
-uses Tor when it finds a local Tor executable. See [Connection options](#connection-options)
-for proxy and challenge settings.
+`USE_TOR=0` 選擇直接連線。若不設定，HBrowser 偵測到本機 Tor 執行檔時會自動使用它。
+其他連線方式見下方「瀏覽器與連線設定」。
 
-## Run your first search
+### 3. 執行第一次搜尋
 
-Save this as `search_galleries.py`, replace the query, and run
-`python search_galleries.py`:
+將以下內容存為 `search_galleries.py`，修改搜尋條件後執行
+`python search_galleries.py`：
 
 ```python
 import asyncio
 
-from hbrowser import ExHDriver, SearchRequest
+from hbrowser import EHDriver, SearchRequest
 
 
 async def main() -> None:
-    async with ExHDriver(headless=False) as driver:
+    async with EHDriver(headless=False) as driver:
         result = await driver.search(
             SearchRequest(
-                scope_url="https://exhentai.org/",
+                scope_url="https://e-hentai.org/",
                 query="language:chinese$",
             )
         )
         for gallery in result.galleries:
             print(gallery.gid, gallery.url)
-        print(f"Read {result.pages_visited} search pages")
+        print(f"找到 {len(result.galleries)} 筆圖庫，讀取 {result.pages_visited} 頁")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-The context manager signs in and opens the site's home page before running your
-code, then closes the browser when the block exits. Leave the browser visible
-for your first run so you can complete an unresolved challenge. For E-Hentai,
-replace `ExHDriver` with `EHDriver` and use `https://e-hentai.org/` as the scope.
+進入 `async with` 時會啟動瀏覽器、登入並前往首頁；離開區塊時會關閉瀏覽器。
+第一次使用建議保留 `headless=False`，以便在必要時手動完成驗證。
 
-A search returns up to 5,000 galleries across at most 100 pages. You can lower
-those limits with `SearchRequest(max_pages=..., max_results=...)`. A search that
-cannot finish within its limits raises `SearchLimitExceededError`; narrow the
-query instead of treating the result as a complete list.
+| 使用網站 | 匯入並建立的 driver | `scope_url` |
+| --- | --- | --- |
+| E-Hentai | `EHDriver` | `https://e-hentai.org/` |
+| ExHentai | `ExHDriver` | `https://exhentai.org/` |
 
-## Common tasks
+使用 ExHentai 時，帳號必須具有該站存取權；將範例的匯入、driver 與網址一起替換即可。
 
-These examples run inside an active `async with` driver block.
+搜尋會收集去重後的結果，預設上限為 100 頁、5,000 筆。可以在 `SearchRequest`
+設定較小的 `max_pages` 或 `max_results`，但不能超過上述上限。
+如果尚有結果卻已達上限，會拋出 `SearchLimitExceededError`；請縮小搜尋範圍。
 
-### Find a gallery by ID
+## 常見操作
+
+以下片段放在上例 `async with ... as driver:` 的區塊內；相應的 `import`
+可放在腳本頂端。這些操作共用已登入的瀏覽器。
+
+### 依 GID 尋找圖庫
 
 ```python
 from hbrowser import ConfirmedGalleryMissing, GalleryFound
@@ -102,30 +110,35 @@ match await driver.lookup_gid(349189):
     case GalleryFound(gallery=gallery):
         print(gallery.url)
     case ConfirmedGalleryMissing(confirmations=confirmations):
-        print(f"Missing after {confirmations} independent searches")
+        print(f"經過 {confirmations} 次獨立搜尋，未找到此圖庫")
 ```
 
-A gallery is reported missing only after two independent empty searches.
-Authentication, challenge, navigation, and malformed-page failures raise an
-error instead; they do not mean that the gallery was removed.
+`lookup_gid()` 接受正整數 GID。只有兩次獨立搜尋都明確回傳空結果，才會回傳
+`ConfirmedGalleryMissing`。登入、驗證、導覽或頁面解析失敗會拋出例外，不能當成
+圖庫不存在的證據。
 
-### Submit an archive download
+### 提交 H@H 下載
+
+先準備可用的 H@H 客戶端，以及網站要求的下載額度或費用，再提交圖庫網址：
 
 ```python
 from h2h_galleryinfo_parser import GalleryURLParser
 
-# Replace this example URL with the gallery you want.
-gallery = GalleryURLParser("https://exhentai.org/g/123/456/")
-accepted = await driver.download(gallery)
-print(f"H@H submission accepted: {accepted}")
+if await driver.checkh2h():
+    # 改成要下載的圖庫網址。
+    gallery = GalleryURLParser("https://e-hentai.org/g/123/456/")
+    accepted = await driver.download(gallery)
+    print(f"下載提交成功：{accepted}")
+else:
+    print("請先讓 H@H 客戶端上線")
 ```
 
-`True` means H@H accepted the submission, not that the archive has finished
-arriving. HBrowser does not return archive bytes or choose a local download
-folder. If `ArchiveDownloadOutcomeUnknownError` is raised, check the H@H download
-state before retrying: the service may already have accepted the request.
+`download()` 的 `True` 表示已排入 H@H 下載，不表示檔案已下載完成；圖庫無法取得等
+情況可能回傳 `False`。檔案接收與儲存位置由 H@H 處理，HBrowser 不回傳封存檔內容。
+若收到 `ArchiveDownloadOutcomeUnknownError`，請先檢查 H@H 狀態再決定是否重試，
+因為前一次操作可能已生效。
 
-### Perform the daily check-in
+### 每日簽到
 
 ```python
 from hbrowser import PunchInComplete, RandomEncounterFound
@@ -134,83 +147,68 @@ match await driver.punchin():
     case RandomEncounterFound(url=url):
         await driver.get(url)
     case PunchInComplete():
-        pass
+        print("簽到完成，沒有隨機遭遇")
 ```
 
-Opening a returned encounter is optional. Encounter URLs are private and
-short-lived; do not log or save them. HentaiVerse automation is provided by the
-separate [HVBrowser project](https://github.com/Kuan-Lun/hvbrowser).
+`RandomEncounterFound` 表示簽到頁提供了 HentaiVerse 隨機遭遇；範例會開啟它。
+若只要簽到，可以略過 `driver.get(url)`。遭遇網址包含短效的私人資訊，請勿記錄或分享。
 
-## Connection options
+## 瀏覽器與連線設定
 
-| Setting | Purpose |
+請在建立 driver 之前設定需要的環境變數。
+
+| 環境變數 | 用途 |
 | --- | --- |
-| `USE_TOR` | Set `0` to disable Tor or `1` to require it. Unset means auto-detect. |
-| `TOR_BINARY_PATH` | Path to your Tor executable when it is not found automatically. |
-| `FLARESOLVERR_URL` | Optional FlareSolverr `/v1` endpoint, such as `http://127.0.0.1:8191/v1`. |
-| `HBROWSER_CHROME_EXECUTABLE` | Absolute path to an installed, executable Chrome binary. Skips automatic Chrome installation. |
+| `HBROWSER_CHROME_EXECUTABLE` | 指定 Chrome 執行檔的絕對路徑，略過自動安裝；必須是可執行的檔案。 |
+| `USE_TOR` | `0` 停用 Tor，`1` 啟用 Tor；未設定時自動偵測。 |
+| `TOR_BINARY_PATH` | 自動偵測不到 Tor 時，指定其執行檔路徑。 |
+| `FLARESOLVERR_URL` | 選用的 FlareSolverr `/v1` 端點，例如 `http://127.0.0.1:8191/v1`。 |
 
-Tor is detected in common Tor Browser installation locations and, on Linux, at
-`/usr/bin/tor`. If Tor is requested but unavailable, install it or set
-`TOR_BINARY_PATH`; use `USE_TOR=0` if you want a direct connection.
+FlareSolverr 可協助處理支援的 Cloudflare 與登入驗證；它必須與 HBrowser 使用相同的
+對外網路路徑。啟用 Tor 或住宅代理時，HBrowser 會停用 FlareSolverr 整合。
 
-An optional FlareSolverr 3.5.0 or newer instance can handle supported Cloudflare
-managed challenges and the Forums login Turnstile widget. Its browser must use
-the same public network route as HBrowser. HBrowser disables this integration
-when Tor or a residential proxy is active.
+Driver 預設 `headless=True`。無法自動完成驗證時，這個模式會失敗；需要人工操作時改用
+`headless=False`。人工驗證預設等待 180 秒，可以在建立 driver 時設定
+`captcha_manual_timeout`；初始 FlareSolverr session 嘗試次數由
+`flaresolverr_session_attempts` 設定，預設為 3 次。
 
-With `headless=False`, unresolved challenges stay in the browser window for
-manual completion. With `headless=True` (the driver default), they fail because
-manual interaction is unavailable. `captcha_manual_timeout` controls the manual
-wait in seconds (default: 180); `flaresolverr_session_attempts` controls initial
-solver-session attempts (default: 3). Restarting Chrome does not rotate your IP.
+## 排錯與日誌
 
-## Logs and troubleshooting
+| 遇到的情況 | 處理方式 |
+| --- | --- |
+| 瀏覽器無法啟動 | 確認可下載 Chrome，或檢查指定的 Chrome 路徑；有視窗模式需要圖形桌面。 |
+| 登入或驗證失敗 | 確認帳號、密碼及網站存取權，使用 `headless=False` 查看並完成驗證。 |
+| 搜尋超過上限 | 縮小搜尋條件或使用更明確的 `scope_url`。 |
+| H@H 離線或額度不足 | 先恢復客戶端連線或處理帳號額度，再提交下載。 |
+| 下載結果不明 | 檢查 H@H 是否已收到工作，避免直接重複提交。 |
+| `ProcessOwnershipError` | 確認作業系統可正常管理子程序；精簡的 POSIX 環境需要 `ps` 與支援 `WNOWAIT` 的 `os.waitid`。 |
 
-To enable console and JSONL file logs, choose a private directory before the
-first `configure_logging()` call. Close logging once when your application exits:
+需要更詳細的日誌時，在搜尋範例頂端增加以下匯入，並將原本的
+`if __name__ == "__main__":` 區塊替換為：
 
 ```python
 import os
 
 from hbrowser import LogLevel, close_logging, configure_logging
 
-os.environ["HBROWSER_LOG_DIR"] = "/path/to/private/run-log"
-configure_logging(console_level=LogLevel.INFO, file_level=LogLevel.DEBUG)
-try:
-    asyncio.run(main())
-finally:
-    close_logging()
+if __name__ == "__main__":
+    os.environ["HBROWSER_LOG_DIR"] = "./private-run-log"
+    configure_logging(console_level=LogLevel.INFO, file_level=LogLevel.DEBUG)
+    try:
+        asyncio.run(main())
+    finally:
+        close_logging()
 ```
 
-This wraps the `main()` from the search example; replace its original
-`asyncio.run(main())` call. The directory defaults to `log` beside the main
-script. Use a separate directory for concurrent processes, and do not change it
-after configuration. Log files are append-only `events-*.jsonl` segments;
-HBrowser does not delete old segments, so archive or remove them after the
-application has closed logging. A required log-file failure raises
-`LogPersistenceError` during setup or when the failure is checked at shutdown.
+每個同時執行的程式請使用不同的可寫目錄，設定後不要更換路徑。
+日誌寫入 `events-*.jsonl`；舊檔不會自動刪除，可在程式關閉日誌後自行封存或清理。
+必要的日誌寫入失敗會在設定或結束檢查時拋出 `LogPersistenceError`。
 
-Browser failures may also save HTML diagnostics. Keep these files private:
-they can contain account-specific content. For a problem you detect yourself,
-use `await driver.save_page_diagnostic("failure_kind")` while the session is
-active.
+瀏覽器失敗時也可能儲存 HTML 診斷檔；這些檔案可能含有帳號相關內容，請妥善保管。
+回報問題時請附上套件版本、作業系統、例外名稱，以及是否使用無視窗模式、Tor 或
+FlareSolverr，並移除日誌中的私人資訊。問題可提交到
+[issue tracker](https://github.com/Kuan-Lun/hbrowser/issues)。
 
-| Symptom | What to check |
-| --- | --- |
-| Login or challenge fails | Confirm your credentials and site access, then retry with `headless=False`. For unattended use, check the optional solver endpoint and connection route. |
-| Browser cannot start | Check the configured Chrome path, or allow the first-run Chrome download. Visible mode needs a graphical desktop. |
-| Search limit exceeded | Narrow the query or choose a more specific search scope. |
-| H@H client offline or insufficient funds | Restore the client or account balance before submitting again. |
-| Archive outcome unknown | Inspect H@H state before retrying to avoid an accidental duplicate. |
-| `ProcessOwnershipError` | Use a supported OS with normal process-management facilities. Minimal POSIX environments need `ps` and Python `os.waitid` support, including `WNOWAIT`. |
-| Log setup fails | Use a writable private directory that no other running process owns. |
+## 授權
 
-When reporting a problem, include the package version, OS, exception type, and
-whether you used headless mode, Tor, or FlareSolverr. Remove credentials and
-account-specific content before sharing logs. Report issues through the
-[issue tracker](https://github.com/Kuan-Lun/hbrowser/issues).
-
-## License
-
-Licensed under GPL-3.0-only. See [LICENSE](LICENSE).
+本專案採用 GPL-3.0-only，詳見 [LICENSE](LICENSE)。
