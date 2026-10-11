@@ -15,10 +15,8 @@ from functools import partial
 from typing import Any, Self, cast
 from uuid import uuid4
 
-from ...exceptions import BrowserMutationOutcomeUnknownError
 from ..utils import (
     Deadline,
-    ZendriverOperationTimeout,
     navigate_and_wait,
     open_tab_and_wait,
 )
@@ -318,11 +316,7 @@ class BrowserOwner[BrowserT, TabT]:
     async def _navigate_owned_tab(self, tab: TabT, url: str) -> None:
         try:
             await self._tab_navigator(tab, url)
-        except (
-            BrowserMutationOutcomeUnknownError,
-            ZendriverOperationTimeout,
-            asyncio.CancelledError,
-        ):
+        except BaseException:
             # Keep every transport and the browser for controlled shutdown,
             # but reject commands against this uncertain generation.
             self._state = BrowserOwnerState.CLOSING

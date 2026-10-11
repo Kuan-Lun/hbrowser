@@ -3,6 +3,7 @@ import unittest
 from collections.abc import Awaitable, Callable
 from dataclasses import FrozenInstanceError, dataclass
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError
@@ -44,6 +45,59 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
             with self.assertRaises(TabTransportUnavailableError):
                 await owner.main_tab.execute(AsyncMock())
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_existing_tab_navigation_ack_without_readiness_retires_owner(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        methods: list[str] = []
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            methods.append(payload["method"])
+            match payload["method"]:
+                case "Page.getFrameTree":
+                    return SimpleNamespace(
+                        frame=SimpleNamespace(id_="main", loader_id="old")
+                    )
+                case "Page.setLifecycleEventsEnabled":
+                    return None
+                case "Page.navigate":
+                    return "main", "new", None, False
+                case _:
+                    raise AssertionError(payload)
+
+        tab = SimpleNamespace(
+            browser=browser,
+            target_id="main-target",
+            websocket=object(),
+            mapper={},
+            send=send,
+            add_handler=Mock(),
+            remove_handlers=Mock(),
+        )
+        closer = AsyncMock()
+        owner: BrowserOwner[SimpleNamespace, SimpleNamespace] = BrowserOwner(
+            browser_factory=AsyncMock(return_value=(browser, tab)),
+            browser_closer=closer,
+            target_id_getter=lambda item: item.target_id,
+        )
+        await owner.start()
+        try:
+            with (
+                patch.object(owner_module, "_TAB_NAVIGATION_DEADLINE_SECONDS", 0.02),
+                self.assertRaises(PageStateTimeout),
+            ):
+                await owner.main_tab.navigate("https://example.test/new")
+            self.assertIn("Page.navigate", methods)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            mutation = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(mutation)
+            mutation.assert_not_awaited()
         finally:
             await owner.close()
         closer.assert_awaited_once_with(browser, ANY)
