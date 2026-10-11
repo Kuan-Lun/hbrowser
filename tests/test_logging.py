@@ -524,30 +524,64 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
     ) -> None:
         ready_payload = b'{"type":"ready"}'
 
-        def connected_socket() -> Mock:
+        @contextmanager
+        def connected_handler() -> Iterator[tuple[ForwardingHandler, Mock, Mock]]:
             connection = Mock()
             connection.recv.side_effect = [
                 struct.pack(">I", len(ready_payload)),
                 ready_payload,
             ]
-            return connection
+            connection_started = Event()
+            connection_allowed = Event()
+            handshake_complete = Event()
+            receive_ready = ForwardingHandler._receive_ready
+            failure_callback = Mock()
+
+            def connect(*_args: object, **_kwargs: object) -> Mock:
+                connection_started.set()
+                if not connection_allowed.wait(timeout=2):
+                    raise TimeoutError("test did not release the pending connection")
+                return connection
+
+            def complete_handshake(peer: socket.socket) -> None:
+                receive_ready(peer)
+                handshake_complete.set()
+
+            with (
+                patch(
+                    "hbrowser.gallery.utils._log_forwarding.socket.create_connection",
+                    side_effect=connect,
+                ),
+                patch.object(
+                    ForwardingHandler, "_receive_ready", side_effect=complete_handshake
+                ),
+            ):
+                handler = ForwardingHandler(
+                    "127.0.0.1:43210",
+                    "a" * 64,
+                    failure_callback=failure_callback,
+                )
+                try:
+                    self.assertTrue(connection_started.wait(timeout=2))
+                    connection.sendall.assert_not_called()
+                    connection_allowed.set()
+                    self.assertTrue(handshake_complete.wait(timeout=2))
+                    connection.sendall.assert_called_once()
+                    failure_callback.assert_not_called()
+                    yield handler, connection, failure_callback
+                finally:
+                    connection_allowed.set()
+                    handler.close_forwarding()
+                self.assertFalse(handler._worker.is_alive())
 
         for method_name, expected_stage in (
             ("emit", "forward-send"),
             ("close", "forward-close"),
         ):
-            with self.subTest(method_name=method_name):
-                connection = connected_socket()
-                failure_callback = Mock()
-                with patch(
-                    "hbrowser.gallery.utils._log_forwarding.socket.create_connection",
-                    return_value=connection,
-                ):
-                    handler = ForwardingHandler(
-                        "127.0.0.1:43210",
-                        "a" * 64,
-                        failure_callback=failure_callback,
-                    )
+            with (
+                self.subTest(method_name=method_name),
+                connected_handler() as (handler, connection, failure_callback),
+            ):
                 connection.sendall.side_effect = OSError(
                     errno.EPIPE,
                     "private transport detail",
@@ -567,7 +601,6 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                 self.assertTrue(_wait_until(failure_was_reported))
                 failure_callback.assert_called_once()
                 self.assertEqual(failure_callback.call_args.args[0], expected_stage)
-                handler.close_forwarding()
 
     def test_forwarding_close_fences_an_in_progress_record_encode(self) -> None:
         delivered: list[object] = []

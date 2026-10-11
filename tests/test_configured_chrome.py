@@ -235,7 +235,11 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--disable-extensions", parameters)
         self.register.assert_called_once_with(self.browser)
         self.setup.assert_awaited_once_with(
-            self.browser, self.page, False, deadline=ANY
+            self.browser,
+            self.page,
+            False,
+            proxy_extension=str(self.extension) if proxy else None,
+            deadline=ANY,
         )
 
         await factory.stop_browser(self.browser)
