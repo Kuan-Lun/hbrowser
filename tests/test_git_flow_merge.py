@@ -122,6 +122,8 @@ fi
 """,
     )
 
+    shutil.copy2(_PROJECT_ROOT / "AGENTS.md", repository / "AGENTS.md")
+    shutil.copy2(_PROJECT_ROOT / "scripts/review-code.py", scripts / "review-code.py")
     (repository / ".gitignore").write_text(".venv/\n")
     (repository / "payload.txt").write_text("base\n")
     _git(repository, "add", ".")

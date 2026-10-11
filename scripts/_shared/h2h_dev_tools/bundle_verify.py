@@ -15,20 +15,21 @@ from typing import TypedDict, cast
 BUNDLE_DIRECTORY = Path("scripts/_shared/h2h_dev_tools")
 MANIFEST_NAME = "manifest.json"
 BASE_FILES = frozenset({"__init__.py", "bundle_verify.py"})
+_MERGE_REVIEW_FILES = frozenset(
+    {
+        "code_review.py",
+        "process.py",
+        "change_scope.py",
+        "review-merge-candidate.sh",
+        "merge_command.py",
+        "git-flow-merge.sh",
+        "primary-branch.sh",
+    }
+)
 COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
-    "code-review": frozenset(
-        {
-            "code_review.py",
-            "process.py",
-            "change_scope.py",
-            "review-merge-candidate.sh",
-            "merge_command.py",
-            "git-flow-merge.sh",
-            "primary-branch.sh",
-        }
-    ),
+    "code-review": _MERGE_REVIEW_FILES,
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),
@@ -39,9 +40,7 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),
     "primary-branch": frozenset({"primary-branch.sh"}),
-    "git-flow": frozenset(
-        {"primary-branch.sh", "git-flow-merge.sh", "merge_command.py", "process.py"}
-    ),
+    "git-flow": _MERGE_REVIEW_FILES,
     "hooks": frozenset({"primary-branch.sh", "install-git-hooks.sh"}),
     "environment": frozenset({"rebuild-env.sh"}),
 }

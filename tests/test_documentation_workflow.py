@@ -98,6 +98,7 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
     ):
         _git(repository, "config", name, value)
     for name in (
+        "AGENTS.md",
         "scripts/detect-primary-branch.sh",
         "scripts/git-flow-merge.sh",
         "scripts/review-merge-candidate.sh",
