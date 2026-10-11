@@ -80,6 +80,11 @@ def _initialize_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     shutil.copy2(_MERGE_SCRIPT, scripts / _MERGE_SCRIPT.name)
     shutil.copy2(_PRIMARY_SCRIPT, scripts / _PRIMARY_SCRIPT.name)
     shutil.copy2(_INSTALL_SCRIPT, scripts / _INSTALL_SCRIPT.name)
+    shutil.copytree(
+        _PROJECT_ROOT / "scripts/_shared",
+        scripts / "_shared",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
 
     hooks = repository / ".githooks"
     hooks.mkdir()
@@ -540,6 +545,11 @@ def test_hook_installation_repairs_unsafe_settings_idempotently(
     _git(repository, "config", "pull.ff", "false")
     _git(repository, "config", f"branch.{primary}.mergeOptions", "--ff")
     _git(repository, "config", "core.hooksPath", "unused-hooks")
+    rejected = _run(repository, "scripts/install-git-hooks.sh", check=False)
+    assert rejected.returncode != 0
+    assert "Refusing to replace" in rejected.stderr
+    assert _git_stdout(repository, "config", "core.hooksPath") == "unused-hooks"
+    _git(repository, "config", "--unset", "core.hooksPath")
 
     for _ in range(2):
         _run(repository, "scripts/install-git-hooks.sh")

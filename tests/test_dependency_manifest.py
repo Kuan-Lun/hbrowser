@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import runpy
 from pathlib import Path
 
@@ -13,10 +14,10 @@ def test_audit_writer_and_validator_share_manifest_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.syspath_prepend(_ROOT / "scripts")
-    audit = runpy.run_path(str(_ROOT / "scripts/audit-dependencies.py"))
-    gate = runpy.run_path(str(_ROOT / "scripts/check-version.py"))
-    serialize = audit["dependency_manifest"]
-    assert serialize is gate["dependency_manifest"]
+    audit = importlib.import_module("_shared.h2h_dev_tools.dependency_audit")
+    gate = importlib.import_module("_shared.h2h_dev_tools.version_policy")
+    serialize = audit.dependency_manifest
+    assert serialize is gate.dependency_manifest
 
 
 def test_manifest_has_stable_canonical_bytes(

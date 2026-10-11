@@ -75,4 +75,27 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 
 [tool.h2h.version]
+development-paths = [
+    ".Codex/**",
+    ".claude/**",
+    ".gitattributes",
+    ".github/**",
+    ".githooks/**",
+    ".gitignore",
+    ".markdownlint-cli2.jsonc",
+    ".release/**",
+    ".vscode/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "*.md",
+    "docs/**",
+    "mypy.ini",
+    "package.json",
+    "scripts/**",
+    "tests/**",
+]
 release-paths = ["LICENSE", "hbrowser/**"]
+
+[tool.h2h-dev-tools]
+components = ["distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-flow", "hooks", "primary-branch", "version-policy"]

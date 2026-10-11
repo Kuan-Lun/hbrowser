@@ -83,7 +83,9 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
         repository,
         "pyproject.toml",
         '[project]\nname = "workflow-fixture"\nversion = "0.1.0"\n'
-        '[tool.h2h.version]\nrelease-paths = ["src/**"]\n',
+        '[tool.h2h.version]\nrelease-paths = ["src/**"]\n'
+        'development-paths = ["README.md", "docs/**", "tests/**", '
+        '"scripts/**", "AGENTS.md"]\n',
     )
     _write(
         repository,
