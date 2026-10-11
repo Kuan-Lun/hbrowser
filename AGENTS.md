@@ -126,6 +126,13 @@
 - Repository 的版本、audit、release gate、Git lifecycle 與測試選擇政策仍由
   本 repository 擁有；shared mechanisms 不取代這些政策。
 
+- `[tool.h2h-dev-tools].components` 明列本 repo 使用的共用機制；快照使用
+  schema 2，必須驗證選擇、完整依賴檔案與雜湊。舊 schema 1 僅用明確的
+  `h2h-dev-tools migrate-v1 --repository` 一次性轉換，不在 hooks 保留 fallback。
+- Git、version、audit、環境、formal 執行與 process ownership 的通用機制可由
+  toolkit 擁有；release paths、review/gate 入口、pytest selectors、timeout
+  budgets、formal targets 與領域驗收仍由本 repo 宣告並驗證。
+
 ## 品質工具
 
 - `pyproject.toml` 是 Ruff與 mypy的唯一規則來源。

@@ -10,6 +10,7 @@ on:
       - hbrowser/**
       - pyproject.toml
       - scripts/check-process-ownership.sh
+      - scripts/check-publish-version.py
       - scripts/install-ci-dependencies.py
       - scripts/_shared/**
       - tests/**
@@ -70,31 +71,7 @@ jobs:
 
       - name: Check whether this version is unpublished
         id: version
-        run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import tomllib
-          import urllib.request
-
-          from packaging.version import Version
-
-          with open("pyproject.toml", "rb") as project_file:
-              current = Version(tomllib.load(project_file)["project"]["version"])
-          with urllib.request.urlopen(
-              "https://pypi.org/pypi/hbrowser/json",
-              timeout=30,
-          ) as response:
-              published = Version(json.load(response)["info"]["version"])
-
-          if current < published:
-              raise SystemExit(
-                  f"Project version {current} is older than published version {published}"
-              )
-
-          print(f"current={current}")
-          print(f"published={published}")
-          print(f"publish={'true' if current > published else 'false'}")
-          PY
+        run: python scripts/check-publish-version.py >> "$GITHUB_OUTPUT"
 
       - name: Build
         if: steps.version.outputs.publish == 'true'
