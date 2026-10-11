@@ -394,16 +394,15 @@ class BrowserOwner[BrowserT, TabT]:
 
             try:
                 tab = await self._tab_factory(browser)
-            except (
-                BrowserMutationOutcomeUnknownError,
-                ZendriverOperationTimeout,
-                asyncio.CancelledError,
-            ):
+                transport = self._bind_tab(role, tab)
+                if url is not None:
+                    await transport.navigate(url)
+            except BaseException:
+                # Once creation starts, a target may exist even if discovery,
+                # binding, or initial navigation fails. Keep the whole browser
+                # for cleanup and reject commands on every existing transport.
                 self._state = BrowserOwnerState.CLOSING
                 raise
-            transport = self._bind_tab(role, tab)
-            if url is not None:
-                await transport.navigate(url)
             return transport
 
     def _shared_close_deadline(

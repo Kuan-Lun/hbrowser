@@ -3,7 +3,7 @@ import unittest
 from collections.abc import Awaitable, Callable
 from dataclasses import FrozenInstanceError, dataclass
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import (
@@ -17,6 +17,7 @@ from hbrowser.gallery.browser import (
 from hbrowser.gallery.browser import owner as owner_module
 from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
 from hbrowser.gallery.utils import deadline as deadline_module
+from hbrowser.gallery.utils.page_state import PageStateTimeout
 
 
 @dataclass(slots=True)
@@ -67,6 +68,7 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         failures = (
             ZendriverOperationTimeout(timeout_seconds=1),
+            PageStateTimeout("target readiness not confirmed"),
             BrowserMutationOutcomeUnknownError("navigation outcome unknown"),
             asyncio.CancelledError(),
         )
@@ -93,6 +95,44 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
                     await owner.close()
                 closer.assert_awaited_once_with(browser, ANY)
                 self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_created_target_missing_from_inventory_retires_owner(self) -> None:
+        main = _FakeTab("main-target")
+        browser = SimpleNamespace(targets=[])
+        connection = SimpleNamespace(
+            _owner=browser,
+            websocket=object(),
+            mapper={},
+            add_handler=Mock(),
+            remove_handlers=Mock(),
+            send=AsyncMock(return_value="created-target"),
+        )
+        browser.connection = connection
+        closer = AsyncMock()
+        owner: BrowserOwner[SimpleNamespace, _FakeTab] = BrowserOwner(
+            browser_factory=AsyncMock(return_value=(browser, main)),
+            browser_closer=closer,
+            target_id_getter=lambda tab: tab.target_id,
+        )
+        await owner.start()
+        try:
+            with (
+                patch.object(owner_module, "_TAB_OPEN_DEADLINE_SECONDS", 0.02),
+                self.assertRaises(PageStateTimeout),
+            ):
+                await owner.open_tab("unconfirmed")
+            connection.send.assert_awaited_once()
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            mutation = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(mutation)
+            with self.assertRaises(BrowserOwnerStateError):
+                await owner.open_tab("unconfirmed")
+            mutation.assert_not_awaited()
+            self.assertEqual(len(owner.tabs), 1)
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
 
     def _owner(
         self,
@@ -594,6 +634,9 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(TabBindingError, "already bound to role"):
             await owner.open_tab("isekai")
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+        with self.assertRaises(TabTransportUnavailableError):
+            await owner.main_tab.execute(AsyncMock())
 
     async def test_failed_main_tab_binding_closes_launched_browser(self) -> None:
         main = _FakeTab("")
