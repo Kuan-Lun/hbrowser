@@ -15,7 +15,13 @@ from functools import partial
 from typing import Any, Self, cast
 from uuid import uuid4
 
-from ..utils import Deadline, navigate_and_wait, open_tab_and_wait
+from ...exceptions import BrowserMutationOutcomeUnknownError
+from ..utils import (
+    Deadline,
+    ZendriverOperationTimeout,
+    navigate_and_wait,
+    open_tab_and_wait,
+)
 from .factory import create_browser, stop_browser
 
 _TAB_OPEN_DEADLINE_SECONDS = 10.0
@@ -302,12 +308,25 @@ class BrowserOwner[BrowserT, TabT]:
         transport = TabTransport(
             handle=handle,
             tab=tab,
-            navigate_tab=self._tab_navigator,
+            navigate_tab=self._navigate_owned_tab,
             is_owner_open=lambda: self._state is BrowserOwnerState.OPEN,
         )
         self._tabs_by_role[role] = transport
         self._tabs_by_target[target_id] = transport
         return transport
+
+    async def _navigate_owned_tab(self, tab: TabT, url: str) -> None:
+        try:
+            await self._tab_navigator(tab, url)
+        except (
+            BrowserMutationOutcomeUnknownError,
+            ZendriverOperationTimeout,
+            asyncio.CancelledError,
+        ):
+            # Keep every transport and the browser for controlled shutdown,
+            # but reject commands against this uncertain generation.
+            self._state = BrowserOwnerState.CLOSING
+            raise
 
     async def start(self) -> Self:
         """Launch and bind the browser factory's main tab exactly once."""
@@ -373,7 +392,15 @@ class BrowserOwner[BrowserT, TabT]:
             if browser is None:  # Defensive invariant guard for injected fakes.
                 raise BrowserOwnerStateError("open owner has no browser instance")
 
-            tab = await self._tab_factory(browser)
+            try:
+                tab = await self._tab_factory(browser)
+            except (
+                BrowserMutationOutcomeUnknownError,
+                ZendriverOperationTimeout,
+                asyncio.CancelledError,
+            ):
+                self._state = BrowserOwnerState.CLOSING
+                raise
             transport = self._bind_tab(role, tab)
             if url is not None:
                 await transport.navigate(url)

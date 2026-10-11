@@ -30,6 +30,70 @@ class _FakeBrowser:
 
 
 class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_navigation_of_existing_tab_retires_generation(self) -> None:
+        owner, browser, closer, _ = self._owner(
+            tab_navigator=AsyncMock(
+                side_effect=BrowserMutationOutcomeUnknownError("unknown")
+            )
+        )
+        await owner.start()
+        try:
+            with self.assertRaises(BrowserMutationOutcomeUnknownError):
+                await owner.main_tab.navigate("https://example.test/")
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(AsyncMock())
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_unknown_tab_creation_retires_existing_transports(self) -> None:
+        owner, browser, closer, tab_factory = self._owner()
+        tab_factory.side_effect = BrowserMutationOutcomeUnknownError("unknown")
+        await owner.start()
+        try:
+            with self.assertRaises(BrowserMutationOutcomeUnknownError):
+                await owner.open_tab("new")
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            self.assertEqual(len(owner.tabs), 1)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(AsyncMock())
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_unknown_initial_navigation_retires_all_owned_transports(
+        self,
+    ) -> None:
+        failures = (
+            ZendriverOperationTimeout(timeout_seconds=1),
+            BrowserMutationOutcomeUnknownError("navigation outcome unknown"),
+            asyncio.CancelledError(),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                navigator = AsyncMock(side_effect=failure)
+                owner, browser, closer, _ = self._owner(
+                    extra_tabs=[_FakeTab("new-target")], tab_navigator=navigator
+                )
+                await owner.start()
+                try:
+                    with self.assertRaises(type(failure)):
+                        await owner.open_tab("new", url="https://example.test/")
+                    self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                    mutation = AsyncMock()
+                    for transport in owner.tabs:
+                        with self.assertRaises(TabTransportUnavailableError):
+                            await transport.execute(mutation)
+                    mutation.assert_not_awaited()
+                    with self.assertRaises(BrowserOwnerStateError):
+                        await owner.open_tab("later")
+                    closer.assert_not_awaited()
+                finally:
+                    await owner.close()
+                closer.assert_awaited_once_with(browser, ANY)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
     def _owner(
         self,
         *,
