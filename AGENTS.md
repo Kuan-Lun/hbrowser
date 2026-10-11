@@ -219,6 +219,10 @@
 - Online review 可使用已登入的 Codex 服務，需要 repository-local `.venv`
   與 PATH 中的 `codex`。使用 read-only sandbox；不得修改檔案、執行
   merge/gate、啟動服務或自動修正，不要求 GitHub PR、Actions 或 Stop hook。
+- Review 使用一般 Codex CLI session，保留 CLI rollout，讓審查子代理可以
+  找到 parent thread；不得使用 `--ephemeral`，亦不得自動刪除 CLI 紀錄。
+  Read-only sandbox、完整審查覆蓋、approval policy 與 owned cleanup 契約
+  維持不變。
 - Review 的單次 Codex invocation 固定 `notify=[]`，防止非同步完成通知在
   CLI 退出後留下子程序。保留既有模型、認證、其他工具、plugins、MCP 與安全
   hooks 設定，不修改全域配置；其他 descendants 仍須符合相同 cleanup 契約。

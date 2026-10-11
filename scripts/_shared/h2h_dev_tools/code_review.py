@@ -766,7 +766,6 @@ class Reviewer:
             # Completion notifications can outlive the CLI's owned command.
             "-c",
             "notify=[]",
-            "--ephemeral",
             "--json",
             "--output-schema",
             str(schema_path),
