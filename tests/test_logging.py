@@ -776,7 +776,16 @@ close_forwarded_logging()
         self.assertEqual(health.forwarding_operation, "forward-protocol")
 
     def test_close_drains_authenticated_client_before_segment_close(self) -> None:
-        with TemporaryDirectory() as directory_name:
+        original_accept = LogForwardingReceiver._accept_connections
+
+        def delayed_accept(receiver: LogForwardingReceiver) -> None:
+            time.sleep(0.1)
+            original_accept(receiver)
+
+        with (
+            TemporaryDirectory() as directory_name,
+            patch.object(LogForwardingReceiver, "_accept_connections", delayed_accept),
+        ):
             directory = Path(directory_name)
             with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
                 configure_logging(console_level=LogLevel.CRITICAL)
@@ -808,6 +817,15 @@ close_forwarded_logging()
                     connection.sendall(
                         _raw_forwarding_frame(
                             {
+                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
+                                "type": "hello",
+                            }
+                        )
+                    )
+                    ForwardingHandler._receive_ready(connection)
+                    connection.sendall(
+                        _raw_forwarding_frame(
+                            {
                                 "record": record,
                                 "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "record",
@@ -827,6 +845,151 @@ close_forwarded_logging()
             [event["message"] for event in events], ["drained before close"]
         )
         self.assertFalse(logging_health().forwarding_degraded)
+
+    def _client_thread_start_failure(self, *, reporting_thread_fails: bool) -> None:
+        original_start = Thread.start
+        failures: list[str] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name == "hbrowser-log-forwarding-client" or (
+                reporting_thread_fails
+                and thread.name
+                in {
+                    "hbrowser-log-forwarding-receiver-failure",
+                    "hbrowser-log-health-diagnostic",
+                }
+            ):
+                failures.append(thread.name)
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        with TemporaryDirectory() as directory_name:
+            with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                receiver = start_log_forwarding_receiver()
+                assert receiver is not None
+                host, port = receiver.endpoint.split(":", 1)
+                connection: socket.socket | None = None
+                try:
+                    with patch.object(Thread, "start", start):
+                        connection = socket.create_connection((host, int(port)), 2)
+                        self.assertTrue(
+                            _wait_until(lambda: not receiver._accept_thread.is_alive())
+                        )
+                        self.assertFalse(receiver._clients)
+                        self.assertTrue(logging_health().forwarding_degraded)
+                        self.assertEqual(
+                            logging_health().forwarding_operation, "forward-accept"
+                        )
+                        if reporting_thread_fails:
+                            self.assertIn("hbrowser-log-health-diagnostic", failures)
+                        with self.assertRaisesRegex(RuntimeError, "stopping"):
+                            receiver.child_environment()
+                        connection.settimeout(1)
+                        self.assertEqual(connection.recv(1), b"")
+                finally:
+                    if connection is not None:
+                        connection.close()
+                    # Clean the intentional old-source leak after a red assertion.
+                    with receiver._clients_lock:
+                        abandoned = tuple(receiver._clients)
+                        receiver._clients.clear()
+                    for client in abandoned:
+                        client.connection.close()
+                    receiver.close()
+
+    def test_client_thread_start_failure_closes_socket_and_latches_health(self) -> None:
+        self._client_thread_start_failure(reporting_thread_fails=False)
+
+    def test_client_start_health_survives_failure_notifier_start_failure(self) -> None:
+        self._client_thread_start_failure(reporting_thread_fails=True)
+
+    def test_receiver_constructor_thread_failure_closes_listener(self) -> None:
+        original_start = Thread.start
+        original_socket = socket.socket
+        listeners: list[socket.socket] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name == "hbrowser-log-forwarding-accept":
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        def new_socket(*args: Any, **kwargs: Any) -> socket.socket:
+            listener = original_socket(*args, **kwargs)
+            listeners.append(listener)
+            return listener
+
+        with TemporaryDirectory() as directory_name:
+            with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                try:
+                    with (
+                        patch.object(Thread, "start", start),
+                        patch.object(socket, "socket", new_socket),
+                    ):
+                        self.assertIsNone(start_log_forwarding_receiver())
+                    self.assertTrue(listeners)
+                    self.assertTrue(all(item.fileno() == -1 for item in listeners))
+                    self.assertTrue(logging_health().forwarding_degraded)
+                finally:
+                    for listener in listeners:
+                        listener.close()
+
+    def test_sender_constructor_thread_failure_can_close_partial_handler(self) -> None:
+        handler = ForwardingHandler.__new__(ForwardingHandler)
+        with patch.object(Thread, "start", side_effect=RuntimeError("no thread")):
+            with self.assertRaisesRegex(RuntimeError, "no thread"):
+                ForwardingHandler.__init__(
+                    handler, "127.0.0.1:1", "1" * 64, failure_callback=lambda *_: None
+                )
+        try:
+            handler.close_forwarding()
+            self.assertTrue(handler._stopped.is_set())
+        finally:
+            # Keep the intentional old partial object from breaking atexit.
+            handler._worker_survived_fork = False
+            handler._stopped.set()
+            logging.Handler.close(handler)
+
+    def test_sender_health_does_not_require_failure_notifier_thread(self) -> None:
+        original_start = Thread.start
+        failed_starts: list[str] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name in {
+                "hbrowser-log-forwarding-failure",
+                "hbrowser-log-health-diagnostic",
+            }:
+                failed_starts.append(thread.name)
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:1",
+                    "HBROWSER_LOG_FORWARD_TOKEN": os.urandom(32).hex(),
+                },
+            ),
+            patch.object(Thread, "start", start),
+            patch.object(
+                socket,
+                "create_connection",
+                side_effect=ConnectionRefusedError(errno.ECONNREFUSED, "unavailable"),
+            ),
+        ):
+            try:
+                configure_forwarded_logging()
+                self.assertTrue(
+                    _wait_until(lambda: logging_health().forwarding_degraded)
+                )
+                self.assertEqual(
+                    logging_health().forwarding_operation, "forward-configure"
+                )
+                self.assertIn("hbrowser-log-health-diagnostic", failed_starts)
+            finally:
+                close_forwarded_logging()
 
     def test_receiver_close_is_bounded_when_delivery_callback_never_returns(
         self,

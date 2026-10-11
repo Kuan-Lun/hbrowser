@@ -1497,7 +1497,7 @@ def start_log_forwarding_receiver() -> LogForwardingReceiver | None:
         try:
             receiver = LogForwardingReceiver(
                 delivery_callback=_deliver_forwarded_record,
-                failure_callback=_record_forwarding_failure,
+                _failure_recorder=_record_forwarding_failure,
             )
         except Exception as error:
             _record_forwarding_failure("forward-configure", error)
@@ -1562,7 +1562,7 @@ def configure_forwarded_logging() -> None:
                 forwarding_handler = ForwardingHandler(
                     endpoint,
                     token,
-                    failure_callback=_record_forwarding_failure,
+                    _failure_recorder=_record_forwarding_failure,
                 )
             except Exception as error:
                 _record_forwarding_failure("forward-configure", error)
