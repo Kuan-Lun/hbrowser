@@ -516,6 +516,27 @@ class ProcessControlProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
 class PosixOwnedProcessTests(unittest.TestCase):
+    def test_supervisor_preflight_tests_preserve_process_signal_handlers(self) -> None:
+        for name in (
+            "test_missing_waitid_primitive_fails_before_target_popen",
+            "test_missing_trusted_ps_fails_before_target_popen",
+            "test_unusable_ps_fails_before_target_popen",
+        ):
+            with self.subTest(test=name):
+                previous = {
+                    signum: signal.getsignal(signum)
+                    for signum in (signal.SIGINT, signal.SIGTERM)
+                }
+                try:
+                    result = unittest.TestResult()
+                    PosixOwnedProcessTests(name).run(result)
+                    self.assertTrue(result.wasSuccessful(), result.errors)
+                    for signum, handler in previous.items():
+                        self.assertIs(signal.getsignal(signum), handler)
+                finally:
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+
     def test_start_reader_leaves_same_write_control_tail_for_cancel_barrier(
         self,
     ) -> None:
@@ -806,6 +827,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     "_posix_exit_receipts_supported",
                     return_value=False,
                 ),
+                patch.object(signal, "signal"),
                 patch.object(subprocess, "Popen") as popen,
             ):
                 result = supervisor_module.main(
@@ -842,6 +864,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     return_value=True,
                 ),
                 patch.object(supervisor_module, "_POSIX_PS_EXECUTABLE", None),
+                patch.object(signal, "signal"),
                 patch.object(subprocess, "Popen") as popen,
             ):
                 result = supervisor_module.main(
@@ -898,6 +921,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                         return_value=(None if run_effect is not None else failure),
                         side_effect=run_effect,
                     ),
+                    patch.object(signal, "signal"),
                     patch.object(subprocess, "Popen") as popen,
                 ):
                     result = supervisor_module.main(
