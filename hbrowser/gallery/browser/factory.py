@@ -40,8 +40,8 @@ from .process import (
 from .proxy import (
     configure_proxy,
     find_available_port,
-    has_residential_proxy,
     verify_proxy_ip,
+    verify_residential_proxy,
 )
 from .tor import (
     TOR_SOCKS_PORT,
@@ -400,9 +400,13 @@ async def _post_create_setup(
     page: zd.Tab,
     use_tor: bool,
     *,
+    proxy_extension: str | None = None,
     deadline: Deadline,
 ) -> None:
     from zendriver import cdp
+
+    if proxy_extension is not None:
+        await verify_residential_proxy(browser, proxy_extension, deadline=deadline)
 
     command_timeout = min(
         _PAGE_SETUP_MUTATION_TIMEOUT_SECONDS,
@@ -417,7 +421,7 @@ async def _post_create_setup(
         operation="Browser geolocation reset",
     )
 
-    if use_tor and not has_residential_proxy():
+    if use_tor or proxy_extension is not None:
         await verify_proxy_ip(browser, page, deadline=deadline)
 
 
@@ -1185,6 +1189,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             browser,
             page,
             use_tor,
+            proxy_extension=proxy_extension,
             deadline=browser_attach_deadline,
         )
         logger.info("Browser ready (%s, %s)", mode, connection)

@@ -911,6 +911,62 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["post-setup"])
         register_atexit.assert_called_once_with(browser)
 
+    async def test_residential_proxy_is_verified_before_browser_publication(
+        self,
+    ) -> None:
+        from hbrowser.gallery.browser.proxy import ProxyVerificationError
+
+        for verification_error in (None, ProxyVerificationError("proxy not applied")):
+            with self.subTest(verification_error=verification_error):
+                page = _tab()
+                browser = _Browser(page, tabs=[page])
+                browser.start = AsyncMock(return_value=browser)  # type: ignore[attr-defined]
+                page.browser = cast(zd.Browser, browser)
+                verify = AsyncMock(side_effect=verification_error)
+                with (
+                    patch.object(factory, "should_use_tor", return_value=False),
+                    patch.object(factory, "configure_proxy", return_value="/proxy"),
+                    patch.object(
+                        factory,
+                        "_install_chrome_in_owned_worker",
+                        new=AsyncMock(
+                            return_value=SimpleNamespace(chrome="/test/chrome")
+                        ),
+                    ),
+                    patch.object(factory, "_build_config", return_value=object()),
+                    patch.object(
+                        factory,
+                        "_construct_owned_browser_async",
+                        new=AsyncMock(return_value=browser),
+                    ),
+                    patch.object(factory, "_register_browser_atexit"),
+                    patch.object(page, "send", new=AsyncMock()),
+                    patch.object(
+                        factory, "verify_proxy_ip", new=AsyncMock()
+                    ) as ip_probe,
+                    patch.object(factory, "verify_residential_proxy", new=verify),
+                    patch.object(factory, "stop_browser", new=AsyncMock()) as stop,
+                ):
+                    if verification_error is None:
+                        result = await factory.create_browser()
+                        self.assertEqual(result, (browser, page))
+                        stop.assert_not_awaited()
+                    else:
+                        with self.assertRaises(ProxyVerificationError) as raised:
+                            await factory.create_browser()
+                        self.assertIs(raised.exception, verification_error)
+                        stop.assert_awaited_once_with(browser, unittest.mock.ANY)
+
+                verify.assert_awaited_once_with(
+                    browser, "/proxy", deadline=unittest.mock.ANY
+                )
+                if verification_error is None:
+                    ip_probe.assert_awaited_once_with(
+                        browser, page, deadline=unittest.mock.ANY
+                    )
+                else:
+                    ip_probe.assert_not_awaited()
+
     async def test_main_tab_failure_stops_browser_without_post_setup(self) -> None:
         browser = _Browser(None)
         browser.start = AsyncMock(return_value=browser)  # type: ignore[attr-defined]

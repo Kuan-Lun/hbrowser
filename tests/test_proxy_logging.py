@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError, ProcessOwnershipError
@@ -23,12 +24,17 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 let authenticate;
 const context = {chrome: {
-    proxy: {settings: {set() {}}},
+    runtime: {},
+    proxy: {settings: {set(_settings, done) {done();}}},
     webRequest: {onAuthRequired: {addListener(callback) {authenticate = callback;}}}
 }};
 vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), context);
 const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
-process.stdout.write(JSON.stringify(cases.map(details => authenticate(details))));
+process.stdout.write(JSON.stringify(cases.map(details => {
+    let response;
+    authenticate(details, value => {response = value;});
+    return response;
+})));
 """
         details: list[dict[str, object]] = [
             {"isProxy": False, "challenger": {"host": "proxy.example", "port": 8443}},
@@ -59,6 +65,69 @@ process.stdout.write(JSON.stringify(cases.map(details => authenticate(details)))
                 {"authCredentials": {"username": "u", "password": "p"}},
             ],
         )
+
+    def test_extension_receipt_requires_effective_config_and_auth_listener(
+        self,
+    ) -> None:
+        harness = """
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const token = fs.readFileSync(process.argv[2], 'utf8');
+async function probe(change) {
+    let callback;
+    let configured;
+    const runtime = {};
+    const context = {chrome: {runtime,
+        proxy: {settings: {
+            set(value, done) {
+                configured = value.value;
+                if (change === 'set-error') runtime.lastError = {message: 'failed'};
+                done();
+                delete runtime.lastError;
+            },
+            get(_request, done) {
+                if (change === 'direct') configured.mode = 'direct';
+                if (change === 'wrong-server') configured.rules.singleProxy.port = 1;
+                if (change === 'bypass') configured.rules.bypassList = ['*'];
+                done({value: configured, levelOfControl:
+                    change === 'other-extension' ? 'controlled_by_other_extensions'
+                                                : 'controlled_by_this_extension'});
+            }
+        }},
+        webRequest: {onAuthRequired: {
+            addListener(value) {callback = value;},
+            hasListener(value) {return change !== 'no-listener' && value === callback;}
+        }}
+    }};
+    vm.runInNewContext(source, context);
+    return await context.hbrowserProxyReady(change === 'wrong-token' ? 'other' : token);
+}
+(async () => process.stdout.write(JSON.stringify(await Promise.all([
+    'valid', 'set-error', 'direct', 'wrong-server', 'bypass',
+    'other-extension', 'no-listener', 'wrong-token'
+].map(probe)))))();
+"""
+        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        self.addCleanup(shutil.rmtree, directory)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["manifest_version"], 3)
+        self.assertIn("webRequestAuthProvider", manifest["permissions"])
+        self.assertNotIn("webRequestBlocking", manifest["permissions"])
+        result = subprocess.run(
+            [
+                "node",
+                "-e",
+                harness,
+                str(directory / "background.js"),
+                str(directory / "verification-token"),
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        self.assertEqual(json.loads(result.stdout), [True] + [False] * 7)
 
     def test_authenticated_proxy_log_does_not_include_credentials(self) -> None:
         logger = Mock()
@@ -166,6 +235,54 @@ process.stdout.write(JSON.stringify(cases.map(details => authenticate(details)))
 
 
 class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_residential_extension_missing_or_failed_never_navigates(
+        self,
+    ) -> None:
+        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        self.addCleanup(shutil.rmtree, directory)
+        for state in ("missing", "rejected", "script-error"):
+            with self.subTest(state=state):
+                target = SimpleNamespace(
+                    type_="service_worker",
+                    url="chrome-extension://owned/background.js",
+                    send=AsyncMock(
+                        return_value=(
+                            SimpleNamespace(value=False),
+                            object() if state == "script-error" else None,
+                        )
+                    ),
+                )
+                browser = SimpleNamespace(
+                    targets=[] if state == "missing" else [target]
+                )
+                with (
+                    patch.object(
+                        proxy, "navigate_and_wait", new=AsyncMock()
+                    ) as navigate,
+                    self.assertRaises(proxy.ProxyVerificationError),
+                ):
+                    await proxy.verify_residential_proxy(
+                        browser,
+                        str(directory),
+                        deadline=Deadline.after(0.02),
+                    )
+                navigate.assert_not_awaited()
+
+    async def test_residential_extension_accepts_only_boolean_receipt(self) -> None:
+        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        self.addCleanup(shutil.rmtree, directory)
+        target = SimpleNamespace(
+            type_="service_worker",
+            url="chrome-extension://owned/background.js",
+            send=AsyncMock(return_value=(SimpleNamespace(value=True), None)),
+        )
+        await proxy.verify_residential_proxy(
+            SimpleNamespace(targets=[target]),
+            str(directory),
+            deadline=Deadline.after(1),
+        )
+        target.send.assert_awaited_once()
+
     async def test_direct_ip_hang_is_cancelled_and_fails_closed(self) -> None:
         cancelled = False
         closed = False

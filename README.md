@@ -160,12 +160,20 @@ match await driver.punchin():
 | 環境變數 | 用途 |
 | --- | --- |
 | `HBROWSER_CHROME_EXECUTABLE` | 指定 Chrome 執行檔的絕對路徑，略過自動安裝；必須是可執行的檔案。 |
+| `RP_DNS`、`RP_USERNAME`、`RP_PASSWORD` | 住宅 HTTP 代理的 `host:port` 與認證；三者須一起提供。 |
 | `USE_TOR` | `0` 停用 Tor，`1` 啟用 Tor；未設定時自動偵測。 |
 | `TOR_BINARY_PATH` | 自動偵測不到 Tor 時，指定其執行檔路徑。 |
 | `FLARESOLVERR_URL` | 選用的 FlareSolverr `/v1` 端點，例如 `http://127.0.0.1:8191/v1`。 |
 
 FlareSolverr 可協助處理支援的 Cloudflare 與登入驗證；它必須與 HBrowser 使用相同的
 對外網路路徑。啟用 Tor 或住宅代理時，HBrowser 會停用 FlareSolverr 整合。
+
+住宅代理使用 Manifest V3 擴充功能。請使用支援命令列載入 unpacked extension 的
+Chrome for Testing 或 Chromium；Chrome branded builds 自 137 起移除
+[`--load-extension`](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY/m/S0ET5wPjCAAJ)，
+因此這類指定執行檔不能用於住宅代理。HBrowser 在任何網路導航前，先核對本次
+擴充功能的認證 listener 與 Chrome 實際代理設定，再驗證出口 IP。擴充功能未載入、
+設定未生效或驗證失敗時會清理並拒絕啟動，不退回直接連線或 Manifest V2。
 
 Driver 預設 `headless=True`。無法自動完成驗證時，這個模式會失敗；需要人工操作時改用
 `headless=False`。人工驗證預設等待 180 秒，可以在建立 driver 時設定
