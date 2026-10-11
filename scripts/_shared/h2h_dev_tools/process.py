@@ -341,7 +341,9 @@ def _start_posix_process(phase: ProcessCommand) -> subprocess.Popen[bytes]:
     )
 
 
-def _windows_supervisor_launch(phase: ProcessCommand) -> tuple[str, dict[str, str]]:
+def _windows_supervisor_launch(
+    phase: ProcessCommand,
+) -> tuple[tuple[str, ...], dict[str, str]]:
     executable = sys.executable
     base_executable = getattr(sys, "_base_executable", None)
     if not isinstance(base_executable, str) or not base_executable:
@@ -354,7 +356,16 @@ def _windows_supervisor_launch(phase: ProcessCommand) -> tuple[str, dict[str, st
         if not Path(base_executable).is_file():
             raise RuntimeError("Windows Python base executable is unavailable")
         executable = base_executable
-    return executable, environment
+    return (
+        executable,
+        # Python startup must not run environment/site hooks before Job.assign.
+        # Flags isolate only this supervisor; the admitted child keeps its env.
+        "-I",
+        "-S",
+        str(Path(__file__).resolve()),
+        _WINDOWS_SUPERVISOR_MODE,
+        *phase.argv,
+    ), environment
 
 
 def _cleanup_windows_supervisor(
@@ -407,7 +418,6 @@ def _start_windows_process(
     deadline: float,
     signal_controller: SignalController | None,
 ) -> OwnedProcess:
-    command = phase.argv
     creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     if not isinstance(creation_flag, int) or creation_flag == 0:
         raise ProcessOwnershipError(phase.label) from None
@@ -419,14 +429,9 @@ def _start_windows_process(
         with defer_signal_interrupts(signal_controller):
             try:
                 job = WindowsJob.create()
-                executable, environment = _windows_supervisor_launch(phase)
+                command, environment = _windows_supervisor_launch(phase)
                 supervisor = subprocess.Popen(
-                    (
-                        executable,
-                        str(Path(__file__).resolve()),
-                        _WINDOWS_SUPERVISOR_MODE,
-                        *command,
-                    ),
+                    command,
                     cwd=phase.cwd,
                     env=environment,
                     stdout=phase.stdout,

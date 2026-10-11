@@ -11,39 +11,22 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("offline_code_review_cli")
+
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-_FAKE_REVIEW = r"""from pathlib import Path
-import json
+_REVIEW_ENTRY = r"""from pathlib import Path
 import os
-import subprocess
 import sys
-import tomllib
+
+sys.dont_write_bytecode = True
+from _shared.h2h_dev_tools.code_review import main
 
 trace = Path(os.environ["DOCUMENTATION_WORKFLOW_TRACE"])
-receipt = trace.with_suffix(".review")
-command = sys.argv[1]
 with trace.open("a", encoding="utf-8") as stream:
-    stream.write(command + "\n")
-
-def git(*arguments):
-    return subprocess.check_output(("git", *arguments), text=True).strip()
-
-candidate = git("rev-parse", "HEAD", "MERGE_HEAD") + "\n" + git("write-tree")
-if command == "run":
-    receipt.unlink(missing_ok=True)
-    if os.environ.get("DOCUMENTATION_FAIL_REVIEW"):
-        raise SystemExit("fixture review requested changes")
-    receipt.write_text(candidate, encoding="utf-8")
-elif command == "verify":
-    if not receipt.exists() or receipt.read_text(encoding="utf-8") != candidate:
-        raise SystemExit("fixture review does not cover candidate")
-    expected = sys.argv[sys.argv.index("--expected-tree") + 1]
-    if expected != git("write-tree"):
-        raise SystemExit("candidate changed during gate")
-else:
-    raise SystemExit("unknown review command")
+    stream.write(sys.argv[1] + "\n")
+main(Path(__file__).resolve().parents[1])
 """
 
 
@@ -114,7 +97,7 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(_ROOT / name, destination)
     shutil.copytree(_ROOT / "scripts/_shared", repository / "scripts/_shared")
-    _write(repository, "scripts/review-code.py", _FAKE_REVIEW)
+    _write(repository, "scripts/review-code.py", _REVIEW_ENTRY)
     _write(repository, ".gitignore", ".venv/\nnode_modules/\n__pycache__/\n")
     _write(repository, "README.md", "# Fixture\n")
     _write(
@@ -142,7 +125,7 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
             f'if [[ "${{DOCUMENTATION_FAIL_PROFILE:-}}" == "{profile}" ]]; '
             "then exit 42; fi\n"
             'if [[ "${DOCUMENTATION_INVALIDATE_REVIEW:-}" == 1 ]]; then\n'
-            '    rm -f "${DOCUMENTATION_WORKFLOW_TRACE%.log}.review"\n'
+            '    rm -f "$(git rev-parse --git-path h2h-review/receipts)"/*.json\n'
             "fi\n"
             'if [[ "${DOCUMENTATION_CHANGE_CANDIDATE:-}" == 1 ]]; then\n'
             "    printf 'changed = True\\n' > tests/gate-change.py\n"
@@ -313,7 +296,7 @@ def test_full_merge_gate_requires_review_before_program_checks(
     result = _run(repository, *entrypoint)
 
     assert result.returncode != 0
-    assert "fixture review does not cover candidate" in result.stderr
+    assert "h2h code review:" in result.stderr
     assert _checks(repository) == ["verify"]
 
 
@@ -358,7 +341,7 @@ def test_full_merge_gate_rechecks_review_after_program_checks(
     result = _run(repository, "scripts/git-flow-merge.sh")
 
     assert result.returncode != 0
-    assert "fixture review does not cover candidate" in result.stderr
+    assert "h2h code review:" in result.stderr
     assert _checks(repository) == ["run", "verify", "full", "verify"]
     assert _git(repository, "rev-parse", "main") == primary
     assert _git(repository, "branch", "--show-current") == "docs/task"

@@ -216,6 +216,14 @@
   offline verify；online review 必須先實作並驗證 Job Object 生命週期。
   預設 timeout 為 900 秒，`run --timeout-seconds` 接受 1..3600 秒；merge 可用
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
+- Merge review stage 先以獨立 owned process group 完成分類，確認清空後，
+  只有 full profile 才要求 local review 入口、取得 candidate lock 並啟動 reviewer；
+  純文件不要求 local review 入口或 Codex。CLI version preflight、reviewer 與
+  Codex 由外部 owner 管理同一 process group，owner 使用真正 staged candidate
+  匯出的完整 review closure，並持有 candidate lock 至清理及 evidence publication
+  完成。Managed reviewer 只寫 pending evidence；owner 證明 owned tree 已清空、
+  重新驗證 exact candidate 與 coverage 後才原子發布，缺少 pending evidence
+  亦須阻止合併，不能以 reviewer exit 0 取代證據。
 - `review-code.py verify` 僅離線驗證，絕不呼叫模型。紀錄位於 Git common
   metadata 的 `h2h-review`，綁定 exact tree、ordered parents、`AGENTS.md`、
   local CLI 與 merge review 入口，以及 shared reviewer、merge review shell、

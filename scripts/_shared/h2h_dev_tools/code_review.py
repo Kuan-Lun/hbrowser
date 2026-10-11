@@ -478,9 +478,13 @@ class Reviewer:
             ) from error
 
     @contextmanager
-    def _covered_baseline(self, target: Target) -> Iterator[Baseline | None]:
+    def _covered_baseline(
+        self, target: Target, *, locked_ancestors: set[str] | None = None
+    ) -> Iterator[Baseline | None]:
         # Each accepted ancestor stays shared-locked through review/verification.
         # A concurrent explicit rerun cannot revoke evidence while we rely on it.
+        if locked_ancestors is None:
+            locked_ancestors = set()
         with ExitStack() as locks:
             references: list[Baseline] = []
             for commit in self._git(
@@ -495,7 +499,12 @@ class Reviewer:
                 if ancestor.policy_digest != target.policy_digest:
                     break
                 try:
-                    locks.enter_context(self._review_lock(ancestor, exclusive=False))
+                    if ancestor.key not in locked_ancestors:
+                        locks.enter_context(
+                            self._review_lock(ancestor, exclusive=False)
+                        )
+                        locked_ancestors.add(ancestor.key)
+                        locks.callback(locked_ancestors.remove, ancestor.key)
                     evidence = self._read_evidence(ancestor)
                 except ReviewError, OSError, ValueError:
                     try:
@@ -524,22 +533,36 @@ class Reviewer:
 
     @contextmanager
     def _select_coverage(
-        self, target: Target, *, force_repository: bool
+        self,
+        target: Target,
+        *,
+        force_repository: bool,
+        locked_ancestors: set[str] | None = None,
     ) -> Iterator[Coverage]:
         if force_repository:
             yield Coverage()
         else:
-            with self._covered_baseline(target) as baseline:
+            with self._covered_baseline(
+                target, locked_ancestors=locked_ancestors
+            ) as baseline:
                 yield (
                     Coverage()
                     if baseline is None
                     else Coverage("incremental", baseline)
                 )
 
-    def _require_coverage(self, target: Target, coverage: Coverage) -> None:
+    def _require_coverage(
+        self,
+        target: Target,
+        coverage: Coverage,
+        *,
+        locked_ancestors: set[str] | None = None,
+    ) -> None:
         if coverage.scope == "repository":
             return
-        with self._covered_baseline(target) as baseline:
+        with self._covered_baseline(
+            target, locked_ancestors=locked_ancestors
+        ) as baseline:
             if baseline is None or baseline != coverage.baseline:
                 raise ReviewError(
                     "Full-repository baseline or intervening review evidence "
@@ -668,12 +691,16 @@ class Reviewer:
         force_repository: bool = False,
     ) -> None:
         self._assert_workspace(target)
+        locked_ancestors: set[str] = set()
         with self._select_coverage(
-            target, force_repository=force_repository
+            target,
+            force_repository=force_repository,
+            locked_ancestors=locked_ancestors,
         ) as coverage:
             self._run_review(
                 target,
                 coverage,
+                locked_ancestors=locked_ancestors,
                 index=index,
                 revision=revision,
                 timeout=timeout,
@@ -685,6 +712,7 @@ class Reviewer:
         target: Target,
         coverage: Coverage,
         *,
+        locked_ancestors: set[str],
         index: bool,
         revision: str,
         timeout: int,
@@ -738,7 +766,10 @@ class Reviewer:
         self._assert_workspace(target)
         if self._target(index=index, revision=revision) != target:
             raise ReviewError("The candidate or review policy changed during review")
-        self._require_coverage(target, coverage)
+        # Re-read every receipt, but reuse the locks retained by selection. A
+        # second descriptor per ancestor can exhaust an otherwise adequate FD
+        # budget on long first-parent histories after a successful online review.
+        self._require_coverage(target, coverage, locked_ancestors=locked_ancestors)
         managed = _external_process_owner()
         receipt = self._write_receipt(
             target,

@@ -42,7 +42,9 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "primary-branch": frozenset({"primary-branch.sh"}),
     "git-flow": _MERGE_REVIEW_FILES,
     "hooks": frozenset({"primary-branch.sh", "install-git-hooks.sh"}),
-    "environment": frozenset({"rebuild-env.sh"}),
+    "environment": frozenset(
+        {"rebuild-env.sh", "resolve-sources.sh", "environment.py"}
+    ),
 }
 
 

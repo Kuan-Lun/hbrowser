@@ -5,6 +5,7 @@ set -euo pipefail
 repository_root=${1:?repository root is required}
 after_build=${2-}
 shift 2
+source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repository_root"
 for executable in uv npm; do
     command -v "$executable" >/dev/null || {
@@ -39,9 +40,7 @@ while (( $# )); do
                 printf 'Invalid dependency override: %s\n' "$assignment" >&2
                 exit 2
             }
-            if [[ "$source" != index ]]; then
-                source_overrides+=("$source")
-            fi
+            source_overrides+=(--source "$assignment")
             shift 2
             ;;
         --help|-h)
@@ -56,22 +55,12 @@ while (( $# )); do
     esac
 done
 
-install_arguments=(-e ".[dev]")
-if (( ${#source_overrides[@]} > 0 )); then
-    for source in "${source_overrides[@]}"; do
-        if [[ -d "$source" ]]; then
-            [[ -f "$source/pyproject.toml" ]] || {
-                printf 'Local project has no pyproject.toml: %s\n' "$source" >&2
-                exit 1
-            }
-            install_arguments+=(--editable "$source")
-        else
-            install_arguments+=("$source")
-        fi
-    done
-fi
+requirements="$(mktemp "${TMPDIR:-/tmp}/h2h-requirements.XXXXXX")"
+trap 'rm -f "$requirements"' EXIT
+bash "$source_directory/resolve-sources.sh" "$requirements" \
+    --editable '.[dev]' ${source_overrides[@]+"${source_overrides[@]}"}
 uv venv --clear --python 3.14 .venv
-uv pip install --refresh --python .venv/bin/python "${install_arguments[@]}"
+uv pip install --refresh --python .venv/bin/python --requirements "$requirements"
 
 npm install --package-lock=false --ignore-scripts --no-audit --no-fund
 

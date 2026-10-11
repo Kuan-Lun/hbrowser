@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("offline_code_review_cli")
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MERGE_SCRIPT = _PROJECT_ROOT / "scripts" / "git-flow-merge.sh"
 _PRIMARY_SCRIPT = _PROJECT_ROOT / "scripts" / "detect-primary-branch.sh"
@@ -90,10 +92,8 @@ def _initialize_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     hooks = repository / ".githooks"
     hooks.mkdir()
     shutil.copy2(_REBASE_HOOK, hooks / _REBASE_HOOK.name)
-    _write_executable(
-        scripts / "review-merge-candidate.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
+    for name in ("review-merge-candidate.sh", "check_change_scope.py"):
+        shutil.copy2(_PROJECT_ROOT / "scripts" / name, scripts / name)
     _write_executable(
         hooks / "pre-commit",
         "#!/usr/bin/env bash\n"
@@ -124,7 +124,7 @@ fi
 
     shutil.copy2(_PROJECT_ROOT / "AGENTS.md", repository / "AGENTS.md")
     shutil.copy2(_PROJECT_ROOT / "scripts/review-code.py", scripts / "review-code.py")
-    (repository / ".gitignore").write_text(".venv/\n")
+    (repository / ".gitignore").write_text(".venv/\n__pycache__/\n")
     (repository / "payload.txt").write_text("base\n")
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", "test: initial state")
@@ -382,6 +382,7 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
         "main",
     )
     _install_test_python(task_worktree)
+    _install_test_python(repository)
     (task_worktree / "payload.txt").write_text("task change\n")
     _git(task_worktree, "add", "payload.txt")
     _git(task_worktree, "commit", "-m", "test: task change")
