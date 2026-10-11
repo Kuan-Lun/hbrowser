@@ -1093,22 +1093,28 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         )
 
         logger.debug("Initializing browser")
-        browser = await _construct_owned_browser_async(
-            config,
-            cleanup_paths=tuple(
-                path
-                for path in (profile_directory, proxy_extension)
-                if path is not None
-            ),
-            startup_deadline=browser_startup_work_deadline,
-        )
+        try:
+            browser = await _construct_owned_browser_async(
+                config,
+                cleanup_paths=tuple(
+                    path
+                    for path in (profile_directory, proxy_extension)
+                    if path is not None
+                ),
+                startup_deadline=browser_startup_work_deadline,
+            )
+        except ProcessOwnershipError:
+            # Only Chrome construction receives these paths. Its unresolved
+            # owner retains them for safe cleanup; an installer failure has
+            # no authority over this independent private generation material.
+            private_paths_are_owned = True
+            raise
         private_paths_are_owned = True
         _require_browser_process_owner(browser)
     except BaseException as construction_error:
         private_paths = (
             ()
             if private_paths_are_owned
-            or isinstance(construction_error, ProcessOwnershipError)
             else tuple(
                 path
                 for path in (profile_directory, proxy_extension)

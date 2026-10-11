@@ -580,6 +580,72 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_chrome_constructor_retains_transferred_private_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile"
+            extension = Path(directory) / "extension"
+            profile.mkdir()
+            extension.mkdir()
+            failure = ProcessOwnershipError("Chrome ownership unresolved")
+            with (
+                patch.object(
+                    factory, "_configured_chrome_executable", return_value="/chrome"
+                ),
+                patch.object(factory, "should_use_tor", return_value=False),
+                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(tempfile, "mkdtemp", return_value=str(profile)),
+                patch.object(factory, "_build_config", return_value=object()),
+                patch.object(
+                    factory,
+                    "_construct_owned_browser_async",
+                    new=AsyncMock(side_effect=failure),
+                ) as construct,
+                patch.object(
+                    factory,
+                    "_cleanup_unowned_private_paths",
+                    new=AsyncMock(return_value=[]),
+                ) as cleanup,
+                self.assertRaises(ProcessOwnershipError) as raised,
+            ):
+                await factory._create_browser(True)
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(
+                construct.call_args.kwargs["cleanup_paths"],
+                (str(profile), str(extension)),
+            )
+            cleanup.assert_awaited_once_with((), deadline=unittest.mock.ANY)
+            self.assertTrue(profile.is_dir())
+            self.assertTrue(extension.is_dir())
+
+    async def test_installer_ownership_failure_cleans_untransferred_proxy_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            extension = Path(directory) / "proxy-extension"
+            extension.mkdir()
+            (extension / "credentials").write_text("synthetic", encoding="utf-8")
+            failure = ProcessOwnershipError("installer ownership unresolved")
+            with (
+                patch.object(
+                    factory, "_configured_chrome_executable", return_value=None
+                ),
+                patch.object(factory, "should_use_tor", return_value=False),
+                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(
+                    factory,
+                    "_install_chrome_in_owned_worker",
+                    new=AsyncMock(side_effect=failure),
+                ),
+                patch.object(factory, "_construct_owned_browser_async") as construct,
+                self.assertRaises(ProcessOwnershipError) as raised,
+            ):
+                await factory._create_browser(True)
+            self.assertIs(raised.exception, failure)
+            construct.assert_not_called()
+            self.assertFalse(extension.exists())
+
     async def test_stop_rejects_missing_owner_before_zendriver_cleanup(self) -> None:
         browser = SimpleNamespace(
             connection=None,
