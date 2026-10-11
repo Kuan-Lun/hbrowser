@@ -651,17 +651,8 @@ async def _wait_for_dom_query(
     async def on_dom_change(_event: Any, _connection: Any = None) -> None:
         changed.set()
 
-    if supports_events:
-        for event_type in _DOM_CHANGE_EVENTS:
-            page.add_handler(event_type, on_dom_change)
+    observing = False
     try:
-        if supports_events:
-            await _run_dom_command(
-                page,
-                lambda: page.send(cdp.dom.enable()),
-                deadline=deadline,
-                description="DOM event subscription",
-            )
         while True:
             changed.clear()
             element = await _run_dom_command(
@@ -684,6 +675,20 @@ async def _wait_for_dom_query(
                 raise PageStateTimeout(
                     f"{description} did not appear before its deadline"
                 )
+            if supports_events and not observing:
+                # A normal initial query settles the previous lifecycle subscription.
+                # Install only if still missing, then immediately re-query so a DOM
+                # change during installation cannot be lost between observers.
+                observing = True
+                for event_type in _DOM_CHANGE_EVENTS:
+                    page.add_handler(event_type, on_dom_change)
+                await _run_dom_command(
+                    page,
+                    lambda: page.send(cdp.dom.enable()),
+                    deadline=deadline,
+                    description="DOM event subscription",
+                )
+                continue
             # CDP DOM mutation events are delivered immediately for materialized
             # nodes.  Reconciliation covers browser versions that do not emit an
             # event until their subtree has first been requested.
@@ -693,7 +698,7 @@ async def _wait_for_dom_query(
                 description=description,
             )
     finally:
-        if supports_events:
+        if observing:
             for event_type in _DOM_CHANGE_EVENTS:
                 page.remove_handlers(event_type, on_dom_change)
 

@@ -10,6 +10,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from zendriver import cdp
+from zendriver.core.connection import Connection, Transaction
 
 from hbrowser.gallery.utils import (
     Deadline,
@@ -380,6 +381,101 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         assert page.reload_payload is not None
         self.assertEqual(page.reload_payload["params"]["loaderId"], "old-loader")
         self.assertEqual(receipt.loader_id, "reload-loader")
+
+    async def test_selector_after_navigation_settles_real_zendriver_handlers(
+        self,
+    ) -> None:
+        for initially_missing in (False, True):
+            with self.subTest(initially_missing=initially_missing):
+                connection = Connection("ws://offline.invalid")
+                connection.websocket = cast(Any, object())
+                connection.listener = cast(Any, SimpleNamespace(running=True))
+                element = object()
+                results = deque([None, element] if initially_missing else [element])
+
+                async def transport(
+                    transaction: Transaction[Any],
+                    target: Connection = connection,
+                ) -> None:
+                    response = (
+                        {"result": {"type": "number", "value": 1}}
+                        if transaction.method == "Runtime.evaluate"
+                        else {}
+                    )
+                    transaction(result=response)
+                    assert transaction.id is not None
+                    target.mapper.pop(transaction.id)
+
+                async def query(
+                    _selector: str,
+                    target: Connection = connection,
+                    matches: deque[object] = results,
+                ) -> object | None:
+                    await target.send(cdp.runtime.evaluate("1", return_by_value=True))
+                    return matches.popleft()
+
+                async def observed(_event: object) -> None:
+                    pass
+
+                cast(Any, connection).query_selector = query
+                with patch.object(connection, "_send_transaction", new=transport):
+                    # Real registration/removal establishes the old domain state.
+                    connection.add_handler(cdp.page.LifecycleEvent, observed)
+                    await connection.send(
+                        cdp.runtime.evaluate("1", return_by_value=True)
+                    )
+                    connection.remove_handlers(cdp.page.LifecycleEvent, observed)
+                    self.assertIn(cdp.page, connection.enabled_domains)
+                    result = await wait_for_selector(
+                        connection, "#ready", deadline=Deadline.after(1)
+                    )
+                self.assertIs(result, element)
+                self.assertFalse(connection.mapper)
+
+    async def test_missing_selector_cleanup_covers_timeout_and_cancellation(
+        self,
+    ) -> None:
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                page = _EventPage()
+                subscribed = asyncio.Event()
+
+                async def send(
+                    command: Any,
+                    target: _EventPage = page,
+                    signal: asyncio.Event = subscribed,
+                ) -> Any:
+                    result = await _EventPage.send(target, command)
+                    if any(
+                        target.handlers[event]
+                        for event in page_state_module._DOM_CHANGE_EVENTS
+                    ):
+                        signal.set()
+                    return result
+
+                with (
+                    patch.object(page, "send", new=send),
+                    patch.object(
+                        page, "query_selector", new=AsyncMock(return_value=None)
+                    ),
+                ):
+                    task = asyncio.create_task(
+                        wait_for_selector(
+                            page,
+                            "#missing",
+                            deadline=Deadline.after(0.04),
+                        )
+                    )
+                    await asyncio.wait_for(subscribed.wait(), timeout=1)
+                    if cancel:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        with self.assertRaises(PageStateTimeout):
+                            await task
+                for event in page_state_module._DOM_CHANGE_EVENTS:
+                    self.assertEqual(page.handlers[event], [])
 
     async def test_selector_uses_dom_signal_and_immediate_queries(self) -> None:
         page = _EventPage()
