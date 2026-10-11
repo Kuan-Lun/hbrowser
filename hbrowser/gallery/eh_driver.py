@@ -80,6 +80,50 @@ def _require_active_deadline(deadline: Deadline | None, description: str) -> Non
         raise TimeoutError(f"{description} completed after its deadline")
 
 
+async def _wait_for_archive_document(page: Any, *, deadline: Deadline) -> None:
+    """Require the popup's real document before an optional-link absence read."""
+
+    try:
+        while not deadline.expired:
+            try:
+                snapshot = await wait_for_zendriver(
+                    page.evaluate(
+                        "({url: window.location.href, readyState: document.readyState})"
+                    ),
+                    timeout=min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining()),
+                    owner=page,
+                )
+            except ProtocolException as error:
+                if not _is_transient_context_error(error):
+                    raise
+                await asyncio.sleep(min(0.1, deadline.remaining()))
+                continue
+            _require_active_deadline(deadline, "Archive popup document read")
+            if not isinstance(snapshot, dict):
+                raise ValueError("Archive popup returned an invalid document snapshot")
+            url = snapshot.get("url")
+            ready_state = snapshot.get("readyState")
+            if not isinstance(url, str) or not isinstance(ready_state, str):
+                raise ValueError("Archive popup document fields are invalid")
+            if urlsplit(url).scheme in {"http", "https"} and ready_state in {
+                "interactive",
+                "complete",
+            }:
+                return
+            await asyncio.sleep(min(0.1, deadline.remaining()))
+        raise TimeoutError("Archive popup document did not become ready")
+    except BaseException as error:
+        _begin_zendriver_retirement(page)
+        if isinstance(error, asyncio.CancelledError) or is_browser_generation_error(
+            error
+        ):
+            raise
+        raise ArchiveDownloadOutcomeUnknownError(
+            "Archive download outcome is unknown because its popup document "
+            "did not become ready; refusing replay"
+        ) from None
+
+
 async def _wait_for_archive_mutation[ResultT](
     awaitable: Awaitable[ResultT],
     *,
@@ -1492,8 +1536,10 @@ class EHDriver(Driver):
                     "refusing further browser mutations"
                 ),
             )
-            # "Original" is optional. One immediate bounded query is evidence;
-            # waiting ten seconds for absence would only stack a semantic phase.
+            # Target inventory and activation do not prove the popup has loaded.
+            # Keep document readiness under the existing click/popup deadline.
+            await _wait_for_archive_document(new_tab, deadline=popup_deadline)
+            # "Original" is optional only after the real document is ready.
             original_links = await wait_for_zendriver(
                 self.page.xpath("//a[contains(text(), 'Original')]", timeout=0.05),
                 timeout=_PAGE_READ_TIMEOUT_SECONDS,
