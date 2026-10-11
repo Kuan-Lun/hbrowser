@@ -1627,8 +1627,9 @@ class EHDriver(Driver):
             # Closing or activating another tab would compound that uncertainty.
             raise
         except asyncio.CancelledError:
-            # wait_for_zendriver tombstones a generation when its caller abandons
-            # live work. Never issue cleanup commands on that generation.
+            # Cancellation may happen between protocol calls, including the
+            # status-poll sleep. The archive operation is still unresolved.
+            _begin_zendriver_retirement(new_tab)
             raise
         except BaseException as operation_error:
             if is_browser_generation_error(operation_error):

@@ -1814,6 +1814,79 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             exact_connection=first_archive_page,
         )
 
+    async def test_status_poll_cancellation_retires_entire_browser_generation(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+        )
+        archive_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
+            target=SimpleNamespace(target_id="archive"),
+            evaluate=AsyncMock(
+                return_value={
+                    "url": "https://exhentai.org/archiver.php",
+                    "readyState": "complete",
+                }
+            ),
+            activate=AsyncMock(),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(return_value="Still preparing archive"),
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        gallery_page.browser = browser
+        archive_page.browser = browser
+        driver.browser = browser
+        driver.page = gallery_page
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+        polling = asyncio.Event()
+
+        async def suspended_status_poll(_seconds: float) -> None:
+            polling.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
+            ),
+            patch(
+                "hbrowser.gallery.eh_driver.asyncio.sleep",
+                new=AsyncMock(side_effect=suspended_status_poll),
+            ) as sleep,
+            patch.object(driver, "save_page_diagnostic", new=AsyncMock()) as diagnostic,
+            patch.object(
+                driver, "_close_archive_tab_and_restore", new=AsyncMock()
+            ) as restore,
+        ):
+            download = asyncio.create_task(driver.download(gallery))
+            try:
+                await asyncio.wait_for(polling.wait(), 1)
+                archive_page.get_content.assert_awaited_once()
+                download.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await download
+            finally:
+                if not download.done():
+                    download.cancel()
+                    await asyncio.gather(download, return_exceptions=True)
+            sleep.assert_awaited_once()
+            diagnostic.assert_not_awaited()
+            restore.assert_not_awaited()
+        archive_link.click.assert_awaited_once()
+        archive_page.close.assert_not_awaited()
+        await _assert_generation_rejects_new_work(
+            self, browser=browser, owner=gallery_page, exact_connection=archive_page
+        )
+
     async def test_protocol_timeout_after_click_runs_no_browser_cleanup(
         self,
     ) -> None:
