@@ -63,7 +63,7 @@ ignore = ["B904", "RUF001", "RUF002", "RUF003", "SIM"]
 
 [tool.mypy]
 python_version = "3.14"
-files = ["hbrowser", "tests"]
+files = ["hbrowser", "tests", "scripts/_shared"]
 strict = true
 warn_unreachable = true
 

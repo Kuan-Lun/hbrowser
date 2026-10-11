@@ -11,6 +11,7 @@ on:
       - pyproject.toml
       - scripts/check-process-ownership.sh
       - scripts/install-ci-dependencies.py
+      - scripts/_shared/**
       - tests/**
 
 jobs:
