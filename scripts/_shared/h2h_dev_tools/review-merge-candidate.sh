@@ -18,7 +18,8 @@ case "$scope" in
         ;;
     full)
         [[ -f scripts/review-code.py ]] || fail 'scripts/review-code.py is missing'
-        exec "$python" scripts/review-code.py run --index
+        exec "$python" scripts/review-code.py run --index \
+            --timeout-seconds "${H2H_CODE_REVIEW_TIMEOUT_SECONDS:-900}"
         ;;
     *) fail "invalid check scope: $scope" ;;
 esac

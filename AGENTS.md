@@ -48,7 +48,7 @@
   含有 primary 尚未包含的 commit，該腳本先準備真正的
   `--no-ff --no-commit` candidate，依範圍執行 code review 與文件或完整 gate，
   成功才建立 merge commit、安全移除 task worktree，並以 `git branch -d`
-  刪除已合併的本機 branch。Review 失敗亦須 abort merge 並保留 task branch。
+  刪除已合併的本機 branch。Review 失敗依下述 cleanup／abort 規則處理。
 - 若且唯若 task tip 已由本機 primary 包含（`git merge-base --is-ancestor`
   成功），`scripts/git-flow-merge.sh` 執行 no-op cleanup：不得執行 gate或merge、
   建立空 commit或空 merge commit；必須先確認涉及的 worktree clean、沒有進行中
@@ -58,7 +58,10 @@
   未由 primary 包含，或任何 safety check失敗，腳本必須 fail closed並保留 task
   branch及仍存在的worktree。no-op cleanup不得使用force、建立或刪除remote ref，
   亦不得 fetch、pull或push。
-- merge conflict 或 gate failure 時必須 abort merge並保留 task branch。
+- merge conflict 或 gate failure 時，確認 owned review／hook process tree 已清空後
+  必須 abort merge 並保留 task branch。若無法證明 owned process cleanup，這是明確
+  例外：不得讓仍存活的 hook 與 abort 競爭，保留 candidate 與 task 待確認及安全處理。
+  已成功建立的 merge commit 不因後續中斷或清理失敗而回滾。
 - merge 後收到的任何 follow-up 都建立新的 task branch。
 - 本機 task branch、commit、`--no-ff` merge與 `branch -d` 已獲預先授權。
 - fetch、pull、push、remote branch、tag、release、publish、deploy與任何
@@ -184,23 +187,41 @@
   `--no-ff --no-commit` candidate，再依 primary parent 到 staged candidate
   的完整差異分類。Full profile 在 Git hooks 之外呼叫
   `scripts/review-code.py run --index`；documentation profile 不啟動 review。
+  實際 merge 使用 repository-local Python 擁有 Git／hook process tree；
+  已整合 task 的 no-op／`--cleanup-only` 不需要 Python 環境。
+- 首次 review 必須審查完整 candidate project，建立成功的 full baseline；
+  之後才可 incremental review。增量審查必須證明 primary first-parent history
+  上存在有效 full baseline，且其後每個非文件變更都有有效 review evidence。
+  缺少 baseline 或任何 coverage、舊 v1 receipt、政策或 reviewer dependency
+  closure 變更，均重新執行 full review，不得只審查目前 task diff。
+- v2 receipt 必須綁定 full／incremental scope 與可驗證的 baseline／history
+  coverage；不能以同名檔案、未驗證舊紀錄或單純 ancestor 關係代替完整覆蓋。
+  Passing full candidate 可立即 offline verify；只有其 exact tree 與 ordered
+  parents 真正成為 primary first-parent commit，才可作後續 baseline。
+  Aborted candidate、側分支與舊版差異 receipt 都不構成基準；新 clone 缺少
+  本機 evidence 時重新 full review，offline verify 不會連線補做。
 - Online review 可使用已登入的 Codex 服務，需要 repository-local `.venv`
   與 PATH 中的 `codex`。使用 read-only sandbox；不得修改檔案、執行
   merge/gate、啟動服務或自動修正，不要求 GitHub PR、Actions 或 Stop hook。
-- Reviewer 必須完整閱讀本檔，審查完整 candidate diff 與相關未修改程式碼的
-  互動，依本 repository 的架構、ownership、side-effect 與測試契約評估。
+- Reviewer 必須完整閱讀本檔；首次審查完整 candidate，包括既存缺陷，
+  incremental 審查完整差異與相關未修改程式碼的互動，依本 repository 的架構、ownership、side-effect 與測試契約評估。
   只回報具體觸發條件及影響的 P0、P1、P2，附檔案、行號與理由；格式交由 lint。
   已授權的破壞性變更本身不是缺陷，但版本誤判或遺漏必要轉換仍須回報。
 - 任何 finding、`incomplete`、逾時、非零退出或無效輸出都阻止 merge。
-  上下文或工具不足須回報 `incomplete`，不得聲稱通過。修正後重新執行 merge
-  流程，不得忽略 finding 或手寫 passing receipt。
+  上下文或工具不足須回報 `incomplete`，不得聲稱通過。失敗須先確認 owned
+  process cleanup 再 abort；無法證明 cleanup 時依前述例外保留 candidate。
+  修正後重新執行 merge 流程，不得忽略 finding 或手寫 passing receipt。
 - Online review 目前只支援 POSIX，以獨立 process group 清理逾時或中斷的
   Codex 及一般 descendants；刻意脫離 group 者不在保證內。Windows 仍可
   offline verify；online review 必須先實作並驗證 Job Object 生命週期。
-  預設 timeout 為 900 秒，`run --timeout-seconds` 接受 1..3600 秒。
+  預設 timeout 為 900 秒，`run --timeout-seconds` 接受 1..3600 秒；merge 可用
+  `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
 - `review-code.py verify` 僅離線驗證，絕不呼叫模型。紀錄位於 Git common
   metadata 的 `h2h-review`，綁定 exact tree、ordered parents、`AGENTS.md`、
-  repository review wrapper 與 shared reviewer implementation；任一變更須重審。
+  local CLI 與 merge review 入口，以及 shared reviewer、merge review shell、
+  process ownership、change-scope 與完整匯出 dependency closure 的 candidate
+  及實際執行 bytes；
+  任一變更須重審，不能沿用舊 full baseline。
   `--revision` 可審查既有 commit，正式 merge 必須使用 `--index`。
 - 同一 candidate 的每次 `run` 先廢止舊紀錄，失敗不能沿用舊通過結果。
   同一 candidate 只允許一個 active run；重疊請求必須在啟動 review 前拒絕，

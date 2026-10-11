@@ -15,24 +15,26 @@
   ],
   "files": {
     "__init__.py": "03d1963265f288085b4351cfc6ca61fc3beb73b2d65ad7cd0098ee6a080db094",
-    "bundle_verify.py": "46c31191b21a069ab821757f80fe94d5388d4b3bfbbac3923d42ffa0c884cb70",
+    "bundle_verify.py": "3a3f1a2144ff48ae8a833622bd784e0cba224b09c7fe41e4ec85c0f4ad3a1367",
     "change_scope.py": "3b3ae0cace8c284a5d49af5ac2d59d1f724acc937b13cb811cdc2149b818b7fc",
     "ci_dependencies.py": "fadaf7aa85852eb4e43b60cfdddbe5ae88743dad15746729417dab7b6a623853",
-    "code_review.py": "d6fa97456c44f1965716e7ee99288980b38a17c7f6f8ea5ab3d056b6f8861060",
+    "code_review.py": "28a45f5034ce1cda99055195f26285009d66b52bfcdcb3e480b01597f07160a5",
     "dependency_audit.py": "ba6b6afc6664f150538ff9dc6e06d837c341901ec0ffa1b1a23653b177b2b6eb",
     "dependency_manifest.py": "b3a2d2d9b71741cd710a477f1ca41ed2787885908016e6ec078c5b46df5dbb62",
     "distribution_check.py": "15ec48c7b2a8715d9910309e9919cd8587ab5d4a3d63e47f96b8b2d7c2de6294",
     "documentation.py": "c54c95c72107967cfd2884cf7552754ea928302148f39f347117461f4a1f03c2",
-    "git-flow-merge.sh": "6b18e67a5ae60f04ba63f0a19e962e88613d6d9d9c7f05e8db279f27bb37f73f",
+    "git-flow-merge.sh": "5209b39f9a6484860d38a59c25e12a5bbe0eb943f4e67d268871319cfd034596",
     "install-git-hooks.sh": "0ead0ec2dc58387236b0c675af5cd1b0f5b2a7335781cf16007a6c40701f8cec",
+    "merge_command.py": "6bad02895bced996ab37ac2c4b568228315f96f07630b067b309ec3bf110ce49",
     "offline_wheel.py": "24ffcf8a74620a08ba152e78b865ac0a4a0c28de152ddcd5c8995f6f998cc8c7",
     "primary-branch.sh": "602f2c63659e10b6dc835fc4026bf9371d9def1fcb49cbdbfabe7fb7b4d76aa5",
+    "process.py": "81c778af9299794d56807f719ac81569fea577acc7a652470c4a468220fb14bc",
     "rebuild-env.sh": "ca76834d7290d2a30ca6488ba952d2f9458f43297ebedf4c4a2b5acdb42cf917",
-    "review-merge-candidate.sh": "fccd44b9771714ca710f94ee8beefd5cc748b76f5bb3947e1f4b7e783a80234b",
+    "review-merge-candidate.sh": "6ae1a418f30cb401b6ebdb2cbda898d8b00f2d8fccd6100b3021bd0ae5fdc413",
     "version_policy.py": "1ec768f0dcef09d531ba640afe87204217c022e528ba8048e9445e6a6b3d76d6"
   },
-  "payload_sha256": "2454a6793448bee61b9cad9b455e53012676064e4bf1eed569e0f9f0c392a054",
+  "payload_sha256": "edc59f4b7fd5970504ac2d03bb5ececf49cdaca96aea023926a831dfa9965b21",
   "schema_version": 2,
   "toolkit_name": "h2h-dev-tools",
-  "toolkit_version": "0.2.2"
+  "toolkit_version": "0.3.0"
 }

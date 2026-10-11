@@ -216,6 +216,16 @@ FlareSolverr，並移除日誌中的私人資訊。問題可提交到
 `scripts/check-fast.sh`、`scripts/check-full.sh` 與 `scripts/git-flow-merge.sh`，
 不需要 sibling checkout、安裝共用工具套件或在每次 commit 時連網。
 
+程式變更合併時需要本機 `.venv` 與 PATH 中已登入的 `codex`。合併腳本會先
+審查真正的 candidate，再執行離線 gate；首次審查涵蓋完整專案，通過並合併後
+才可使用增量審查。新 checkout 缺少本機紀錄或審查基準失效時會重新完整審查。
+純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
+大型專案的首次審查可明確延長至一小時：
+
+```bash
+H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600 scripts/git-flow-merge.sh
+```
+
 更新時，在獨立工具環境安裝明確選定的 `h2h-dev-tools` wheel 或版本，再執行：
 
 ```bash

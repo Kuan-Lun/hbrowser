@@ -77,16 +77,22 @@ abort_merge_if_needed() {
 }
 
 restore_after_failure() {
-    local status=$?
+    local status=$? child_status=0
 
-    trap - EXIT HUP INT TERM
+    trap - EXIT
+    # Repeated signals cannot cut short the owned supervisor's cleanup.
+    trap '' HUP INT TERM
     if (( status != 0 )); then
-        if [[ -n "$reviewer_pid" ]]; then
-            # wait is interruptible; stop review before discarding its candidate.
-            kill -TERM "$reviewer_pid" 2>/dev/null || true
-            wait "$reviewer_pid" || true
+        if [[ -n "$active_pid" ]]; then
+            # The child owns its descendants. Wait for teardown before aborting
+            # a candidate which a surviving hook could otherwise still modify.
+            kill -TERM "$active_pid" 2>/dev/null || true
+            wait "$active_pid" || child_status=$?
+            check_owner_cleanup "$child_status"
         fi
-        if abort_merge_if_needed "$merge_worktree"; then
+        if [[ "$owner_cleanup_failed" -ne 0 ]]; then
+            printf 'git-flow-merge: process cleanup unproven; candidate and task retained\n' >&2
+        elif abort_merge_if_needed "$merge_worktree"; then
             # A signal or cleanup failure after the commit must not undo success.
             if [[ "$merge_worktree" == "$repository_root" ]] \
                 && [[ "$(git -C "$merge_worktree" rev-parse HEAD)" == "$primary_oid" ]]; then
@@ -97,7 +103,51 @@ restore_after_failure() {
             fi
         fi
     fi
+    if [[ -n "$execution_directory" && "$owner_cleanup_failed" -eq 0 ]]; then
+        rm -rf -- "$execution_directory"
+    fi
     exit "$status"
+}
+
+check_owner_cleanup() {
+    if [[ "$active_owner" == process ]]; then
+        if [[ "$1" -eq 125 || ! -f "$active_cleanup_receipt" ]] \
+            || [[ "$(cat "$active_cleanup_receipt")" != owned_tree_empty ]]; then
+            owner_cleanup_failed=1
+        fi
+    fi
+}
+
+receive_signal() {
+    if [[ "$starting_child" -eq 1 ]]; then
+        pending_signal=$1
+    else
+        exit "$1"
+    fi
+}
+
+run_tracked() {
+    local status=0 working_directory=$2
+    active_owner=$1
+    shift 2
+    if [[ "$active_owner" == process ]]; then
+        command_number=$((command_number + 1))
+        active_cleanup_receipt="$execution_directory/cleanup-$command_number"
+        set -- "$merge_python" -I -B "$merge_launcher" \
+            --cleanup-receipt "$active_cleanup_receipt" "$working_directory" -- "$@"
+    fi
+    # Do not leave a forked supervisor unregistered if a signal arrives between
+    # the background launch and assignment of its PID.
+    starting_child=1
+    (cd "$working_directory" && exec "$@") &
+    active_pid=$!
+    starting_child=0
+    [[ "$pending_signal" -eq 0 ]] || exit "$pending_signal"
+    wait "$active_pid" || status=$?
+    check_owner_cleanup "$status"
+    active_pid=''
+    [[ "$owner_cleanup_failed" -eq 0 ]] || return 125
+    return "$status"
 }
 
 repository_root=${1:?repository root is required}
@@ -216,11 +266,32 @@ else
     merge_worktree="$repository_root"
 fi
 
-reviewer_pid=''
+active_pid=''
+active_owner=''
+active_cleanup_receipt=''
+command_number=0
+starting_child=0
+pending_signal=0
+owner_cleanup_failed=0
+execution_directory=''
 trap restore_after_failure EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'receive_signal 129' HUP
+trap 'receive_signal 130' INT
+trap 'receive_signal 143' TERM
+if [[ -x "$repository_root/.venv/bin/python" ]]; then
+    merge_python="$repository_root/.venv/bin/python"
+elif [[ -x "$repository_root/.venv/Scripts/python.exe" ]]; then
+    merge_python="$repository_root/.venv/Scripts/python.exe"
+else
+    fail 'missing repository-local Python; run scripts/rebuild-env.sh'
+fi
+source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+execution_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-merge-owner.XXXXXX")"
+mkdir "$execution_directory/h2h_dev_tools"
+for source_file in __init__.py merge_command.py process.py; do
+    cp "$source_directory/$source_file" "$execution_directory/h2h_dev_tools/$source_file"
+done
+merge_launcher="$execution_directory/h2h_dev_tools/merge_command.py"
 if [[ -z "$primary_worktree" ]]; then
     git switch "$primary"
 fi
@@ -229,22 +300,19 @@ assert_ref_equals "$merge_worktree" "$task_ref" "$task_oid"
 export WORKFLOW_MERGE_TASK_REF="$task_branch"
 if [[ "$strategy" == direct ]]; then
     # Git invokes pre-merge-commit for the exact candidate in these repositories.
-    git -C "$merge_worktree" merge --no-ff --no-edit "$task_branch" \
+    run_tracked process "$merge_worktree" git -C "$merge_worktree" \
+        merge --no-ff --no-edit "$task_branch" \
         || fail 'merge or merge gate failed; task branch was retained'
 else
     # These repositories' pre-commit hooks delegate pending merges to their gate.
-    git -C "$merge_worktree" merge --no-ff --no-commit "$task_branch" \
+    run_tracked process "$merge_worktree" git -C "$merge_worktree" \
+        merge --no-ff --no-commit "$task_branch" \
         || fail 'merge failed; task branch was retained'
     if [[ -n "$review_command" ]]; then
-        (cd "$merge_worktree" && exec bash "$review_command") &
-        reviewer_pid=$!
-        if ! wait "$reviewer_pid"; then
-            reviewer_pid=''
-            fail 'code review failed; task branch was retained'
-        fi
-        reviewer_pid=''
+        run_tracked review "$merge_worktree" bash "$review_command" \
+            || fail 'code review failed; task branch was retained'
     fi
-    git -C "$merge_worktree" commit --no-edit \
+    run_tracked process "$merge_worktree" git -C "$merge_worktree" commit --no-edit \
         || fail 'merge commit or release gate failed; task branch was retained'
 fi
 

@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -121,12 +122,19 @@ fi
 """,
     )
 
+    (repository / ".gitignore").write_text(".venv/\n")
     (repository / "payload.txt").write_text("base\n")
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", "test: initial state")
     initial_oid = _git_stdout(repository, "rev-parse", "HEAD")
     _run(repository, "scripts/install-git-hooks.sh")
     return repository, initial_oid, tmp_path / "gate.log"
+
+
+def _install_test_python(repository: Path) -> None:
+    python = repository / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
 
 
 def _run_merge_script(
@@ -371,6 +379,7 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
         str(task_worktree),
         "main",
     )
+    _install_test_python(task_worktree)
     (task_worktree / "payload.txt").write_text("task change\n")
     _git(task_worktree, "add", "payload.txt")
     _git(task_worktree, "commit", "-m", "test: task change")
@@ -399,6 +408,7 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
 
 def _initialize_merged_repository(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     repository, _, gate_log = _initialize_repository(tmp_path)
+    _install_test_python(repository)
     upstream = tmp_path / "upstream.git"
     _git(tmp_path, "clone", "--bare", str(repository), str(upstream))
     _git(repository, "remote", "add", "origin", str(upstream))
