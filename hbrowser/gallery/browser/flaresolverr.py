@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -155,7 +156,31 @@ class FlareSolverrResult:
 
     @staticmethod
     def _cookie_to_cdp_param(cookie: dict[str, Any]) -> cdp.network.CookieParam:
+        if not all(isinstance(cookie.get(key), str) for key in ("name", "value")):
+            raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        for key in ("domain", "path"):
+            value = cookie.get(key)
+            if value is not None and not isinstance(value, str):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        for key in ("secure", "httpOnly"):
+            value = cookie.get(key)
+            if value is not None and not isinstance(value, bool):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        same_site = cookie.get("sameSite")
+        if same_site is not None and (
+            not isinstance(same_site, str) or same_site not in ("", *_SAME_SITE_MAP)
+        ):
+            raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
         expiry = cookie.get("expiry", cookie.get("expires"))
+        if expiry is not None:
+            if isinstance(expiry, bool) or not isinstance(expiry, int | float):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+            try:
+                finite_expiry = math.isfinite(expiry)
+            except OverflowError:
+                finite_expiry = False
+            if not finite_expiry:
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
         return cdp.network.CookieParam(
             name=cookie["name"],
             value=cookie["value"],
@@ -163,7 +188,7 @@ class FlareSolverrResult:
             path=cookie.get("path"),
             secure=cookie.get("secure"),
             http_only=cookie.get("httpOnly"),
-            same_site=_SAME_SITE_MAP.get(cookie.get("sameSite", "")),
+            same_site=_SAME_SITE_MAP.get(same_site or ""),
             expires=(
                 cdp.network.TimeSinceEpoch(expiry) if expiry and expiry > 0 else None
             ),
@@ -972,6 +997,8 @@ class FlareSolverrClient:
             user_agent=user_agent,
             turnstile_token=token if isinstance(token, str) and token else None,
         )
+        # Reject malformed external identity data before publishing a usable solve.
+        result.to_cdp_cloudflare_cookie_params()
         _require_flaresolverr_deadline(operation_deadline)
         self._uncertain_request_ids.discard(session_id)
         return result

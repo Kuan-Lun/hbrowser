@@ -47,6 +47,7 @@ from .utils import (
     wait_for_zendriver,
 )
 from .utils.mutation import wait_for_zendriver_mutation
+from .utils.protocol import _begin_zendriver_retirement
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
 _PAGE_DIAGNOSTIC_TOTAL_TIMEOUT_SECONDS = 5.0
@@ -553,43 +554,50 @@ class Driver(ABC):
         self,
         result: FlareSolverrResult,
     ) -> None:
-        if result.user_agent:
-            identity_failed = False
+        cookie_params = result.to_cdp_cloudflare_cookie_params()
+        try:
+            if result.user_agent:
+                identity_failed = False
+                try:
+                    await wait_for_zendriver_mutation(
+                        self.page.send(
+                            cdp.network.set_user_agent_override(
+                                user_agent=result.user_agent
+                            )
+                        ),
+                        timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
+                        owner=self.page,
+                        operation="Browser user-agent override",
+                    )
+                except BrowserMutationOutcomeUnknownError:
+                    identity_failed = True
+                if identity_failed:
+                    raise BrowserIdentityApplyException(
+                        "Could not apply the FlareSolverr browser identity"
+                    )
+            if not cookie_params:
+                return
+            cookie_apply_failed = False
             try:
                 await wait_for_zendriver_mutation(
-                    self.page.send(
-                        cdp.network.set_user_agent_override(
-                            user_agent=result.user_agent
-                        )
-                    ),
+                    self.page.send(cdp.network.set_cookies(cookie_params)),
                     timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
                     owner=self.page,
-                    operation="Browser user-agent override",
+                    operation="Browser cookie replacement",
                 )
             except BrowserMutationOutcomeUnknownError:
-                identity_failed = True
-            if identity_failed:
+                cookie_apply_failed = True
+            if cookie_apply_failed:
+                # CDP protocol errors may contain cookie values in their params.
                 raise BrowserIdentityApplyException(
-                    "Could not apply the FlareSolverr browser identity"
+                    "Could not apply the FlareSolverr Cloudflare cookies"
                 )
-        cookie_params = result.to_cdp_cloudflare_cookie_params()
-        if not cookie_params:
-            return
-        cookie_apply_failed = False
-        try:
-            await wait_for_zendriver_mutation(
-                self.page.send(cdp.network.set_cookies(cookie_params)),
-                timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
-                owner=self.page,
-                operation="Browser cookie replacement",
-            )
-        except BrowserMutationOutcomeUnknownError:
-            cookie_apply_failed = True
-        if cookie_apply_failed:
-            # CDP protocol errors may contain cookie values in their params.
-            raise BrowserIdentityApplyException(
-                "Could not apply the FlareSolverr Cloudflare cookies"
-            )
+        except BaseException:
+            # Identity is one semantic transition across multiple CDP commands.
+            # A later local failure must not leave an accepted UA reusable with
+            # the previous cookies, even when no protocol await is active.
+            _begin_zendriver_retirement(self.page)
+            raise
 
     async def login(self) -> None:
         """Authenticate on Forums without choosing a post-login destination.

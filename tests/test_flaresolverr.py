@@ -575,6 +575,57 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsNone(result.turnstile_token)
 
+    async def test_malformed_cookie_response_is_not_published_as_a_solve(self) -> None:
+        response = _solution()
+        response["solution"]["cookies"] = [
+            {"name": "cf_clearance", "value": "opaque", "expiry": "invalid"}
+        ]
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        client._http = _HTTP(response)  # type: ignore[assignment]
+        _own_session(client, "session")
+
+        with self.assertRaises(FlareSolverrProtocolError) as raised:
+            await client.get(LOGIN_URL, session_id="session")
+        self.assertNotIn("opaque", str(raised.exception))
+        self.assertIn("session", client._uncertain_request_ids)
+
+    def test_valid_cookie_fields_preserve_cdp_identity(self) -> None:
+        for expiry in (None, -1, 0, 1_700_000_000.5):
+            with self.subTest(expiry=expiry):
+                result = FlareSolverrResult(
+                    cookies=[
+                        {
+                            "name": "cf_clearance",
+                            "value": "opaque",
+                            "domain": ".example.test",
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": False,
+                            "sameSite": "Lax",
+                            "expiry": expiry,
+                        }
+                    ],
+                    user_agent="test-agent",
+                )
+                cookie = result.to_cdp_cloudflare_cookie_params()[0].to_json()
+                self.assertEqual(
+                    cookie,
+                    {
+                        "name": "cf_clearance",
+                        "value": "opaque",
+                        "domain": ".example.test",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": False,
+                        "sameSite": "Lax",
+                        **(
+                            {"expires": expiry}
+                            if expiry is not None and expiry > 0
+                            else {}
+                        ),
+                    },
+                )
+
     async def test_empty_user_agent_is_rejected(self) -> None:
         client = FlareSolverrClient("http://127.0.0.1:8191/v1")
         client._http = _HTTP(  # type: ignore[assignment]
