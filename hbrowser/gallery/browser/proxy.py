@@ -141,6 +141,13 @@ var config = {{
 chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
 
 function callbackFn(details) {{
+    const challenger = details.challenger;
+    if (details.isProxy !== true || !challenger ||
+        typeof challenger.host !== "string" ||
+        challenger.host.toLowerCase() !== {proxy_host_literal}.toLowerCase() ||
+        challenger.port !== {proxy_port}) {{
+        return {{}};
+    }}
     return {{
         authCredentials: {{
             username: {proxy_user_literal},

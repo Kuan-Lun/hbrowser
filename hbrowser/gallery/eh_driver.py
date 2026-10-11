@@ -281,6 +281,16 @@ def _looks_like_random_encounter_url(href: str) -> bool:
 def _parse_punch_in_result(html_content: str) -> PunchInResult:
     """Classify the random-encounter state of one check-in document."""
     soup = BeautifulSoup(html_content, "html.parser")
+    # Absence of an encounter is meaningful only in a recognizable news page.
+    # Challenge, login, error and partial documents must never imply completion.
+    title = soup.title.get_text().strip() if soup.title is not None else ""
+    if (
+        not title.startswith("E-Hentai Galleries")
+        or len(soup.select("#newsouter #newsinner")) != 1
+        or soup.select_one('#nb a[href="https://e-hentai.org/news.php"]') is None
+        or soup.select_one("#newsinner #nt") is None
+    ):
+        raise RuntimeError("Daily check-in did not return a recognized news document")
     event_panes = soup.select("#eventpane")
     if not event_panes:
         return PunchInComplete()
@@ -568,6 +578,14 @@ class EHDriver(Driver):
             raise RuntimeError(
                 "Daily check-in document changed after lifecycle confirmation"
             )
+        if snapshot.url != "https://e-hentai.org/news.php":
+            raise RuntimeError("Daily check-in document has an untrusted URL")
+        if (
+            check_ban_status(snapshot.html).should_wait
+            or self._is_challenge_page(snapshot)
+            or self._is_authentication_page(snapshot)
+        ):
+            raise RuntimeError("Daily check-in document is blocked or unauthenticated")
         return snapshot.html
 
     async def _read_raw_page_snapshot(
@@ -785,7 +803,7 @@ class EHDriver(Driver):
         )
 
     @staticmethod
-    def _is_challenge_page(snapshot: _SearchPageSnapshot) -> bool:
+    def _is_challenge_page(snapshot: _SearchPageSnapshot | _RawPageSnapshot) -> bool:
         title = snapshot.title.casefold()
         html = snapshot.html.casefold()
         return (
@@ -802,7 +820,9 @@ class EHDriver(Driver):
         )
 
     @staticmethod
-    def _is_authentication_page(snapshot: _SearchPageSnapshot) -> bool:
+    def _is_authentication_page(
+        snapshot: _SearchPageSnapshot | _RawPageSnapshot,
+    ) -> bool:
         try:
             hostname = urlsplit(snapshot.url).hostname
         except ValueError:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,51 @@ from hbrowser.gallery.utils import Deadline
 
 
 class ProxyLoggingTests(unittest.TestCase):
+    def test_credentials_are_only_returned_to_the_configured_proxy(self) -> None:
+        # Execute the generated extension, including the registered callback,
+        # without opening a browser or contacting any network service.
+        harness = """
+const fs = require('node:fs');
+const vm = require('node:vm');
+let authenticate;
+const context = {chrome: {
+    proxy: {settings: {set() {}}},
+    webRequest: {onAuthRequired: {addListener(callback) {authenticate = callback;}}}
+}};
+vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
+process.stdout.write(JSON.stringify(cases.map(details => authenticate(details))));
+"""
+        details: list[dict[str, object]] = [
+            {"isProxy": False, "challenger": {"host": "proxy.example", "port": 8443}},
+            {"isProxy": True, "challenger": {"host": "origin.example", "port": 8443}},
+            {"isProxy": True, "challenger": {"host": "proxy.example", "port": 443}},
+            {"isProxy": True},
+            {"challenger": {"host": "proxy.example", "port": 8443}},
+            {"isProxy": True, "challenger": {"host": "PROXY.EXAMPLE", "port": 8443}},
+        ]
+        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        self.addCleanup(shutil.rmtree, directory)
+        result = subprocess.run(
+            ["node", "-e", harness, str(directory / "background.js")],
+            input=json.dumps(details),
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                {},
+                {},
+                {},
+                {},
+                {},
+                {"authCredentials": {"username": "u", "password": "p"}},
+            ],
+        )
+
     def test_authenticated_proxy_log_does_not_include_credentials(self) -> None:
         logger = Mock()
         with (
