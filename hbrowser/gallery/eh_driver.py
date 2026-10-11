@@ -1526,6 +1526,7 @@ class EHDriver(Driver):
         self.page = new_tab
         deferred_operation_error: BaseException | None = None
         terminal_cleanup_error: BaseException | None = None
+        outcome_unknown = False
         try:
             await _wait_for_archive_mutation(
                 new_tab.activate(),
@@ -1631,9 +1632,8 @@ class EHDriver(Driver):
             # status-poll sleep. The archive operation is still unresolved.
             _begin_zendriver_retirement(new_tab)
             raise
-        except BaseException as operation_error:
-            if is_browser_generation_error(operation_error):
-                raise
+        except (ClientOfflineException, InsufficientFundsException) as operation_error:
+            # These explicit server responses prove that no archive was queued.
             try:
                 await self._close_archive_tab_and_restore(gallery_tab, new_tab)
             except BaseException as cleanup_error:
@@ -1655,9 +1655,22 @@ class EHDriver(Driver):
                     deferred_operation_error = operation_error
             else:
                 deferred_operation_error = operation_error
+        except BaseException as operation_error:
+            _begin_zendriver_retirement(new_tab)
+            if is_browser_generation_error(operation_error) or not isinstance(
+                operation_error, Exception
+            ):
+                raise
+            outcome_unknown = True
         else:
             await self._close_archive_tab_and_restore(gallery_tab, new_tab)
 
+        if outcome_unknown:
+            # Leave the exception handler before raising, so sensitive CDP
+            # payloads cannot escape through implicit exception context.
+            raise ArchiveDownloadOutcomeUnknownError(
+                "Archive download outcome is unknown after click; refusing replay"
+            ) from None
         if terminal_cleanup_error is not None:
             raise terminal_cleanup_error from None
         if deferred_operation_error is not None:

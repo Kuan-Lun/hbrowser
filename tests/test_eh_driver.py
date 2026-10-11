@@ -1814,6 +1814,65 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             exact_connection=first_archive_page,
         )
 
+    async def test_status_read_failure_after_archive_click_is_outcome_unknown(
+        self,
+    ) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        archive_link = SimpleNamespace(click=AsyncMock())
+        gallery_page = SimpleNamespace(
+            mapper={},
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [archive_link]]),
+        )
+        archive_page = SimpleNamespace(
+            websocket=object(),
+            mapper={},
+            target=SimpleNamespace(target_id="archive"),
+            evaluate=AsyncMock(
+                return_value={
+                    "url": "https://exhentai.org/archiver.php",
+                    "readyState": "complete",
+                }
+            ),
+            activate=AsyncMock(),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(
+                side_effect=ProtocolException(
+                    {"message": "Execution context was destroyed."}
+                )
+            ),
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        gallery_page.browser = browser
+        archive_page.browser = browser
+        driver.browser = browser
+        driver.page = gallery_page
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+        with (
+            patch(
+                "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
+            ),
+            patch.object(driver, "save_page_diagnostic", new=AsyncMock()) as diagnostic,
+            patch.object(
+                driver, "_close_archive_tab_and_restore", new=AsyncMock()
+            ) as restore,
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError) as raised,
+        ):
+            await driver.download(gallery)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        restore.assert_not_awaited()
+        diagnostic.assert_not_awaited()
+        archive_link.click.assert_awaited_once()
+        archive_page.get_content.assert_awaited_once()
+        await _assert_generation_rejects_new_work(
+            self, browser=browser, owner=gallery_page, exact_connection=archive_page
+        )
+
     async def test_status_poll_cancellation_retires_entire_browser_generation(
         self,
     ) -> None:
