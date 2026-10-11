@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import DriverBrowserBindingError
@@ -14,6 +15,36 @@ class _TestDriver(Driver):
 
 
 class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
+    def test_idempotent_binding_revalidates_page_browser_identity(self) -> None:
+        browser = object()
+        page = SimpleNamespace(browser=browser)
+        driver = _TestDriver()
+        driver.bind_existing_browser(browser, page)
+        page.browser = object()
+        with self.assertRaises(DriverBrowserBindingError):
+            driver.bind_existing_browser(browser, page)
+
+    def test_mismatched_or_missing_page_browser_cannot_transfer_ownership(self) -> None:
+        for page in (SimpleNamespace(browser=object()), object()):
+            for owns_browser in (False, True):
+                with self.subTest(page=page, owns_browser=owns_browser):
+                    driver = _TestDriver()
+                    with (
+                        patch(
+                            "hbrowser.gallery.driver_base.handle_ban_decorator"
+                        ) as decorate,
+                        self.assertRaises(DriverBrowserBindingError),
+                    ):
+                        driver.bind_existing_browser(
+                            object(), page, owns_browser=owns_browser
+                        )
+                    decorate.assert_not_called()
+                    self.assertFalse(driver.is_browser_bound)
+                    self.assertFalse(driver.owns_browser)
+                    self.assertIsNone(driver.browser)
+                    self.assertIsNone(driver.page)
+                    self.assertIsNone(driver.myget)
+
     def test_manual_captcha_timeout_is_capped_at_180_seconds(self) -> None:
         with self.assertRaisesRegex(ValueError, r"\(0, 180\]"):
             _TestDriver(captcha_manual_timeout=181)
@@ -27,7 +58,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
     def test_binding_sets_fixed_objects_and_builds_page_navigator(self) -> None:
         driver = _TestDriver()
         browser = object()
-        page = object()
+        page = SimpleNamespace(browser=browser)
         navigator = AsyncMock()
 
         with patch(
@@ -46,7 +77,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
     def test_identical_binding_is_idempotent(self) -> None:
         driver = _TestDriver()
         browser = object()
-        page = object()
+        page = SimpleNamespace(browser=browser)
 
         with patch(
             "hbrowser.gallery.driver_base.handle_ban_decorator",
@@ -62,7 +93,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_rebinding_browser_page_or_ownership_is_rejected(self) -> None:
         original_browser = object()
-        original_page = object()
+        original_page = SimpleNamespace(browser=original_browser)
 
         cases = (
             (object(), original_page, False),
@@ -126,7 +157,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
     async def test_init_browser_uses_an_owned_binding(self) -> None:
         driver = _TestDriver(headless=True)
         browser = object()
-        page = object()
+        page = SimpleNamespace(browser=browser)
         navigator = AsyncMock()
         get = AsyncMock()
         driver.get = get  # type: ignore[method-assign]
@@ -174,7 +205,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "hbrowser.gallery.driver_base.create_browser",
-                new=AsyncMock(return_value=(browser, object())),
+                new=AsyncMock(return_value=(browser, SimpleNamespace(browser=browser))),
             ),
             patch(
                 "hbrowser.gallery.driver_base.handle_ban_decorator",
@@ -226,7 +257,7 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "hbrowser.gallery.driver_base.create_browser",
-                new=AsyncMock(return_value=(browser, object())),
+                new=AsyncMock(return_value=(browser, SimpleNamespace(browser=browser))),
             ),
             patch(
                 "hbrowser.gallery.driver_base.handle_ban_decorator",
@@ -246,9 +277,11 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_owner_closes_the_browser(self) -> None:
         browser = object()
         owner = _TestDriver()
-        owner.bind_existing_browser(browser, object(), owns_browser=True)
+        owner.bind_existing_browser(
+            browser, SimpleNamespace(browser=browser), owns_browser=True
+        )
         shared = _TestDriver()
-        shared.bind_existing_browser(browser, object())
+        shared.bind_existing_browser(browser, SimpleNamespace(browser=browser))
 
         with patch(
             "hbrowser.gallery.driver_base.stop_browser",

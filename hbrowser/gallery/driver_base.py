@@ -200,6 +200,10 @@ class Driver(ABC):
             raise ValueError("page must not be None")
         if type(owns_browser) is not bool:
             raise TypeError("owns_browser must be a bool")
+        if getattr(page, "browser", None) is not browser:
+            raise DriverBrowserBindingError(
+                "page must belong to the browser receiving the driver binding"
+            )
 
         if self._browser_bound:
             if (
