@@ -30,10 +30,6 @@ from ..utils.protocol import (
     _ZendriverRetirement,
 )
 from .chrome_manager import ChromePaths, create_chrome_install_staging_root
-from .mapper import (
-    start_zendriver_mapper_janitor,
-    stop_zendriver_mapper_janitor,
-)
 from .process import (
     OwnedProcess,
     ProcessOwnershipError,
@@ -68,7 +64,6 @@ _PROCESS_OWNERSHIP_START_TIMEOUT_SECONDS = 10.0
 _CONNECTION_CLOSE_TIMEOUT_SECONDS = 5.0
 _CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS = 2.0
 _STOP_TASK_CANCEL_TIMEOUT_SECONDS = 2.0
-_JANITOR_STOP_TIMEOUT_SECONDS = 2.0
 _BROWSER_PROCESS_NATURAL_EXIT_SECONDS = 3.0
 _BROWSER_PROCESS_TERMINATE_WAIT_SECONDS = 3.0
 _BROWSER_PROCESS_KILL_WAIT_SECONDS = 3.0
@@ -1192,7 +1187,6 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             use_tor,
             deadline=browser_attach_deadline,
         )
-        start_zendriver_mapper_janitor(browser)
         logger.info("Browser ready (%s, %s)", mode, connection)
     except BaseException as startup_error:
         await _cleanup_browser_after_startup_failure(
@@ -1462,25 +1456,6 @@ def _raise_browser_shutdown_errors(
         f"Primary shutdown failure: {type(primary).__name__}: {primary}"
     )
     raise ownership_error from primary
-
-
-async def _stop_mapper_janitor(
-    browser: Any,
-    retirement: _ZendriverRetirement,
-    *,
-    deadline: Deadline,
-) -> list[BaseException]:
-    if retirement.janitor_cleanup_is_complete():
-        return []
-    completed, errors = await _bounded_shutdown_awaitable(
-        stop_zendriver_mapper_janitor(browser),
-        timeout=_JANITOR_STOP_TIMEOUT_SECONDS,
-        description="Zendriver mapper janitor stop",
-        deadline=deadline,
-    )
-    if completed and not errors:
-        retirement.mark_janitor_cleanup_complete()
-    return errors
 
 
 async def _await_browser_stop_task(
@@ -1789,7 +1764,6 @@ def _mark_shutdown_complete_if_ready(
         retirement.protocol_is_retired()
         and retirement.browser_cleanup_is_complete()
         and retirement.tor_cleanup_is_complete()
-        and retirement.janitor_cleanup_is_complete()
     ):
         _release_browser_atexit(browser)
         retirement.mark_complete()
@@ -1805,11 +1779,7 @@ async def _stop_browser_cleanup(
 ) -> None:
     """Run the first bounded shutdown attempt for one browser generation."""
 
-    errors = await _stop_mapper_janitor(
-        browser,
-        retirement,
-        deadline=deadline,
-    )
+    errors: list[BaseException] = []
     initial_browser_errors = await _ensure_browser_cleanup(
         browser,
         retirement,
@@ -1871,11 +1841,7 @@ async def _retry_browser_retirement(
     """Retry incomplete resource cleanup without reviving the generation."""
 
     retirement.capture_connections(connections)
-    errors = await _stop_mapper_janitor(
-        browser,
-        retirement,
-        deadline=deadline,
-    )
+    errors: list[BaseException] = []
     errors.extend(
         await _retire_protocol_operations(
             browser,

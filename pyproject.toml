@@ -17,9 +17,9 @@ dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
     "httpx>=0.28.1",
     "websockets>=17.0.1",
-    # hbrowser's browser lifecycle has been verified against this exact
-    # Zendriver cohort; upgrades require the ownership/lifecycle suite.
-    "zendriver==0.16.0",
+    # Flat CDP sessions, event dispatch and shutdown are verified against this
+    # exact Zendriver cohort; upgrades require the ownership/lifecycle suite.
+    "zendriver==0.17.1",
 ]
 
 classifiers = [

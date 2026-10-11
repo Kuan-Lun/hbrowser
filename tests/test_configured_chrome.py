@@ -178,9 +178,6 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         self.setup = self.enterContext(
             patch.object(factory, "_post_create_setup", new=AsyncMock())
         )
-        self.janitor = self.enterContext(
-            patch.object(factory, "start_zendriver_mapper_janitor")
-        )
 
     def _assert_no_installer(self) -> None:
         self.install.assert_not_awaited()
@@ -240,7 +237,6 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         self.setup.assert_awaited_once_with(
             self.browser, self.page, False, deadline=ANY
         )
-        self.janitor.assert_called_once_with(self.browser)
 
         await factory.stop_browser(self.browser)
 
@@ -314,5 +310,4 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         self._assert_owner_shutdown()
         self.main_tab.assert_not_awaited()
         self.setup.assert_not_awaited()
-        self.janitor.assert_not_called()
         self.assertTrue(self.executable.is_file())

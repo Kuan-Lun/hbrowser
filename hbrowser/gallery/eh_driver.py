@@ -39,7 +39,6 @@ from ..exceptions import (
     SearchRateLimitError,
 )
 from .browser.ban_handler import check_ban_status
-from .browser.mapper import prune_zendriver_connection_mapper
 from .driver_base import Driver
 from .models import Tag
 from .punchin_models import PunchInComplete, PunchInResult, RandomEncounterFound
@@ -1376,7 +1375,6 @@ class EHDriver(Driver):
         return await self._download(gallery, deadline=control_deadline)
 
     async def _download(self, gallery: GalleryURLParser, *, deadline: Deadline) -> bool:
-        prune_zendriver_connection_mapper(self.page)
 
         await self.get(gallery.url, deadline=deadline)
         try:
