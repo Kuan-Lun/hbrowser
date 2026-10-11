@@ -2000,7 +2000,7 @@ async def _stop_browser(
         retirement.replace_completed_shutdown_task(cleanup_task)
     await _await_cleanup_deferring_caller_cancellation(
         cleanup_task,
-        shutdown_deadline,
+        Deadline(min(proposed_deadline.expires_at, shutdown_deadline.expires_at)),
     )
 
 

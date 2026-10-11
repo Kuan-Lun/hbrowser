@@ -2033,6 +2033,47 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         browser.stop.assert_awaited_once_with()
         self.assertTrue(operation.cancelled())
 
+    async def test_later_stop_caller_keeps_its_shorter_deadline(self) -> None:
+        for seconds in (0.0, 0.01):
+            with self.subTest(seconds=seconds):
+                started = asyncio.Event()
+                release = asyncio.Event()
+
+                async def blocking_stop(
+                    started: asyncio.Event = started,
+                    release: asyncio.Event = release,
+                ) -> None:
+                    started.set()
+                    await release.wait()
+
+                browser = SimpleNamespace(
+                    connection=None,
+                    targets=[],
+                    stop=AsyncMock(side_effect=blocking_stop),
+                )
+                _bind_browser_process_owner(browser)
+                first_deadline = Deadline.after(1)
+                first = asyncio.create_task(
+                    factory.stop_browser(browser, first_deadline)
+                )
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    with self.assertRaises(ProcessOwnershipError):
+                        await asyncio.wait_for(
+                            factory.stop_browser(browser, Deadline.after(seconds)), 0.2
+                        )
+                    self.assertFalse(first.done())
+                    lifecycle = browser._hbrowser_zendriver_lifecycle
+                    self.assertEqual(
+                        lifecycle.shutdown_deadline_expires_at,
+                        first_deadline.expires_at,
+                    )
+                    self.assertFalse(lifecycle.shutdown_task.cancelled())
+                finally:
+                    release.set()
+                    await first
+                browser.stop.assert_awaited_once()
+
     async def test_concurrent_stop_callers_share_one_cleanup(self) -> None:
         browser_stop_started = asyncio.Event()
         allow_browser_stop = asyncio.Event()
