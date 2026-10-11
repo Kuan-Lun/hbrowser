@@ -24,14 +24,8 @@ def test_fast_gate_rejects_damaged_snapshot_before_quality_tools(
     scripts.mkdir(parents=True)
     shutil.copy2(_ROOT / "scripts/check-fast.sh", scripts / "check-fast.sh")
     shutil.copytree(_ROOT / "scripts/_shared", scripts / "_shared")
+    shutil.copy2(_ROOT / "pyproject.toml", repository / "pyproject.toml")
     bundle = scripts / "_shared/h2h_dev_tools"
-    if damage == "modified":
-        with (bundle / "dependency_manifest.py").open("a", encoding="utf-8") as stream:
-            stream.write("\nraise AssertionError('modified snapshot must not run')\n")
-    elif damage == "missing":
-        (bundle / "dependency_manifest.py").unlink()
-    else:
-        (bundle / "unexpected.py").write_text("unexpected = True\n", encoding="utf-8")
     marker = repository / "quality-tool-started"
     executables = {
         ".venv/bin/python": f'exec {shlex.quote(sys.executable)} "$@"\n',
@@ -57,6 +51,27 @@ def test_fast_gate_rejects_damaged_snapshot_before_quality_tools(
         timeout=30,
     )
 
+    baseline = subprocess.run(
+        ("bash", "scripts/check-fast.sh"),
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    assert marker.exists()
+    marker.unlink()
+
+    if damage == "modified":
+        with (bundle / "dependency_manifest.py").open("a", encoding="utf-8") as stream:
+            stream.write("\nraise AssertionError('modified snapshot must not run')\n")
+    elif damage == "missing":
+        (bundle / "dependency_manifest.py").unlink()
+    else:
+        (bundle / "unexpected.py").write_text("unexpected = True\n", encoding="utf-8")
+
     result = subprocess.run(
         ("bash", "scripts/check-fast.sh"),
         cwd=repository,
@@ -68,5 +83,10 @@ def test_fast_gate_rejects_damaged_snapshot_before_quality_tools(
     )
 
     assert result.returncode != 0
-    assert "h2h-dev-tools" in result.stderr
+    expected_errors = {
+        "modified": "Generated source was modified: dependency_manifest.py",
+        "missing": "missing=['dependency_manifest.py']",
+        "unexpected": "extra=['unexpected.py']",
+    }
+    assert expected_errors[damage] in result.stderr
     assert not marker.exists()

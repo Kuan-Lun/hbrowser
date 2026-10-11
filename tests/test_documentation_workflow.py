@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -13,9 +15,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 _FAKE_REVIEW = r"""from pathlib import Path
+import json
 import os
 import subprocess
 import sys
+import tomllib
 
 trace = Path(os.environ["DOCUMENTATION_WORKFLOW_TRACE"])
 receipt = trace.with_suffix(".review")
@@ -359,3 +363,55 @@ def test_full_merge_gate_rechecks_review_after_program_checks(
     assert _git(repository, "branch", "--show-current") == "docs/task"
     assert not (repository / ".git/MERGE_HEAD").exists()
     assert _git(repository, "status", "--porcelain") == ""
+
+
+def test_merge_version_gate_uses_repository_python_without_system_shebang(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    script = repository / "scripts/check-version.py"
+    script.write_text(
+        "#!/nonexistent/system/python\n" + script.read_text().split("\n", 1)[1],
+        encoding="utf-8",
+    )
+    _commit(repository, "test: remove the system interpreter prerequisite")
+
+    result = _run(repository, "scripts/git-flow-merge.sh")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _git(repository, "branch", "--show-current") == "main"
+
+
+def test_repository_policy_rejects_combined_runtime_and_version_commit(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path, install_hooks=False)
+    configuration = tomllib.loads((_ROOT / "pyproject.toml").read_text())
+    policy = configuration["tool"]["h2h"]["version"]
+    policy_text = "\n".join(
+        f"{key} = {json.dumps(value)}" for key, value in policy.items()
+    )
+    metadata = (
+        '[project]\nname = "release-fixture"\nversion = "0.1.0"\n'
+        "[tool.h2h.version]\n" + policy_text + "\n"
+    )
+    release_directory = next(
+        pattern.removesuffix("**")
+        for pattern in policy["release-paths"]
+        if pattern.endswith("/**")
+    )
+    runtime = release_directory + "version_probe.py"
+    _write(repository, "pyproject.toml", metadata)
+    _write(repository, runtime, "value = 1\n")
+    _commit(repository, "chore: seed actual repository version policy")
+    base = _git(repository, "rev-parse", "HEAD")
+    _write(repository, runtime, "value = 2\n")
+    _write(repository, "pyproject.toml", metadata.replace('"0.1.0"', '"0.1.1"'))
+    _commit(repository, "fix: combine runtime change and version bump")
+
+    result = _run(
+        repository, ".venv/bin/python", "scripts/check-version.py", "--base", base
+    )
+
+    assert result.returncode != 0
+    assert "version transition requires its dedicated release commit" in result.stderr

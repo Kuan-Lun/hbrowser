@@ -12,7 +12,7 @@ current="$(git branch --show-current)"
     exit 1
 }
 
-scripts/check-version.py --index
+.venv/bin/python scripts/check-version.py --index
 candidate_tree="$(git write-tree)"
 profile="$(.venv/bin/python scripts/check_change_scope.py --index --base HEAD)"
 case "$profile" in

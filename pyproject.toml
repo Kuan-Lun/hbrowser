@@ -75,6 +75,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 
 [tool.h2h.version]
+dedicated-release-commit = true
 development-paths = [
     ".Codex/**",
     ".claude/**",
