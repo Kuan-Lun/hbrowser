@@ -218,12 +218,10 @@ def configure_proxy() -> str | None:
     Returns:
         proxy extension 路徑，或 None
     """
-    rp_username = os.getenv("RP_USERNAME")
-    rp_password = os.getenv("RP_PASSWORD")
-    rp_dns = os.getenv("RP_DNS")
-
-    if not (rp_username and rp_password and rp_dns):
+    credentials = _residential_proxy_credentials()
+    if credentials is None:
         return None
+    rp_username, rp_password, rp_dns = credentials
 
     if ":" in rp_dns:
         proxy_host, proxy_port = rp_dns.split(":", 1)
@@ -250,9 +248,24 @@ def configure_proxy() -> str | None:
     return proxy_extension
 
 
+def _residential_proxy_credentials() -> tuple[str, str, str] | None:
+    """Treat an entirely empty configuration as disabled; reject partial input."""
+
+    username = os.getenv("RP_USERNAME")
+    password = os.getenv("RP_PASSWORD")
+    endpoint = os.getenv("RP_DNS")
+    if not any((username, password, endpoint)):
+        return None
+    if not username or not password or not endpoint:
+        raise ValueError(
+            "RP_USERNAME, RP_PASSWORD and RP_DNS must be provided together"
+        )
+    return username, password, endpoint
+
+
 def has_residential_proxy() -> bool:
-    """檢查是否有設定住宅代理環境變數。"""
-    return all(os.getenv(k) for k in ("RP_USERNAME", "RP_PASSWORD", "RP_DNS"))
+    """Return whether complete credentials are configured, rejecting partial input."""
+    return _residential_proxy_credentials() is not None
 
 
 def find_available_port(start: int = 9150) -> int:
