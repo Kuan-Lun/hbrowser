@@ -1982,9 +1982,12 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         archive_link.click.assert_awaited_once_with()
         driver.myget.assert_awaited_once_with(gallery.url, deadline=ANY)
-        lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE, None)
-        if lifecycle is not None:
-            self.assertFalse(lifecycle.retired)
+        await _assert_generation_rejects_new_work(
+            self,
+            browser=browser,
+            owner=gallery_page,
+            exact_connection=gallery_page,
+        )
 
     async def test_client_offline_cleanup_activation_failure_is_terminal(self) -> None:
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")

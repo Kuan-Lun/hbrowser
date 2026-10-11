@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import DriverBrowserBindingError
+from hbrowser.gallery.browser.process import ProcessOwnershipError
 from hbrowser.gallery.driver_base import Driver
 
 
@@ -148,6 +149,99 @@ class DriverBrowserBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(driver.myget, navigator)
         self.assertTrue(driver.owns_browser)
         get.assert_awaited_once_with(driver.url["Forums"])
+
+    async def test_partial_binding_is_rejected_before_browser_creation(self) -> None:
+        for attribute in ("browser", "page", "myget"):
+            with self.subTest(attribute=attribute):
+                driver = _TestDriver()
+                previous = object()
+                setattr(driver, attribute, previous)
+                with (
+                    patch(
+                        "hbrowser.gallery.driver_base.create_browser",
+                        new=AsyncMock(return_value=(object(), object())),
+                    ) as create_browser,
+                    self.assertRaises(DriverBrowserBindingError),
+                ):
+                    await driver._init_browser()
+                create_browser.assert_not_awaited()
+                self.assertIs(getattr(driver, attribute), previous)
+
+    async def test_binding_failure_closes_the_new_browser(self) -> None:
+        driver = _TestDriver()
+        browser = object()
+        failure = RuntimeError("navigator construction failed")
+        with (
+            patch(
+                "hbrowser.gallery.driver_base.create_browser",
+                new=AsyncMock(return_value=(browser, object())),
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.handle_ban_decorator",
+                side_effect=failure,
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.stop_browser", new=AsyncMock()
+            ) as stop_browser,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            await driver._init_browser()
+        self.assertIs(raised.exception, failure)
+        stop_browser.assert_awaited_once_with(browser, deadline=ANY)
+        self.assertIsNone(driver.browser)
+        self.assertIsNone(driver.page)
+        self.assertFalse(driver.is_browser_bound)
+        self.assertFalse(driver.owns_browser)
+
+    async def test_binding_race_closes_only_the_new_browser(self) -> None:
+        driver = _TestDriver()
+        browser = object()
+        previous_page = object()
+
+        async def create(**_kwargs: object) -> tuple[object, object]:
+            driver.page = previous_page
+            return browser, object()
+
+        with (
+            patch(
+                "hbrowser.gallery.driver_base.create_browser",
+                new=AsyncMock(side_effect=create),
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.stop_browser", new=AsyncMock()
+            ) as stop_browser,
+            self.assertRaises(DriverBrowserBindingError),
+        ):
+            await driver._init_browser()
+        stop_browser.assert_awaited_once_with(browser, deadline=ANY)
+        self.assertIs(driver.page, previous_page)
+        self.assertIsNone(driver.browser)
+        self.assertFalse(driver.owns_browser)
+
+    async def test_unproven_new_browser_cleanup_is_reported(self) -> None:
+        driver = _TestDriver()
+        browser = object()
+        binding_error = RuntimeError("navigator construction failed")
+        cleanup_error = ProcessOwnershipError("new browser remains owned")
+        with (
+            patch(
+                "hbrowser.gallery.driver_base.create_browser",
+                new=AsyncMock(return_value=(browser, object())),
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.handle_ban_decorator",
+                side_effect=binding_error,
+            ),
+            patch(
+                "hbrowser.gallery.driver_base.stop_browser",
+                new=AsyncMock(side_effect=cleanup_error),
+            ),
+            self.assertRaises(ProcessOwnershipError) as raised,
+        ):
+            await driver._init_browser()
+        self.assertIs(raised.exception, cleanup_error)
+        self.assertIs(raised.exception.__cause__, binding_error)
+        self.assertFalse(driver.is_browser_bound)
 
     async def test_only_owner_closes_the_browser(self) -> None:
         browser = object()

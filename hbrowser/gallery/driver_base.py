@@ -212,22 +212,40 @@ class Driver(ABC):
                 "ownership mode"
             )
 
+        self._require_unbound_browser_state()
+        navigator = handle_ban_decorator(page)
+        self.browser = browser
+        self.page = page
+        self.myget = navigator
+        self._owns_browser = owns_browser
+        self._browser_bound = True
+
+    def _require_unbound_browser_state(self) -> None:
+        if self._browser_bound:
+            raise DriverBrowserBindingError("driver already has a browser binding")
         if self.browser is not None or self.page is not None or self.myget is not None:
             raise DriverBrowserBindingError(
                 "driver browser state was assigned without bind_existing_browser"
             )
 
-        self.browser = browser
-        self.page = page
-        self.myget = handle_ban_decorator(page)
-        self._owns_browser = owns_browser
-        self._browser_bound = True
-
     async def _init_browser(self) -> None:
-        if self._browser_bound:
-            raise DriverBrowserBindingError("driver already has a browser binding")
+        self._require_unbound_browser_state()
         browser, page = await create_browser(headless=self.headless)
-        self.bind_existing_browser(browser, page, owns_browser=True)
+        try:
+            self.bind_existing_browser(browser, page, owns_browser=True)
+        except BaseException as binding_error:
+            try:
+                await stop_browser(
+                    browser,
+                    deadline=Deadline.after(_DRIVER_EXIT_TOTAL_DEADLINE_SECONDS),
+                )
+            except BaseException as cleanup_error:
+                cleanup_error.add_note(
+                    "New browser binding failed before ownership transfer: "
+                    f"{type(binding_error).__name__}"
+                )
+                raise cleanup_error from binding_error
+            raise
         await self.get(self.url["Forums"])
 
     async def __aenter__(self) -> Self:

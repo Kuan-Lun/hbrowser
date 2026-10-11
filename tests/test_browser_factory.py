@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -17,7 +18,11 @@ from zendriver import cdp
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import factory
 from hbrowser.gallery.browser import tor as tor_module
-from hbrowser.gallery.browser.process import OwnedProcess, ProcessOwnershipError
+from hbrowser.gallery.browser.process import (
+    OwnedProcess,
+    ProcessOwnershipError,
+    start_owned_process,
+)
 from hbrowser.gallery.browser.tor import terminate_tor_process
 from hbrowser.gallery.utils import (
     Deadline,
@@ -2109,6 +2114,48 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             allow_stop = True
             operation.cancel()
             await operation
+
+
+class TorRealDeadlineTests(unittest.TestCase):
+    def test_bootstrap_exhaustion_reaps_process_before_returning(self) -> None:
+        owners: list[OwnedProcess] = []
+
+        def start_fake_tor(*_args: Any, **kwargs: Any) -> OwnedProcess:
+            owner = start_owned_process(
+                sys.executable,
+                ["-c", "import time; time.sleep(60)"],
+                **kwargs,
+            )
+            owners.append(owner)
+            return owner
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "tor-data"
+            data.mkdir()
+            deadline = Deadline.after(4)
+            try:
+                with (
+                    patch.object(tor_module, "_find_tor_binary", return_value="tor"),
+                    patch.object(
+                        tor_module,
+                        "tempfile",
+                        SimpleNamespace(mkdtemp=lambda **_: str(data)),
+                    ),
+                    patch.object(tor_module, "start_owned_process", new=start_fake_tor),
+                    self.assertRaisesRegex(
+                        RuntimeError, "failed to bootstrap"
+                    ) as raised,
+                ):
+                    tor_module._start_tor_process(9150, deadline=deadline)
+                self.assertNotIsInstance(raised.exception, ProcessOwnershipError)
+                self.assertEqual(len(owners), 1)
+                self.assertIsNotNone(owners[0].poll())
+                self.assertFalse(data.exists())
+                self.assertGreater(deadline.remaining(), 0)
+            finally:
+                for owner in owners:
+                    # Negative controls must not leave a live synthetic Tor process.
+                    terminate_tor_process(owner)
 
 
 class TorProcessCleanupTests(unittest.TestCase):

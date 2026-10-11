@@ -1468,6 +1468,7 @@ class EHDriver(Driver):
             ) from None
 
         if not new_tab:
+            _begin_zendriver_retirement(gallery_tab)
             self.logger.warning(
                 "Archive download tab did not appear after click; not replaying: "
                 "gid=%d",

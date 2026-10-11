@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 TOR_SOCKS_PORT = 9150
 _TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
 _TOR_BOOTSTRAP_TIMEOUT_SECONDS = 120.0
+# Allow five seconds each for termination, force-kill, and private-path cleanup.
+_TOR_BOOTSTRAP_CLEANUP_RESERVE_SECONDS = 15.0
 _TOR_MAX_RETRIES = 3
 _TOR_MAX_RETRY_WAIT_SECONDS = 5.0
 
@@ -163,8 +165,13 @@ def _start_tor_process(
         if deadline is None
         else deadline.bounded(_TOR_BOOTSTRAP_TIMEOUT_SECONDS)
     )
+    cleanup_reserve = min(
+        _TOR_BOOTSTRAP_CLEANUP_RESERVE_SECONDS,
+        operation_deadline.remaining() / 2.0,
+    )
+    bootstrap_deadline = Deadline(operation_deadline.expires_at - cleanup_reserve)
     tor_binary = _find_tor_binary()
-    process_startup_timeout = min(10.0, operation_deadline.remaining())
+    process_startup_timeout = min(10.0, bootstrap_deadline.remaining())
     if process_startup_timeout <= 0:
         raise RuntimeError("Tor startup exceeded the shared browser deadline")
     data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
@@ -182,7 +189,7 @@ def _start_tor_process(
         stderr=subprocess.STDOUT,
         cleanup_paths=(data_dir,),
         startup_timeout=process_startup_timeout,
-        deadline=operation_deadline.expires_at,
+        deadline=bootstrap_deadline.expires_at,
     )
     process_cleanup: _TorProcessAtexitCleanup | None = None
     try:
@@ -220,7 +227,6 @@ def _start_tor_process(
         thread.start()
 
         # 等待 Tor bootstrap 完成
-        bootstrap_deadline = operation_deadline
         start_time = time.monotonic()
         last_status_time = start_time
         last_bootstrap_pct = "0%"
