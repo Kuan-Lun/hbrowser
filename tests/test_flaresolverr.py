@@ -9,6 +9,7 @@ import httpx
 from hbrowser.gallery.browser.flaresolverr import (
     FlareSolverrClient,
     FlareSolverrConfigurationError,
+    FlareSolverrError,
     FlareSolverrProtocolError,
     FlareSolverrRequestError,
     FlareSolverrResult,
@@ -458,26 +459,110 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
                     turnstile_tabs=invalid,  # type: ignore[arg-type]
                 )
 
-    async def test_http_transport_close_has_a_command_phase_watchdog(self) -> None:
+    async def test_http_transport_close_failure_keeps_terminal_ownership(self) -> None:
         async def hang() -> None:
             await asyncio.Event().wait()
 
-        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
-        close = AsyncMock(side_effect=hang)
-        client._http = Mock(aclose=close)
+        for failure in (hang, RuntimeError("PRIVATE-TRANSPORT-DETAIL")):
+            with self.subTest(failure=type(failure).__name__):
+                client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+                close = AsyncMock(side_effect=failure)
 
+                class ClosingTransport(httpx.AsyncBaseTransport):
+                    def __init__(self, close_call: AsyncMock) -> None:
+                        self.close_call = close_call
+
+                    async def aclose(self) -> None:
+                        await self.close_call()
+
+                http = httpx.AsyncClient(
+                    transport=ClosingTransport(close), trust_env=False
+                )
+                client._http = http
+                with (
+                    patch(
+                        "hbrowser.gallery.browser.flaresolverr._TRANSPORT_PHASE_TIMEOUT_SECONDS",
+                        0.01,
+                    ),
+                    self.assertRaisesRegex(FlareSolverrError, "transport.*unresolved"),
+                ):
+                    await client.__aexit__(None, None, None)
+                self.assertIs(client._http, http)
+                self.assertTrue(http.is_closed)
+                # HTTPX marks itself closed before its awaited pool cleanup.
+                # Calling aclose again may be a no-op, not a cleanup receipt.
+                with self.assertRaises(FlareSolverrError):
+                    await client.__aexit__(None, None, None)
+                close.assert_awaited_once_with()
+                with self.assertRaises(RuntimeError):
+                    await client.__aenter__()
+                with self.assertRaises(RuntimeError):
+                    await client.create_session()
+                with self.assertRaises(RuntimeError):
+                    await client.get(LOGIN_URL, session_id="session")
+                self.assertIs(client._http, http)
+
+    async def test_session_cleanup_reserves_transport_close_budget(self) -> None:
+        clock = _Clock()
+        close_times: list[float] = []
+
+        class ExhaustedDestroyHTTP(_HTTP):
+            async def post(
+                self,
+                endpoint: str,
+                *,
+                json: dict[str, Any],
+                timeout: httpx.Timeout | float,
+            ) -> _Response:
+                if not isinstance(timeout, httpx.Timeout) or timeout.read is None:
+                    raise AssertionError("expected a bounded HTTP phase")
+                clock.now += timeout.read
+                raise httpx.ReadTimeout("destroy exhausted its phase")
+
+            async def aclose(self) -> None:
+                close_times.append(clock.now)
+                await super().aclose()
+
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = ExhaustedDestroyHTTP()
+        client._http = http  # type: ignore[assignment]  # Test transport.
+        _own_session(client, "session")
         with (
             patch(
-                "hbrowser.gallery.browser.flaresolverr._TRANSPORT_PHASE_TIMEOUT_SECONDS",
-                0.01,
+                "hbrowser.gallery.browser.flaresolverr.Deadline.after",
+                return_value=_ClockDeadline(clock, expires_at=15.0),
             ),
-            patch("hbrowser.gallery.browser.flaresolverr.logger") as logger,
+            self.assertRaises(FlareSolverrSessionOwnershipError),
         ):
             await client.__aexit__(None, None, None)
-
-        close.assert_awaited_once_with()
-        logger.warning.assert_called_once()
+        self.assertEqual(close_times, [10.0])
+        self.assertTrue(http.closed)
         self.assertIsNone(client._http)
+        self.assertEqual(client._owned_session_ids, {"session"})
+
+    async def test_cancelled_transport_close_retains_unresolved_owner(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        started = asyncio.Event()
+
+        async def close() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        http = Mock(aclose=AsyncMock(side_effect=close))
+        client._http = http
+        task = asyncio.create_task(client.__aexit__(None, None, None))
+        await started.wait()
+        with self.assertRaisesRegex(RuntimeError, "already in progress"):
+            await client.__aexit__(None, None, None)
+        self.assertIs(client._http, http)
+        http.aclose.assert_awaited_once_with()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIs(client._http, http)
+        with self.assertRaises(FlareSolverrError):
+            await client.__aexit__(None, None, None)
+        http.aclose.assert_awaited_once_with()
 
     async def test_invalid_or_empty_tokens_are_normalized_to_none(self) -> None:
         for token in ("", None, 123):
