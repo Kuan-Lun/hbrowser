@@ -98,4 +98,4 @@ development-paths = [
 release-paths = ["LICENSE", "hbrowser/**"]
 
 [tool.h2h-dev-tools]
-components = ["distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-flow", "hooks", "primary-branch", "version-policy"]
+components = ["code-review", "distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-flow", "hooks", "primary-branch", "version-policy"]

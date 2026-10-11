@@ -1,6 +1,7 @@
 {
   "components": [
     "change-scope",
+    "code-review",
     "dependencies",
     "dependency-audit",
     "distribution-check",
@@ -14,9 +15,10 @@
   ],
   "files": {
     "__init__.py": "03d1963265f288085b4351cfc6ca61fc3beb73b2d65ad7cd0098ee6a080db094",
-    "bundle_verify.py": "948b61243fe09c042e00ad95f87056c129d33e1a02ff9ce189cef112b93bc32c",
+    "bundle_verify.py": "46c31191b21a069ab821757f80fe94d5388d4b3bfbbac3923d42ffa0c884cb70",
     "change_scope.py": "3b3ae0cace8c284a5d49af5ac2d59d1f724acc937b13cb811cdc2149b818b7fc",
     "ci_dependencies.py": "fadaf7aa85852eb4e43b60cfdddbe5ae88743dad15746729417dab7b6a623853",
+    "code_review.py": "d6fa97456c44f1965716e7ee99288980b38a17c7f6f8ea5ab3d056b6f8861060",
     "dependency_audit.py": "ba6b6afc6664f150538ff9dc6e06d837c341901ec0ffa1b1a23653b177b2b6eb",
     "dependency_manifest.py": "b3a2d2d9b71741cd710a477f1ca41ed2787885908016e6ec078c5b46df5dbb62",
     "distribution_check.py": "15ec48c7b2a8715d9910309e9919cd8587ab5d4a3d63e47f96b8b2d7c2de6294",
@@ -26,10 +28,11 @@
     "offline_wheel.py": "24ffcf8a74620a08ba152e78b865ac0a4a0c28de152ddcd5c8995f6f998cc8c7",
     "primary-branch.sh": "602f2c63659e10b6dc835fc4026bf9371d9def1fcb49cbdbfabe7fb7b4d76aa5",
     "rebuild-env.sh": "ca76834d7290d2a30ca6488ba952d2f9458f43297ebedf4c4a2b5acdb42cf917",
+    "review-merge-candidate.sh": "fccd44b9771714ca710f94ee8beefd5cc748b76f5bb3947e1f4b7e783a80234b",
     "version_policy.py": "1ec768f0dcef09d531ba640afe87204217c022e528ba8048e9445e6a6b3d76d6"
   },
-  "payload_sha256": "2eaed0314e24dc5013ba794751c925f7a2f7bfa8c77ed96fa692857a64b8dc7e",
+  "payload_sha256": "2454a6793448bee61b9cad9b455e53012676064e4bf1eed569e0f9f0c392a054",
   "schema_version": 2,
   "toolkit_name": "h2h-dev-tools",
-  "toolkit_version": "0.2.1"
+  "toolkit_version": "0.2.2"
 }

@@ -12,6 +12,37 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 
 
+_FAKE_REVIEW = r"""from pathlib import Path
+import os
+import subprocess
+import sys
+
+trace = Path(os.environ["DOCUMENTATION_WORKFLOW_TRACE"])
+receipt = trace.with_suffix(".review")
+command = sys.argv[1]
+with trace.open("a", encoding="utf-8") as stream:
+    stream.write(command + "\n")
+
+def git(*arguments):
+    return subprocess.check_output(("git", *arguments), text=True).strip()
+
+candidate = git("rev-parse", "HEAD", "MERGE_HEAD") + "\n" + git("write-tree")
+if command == "run":
+    receipt.unlink(missing_ok=True)
+    if os.environ.get("DOCUMENTATION_FAIL_REVIEW"):
+        raise SystemExit("fixture review requested changes")
+    receipt.write_text(candidate, encoding="utf-8")
+elif command == "verify":
+    if not receipt.exists() or receipt.read_text(encoding="utf-8") != candidate:
+        raise SystemExit("fixture review does not cover candidate")
+    expected = sys.argv[sys.argv.index("--expected-tree") + 1]
+    if expected != git("write-tree"):
+        raise SystemExit("candidate changed during gate")
+else:
+    raise SystemExit("unknown review command")
+"""
+
+
 def _run(repository: Path, *command: str) -> subprocess.CompletedProcess[str]:
     environment = {
         key: value
@@ -65,6 +96,7 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
     for name in (
         "scripts/detect-primary-branch.sh",
         "scripts/git-flow-merge.sh",
+        "scripts/review-merge-candidate.sh",
         "scripts/check_change_scope.py",
         "scripts/check-docs.py",
         "scripts/check-version.py",
@@ -77,6 +109,7 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(_ROOT / name, destination)
     shutil.copytree(_ROOT / "scripts/_shared", repository / "scripts/_shared")
+    _write(repository, "scripts/review-code.py", _FAKE_REVIEW)
     _write(repository, ".gitignore", ".venv/\nnode_modules/\n__pycache__/\n")
     _write(repository, "README.md", "# Fixture\n")
     _write(
@@ -102,7 +135,14 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
             "#!/usr/bin/env bash\nset -euo pipefail\n"
             f'printf "{profile}\\n" >> "$DOCUMENTATION_WORKFLOW_TRACE"\n'
             f'if [[ "${{DOCUMENTATION_FAIL_PROFILE:-}}" == "{profile}" ]]; '
-            "then exit 42; fi\n",
+            "then exit 42; fi\n"
+            'if [[ "${DOCUMENTATION_INVALIDATE_REVIEW:-}" == 1 ]]; then\n'
+            '    rm -f "${DOCUMENTATION_WORKFLOW_TRACE%.log}.review"\n'
+            "fi\n"
+            'if [[ "${DOCUMENTATION_CHANGE_CANDIDATE:-}" == 1 ]]; then\n'
+            "    printf 'changed = True\\n' > tests/gate-change.py\n"
+            "    git add tests/gate-change.py\n"
+            "fi\n",
             encoding="utf-8",
         )
         path.chmod(0o755)
@@ -203,7 +243,9 @@ def test_merge_dispatch_uses_complete_candidate_not_last_commit(
     result = _run(repository, "scripts/git-flow-merge.sh")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _checks(repository) == (["full"] if code_first else [])
+    assert _checks(repository) == (
+        ["run", "verify", "full", "verify"] if code_first else []
+    )
     assert _git(repository, "branch", "--show-current") == "main"
     assert (
         len(_git(repository, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
@@ -230,12 +272,90 @@ def test_failed_selected_merge_profile_aborts_and_retains_task(
     result = _run(repository, "scripts/git-flow-merge.sh")
 
     assert result.returncode != 0
-    assert "merge or merge gate failed; task branch was retained" in result.stderr
+    assert (
+        "merge commit or release gate failed; task branch was retained" in result.stderr
+    )
     assert _git(repository, "rev-parse", "main") == primary
     assert _git(repository, "rev-parse", "docs/task") == task
     assert _git(repository, "branch", "--show-current") == "docs/task"
     assert _git(repository, "status", "--porcelain") == ""
     assert not (repository / ".git/MERGE_HEAD").exists()
-    assert _checks(repository) == (["full"] if failure == "full" else [])
+    assert _checks(repository) == (
+        ["run", "verify", "full"] if failure == "full" else []
+    )
     if failure == "documentation":
         assert "MD001" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    (
+        (".githooks/pre-merge-commit",),
+        (".githooks/pre-commit",),
+        ("git", "commit", "--no-edit"),
+    ),
+)
+def test_full_merge_gate_requires_review_before_program_checks(
+    tmp_path: Path, entrypoint: tuple[str, ...]
+) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "tests/example.py", "value = 1\n")
+    _commit(repository, "test: add example")
+    _git(repository, "switch", "main")
+    _git(repository, "merge", "--no-ff", "--no-commit", "docs/task")
+    (repository.parent / "checks.log").write_text("", encoding="utf-8")
+
+    result = _run(repository, *entrypoint)
+
+    assert result.returncode != 0
+    assert "fixture review does not cover candidate" in result.stderr
+    assert _checks(repository) == ["verify"]
+
+
+def test_failed_review_aborts_candidate_without_running_full_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "tests/example.py", "value = 1\n")
+    _commit(repository, "test: add example")
+    primary = _git(repository, "rev-parse", "main")
+    task = _git(repository, "rev-parse", "HEAD")
+    (repository.parent / "checks.log").write_text("", encoding="utf-8")
+    monkeypatch.setenv("DOCUMENTATION_FAIL_REVIEW", "1")
+
+    result = _run(repository, "scripts/git-flow-merge.sh")
+
+    assert result.returncode != 0
+    assert "code review failed" in result.stderr
+    assert _checks(repository) == ["run"]
+    assert _git(repository, "rev-parse", "main") == primary
+    assert _git(repository, "rev-parse", "docs/task") == task
+    assert _git(repository, "branch", "--show-current") == "docs/task"
+    assert not (repository / ".git/MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("invalidation", ("receipt", "tree"))
+def test_full_merge_gate_rechecks_review_after_program_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalidation: str
+) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "tests/example.py", "value = 1\n")
+    _commit(repository, "test: add example")
+    primary = _git(repository, "rev-parse", "main")
+    (repository.parent / "checks.log").write_text("", encoding="utf-8")
+    monkeypatch.setenv(
+        "DOCUMENTATION_INVALIDATE_REVIEW"
+        if invalidation == "receipt"
+        else "DOCUMENTATION_CHANGE_CANDIDATE",
+        "1",
+    )
+
+    result = _run(repository, "scripts/git-flow-merge.sh")
+
+    assert result.returncode != 0
+    assert "fixture review does not cover candidate" in result.stderr
+    assert _checks(repository) == ["run", "verify", "full", "verify"]
+    assert _git(repository, "rev-parse", "main") == primary
+    assert _git(repository, "branch", "--show-current") == "docs/task"
+    assert not (repository / ".git/MERGE_HEAD").exists()
+    assert _git(repository, "status", "--porcelain") == ""

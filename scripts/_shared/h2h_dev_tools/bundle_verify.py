@@ -18,6 +18,7 @@ BASE_FILES = frozenset({"__init__.py", "bundle_verify.py"})
 COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
+    "code-review": frozenset({"code_review.py", "review-merge-candidate.sh"}),
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),

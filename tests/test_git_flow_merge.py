@@ -90,6 +90,17 @@ def _initialize_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     hooks.mkdir()
     shutil.copy2(_REBASE_HOOK, hooks / _REBASE_HOOK.name)
     _write_executable(
+        scripts / "review-merge-candidate.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        hooks / "pre-commit",
+        "#!/usr/bin/env bash\n"
+        "if git rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then\n"
+        "    exec .githooks/pre-merge-commit\n"
+        "fi\n",
+    )
+    _write_executable(
         hooks / "pre-merge-commit",
         """#!/usr/bin/env bash
 set -euo pipefail

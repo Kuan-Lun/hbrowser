@@ -45,9 +45,10 @@
   `branch.<primary>.rebase=false` 與 `pull.ff=only`；pull 只可 fast-forward，
   分歧時停止並明確處理。Task 整合仍使用 `--no-ff` 保留 merge commit。
 - 任務完成後從 task branch 執行 `scripts/git-flow-merge.sh`。若 task branch
-  含有 primary 尚未包含的 commit，該腳本依範圍選擇文件或完整 gate、
-  執行 `--no-ff` merge、安全移除 task worktree，以及以 `git branch -d`
-  刪除已合併的本機 branch。
+  含有 primary 尚未包含的 commit，該腳本先準備真正的
+  `--no-ff --no-commit` candidate，依範圍執行 code review 與文件或完整 gate，
+  成功才建立 merge commit、安全移除 task worktree，並以 `git branch -d`
+  刪除已合併的本機 branch。Review 失敗亦須 abort merge 並保留 task branch。
 - 若且唯若 task tip 已由本機 primary 包含（`git merge-base --is-ancestor`
   成功），`scripts/git-flow-merge.sh` 執行 no-op cleanup：不得執行 gate或merge、
   建立空 commit或空 merge commit；必須先確認涉及的 worktree clean、沒有進行中
@@ -176,6 +177,42 @@
 - GitHub Actions只呼叫相同 scripts，並保留 trusted publishing、平台特有
   或本機無法可靠重現的檢查。
 - 不使用 Claude、Codex或其他 provider-specific Stop hooks重複檢查。
+
+## Code Review Rules
+
+- 每次 task 合併先由 `scripts/git-flow-merge.sh` 準備真正的 two-parent
+  `--no-ff --no-commit` candidate，再依 primary parent 到 staged candidate
+  的完整差異分類。Full profile 在 Git hooks 之外呼叫
+  `scripts/review-code.py run --index`；documentation profile 不啟動 review。
+- Online review 可使用已登入的 Codex 服務，需要 repository-local `.venv`
+  與 PATH 中的 `codex`。使用 read-only sandbox；不得修改檔案、執行
+  merge/gate、啟動服務或自動修正，不要求 GitHub PR、Actions 或 Stop hook。
+- Reviewer 必須完整閱讀本檔，審查完整 candidate diff 與相關未修改程式碼的
+  互動，依本 repository 的架構、ownership、side-effect 與測試契約評估。
+  只回報具體觸發條件及影響的 P0、P1、P2，附檔案、行號與理由；格式交由 lint。
+  已授權的破壞性變更本身不是缺陷，但版本誤判或遺漏必要轉換仍須回報。
+- 任何 finding、`incomplete`、逾時、非零退出或無效輸出都阻止 merge。
+  上下文或工具不足須回報 `incomplete`，不得聲稱通過。修正後重新執行 merge
+  流程，不得忽略 finding 或手寫 passing receipt。
+- Online review 目前只支援 POSIX，以獨立 process group 清理逾時或中斷的
+  Codex 及一般 descendants；刻意脫離 group 者不在保證內。Windows 仍可
+  offline verify；online review 必須先實作並驗證 Job Object 生命週期。
+  預設 timeout 為 900 秒，`run --timeout-seconds` 接受 1..3600 秒。
+- `review-code.py verify` 僅離線驗證，絕不呼叫模型。紀錄位於 Git common
+  metadata 的 `h2h-review`，綁定 exact tree、ordered parents、`AGENTS.md`、
+  repository review wrapper 與 shared reviewer implementation；任一變更須重審。
+  `--revision` 可審查既有 commit，正式 merge 必須使用 `--index`。
+- 同一 candidate 的每次 `run` 先廢止舊紀錄，失敗不能沿用舊通過結果。
+  同一 candidate 只允許一個 active run；重疊請求必須在啟動 review 前拒絕，
+  不得取代正在執行者；POSIX offline verify 在 review 執行中也須拒絕。
+- Pending merge 的 `pre-commit` 委派 `pre-merge-commit`，避免以手動
+  `git commit` 繞過 gate。Full gate 前後均離線驗證 review evidence，並以
+  `--expected-tree` 綁定開始檢查的 staged tree；Git hooks 不啟動 online review。
+  Documentation profile 保留版本及文件檢查，不能重用為程式驗收。
+- Code review evidence 與完整測試結果是不同證據。AI 未發現問題不代表程式
+  正確性的證明，本機紀錄也不是防竄改簽章。原始輸出、診斷、CLI 版本與 model
+  override 保留於 metadata；未指定 model 時沿用 Codex 設定，不聲稱知道 CLI
+  未回報的解析後模型。
 
 ## 測試與例外
 
