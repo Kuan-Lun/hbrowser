@@ -13,18 +13,33 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Never, cast
+from typing import TYPE_CHECKING, Never, cast
 
-from ._process_control import (
-    MAX_CONTROL_LINE_BYTES,
-    MAX_START_LINE_BYTES,
-    PROVEN_CLEANUP_FAILURE_EXIT_CODE,
-    PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
-    PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
-    ControlIntent,
-    ControlRequest,
-    StartRequest,
-)
+# Production runs this stdlib-only script without site initialization. Tests
+# import its package module; both contexts resolve the same sibling protocol.
+if TYPE_CHECKING or __package__:
+    from ._process_control import (
+        MAX_CONTROL_LINE_BYTES,
+        MAX_START_LINE_BYTES,
+        PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+        PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+        PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+        ControlIntent,
+        ControlRequest,
+        StartRequest,
+    )
+else:
+    from _process_control import (  # type: ignore[import-not-found]  # Direct script sibling.
+        MAX_CONTROL_LINE_BYTES,
+        MAX_START_LINE_BYTES,
+        PROVEN_CLEANUP_FAILURE_EXIT_CODE,
+        PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
+        PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
+        ControlIntent,
+        ControlRequest,
+        StartRequest,
+    )
+
 
 _POLL_SECONDS = 0.05
 _FALLBACK_TERM_SECONDS = 2.0

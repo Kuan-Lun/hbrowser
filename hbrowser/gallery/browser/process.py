@@ -61,6 +61,7 @@ _PRIVATE_CLEANUP_WORKER_DIAGNOSTIC_BYTES: Final = 1024
 _PRIVATE_CLEANUP_WORKER_PATH: Final = (
     Path(__file__).with_name("_directory_cleanup_worker.py").resolve()
 )
+_SUPERVISOR_PATH: Final = Path(__file__).with_name("_process_supervisor.py").resolve()
 _OUTPUT_RING_BYTES: Final = 256 * 1024
 _SUPERVISOR_READY_PREFIX: Final = "ready "
 _SUPERVISOR_ERROR_PREFIX: Final = "error "
@@ -1541,7 +1542,12 @@ def _supervisor_launch_context(
     environment: Mapping[str, str] | None = None,
     forwarding_environment: Mapping[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Select an interpreter whose process identity can be owned directly."""
+    """Select an interpreter whose process identity can be owned directly.
+
+    Internal workers run as absolute scripts with ``-E -S``: Python startup
+    configuration cannot create work before ownership admission. Their retained
+    environment is still passed to the authorized target without those flags.
+    """
 
     executable = sys.executable
     if not isinstance(executable, str) or not executable:
@@ -1769,6 +1775,8 @@ def _spawn_private_directory_cleanup(
         process = subprocess.Popen(
             [
                 executable,
+                "-E",
+                "-S",
                 str(_PRIVATE_CLEANUP_WORKER_PATH),
                 str(guard.path),
                 str(guard.device),
@@ -2115,8 +2123,9 @@ def start_owned_process(
         )
         command = [
             supervisor_executable,
-            "-m",
-            "hbrowser.gallery.browser._process_supervisor",
+            "-E",
+            "-S",
+            str(_SUPERVISOR_PATH),
             str(status_path),
             "--",
             str(executable),

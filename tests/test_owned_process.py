@@ -1040,6 +1040,89 @@ class PosixOwnedProcessTests(unittest.TestCase):
             )
             self.assertEqual(process.wait(timeout=5), 0)
 
+    def _write_startup_child_hook(self, directory: Path) -> None:
+        (directory / "sitecustomize.py").write_text(
+            "import os, pathlib, subprocess, sys\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-E', '-S', '-c', 'import time; time.sleep(30)'],\n"
+            "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL)\n"
+            "pathlib.Path(__file__).with_name(f'startup-{os.getpid()}').write_text(\n"
+            "    str(child.pid), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+    def _reap_startup_probe_children(self, directory: Path) -> None:
+        # Old-code negative controls deliberately reveal unowned helpers. Only
+        # the exact PIDs recorded by this disposable hook are cleaned here.
+        for marker in directory.glob("startup-*"):
+            pid = int(marker.read_text(encoding="utf-8"))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.assertTrue(_wait_for_pid_exit(pid), f"Probe helper {pid} survived")
+
+    def test_supervisor_and_cleanup_skip_python_startup_hooks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-startup-hooks-") as directory:
+            root = Path(directory)
+            self._write_startup_child_hook(root)
+            with patch.dict(os.environ, {"PYTHONPATH": str(root)}):
+                owner = process_module.start_owned_process(
+                    sys.executable,
+                    ["-E", "-S", "-c", "pass"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    self.assertEqual(owner.wait(timeout=5), 0)
+                    unexpected = list(root.glob("startup-*"))
+                    live = [
+                        int(path.read_text(encoding="utf-8"))
+                        for path in unexpected
+                        if _pid_exists(int(path.read_text(encoding="utf-8")))
+                    ]
+                    self.assertEqual(
+                        unexpected, [], f"Unowned startup children: {live}"
+                    )
+                finally:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                        )
+                    self._reap_startup_probe_children(root)
+
+    def test_target_startup_hooks_keep_their_environment_and_owned_group(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-target-hooks-") as directory:
+            root = Path(directory)
+            self._write_startup_child_hook(root)
+            with patch.dict(os.environ, {"PYTHONPATH": str(root)}):
+                owner = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    marker = root / f"startup-{owner.target_pid}"
+                    deadline = time.monotonic() + 5
+                    while not marker.is_file() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(marker.is_file(), "Target lost its Python config")
+                    helper_pid = int(marker.read_text(encoding="utf-8"))
+                    self.assertEqual(os.getpgid(helper_pid), owner.target_pid)
+                    owner.shutdown(
+                        graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                    )
+                    self.assertTrue(_wait_for_pid_exit(helper_pid))
+                    self.assertEqual(list(root.glob("startup-*")), [marker])
+                finally:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                        )
+                    self._reap_startup_probe_children(root)
+
     def test_target_inherits_sanitized_supervisor_environment(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="hbrowser-environment-test-"
@@ -2473,8 +2556,8 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
 
                 command = popen.call_args.args[0]
                 self.assertEqual(
-                    command[1],
-                    str(process_module._PRIVATE_CLEANUP_WORKER_PATH),
+                    command[1:4],
+                    ["-E", "-S", str(process_module._PRIVATE_CLEANUP_WORKER_PATH)],
                 )
                 self.assertNotIn("-m", command)
                 self.assertIn(
@@ -3668,10 +3751,10 @@ class ProcessPolicyTests(unittest.TestCase):
         assert isinstance(command, list)
         self.assertEqual(command[0], r"C:\Python314\python.exe")
         self.assertEqual(
-            command[1:4],
-            ["-m", "hbrowser.gallery.browser._process_supervisor", ANY],
+            command[1:5],
+            ["-E", "-S", str(process_module._SUPERVISOR_PATH), ANY],
         )
-        self.assertEqual(command[4:], ["--", "browser"])
+        self.assertEqual(command[5:], ["--", "browser"])
         self.assertEqual(
             options["env"],
             {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
@@ -4613,22 +4696,33 @@ class WindowsVenvOwnedProcessTests(unittest.TestCase):
                 timeout=60,
             )
             venv_python = venv_path / "Scripts" / "python.exe"
+            marker = Path(directory) / "startup-hook"
+            hook_root = Path(directory) / "python-startup"
+            hook_root.mkdir()
+            (hook_root / "sitecustomize.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
             harness = """
+import os
+import pathlib
 import sys
 
 from hbrowser.gallery.browser.process import start_owned_process
 
 assert sys.executable.lower() != sys._base_executable.lower()
+os.environ["PYTHONPATH"] = sys.argv[1]
 owner = start_owned_process(
     sys._base_executable,
-    ["-c", "import time; time.sleep(30)"],
+    ["-E", "-S", "-c", "import time; time.sleep(30)"],
 )
 assert owner.target_pid is not None
 owner.terminate()
 owner.wait(timeout=10)
+assert not pathlib.Path(sys.argv[2]).exists()
 """
             result = subprocess.run(
-                [str(venv_python), "-c", harness],
+                [str(venv_python), "-c", harness, str(hook_root), str(marker)],
                 cwd=Path(__file__).resolve().parents[1],
                 capture_output=True,
                 text=True,
