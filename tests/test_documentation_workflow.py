@@ -14,12 +14,20 @@ import pytest
 pytestmark = pytest.mark.usefixtures("offline_code_review_cli")
 
 _ROOT = Path(__file__).resolve().parents[1]
+_COMPONENTS = tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"][
+    "h2h-dev-tools"
+]["components"]
 
 
 _REVIEW_ENTRY = r"""from pathlib import Path
 import os
+import runpy
 import sys
 
+shared = Path(__file__).resolve().parent / "_shared/h2h_dev_tools"
+runpy.run_path(str(shared / "source_loader.py"))["load_package"](
+    shared, "_shared.h2h_dev_tools"
+)
 sys.dont_write_bytecode = True
 from _shared.h2h_dev_tools.code_review import main
 
@@ -106,7 +114,10 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
         '[project]\nname = "workflow-fixture"\nversion = "0.1.0"\n'
         '[tool.h2h.version]\nrelease-paths = ["src/**"]\n'
         'development-paths = ["README.md", "docs/**", "tests/**", '
-        '"scripts/**", "AGENTS.md"]\n',
+        '"scripts/**", "AGENTS.md"]\n'
+        + "[tool.h2h-dev-tools]\ncomponents = "
+        + json.dumps(_COMPONENTS)
+        + "\n",
     )
     _write(
         repository,
@@ -144,6 +155,63 @@ def _repository(tmp_path: Path, *, install_hooks: bool = True) -> Path:
 def _checks(repository: Path) -> list[str]:
     path = repository.parent / "checks.log"
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX newline paths and shell hooks")
+@pytest.mark.parametrize("profile", ["documentation", "full"])
+def test_real_local_workflow_preserves_root_trailing_newlines(
+    tmp_path: Path, profile: str
+) -> None:
+    repository = _repository(tmp_path)
+    renamed = repository.with_name("repository\n\n")
+    repository.rename(renamed)
+    repository = renamed
+    base = _git(repository, "rev-parse", "HEAD")
+    if profile == "documentation":
+        _write(repository, "README.md", "# Updated guide\n")
+    else:
+        _write(repository, "tests/local-path.py", "value = 1\n")
+    _commit(repository, "test: exercise real local entry paths")
+    task = _git(repository, "rev-parse", "HEAD")
+
+    result = _run(repository, "scripts/git-flow-merge.sh")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _git(repository, "branch", "--show-current") == "main"
+    assert _git(repository, "branch", "--list", "docs/task") == ""
+    assert _git(repository, "show", "-s", "--format=%P", "HEAD").split() == [base, task]
+    assert _git(repository, "status", "--porcelain") == ""
+    assert not (repository / ".git/MERGE_HEAD").exists()
+    assert _checks(repository) == (
+        ["fast", "run", "verify", "full", "verify"] if profile == "full" else []
+    )
+
+
+def test_merge_message_exemption_requires_a_real_merge(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    base = _git(repository, "rev-parse", "HEAD")
+    _write(repository, "README.md", "# Updated guide\n")
+    _git(repository, "add", "README.md")
+    candidate_tree = _git(repository, "write-tree")
+
+    rejected = _run(repository, "git", "commit", "-m", "Merge a normal task change")
+
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+    assert "Commit message must follow Conventional Commits" in rejected.stderr
+    assert _git(repository, "rev-parse", "HEAD") == base
+    assert _git(repository, "write-tree") == candidate_tree
+    assert (
+        _run(repository, "git", "rev-parse", "--verify", "MERGE_HEAD").returncode != 0
+    )
+    _commit(repository, "docs: update the guide with a conventional message")
+    task = _git(repository, "rev-parse", "HEAD")
+
+    merged = _run(repository, "scripts/git-flow-merge.sh")
+
+    assert merged.returncode == 0, merged.stdout + merged.stderr
+    assert _git(repository, "show", "-s", "--format=%P", "HEAD").split() == [base, task]
+    assert _git(repository, "show", "-s", "--format=%s", "HEAD").startswith("Merge ")
+    assert _git(repository, "status", "--porcelain") == ""
 
 
 def test_documentation_commit_checks_staged_content_without_program_tools(
@@ -377,7 +445,12 @@ def test_repository_policy_rejects_combined_runtime_and_version_commit(
     )
     metadata = (
         '[project]\nname = "release-fixture"\nversion = "0.1.0"\n'
-        "[tool.h2h.version]\n" + policy_text + "\n"
+        "[tool.h2h.version]\n"
+        + policy_text
+        + "\n"
+        + "[tool.h2h-dev-tools]\ncomponents = "
+        + json.dumps(_COMPONENTS)
+        + "\n"
     )
     release_directory = next(
         pattern.removesuffix("**")

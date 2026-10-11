@@ -14,7 +14,7 @@ from typing import TypedDict, cast
 
 BUNDLE_DIRECTORY = Path("scripts/_shared/h2h_dev_tools")
 MANIFEST_NAME = "manifest.json"
-BASE_FILES = frozenset({"__init__.py", "bundle_verify.py"})
+BASE_FILES = frozenset({"__init__.py", "bundle_verify.py", "source_loader.py"})
 _MERGE_REVIEW_FILES = frozenset(
     {
         "code_review.py",
@@ -36,12 +36,16 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "version-policy": frozenset({"dependency_manifest.py", "version_policy.py"}),
     "publish-version": frozenset({"publish_version.py"}),
     "process": frozenset({"process.py"}),
+    "pytest": frozenset({"pytest_source.py"}),
     "distribution-check": frozenset({"distribution_check.py"}),
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),
     "primary-branch": frozenset({"primary-branch.sh"}),
     "git-flow": _MERGE_REVIEW_FILES,
-    "hooks": frozenset({"primary-branch.sh", "install-git-hooks.sh"}),
+    "git-environment": frozenset({"git_environment.py"}),
+    "hooks": frozenset(
+        {"primary-branch.sh", "install-git-hooks.sh", "commit-message.sh"}
+    ),
     "environment": frozenset(
         {"rebuild-env.sh", "resolve-sources.sh", "environment.py"}
     ),

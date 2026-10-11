@@ -60,10 +60,14 @@ trap 'rm -f "$requirements"' EXIT
 bash "$source_directory/resolve-sources.sh" "$requirements" \
     --editable '.[dev]' ${source_overrides[@]+"${source_overrides[@]}"}
 uv venv --clear --python 3.14 .venv
-uv pip install --refresh --python .venv/bin/python --requirements "$requirements"
+environment_python=.venv/bin/python
+if [[ ! -x "$environment_python" ]]; then
+    environment_python=.venv/Scripts/python.exe
+fi
+uv pip install --refresh --python "$environment_python" --requirements "$requirements"
 
 npm install --package-lock=false --ignore-scripts --no-audit --no-fund
 
 if [[ -n "$after_build" ]]; then
-    .venv/bin/python "$after_build"
+    "$environment_python" "$after_build"
 fi

@@ -8,8 +8,8 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
@@ -259,15 +259,12 @@ Otherwise use changes_requested. Write summary and findings in Traditional Chine
 
 
 def _stop(process: subprocess.Popen[bytes]) -> None:
-    # Online review admits only POSIX, where the group survives its leader.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired as error:
-        raise ReviewError("Codex did not exit after termination") from error
+    # Online review admits only POSIX. Its group can outlive a successful leader;
+    # use the shared bounded group oracle before publishing any passing receipt.
+    if not process_control.terminate_owned_tree(
+        process_control.OwnedProcess(process), deadline=time.monotonic() + 5
+    ):
+        raise ReviewError("Codex process-group cleanup could not be proven")
 
 
 def _external_process_owner() -> bool:
@@ -739,6 +736,9 @@ class Reviewer:
             "read-only",
             "-c",
             'approval_policy="never"',
+            # Completion notifications can outlive the CLI's owned command.
+            "-c",
+            "notify=[]",
             "--ephemeral",
             "--json",
             "--output-schema",
@@ -749,11 +749,11 @@ class Reviewer:
         if model:
             command.extend(("--model", model))
         command.append("-")
-        print(
+        process_control.report_diagnostic(
             f"Reviewing {coverage.scope} scope: {target.base} -> {target.tree} "
             f"with {version}\n"
             f"Review logs: {run_directory}",
-            flush=True,
+            standard_output=True,
         )
         self._execute(command, _prompt(target, coverage), run_directory, timeout)
         try:
@@ -783,11 +783,15 @@ class Reviewer:
             else None,
         )
         if managed:
-            print(
-                f"{result['summary']}\nReview result pending owner cleanup: {receipt}"
+            process_control.report_diagnostic(
+                f"{result['summary']}\nReview result pending owner cleanup: {receipt}",
+                standard_output=True,
             )
         else:
-            print(f"{result['summary']}\nCode review passed; wrote {receipt}")
+            process_control.report_diagnostic(
+                f"{result['summary']}\nCode review passed; wrote {receipt}",
+                standard_output=True,
+            )
 
 
 def main(repository: Path) -> None:
@@ -823,8 +827,9 @@ def main(repository: Path) -> None:
             with reviewer._review_lock(target, exclusive=False):
                 if args.index:
                     reviewer._assert_workspace(target)
-                print(
-                    f"Verified exact-candidate code review: {reviewer._verify(target)}"
+                process_control.report_diagnostic(
+                    f"Verified exact-candidate code review: {reviewer._verify(target)}",
+                    standard_output=True,
                 )
         else:
             managed = _external_process_owner()
@@ -854,5 +859,5 @@ def main(repository: Path) -> None:
                     force_repository=args.scope == "repository",
                 )
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"h2h code review: {error}", file=sys.stderr)
+        process_control.report_diagnostic(f"h2h code review: {error}")
         raise SystemExit(1) from error

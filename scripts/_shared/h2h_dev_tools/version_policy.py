@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,8 @@ def _release_metadata(document: dict[str, Any]) -> dict[str, Any]:
     optional = project.get("optional-dependencies")
     if isinstance(optional, dict):
         optional.pop("dev", None)
+        if not optional:
+            project.pop("optional-dependencies")
     return {
         "build-system": document.get("build-system", {}),
         "project": project,
@@ -116,18 +119,29 @@ def _validate_transition(message_range: str, version: str) -> None:
 
 def _changed_paths(base: str, candidate: str) -> tuple[str, ...]:
     # A move out of a public release path still retires its old surface.
-    return tuple(
-        path
-        for path in _git(
+    # Keep names as bytes until after splitting: text mode translates CR/LF,
+    # while Git's ordinary display quoting changes non-ASCII and control names.
+    output = subprocess.run(
+        (
+            "git",
             "diff",
             "--no-renames",
             "--name-only",
+            "-z",
             "--diff-filter=ACDMRT",
             base,
             candidate,
-        ).splitlines()
-        if path
-    )
+            "--",
+        ),
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if not output:
+        return ()
+    paths = output.split(b"\0")
+    if paths.pop() != b"" or not all(paths):
+        raise ValueError("malformed NUL-delimited Git difference")
+    return tuple(os.fsdecode(path) for path in paths)
 
 
 def _release_changed(
@@ -141,27 +155,123 @@ def _release_changed(
     )
 
 
-def _release_messages(message_range: str, patterns: tuple[str, ...]) -> str:
-    """Classify release signals without promoting dev-only commit messages.
+@dataclass(frozen=True)
+class _CommitImpact:
+    message: str
+    paths: frozenset[str]
+    metadata_changed: bool
+    release_changed: bool
+    exempt: bool
 
-    The task's final diff still decides whether a single bump is required.
-    Each message contributes its severity only when that commit changes a
-    release surface. Both sides' declarations preserve retired public paths.
-    """
 
-    messages = []
-    for revision in _git("rev-list", message_range).splitlines():
-        parent = f"{revision}^1"
+def _none_impact(message: str, *, allowed: bool) -> bool:
+    impacts = re.findall(r"^Version-Impact:[ \t]*(.*)$", message, re.MULTILINE)
+    reasons = re.findall(r"^Version-Reason:[ \t]*(.*)$", message, re.MULTILINE)
+    if not impacts and not reasons:
+        return False
+    if (
+        len(impacts) != 1
+        or impacts[0].strip() != "none"
+        or len(reasons) != 1
+        or not reasons[0].strip()
+    ):
+        raise ValueError(
+            "Version-Impact: none and a nonempty Version-Reason "
+            "must be used together in the same commit"
+        )
+    if not allowed:
+        raise ValueError("this repository does not permit Version-Impact: none")
+    return True
+
+
+def _automatic_merge(base: str, task: str) -> str:
+    try:
+        return _git("merge-tree", "--write-tree", base, task).splitlines()[0]
+    except subprocess.CalledProcessError as error:
+        raise ValueError(
+            "cannot establish Version-Impact: none scope across a conflicted merge"
+        ) from error
+
+
+def _commit_impacts(
+    message_range: str, patterns: tuple[str, ...], *, allow_none: bool
+) -> tuple[_CommitImpact, ...]:
+    history = []
+    for row in _git("rev-list", "--reverse", "--parents", message_range).splitlines():
+        revision, *parents = row.split()
+        message = _git("show", "-s", "--format=%B", revision)
+        history.append(
+            (revision, parents, message, _none_impact(message, allowed=allow_none))
+        )
+    has_exemptions = any(exempt for _, _, _, exempt in history)
+    impacts = []
+    for revision, parents, message, exempt in history:
+        if not parents:
+            raise ValueError(
+                "task history contains a commit without a comparison parent"
+            )
+        parent = parents[0]
+        if has_exemptions and len(parents) > 1:
+            if len(parents) != 2:
+                raise ValueError(
+                    "cannot establish none-impact scope for an octopus merge"
+                )
+            # A normal merge only aggregates contributions already evaluated
+            # below. Additional resolution changes belong to this merge itself.
+            parent = _automatic_merge(*parents)
         base = _load_toml(parent)
         candidate = _load_toml(revision)
+        if exempt and base["project"]["version"] != candidate["project"]["version"]:
+            raise ValueError("Version-Impact: none cannot accompany a version bump")
+        paths = _changed_paths(parent, revision)
         commit_patterns = (
             patterns + _release_patterns(base) + _release_patterns(candidate)
         )
-        if _release_changed(
-            base, candidate, _changed_paths(parent, revision), commit_patterns
-        ):
-            messages.append(_git("show", "-s", "--format=%B", revision))
-    return "\n\0\n".join(messages)
+        impacts.append(
+            _CommitImpact(
+                message=message,
+                paths=frozenset(paths),
+                metadata_changed=_release_metadata(base)
+                != _release_metadata(candidate),
+                release_changed=_release_changed(
+                    base, candidate, paths, commit_patterns
+                ),
+                exempt=exempt,
+            )
+        )
+    return tuple(impacts)
+
+
+def _exempt_changes(
+    impacts: tuple[_CommitImpact, ...],
+    base: str,
+    candidate: str,
+    message_range: str,
+    candidate_document: dict[str, Any],
+) -> tuple[set[str], bool]:
+    exempt_paths = {
+        path for impact in impacts if impact.exempt for path in impact.paths
+    }
+    required_paths = {
+        path for impact in impacts if not impact.exempt for path in impact.paths
+    }
+    exempt_paths.difference_update(required_paths)
+    metadata_exempt = any(
+        impact.exempt and impact.metadata_changed for impact in impacts
+    ) and not any(not impact.exempt and impact.metadata_changed for impact in impacts)
+    if not exempt_paths and not metadata_exempt:
+        return set(), False
+    _, separator, task = message_range.partition("..")
+    if not separator or not task or task.startswith("."):
+        raise ValueError("none-impact scope requires a two-endpoint task history")
+    expected = _automatic_merge(base, task)
+    # Only the annotated commits' own changes are exempt. An additional staged
+    # edit or merge resolution cannot borrow a historical exception for its path.
+    exempt_paths.difference_update(_changed_paths(expected, candidate))
+    metadata_exempt &= _release_metadata(_load_toml(expected)) == _release_metadata(
+        candidate_document
+    )
+    return exempt_paths, metadata_exempt
 
 
 def _parse_version(value: str) -> tuple[int, int, int]:
@@ -249,19 +359,23 @@ def _validate_audit(tree: str, document: dict[str, Any], version: str) -> None:
 
 def _candidate(arguments: argparse.Namespace) -> tuple[str, str, str]:
     if arguments.index:
-        merge_task_ref = os.environ.get("WORKFLOW_MERGE_TASK_REF")
-        if merge_task_ref:
-            merge_revision = _git(
-                "rev-parse", "--verify", f"{merge_task_ref}^{{commit}}"
-            )
+        base = _git("rev-parse", "--verify", "HEAD^{commit}")
+        merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
+        if merge_head.exists():
+            parents = merge_head.read_text(encoding="ascii").splitlines()
+            if len(parents) != 1:
+                raise ValueError("--index requires a two-parent merge")
+            merge_parent = parents[0]
         else:
-            merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
-            if not merge_head.exists():
-                raise ValueError(
-                    "--index requires WORKFLOW_MERGE_TASK_REF or an active merge"
-                )
-            merge_revision = _git("rev-parse", "MERGE_HEAD")
-        return "HEAD", _git("write-tree"), f"HEAD..{merge_revision}"
+            # Git's direct pre-merge hook runs before writing MERGE_HEAD. The
+            # launcher must supply its captured commit, never a moving branch.
+            merge_parent = os.environ.get("WORKFLOW_MERGE_TASK_REF", "")
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_parent):
+            raise ValueError("--index requires an immutable full task commit OID")
+        merge_revision = _git("rev-parse", "--verify", f"{merge_parent}^{{commit}}")
+        if merge_revision != merge_parent:
+            raise ValueError("--index task OID must identify a commit, not a tag")
+        return base, _git("write-tree"), f"{base}..{merge_revision}"
     if arguments.base:
         return (
             str(arguments.base),
@@ -310,8 +424,20 @@ def _validate(base_tree: str, candidate_tree: str, message_range: str) -> None:
     release_patterns = _release_patterns(base_document) + _release_patterns(
         candidate_document
     )
-    release_changed = _release_changed(
-        base_document, candidate_document, changed_paths, release_patterns
+    impacts = _commit_impacts(
+        message_range,
+        release_patterns,
+        allow_none=bool(_policy(candidate_document).get("allow-none-impact", False)),
+    )
+    exempt_paths, metadata_exempt = _exempt_changes(
+        impacts, base_tree, candidate_tree, message_range, candidate_document
+    )
+    release_changed = (
+        _release_metadata(base_document) != _release_metadata(candidate_document)
+        and not metadata_exempt
+    ) or any(
+        path not in exempt_paths and _matches(path, release_patterns)
+        for path in changed_paths
     )
     unknown = [
         path
@@ -319,40 +445,37 @@ def _validate(base_tree: str, candidate_tree: str, message_range: str) -> None:
         if path != "pyproject.toml"
         and not _matches(path, release_patterns)
         and not _matches(path, _development_patterns(candidate_document))
+        and path not in exempt_paths
     ]
 
-    messages = _git("log", "--format=%B%x00", message_range)
-    none_impact = bool(
-        re.search(r"^Version-Impact:\s*none\s*$", messages, re.MULTILINE)
-    )
-    none_reason = re.search(r"^Version-Reason:\s*(\S.+)$", messages, re.MULTILINE)
-    if none_impact != (none_reason is not None):
-        raise ValueError(
-            "Version-Impact: none and a nonempty Version-Reason must be used together"
-        )
-    if none_impact and not _policy(candidate_document).get("allow-none-impact", False):
-        raise ValueError("this repository does not permit Version-Impact: none")
-    if unknown and not none_impact:
+    if unknown:
         raise ValueError(
             "unclassified version impact paths: " + ", ".join(sorted(unknown))
         )
 
     version_changed = base_version_text != candidate_version_text
-    if release_changed and not version_changed and not none_impact:
+    if release_changed and not version_changed:
         raise ValueError("release surface changed without a project version bump")
-    if version_changed and none_impact:
-        raise ValueError("Version-Impact: none cannot accompany a version bump")
     if not release_changed and not unknown and version_changed:
         raise ValueError("project version changed without a release-surface change")
     if not version_changed:
         return
 
-    release_messages = _release_messages(message_range, release_patterns)
-    breaking = bool(
-        re.search(r"^[a-z]+(?:\([^\n)]+\))?!:", release_messages, re.MULTILINE)
-        or re.search(r"^BREAKING CHANGE:", release_messages, re.MULTILINE)
+    release_messages = tuple(
+        impact.message
+        for impact in impacts
+        if impact.release_changed and not impact.exempt
     )
-    feature = bool(re.search(r"^feat(?:\([^\n)]+\))?:", release_messages, re.MULTILINE))
+    # Commit types and the bang marker belong to the subject. The body may
+    # quote older subjects; only the explicit breaking footer is independent.
+    subjects = tuple(message.partition("\n")[0] for message in release_messages)
+    breaking = any(
+        re.match(r"[a-z]+(?:\([^\n)]+\))?!:", subject) for subject in subjects
+    ) or any(
+        re.search(r"^BREAKING CHANGE:", message, re.MULTILINE)
+        for message in release_messages
+    )
+    feature = any(re.match(r"feat(?:\([^\n)]+\))?:", subject) for subject in subjects)
     expected = _expected_version(
         base_version,
         breaking=breaking,

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repository_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd -P -- "$(dirname "$0")/.."
+repository_root="$PWD"
 cd "$repository_root"
 
 if [[ -n "${HBROWSER_CHECK_PYTHON:-}" ]]; then
@@ -12,6 +13,7 @@ else
     process_python="python"
 fi
 
-"$process_python" -m pytest \
+"$process_python" scripts/_shared/h2h_dev_tools/git_environment.py \
+    --repository "$repository_root" -- "$process_python" scripts/pytest-source.py \
     tests/test_owned_process.py \
     tests/test_browser_factory.py

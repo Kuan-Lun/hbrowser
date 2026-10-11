@@ -89,6 +89,7 @@ def _check_readme_reference(root: Path, tree: str) -> None:
 
 
 def _export_documents(root: Path, tree: str, destination: Path) -> None:
+    destination = destination.resolve()
     config_found = False
     directories: dict[tuple[int, int], tuple[str, ...]] = {}
     for entry in git_output(root, "ls-tree", "-r", "-z", tree).split(b"\0"):
@@ -109,9 +110,16 @@ def _export_documents(root: Path, tree: str, destination: Path) -> None:
                 raise ChangeScopeError("Markdown configuration must be a regular file")
             continue
         parts = PurePosixPath(path).parts
-        if not parts or PurePosixPath(path).is_absolute() or ".." in parts:
+        if (
+            not parts
+            or PurePosixPath(path).is_absolute()
+            or ".." in parts
+            or any("\\" in component or ":" in component for component in parts)
+        ):
             raise ChangeScopeError("Unsafe path in documentation tree")
         output = destination.joinpath(*parts)
+        if not output.resolve().is_relative_to(destination):
+            raise ChangeScopeError("Unsafe path in documentation tree")
         try:
             parent = destination
             for depth, component in enumerate(parts[:-1], start=1):

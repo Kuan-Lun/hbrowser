@@ -62,6 +62,14 @@
   必須 abort merge 並保留 task branch。若無法證明 owned process cleanup，這是明確
   例外：不得讓仍存活的 hook 與 abort 競爭，保留 candidate 與 task 待確認及安全處理。
   已成功建立的 merge commit 不因後續中斷或清理失敗而回滾。
+- Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
+  統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 no-op／
+  `--cleanup-only` 都需要 repository-local `.venv`；缺少時先執行
+  `scripts/rebuild-env.sh`。Linked worktree 移除前，必須先確認並改用 primary
+  checkout 的 `.venv` 完成剩餘清理；缺少時保留 task worktree 與 branch。
+  正常操作可由外層中斷；failure recovery 的每次 abort 或 checkout 各有
+  10 秒 hard budget（含 6 秒 teardown reserve），abort 失敗不得繼續 checkout。
+  `--cleanup-only` 仍可安全重試清理，不重跑已完成 merge 的 review 或 gate。
 - merge 後收到的任何 follow-up 都建立新的 task branch。
 - 本機 task branch、commit、`--no-ff` merge與 `branch -d` 已獲預先授權。
 - fetch、pull、push、remote branch、tag、release、publish、deploy與任何
@@ -175,6 +183,11 @@
   check，並從 candidate metadata 驗證 `project.readme` 引用存在的普通檔案；
   inline text 不需外部文件。檢查不讀取未 stage 的內容，也不執行 Ruff、mypy、
   pytest、build 或 online review。
+- Repository 提供的 pytest child 統一使用 `scripts/pytest-source.py`，先載入
+  經驗證的 source snapshot，再啟動 pytest、plugins 與 workers；沿用原有
+  selectors、Git environment boundary 與 process ownership。手動需要相同來源
+  保證時使用 `.venv/bin/python scripts/pytest-source.py <pytest arguments>`；
+  普通 `pytest` 僅為手動便利入口，不承諾排除既有 bytecode。
 - dependency audit可連網，但 hooks只驗證本機 receipt，不在 commit過程
   連網。
 - GitHub Actions只呼叫相同 scripts，並保留 trusted publishing、平台特有
@@ -187,8 +200,6 @@
   `--no-ff --no-commit` candidate，再依 primary parent 到 staged candidate
   的完整差異分類。Full profile 在 Git hooks 之外呼叫
   `scripts/review-code.py run --index`；documentation profile 不啟動 review。
-  實際 merge 使用 repository-local Python 擁有 Git／hook process tree；
-  已整合 task 的 no-op／`--cleanup-only` 不需要 Python 環境。
 - 首次 review 必須審查完整 candidate project，建立成功的 full baseline；
   之後才可 incremental review。增量審查必須證明 primary first-parent history
   上存在有效 full baseline，且其後每個非文件變更都有有效 review evidence。
@@ -203,6 +214,9 @@
 - Online review 可使用已登入的 Codex 服務，需要 repository-local `.venv`
   與 PATH 中的 `codex`。使用 read-only sandbox；不得修改檔案、執行
   merge/gate、啟動服務或自動修正，不要求 GitHub PR、Actions 或 Stop hook。
+- Review 的單次 Codex invocation 固定 `notify=[]`，防止非同步完成通知在
+  CLI 退出後留下子程序。保留既有模型、認證、其他工具、plugins、MCP 與安全
+  hooks 設定，不修改全域配置；其他 descendants 仍須符合相同 cleanup 契約。
 - Reviewer 必須完整閱讀本檔；首次審查完整 candidate，包括既存缺陷，
   incremental 審查完整差異與相關未修改程式碼的互動，依本 repository 的架構、ownership、side-effect 與測試契約評估。
   只回報具體觸發條件及影響的 P0、P1、P2，附檔案、行號與理由；格式交由 lint。
