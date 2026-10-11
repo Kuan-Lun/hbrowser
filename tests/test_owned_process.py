@@ -2346,6 +2346,68 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
                 )
 
+    def test_removed_directory_retry_must_reap_its_existing_cleanup_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-removed-retry-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            process = Mock(stdin=Mock(), stderr=None, returncode=0)
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            job = Mock()
+            failure = process_module.ProcessOwnershipError("Job still owns a child")
+            job.wait_empty.side_effect = [failure, failure, None]
+            active = process_module._ActivePrivateDirectoryCleanup(
+                guard=guard,
+                process=process,
+                windows_job=job,
+                windows_job_assigned=True,
+            )
+            process_module._register_pending_private_directory(guard)
+            process_module._register_active_private_directory_cleanup(active)
+            private_directory.rmdir()  # The old worker finished its filesystem work.
+            try:
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    process_module._release_reaped_private_directory_cleanup(
+                        active, deadline=time.monotonic() + 2
+                    )
+                with (
+                    patch.object(
+                        process_module, "_spawn_private_directory_cleanup"
+                    ) as spawn,
+                    self.assertRaises(process_module.ProcessOwnershipError) as raised,
+                ):
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIs(raised.exception, failure)
+                self.assertIs(
+                    process_module._active_private_directory_cleanup(guard), active
+                )
+                self.assertIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+                job.close.assert_not_called()
+                spawn.assert_not_called()
+
+                with patch.object(
+                    process_module, "_spawn_private_directory_cleanup"
+                ) as spawn:
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                self.assertNotIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+                self.assertEqual(job.wait_empty.call_count, 3)
+                job.close.assert_called_once_with()
+                self.assertEqual(process.wait.call_count, 2)
+                spawn.assert_not_called()
+            finally:
+                process_module._release_active_private_directory_cleanup(active)
+                process_module._release_pending_private_directory(guard)
+
     def test_parent_channel_eof_is_a_terminal_worker_signal(self) -> None:
         read_descriptor, write_descriptor = os.pipe()
         os.close(write_descriptor)

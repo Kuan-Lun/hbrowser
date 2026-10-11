@@ -31,6 +31,7 @@ from .browser import (
 from .browser.ban_handler import handle_ban_decorator
 from .browser.flaresolverr import MAX_FLARESOLVERR_SESSION_ATTEMPTS
 from .browser.page_diagnostic import write_page_diagnostic_owned
+from .browser.process import ProcessOwnershipError
 from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandler
 from .captcha.constants import MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
 from .challenge_policy import validate_turnstile_tabs
@@ -425,9 +426,9 @@ class Driver(ABC):
                 content,
                 deadline=operation_deadline,
             )
-        except BaseException as error:
-            if isinstance(error, asyncio.CancelledError):
-                raise
+        except asyncio.CancelledError, ProcessOwnershipError:
+            raise
+        except Exception as error:
             self.logger.warning(
                 "Failed to save %s page diagnostic: error_type=%s",
                 kind,

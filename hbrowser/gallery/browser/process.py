@@ -1848,19 +1848,15 @@ def _remove_private_directory_owned(
             raise ProcessOwnershipError(
                 "Private directory cleanup deadline expired before identity proof"
             )
-        if not guard._assert_identity_or_absence():
-            _release_pending_private_directory(guard)
-            return
-
         prior_active = _active_private_directory_cleanup(guard)
         if prior_active is not None:
             _force_reap_private_directory_cleanup(
                 prior_active,
                 deadline=absolute_deadline,
             )
-            if not guard._assert_identity_or_absence():
-                _release_pending_private_directory(guard)
-                return
+        if not guard._assert_identity_or_absence():
+            _release_pending_private_directory(guard)
+            return
 
         remaining = absolute_deadline - time.monotonic()
         if remaining <= 0:

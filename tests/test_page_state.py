@@ -22,6 +22,7 @@ from hbrowser.gallery.utils import (
     wait_for_zendriver,
 )
 from hbrowser.gallery.utils import page_state as page_state_module
+from hbrowser.gallery.utils import window as window_module
 from hbrowser.gallery.utils.protocol import (
     ZendriverOperationTimeout,
     ZendriverOwnerRetiredError,
@@ -201,12 +202,58 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
                 cast(Any, browser),
                 set(),
                 mutation,
-                owner=object(),
+                owner=browser,
                 operation="Popup click",
                 deadline=_RemainingDeadline(1.0, 0.0),  # type: ignore[arg-type]
             )
 
         mutation.assert_awaited_once_with()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
+
+    async def test_cancelled_popup_wait_retires_original_generation(self) -> None:
+        page = _EventPage()
+        browser = page.browser
+        browser.connection = page
+        browser.tabs = []
+        replacement_browser = SimpleNamespace()
+        waiting = asyncio.Event()
+        original_wait = window_module._wait_for_inventory_change
+
+        async def wait_for_inventory(*args: Any, **kwargs: Any) -> Any:
+            waiting.set()
+            return await original_wait(*args, **kwargs)
+
+        mutation = AsyncMock(return_value="ack")
+        with patch.object(
+            window_module, "_wait_for_inventory_change", side_effect=wait_for_inventory
+        ):
+            task = asyncio.create_task(
+                mutate_and_wait_for_new_tab(
+                    cast(Any, browser),
+                    set(),
+                    mutation,
+                    owner=page,
+                    operation="Popup click",
+                    deadline=Deadline.after(5),
+                )
+            )
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            # Retirement must remain bound to the original browser even when
+            # a page owner is rebound after its mutation acknowledgement.
+            page.browser = replacement_browser
+            task.cancel("caller cancellation")
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await task
+
+        self.assertEqual(raised.exception.args, ("caller cancellation",))
+        mutation.assert_awaited_once_with()
+        self.assertTrue(all(not handlers for handlers in page.handlers.values()))
+        new_work = AsyncMock()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(new_work(), timeout=1, owner=browser)
+        new_work.assert_not_awaited()
+        await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=replacement_browser)
 
     async def test_fallback_navigation_rejects_a_late_command_success(self) -> None:
         browser = SimpleNamespace()

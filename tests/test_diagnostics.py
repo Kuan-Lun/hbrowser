@@ -18,6 +18,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 from hbrowser import EHDriver
 from hbrowser.gallery import utils as gallery_utils
 from hbrowser.gallery.browser import page_diagnostic as page_diagnostic_module
+from hbrowser.gallery.browser.process import ProcessOwnershipError
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.utils import (
     Deadline,
@@ -910,6 +911,22 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 await save_task
 
         self.assertTrue(finished.is_set())
+
+    async def test_unresolved_diagnostic_worker_ownership_is_not_best_effort(
+        self,
+    ) -> None:
+        failure = ProcessOwnershipError("diagnostic worker ownership unresolved")
+        next_action = AsyncMock()
+        with patch.object(
+            self.driver, "_write_page_diagnostic", new=AsyncMock(side_effect=failure)
+        ):
+            with self.assertRaises(ProcessOwnershipError) as raised:
+                await self.driver.save_page_diagnostic("driver_error", "content")
+                await next_action()
+
+        self.assertIs(raised.exception, failure)
+        next_action.assert_not_awaited()
+        self.logger.warning.assert_not_called()
 
     async def test_owned_worker_timeout_is_reported(self) -> None:
         with patch.object(

@@ -12,6 +12,7 @@ from zendriver import cdp
 
 from .deadline import Deadline
 from .mutation import wait_for_zendriver_mutation
+from .protocol import _begin_zendriver_retirement
 
 _TARGET_COMMAND_TIMEOUT_SECONDS = 5.0
 _TARGET_SEMANTIC_DEADLINE_SECONDS = 10.0
@@ -102,15 +103,21 @@ async def mutate_and_wait_for_new_tab[ResultT](
             owner=owner,
             operation=operation,
         )
-        if deadline.remaining() <= 0:
-            raise TimeoutError(f"{operation} completed after its deadline")
-        tab = await _wait_for_inventory_change(
-            browser,
-            changed,
-            existing_tabs,
-            deadline,
-        )
-        return result, tab
+        try:
+            if deadline.remaining() <= 0:
+                raise TimeoutError(f"{operation} completed after its deadline")
+            tab = await _wait_for_inventory_change(
+                browser,
+                changed,
+                existing_tabs,
+                deadline,
+            )
+            return result, tab
+        except BaseException:
+            # Acknowledgement does not settle the popup's semantic outcome.
+            # Retire the original browser, even if the page owner was rebound.
+            _begin_zendriver_retirement(browser)
+            raise
     finally:
         if supports_events:
             event_connection.remove_handlers(cdp.target.TargetCreated, on_target)
