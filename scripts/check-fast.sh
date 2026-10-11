@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-cd -P -- "$(dirname "$0")/.."
+CDPATH= cd -P -- "$(dirname "$0")/.."
 repository_root="$PWD"
-cd "$repository_root"
+CDPATH= cd "$repository_root"
 
 [[ -x .venv/bin/ruff && -x .venv/bin/mypy ]] || {
     printf 'check-fast: run scripts/rebuild-env.sh first\n' >&2

@@ -9,8 +9,8 @@ from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 
-def source_requirement(assignment: str) -> str:
-    """Produce a named requirement; uv owns metadata and PEP 508 validation."""
+def source_requirement(assignment: str, *, source_base: Path | None = None) -> str:
+    """Bind local sources to their caller; uv validates metadata and PEP 508."""
     package, separator, source = assignment.partition("=")
     if (
         not separator
@@ -34,6 +34,8 @@ def source_requirement(assignment: str) -> str:
     ):
         local = Path(source)
     if local is not None:
+        if source_base is not None and not local.is_absolute():
+            local = source_base / local
         local = local.resolve(strict=True)
         if local.is_dir():
             if not (local / "pyproject.toml").is_file():
@@ -51,10 +53,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source", action="append", default=[])
+    parser.add_argument(
+        "--source-base",
+        type=Path,
+        help="Directory in which relative --source paths were supplied",
+    )
     parser.add_argument("--editable", action="append", default=[])
     arguments = parser.parse_args()
     try:
-        requirements = [source_requirement(item) for item in arguments.source]
+        requirements = [
+            source_requirement(item, source_base=arguments.source_base)
+            for item in arguments.source
+        ]
         for editable in arguments.editable:
             if not editable or any(character in editable for character in "\r\n\0"):
                 raise ValueError("Editable requirements must be nonempty single lines")

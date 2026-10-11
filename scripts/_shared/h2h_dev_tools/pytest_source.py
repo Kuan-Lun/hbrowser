@@ -28,7 +28,32 @@ class _Gateway(Protocol):
     def remote_exec(self, source: str) -> _Channel: ...
 
 
-def _run_pytest(package: Path, namespace: str, import_root: str) -> None:
+def _registered_hashes(package: Path, namespace: str) -> dict[str, str]:
+    registration = getattr(
+        globals().get("__loader__"), "_h2h_source_registration", None
+    )
+    if (
+        not isinstance(registration, tuple)
+        or len(registration) != 3
+        or not isinstance(registration[0], str)
+        or Path(registration[0]).resolve() != package
+        or registration[1] != namespace
+        or not isinstance(registration[2], dict)
+    ):
+        raise RuntimeError("Pytest runner requires a verified controller source loader")
+    hashes = {}
+    for filename, digest in registration[2].items():
+        if not isinstance(filename, str) or not isinstance(digest, str):
+            raise RuntimeError("Invalid controller source registration")
+        hashes[filename] = digest
+    if "source_loader.py" not in hashes:
+        raise RuntimeError("Controller source registration has no bootstrap")
+    return hashes
+
+
+def _run_pytest(
+    package: Path, namespace: str, import_root: str, hashes: dict[str, str]
+) -> None:
     # Pytest is an invocation dependency, not a runtime requirement of the
     # toolkit distribution or of consumers that select other components.
     import pytest
@@ -41,11 +66,24 @@ def _run_pytest(package: Path, namespace: str, import_root: str) -> None:
             if not gateway.spec.popen or gateway.spec.via:
                 return
             gateway.remote_exec(
-                "import runpy, sys\nfrom pathlib import Path\n"
+                "import hashlib, stat, sys\nfrom pathlib import Path\n"
                 f"sys.path.insert(0, {import_root!r})\n"
                 f"package = Path({str(package)!r})\n"
-                "runpy.run_path(str(package / 'source_loader.py'))['load_package'](\n"
-                f"    package, {namespace!r})\n"
+                f"hashes = {hashes!r}\n"
+                "path = package / 'source_loader.py'\n"
+                "if not stat.S_ISREG(path.lstat().st_mode):\n"
+                "    raise RuntimeError("
+                "'Source bootstrap differs from the controller registration')\n"
+                "content = path.read_bytes()\n"
+                "if hashlib.sha256(content).hexdigest() != "
+                "hashes['source_loader.py']:\n"
+                "    raise RuntimeError("
+                "'Source bootstrap differs from the controller registration')\n"
+                "bootstrap = {'__file__': str(path), "
+                "'__name__': '<worker_source_bootstrap>'}\n"
+                "exec(compile(content, str(path), 'exec'), bootstrap)\n"
+                "bootstrap['load_package'](\n"
+                f"    package, {namespace!r}, expected_hashes=hashes)\n"
             ).waitclose()
 
     raise SystemExit(pytest.main(plugins=[WorkerSource()]))
@@ -63,6 +101,7 @@ def main() -> None:
     parts = __package__.split(".")
     if tuple(package.parts[-len(parts) :]) != tuple(parts):
         raise RuntimeError("Pytest source package path does not match its namespace")
+    hashes = _registered_hashes(package, __package__)
     import_root = str(package.parents[len(parts) - 1])
     environment_keys = (
         "PYTHONPYCACHEPREFIX",
@@ -86,7 +125,7 @@ def main() -> None:
                 if previous_pythonpath is not None
                 else ""
             )
-            _run_pytest(package, __package__, import_root)
+            _run_pytest(package, __package__, import_root, hashes)
         finally:
             sys.pycache_prefix = previous_prefix
             sys.dont_write_bytecode = previous_write_flag

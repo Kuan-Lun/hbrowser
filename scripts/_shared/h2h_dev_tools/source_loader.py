@@ -31,7 +31,9 @@ def _bytes(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def _sources(directory: Path, namespace: str) -> dict[str, str]:
+def _sources(
+    directory: Path, namespace: str, expected_hashes: dict[str, str] | None
+) -> dict[str, str]:
     manifest = directory / "manifest.json"
     if (
         manifest.exists()
@@ -40,7 +42,24 @@ def _sources(directory: Path, namespace: str) -> dict[str, str]:
     ):
         # This verifier is intentionally executed from source too. Its complete
         # graph checks the loader, verifier, and every module before any import.
-        verifier = runpy.run_path(str(directory / "bundle_verify.py"))
+        verifier_path = directory / "bundle_verify.py"
+        if expected_hashes is None:
+            verifier = runpy.run_path(str(verifier_path))
+        else:
+            content = _bytes(verifier_path)
+            if hashlib.sha256(content).hexdigest() != expected_hashes.get(
+                "bundle_verify.py"
+            ):
+                raise SourceLoadError(
+                    "Snapshot verifier differs from the controller registration"
+                )
+            # Compile the bytes just checked, rather than reopening the path
+            # after the comparison. The verifier still checks the full manifest.
+            verifier = {
+                "__file__": str(verifier_path),
+                "__name__": "<worker_source_verifier>",
+            }
+            exec(compile(content, str(verifier_path), "exec"), verifier)
         document = verifier["verify_bundle"](directory.parents[2])
         return dict(document["files"])
     return {
@@ -122,7 +141,12 @@ class _SourceFinder(importlib.abc.MetaPathFinder):
         )
 
 
-def load_package(directory: Path, namespace: str) -> ModuleType:
+def load_package(
+    directory: Path,
+    namespace: str,
+    *,
+    expected_hashes: dict[str, str] | None = None,
+) -> ModuleType:
     """Verify source and register its flat package; preserve identical loaded types.
 
     Repeated calls reverify the payload. A changed package or an earlier normal
@@ -131,7 +155,9 @@ def load_package(directory: Path, namespace: str) -> ModuleType:
     directory = directory.absolute()
     if not stat.S_ISDIR(directory.lstat().st_mode):
         raise SourceLoadError(f"Source package must be a real directory: {directory}")
-    hashes = _sources(directory, namespace)
+    hashes = _sources(directory, namespace, expected_hashes)
+    if expected_hashes is not None and hashes != expected_hashes:
+        raise SourceLoadError("Source package differs from the controller registration")
     if "__init__.py" not in hashes:
         raise SourceLoadError("Source package is missing __init__.py")
     registration = (str(directory), namespace, hashes)

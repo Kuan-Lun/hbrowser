@@ -5,8 +5,9 @@ set -euo pipefail
 repository_root=${1:?repository root is required}
 after_build=${2-}
 shift 2
-source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$repository_root"
+source_base=$PWD
+source_directory="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CDPATH= cd "$repository_root"
 for executable in uv npm; do
     command -v "$executable" >/dev/null || {
         printf 'rebuild-env: %s is required\n' "$executable" >&2
@@ -22,7 +23,8 @@ usage() {
         '' \
         'Dependencies use the package index by default. SOURCE can be index,' \
         'a local project, wheel, archive/URL, or Git requirement. Overrides' \
-        'must be supplied explicitly; sibling repositories are never guessed.'
+        'must be supplied explicitly; sibling repositories are never guessed.' \
+        'Relative SOURCE paths are resolved from the caller working directory.'
 }
 
 while (( $# )); do
@@ -58,7 +60,8 @@ done
 requirements="$(mktemp "${TMPDIR:-/tmp}/h2h-requirements.XXXXXX")"
 trap 'rm -f "$requirements"' EXIT
 bash "$source_directory/resolve-sources.sh" "$requirements" \
-    --editable '.[dev]' ${source_overrides[@]+"${source_overrides[@]}"}
+    --source-base "$source_base" --editable '.[dev]' \
+    ${source_overrides[@]+"${source_overrides[@]}"}
 uv venv --clear --python 3.14 .venv
 environment_python=.venv/bin/python
 if [[ ! -x "$environment_python" ]]; then

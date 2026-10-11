@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-cd -P -- "$(dirname "$0")/.."
+CDPATH= cd -P -- "$(dirname "$0")/.."
 repository_root="$PWD"
-cd "$repository_root"
+CDPATH= cd "$repository_root"
 
 scripts/check-fast.sh
 .venv/bin/python scripts/_shared/h2h_dev_tools/git_environment.py \

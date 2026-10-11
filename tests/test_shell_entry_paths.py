@@ -206,8 +206,9 @@ def _two_checkouts(tmp_path: Path) -> tuple[Path, Path]:
 @pytest.mark.parametrize(
     "entry", ["format.sh", "install-git-hooks.sh", "rebuild-env.sh"]
 )
+@pytest.mark.parametrize("directory_search", ["unset", "current", "foreign"])
 def test_mutating_entries_never_target_a_truncated_sibling_checkout(
-    tmp_path: Path, entry: str
+    tmp_path: Path, entry: str, directory_search: str
 ) -> None:
     intended, sibling = _two_checkouts(tmp_path)
     sibling_config = (sibling / ".git/config").read_bytes()
@@ -243,17 +244,27 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
         f"#!{sys.executable}\nfrom pathlib import Path\nPath('.npm-ran').touch()\n"
     )
     npm.chmod(0o755)
-    nested = intended / "nested"
-    nested.mkdir()
+    nested = (sibling if entry == "rebuild-env.sh" else intended) / "nested"
+    if directory_search != "unset":
+        nested = intended
+    nested.mkdir(exist_ok=True)
+    if entry == "rebuild-env.sh":
+        (nested / "candidate.whl").write_bytes(b"caller-selected fixture source")
     arguments = (
         ("--source", "sample=./candidate.whl") if entry == "rebuild-env.sh" else ()
     )
 
+    environment = dict(os.environ)
+    environment["PATH"] = str(binary) + os.pathsep + environment.get("PATH", "")
+    environment.pop("CDPATH", None)
+    entry_path = str(intended / "scripts" / entry)
+    if directory_search != "unset":
+        environment["CDPATH"] = "." if directory_search == "current" else str(sibling)
+        entry_path = f"scripts/{entry}"
     result = subprocess.run(
-        ("bash", str(intended / "scripts" / entry), *arguments),
+        ("bash", entry_path, *arguments),
         cwd=nested,
-        env=os.environ
-        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
@@ -297,7 +308,36 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
             {
                 "cwd": str(intended),
                 "plan": (
-                    f"sample @ {(intended / 'candidate.whl').as_uri()}\n-e .[dev]\n"
+                    f"sample @ {(nested / 'candidate.whl').as_uri()}\n-e .[dev]\n"
                 ),
             }
         ]
+
+
+@pytest.mark.parametrize("directory_search", ["current", "foreign"])
+def test_primary_query_ignores_cdpath_and_emits_only_branch_name(
+    tmp_path: Path, directory_search: str
+) -> None:
+    intended, sibling = _two_checkouts(tmp_path)
+    for root in (intended, sibling):
+        _copy(root, "scripts/detect-primary-branch.sh")
+    subprocess.run(
+        ("git", "-C", str(sibling), "branch", "-m", "main"),
+        check=True,
+        capture_output=True,
+    )
+    environment = dict(os.environ)
+    environment["CDPATH"] = "." if directory_search == "current" else str(sibling)
+
+    result = subprocess.run(
+        ("bash", "scripts/detect-primary-branch.sh"),
+        cwd=intended,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "master\n"

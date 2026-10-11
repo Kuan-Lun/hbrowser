@@ -293,9 +293,9 @@ run_tracked() {
         # Preserve destinations for the nonblocking diagnostic writer only.
         # Startup errors (missing cwd/interpreter/launcher) must not block before
         # the owner can install that writer or establish its hard deadline.
-        (cd "$working_directory" && exec "$@") 3>&1 4>&2 >/dev/null 2>&1 &
+        (CDPATH= cd "$working_directory" && exec "$@") 3>&1 4>&2 >/dev/null 2>&1 &
     else
-        (cd "$working_directory" && exec "$@") &
+        (CDPATH= cd "$working_directory" && exec "$@") &
     fi
     active_pid=$!
     starting_child=0
@@ -328,7 +328,8 @@ if [[ $# -eq 1 ]]; then
     mode='cleanup-only'
 fi
 
-cd "$repository_root"
+CDPATH= cd "$repository_root"
+repository_root=$PWD
 
 primary="$(scripts/detect-primary-branch.sh)"
 task_branch="$(git branch --show-current)"
@@ -402,7 +403,7 @@ trap 'receive_signal 143' TERM
 # this owner or prevent its EXIT handler from validating the cleanup receipt.
 trap '' PIPE
 select_local_python "$repository_root"
-source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_directory="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 execution_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-merge-owner.XXXXXX")"
 prepare_owner "$source_directory" "$execution_directory/bootstrap"
 if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
@@ -426,7 +427,7 @@ if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
     else
         assert_checked_out_ref "$repository_root" "$task_ref"
         select_local_python "$cleanup_worktree"
-        cd "$cleanup_worktree"
+        CDPATH= cd "$cleanup_worktree"
         run_tracked process "$cleanup_worktree" git -C "$cleanup_worktree" worktree remove "$repository_root" \
             || fail "no-op task worktree remains: $repository_root"
     fi
@@ -495,7 +496,7 @@ else
         || fail 'merge commit or release gate failed; task branch was retained'
 fi
 
-cd "$merge_worktree"
+CDPATH= cd "$merge_worktree"
 merge_commit="$(git -C "$merge_worktree" rev-parse HEAD)"
 assert_checked_out_ref "$merge_worktree" "$primary_ref"
 assert_cleanup_refs "$merge_worktree" "$merge_commit"

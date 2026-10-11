@@ -4,7 +4,7 @@ set -euo pipefail
 
 requirements=${1:?output requirements file is required}
 shift
-source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_directory="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bootstrap_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-environment.XXXXXX")"
 trap 'rm -rf "$bootstrap_directory"' EXIT
 

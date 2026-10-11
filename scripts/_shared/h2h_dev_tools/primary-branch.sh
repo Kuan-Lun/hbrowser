@@ -3,7 +3,7 @@
 set -euo pipefail
 
 repository_root=${1:?repository root is required}
-cd "$repository_root"
+CDPATH= cd "$repository_root"
 
 configured_primary="$(git config --local --get workflow.primaryBranch || true)"
 if [[ -n "$configured_primary" ]]; then

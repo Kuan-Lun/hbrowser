@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repository_root=${1:?repository root is required}
-cd "$repository_root"
+CDPATH= cd "$repository_root"
 fail() { printf 'review-merge-candidate: %s\n' "$1" >&2; exit 1; }
 if [[ -x .venv/bin/python ]]; then
     python=.venv/bin/python

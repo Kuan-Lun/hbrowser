@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd -P -- "$(dirname "$0")/.."
+CDPATH= cd -P -- "$(dirname "$0")/.."
 repository_root="$PWD"
-cd "$repository_root"
+CDPATH= cd "$repository_root"
 
 if [[ -n "${HBROWSER_CHECK_PYTHON:-}" ]]; then
     process_python="$HBROWSER_CHECK_PYTHON"
