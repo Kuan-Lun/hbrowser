@@ -224,6 +224,22 @@ P0/P1/P2 defects even when they predate this task. A prior diff review is not a
 full-repository baseline. Inventory the tree with `git ls-tree -r {target.tree}`
 and read authoritative contents with `git show {target.tree}:<path>`.
 Do not limit inspection or findings to lines introduced by the current change.
+
+Maintain an in-memory worklist of all tracked paths from that inventory, recording
+reviewed and remaining paths; do not write review-planning files. Divide work into
+bounded logical chunks. Read large files with bounded output from the authoritative
+`git show` contents and continue through the remaining sections; truncated output
+does not establish coverage. Include related tests and configuration with each
+chunk, and reconcile cross-boundary dependencies and interactions before finishing.
+If delegating, give each worker a concrete, bounded set of paths and require its
+findings, reviewed paths and remaining paths. Wait for and consolidate worker
+results. A partial assignment or a worker's incomplete result is work to continue:
+follow up, reassign smaller remaining chunks or inspect them yourself. Do not end
+the review merely because a worker finished without covering its assignment.
+Continue until the full worklist and interactions are examined, unless an actual
+tool, context or time limit prevents completion. In that case use incomplete,
+identify the specific blocker and remaining paths in the summary, and preserve
+every actionable finding already established. Never turn unreviewed work into pass.
 """
     else:
         instructions = f"""Review scope: incremental.
