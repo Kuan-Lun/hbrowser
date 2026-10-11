@@ -1523,18 +1523,27 @@ def _log_forwarding_environment_for_child() -> dict[str, str]:
             return {}
 
 
+def _reject_parent_logging_lifecycle() -> None:
+    """Keep child entry points from taking over an already claimed parent role."""
+
+    if _FILE_SINK_ATTEMPTED or _LOGGING_CONFIGURED or _LOGGING_CLOSED:
+        raise RuntimeError("A parent logging lifecycle already exists")
+
+
 def configure_forwarded_logging() -> None:
     """Configure a child to forward trace records without opening local sinks.
 
-    The capability is consumed from the environment and removed immediately so
+    A parent lifecycle conflict raises before changing state or capabilities.
+    Otherwise, the capability is consumed from the environment immediately so
     later descendants cannot inherit it accidentally. Connection/configuration
     failures latch forwarding-degraded health and keep ordinary log calls quiet.
     """
     global _FORWARDED_LOGGING_CONFIGURED, _FORWARDING_HANDLER
 
-    endpoint = os.environ.pop(FORWARD_ENDPOINT_ENVIRONMENT_VARIABLE, None)
-    token = os.environ.pop(FORWARD_TOKEN_ENVIRONMENT_VARIABLE, None)
     with _LOGGING_CONFIGURATION_LOCK:
+        _reject_parent_logging_lifecycle()
+        endpoint = os.environ.pop(FORWARD_ENDPOINT_ENVIRONMENT_VARIABLE, None)
+        token = os.environ.pop(FORWARD_TOKEN_ENVIRONMENT_VARIABLE, None)
         if _FORWARDED_LOGGING_CLOSED:
             _record_forwarding_failure(
                 "forward-configure",
@@ -1545,12 +1554,7 @@ def configure_forwarded_logging() -> None:
             return
         _FORWARDED_LOGGING_CONFIGURED = True
         forwarding_handler: ForwardingHandler | None = None
-        if _LOGGING_CONFIGURED or _LOGGING_CLOSED:
-            _record_forwarding_failure(
-                "forward-configure",
-                RuntimeError("A parent logging lifecycle already exists"),
-            )
-        elif endpoint is None or token is None:
+        if endpoint is None or token is None:
             _record_forwarding_failure(
                 "forward-configure",
                 ForwardingConfigurationError(
@@ -1583,11 +1587,15 @@ def configure_forwarded_logging() -> None:
 
 
 def close_forwarded_logging() -> None:
-    """Gracefully close a child forwarding lifecycle without raising."""
+    """Close child forwarding; reject a parent role before changing its state.
+
+    Forwarding cleanup failures latch degraded health rather than raising.
+    """
     global _FORWARDED_LOGGING_CLOSED, _FORWARDED_LOGGING_CONFIGURED
     global _FORWARDING_HANDLER
 
     with _LOGGING_CONFIGURATION_LOCK:
+        _reject_parent_logging_lifecycle()
         if _FORWARDED_LOGGING_CLOSED:
             return
         _FORWARDED_LOGGING_CLOSED = True

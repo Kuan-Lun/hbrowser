@@ -468,6 +468,94 @@ class LoggerConfigurationTests(IsolatedLoggingTestCase):
 
 
 class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
+    def test_child_entry_rejects_active_parent_without_changing_its_resources(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _SystemTemporaryDirectory() as directory_name,
+                _isolated_logging_state_for_testing(),
+                patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+            ):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                receiver = start_log_forwarding_receiver()
+                self.assertIsNotNone(receiver)
+                assert receiver is not None
+                handler = log_module._PROCESS_LOG_HANDLER
+                assert handler is not None
+                logger = setup_logger("hbrowser.tests.parent_conflict")
+                handlers = tuple(logger.handlers)
+                before_health = logging_health()
+                capability = receiver.child_environment()
+                with patch.dict(os.environ, capability):
+                    with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                        operation()
+                    for key, value in capability.items():
+                        self.assertEqual(os.environ.get(key), value)
+                self.assertEqual(tuple(logger.handlers), handlers)
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                self.assertIs(log_module._PROCESS_LOG_HANDLER, handler)
+                self.assertIs(log_module._LOG_FORWARDING_RECEIVER, receiver)
+                logger.info("parent remains usable after rejected child entry")
+                self.assertEqual(
+                    [event["message"] for event in _read_events(Path(directory_name))],
+                    ["parent remains usable after rejected child entry"],
+                )
+                close_logging()
+                self.assertFalse(handler._worker.is_alive())
+                self.assertFalse(receiver._accept_thread.is_alive())
+                self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
+                self.assertIsNone(log_module._LOG_FORWARDING_RECEIVER)
+
+    def test_child_entry_rejects_closed_parent_without_creating_child_state(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _SystemTemporaryDirectory() as directory_name,
+                _isolated_logging_state_for_testing(),
+                patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+            ):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                close_logging()
+                before_health = logging_health()
+                with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                    operation()
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                close_logging()
+
+    def test_child_entry_rejects_parent_after_strict_sink_startup_failure(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _isolated_logging_state_for_testing(),
+                patch.object(
+                    log_module,
+                    "get_log_dir",
+                    side_effect=OSError(errno.EACCES, "denied"),
+                ),
+                patch("hbrowser.gallery.utils.log.os.write"),
+            ):
+                with self.assertRaises(LogPersistenceError):
+                    configure_logging()
+                before_health = logging_health()
+                with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                    operation()
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                with self.assertRaises(LogPersistenceError):
+                    close_logging()
+                self.assertTrue(log_module._LOGGING_CLOSED)
+
     @staticmethod
     def _child_environment(receiver: LogForwardingReceiver) -> dict[str, str]:
         environment = os.environ.copy()
