@@ -20,10 +20,13 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
-from typing import Any, BinaryIO, Final, TextIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Final, TextIO, cast
+
+if TYPE_CHECKING:
+    from ._process_scope import PosixScope
 
 TERMINATION_GRACE_SECONDS = 2.0
 TERMINATION_POLL_SECONDS = 0.05
@@ -329,6 +332,7 @@ class WindowsJob:
 class OwnedProcess:
     process: subprocess.Popen[bytes]
     windows_job: WindowsJob | None = None
+    posix_scope: PosixScope | None = None
 
 
 def _start_posix_process(phase: ProcessCommand) -> subprocess.Popen[bytes]:
@@ -508,9 +512,21 @@ def start_owned_process(
             deadline=deadline,
             signal_controller=signal_controller,
         )
+    from ._process_scope import PosixScope, ScopeError
+
+    scope: PosixScope | None = None
     try:
-        return OwnedProcess(_start_posix_process(phase))
-    except OSError as error:
+        scope = PosixScope.create(deadline=deadline)
+        child = _start_posix_process(
+            replace(phase, environment=scope.environment(phase.environment))
+        )
+        return OwnedProcess(child, posix_scope=scope)
+    except (OSError, ScopeError) as error:
+        if scope is not None:
+            # Popen reported failure before it returned a child handle. Its
+            # subprocess contract reaps a failed exec before raising OSError.
+            scope.proven_empty = True
+            scope.close(deadline=deadline)
         raise ProcessOwnershipError(phase.label) from error
 
 
@@ -536,6 +552,7 @@ def _wait_for_posix_process_group_exit(
     *,
     kill_process_group: Callable[[int, int], None],
     deadline: float,
+    scope: PosixScope | None = None,
 ) -> bool:
     while True:
         # poll() reaps an exited leader; group membership, rather than leader
@@ -544,7 +561,10 @@ def _wait_for_posix_process_group_exit(
         try:
             kill_process_group(process.pid, 0)
         except ProcessLookupError:
-            return _wait_for_process_until(process, deadline=deadline)
+            if scope is not None and seconds_remaining(deadline) <= 0:
+                return False
+            if scope is None or not scope.has_pending(deadline=deadline):
+                return _wait_for_process_until(process, deadline=deadline)
         except PermissionError:
             pass
         remaining_seconds = seconds_remaining(deadline)
@@ -554,7 +574,10 @@ def _wait_for_posix_process_group_exit(
 
 
 def _terminate_posix_process_group(
-    process: subprocess.Popen[bytes], *, deadline: float
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+    scope: PosixScope | None = None,
 ) -> bool:
     kill_process_group = cast(
         Callable[[int, int], None] | None,
@@ -563,10 +586,18 @@ def _terminate_posix_process_group(
     if kill_process_group is None:
         return False
 
+    if scope is not None:
+        scope.close_admission(deadline=deadline)
+
     try:
         kill_process_group(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return _wait_for_process_until(process, deadline=deadline)
+        return _wait_for_posix_process_group_exit(
+            process,
+            kill_process_group=kill_process_group,
+            deadline=deadline,
+            scope=scope,
+        )
     except OSError:
         return False
     now = time.monotonic()
@@ -578,18 +609,45 @@ def _terminate_posix_process_group(
         process,
         kill_process_group=kill_process_group,
         deadline=graceful_deadline,
+        scope=scope,
     ):
+        return True
+    # The inner owner must survive long enough to prove its separate session
+    # empty. Closing admission before TERM prevents a new phase racing this
+    # check. Expiry or a crashed nested owner retains the obligation and makes
+    # the result unproven; killing that owner cannot manufacture tree proof.
+    while scope is not None:
+        remaining = seconds_remaining(deadline)
+        if remaining <= 0:
+            return False
+        if not scope.has_pending(deadline=deadline):
+            break
+        time.sleep(min(TERMINATION_POLL_SECONDS, remaining))
+    if scope is not None and _wait_for_posix_process_group_exit(
+        process,
+        kill_process_group=kill_process_group,
+        deadline=time.monotonic(),
+    ):
+        # Reap an inner owner that exited after releasing its last obligation.
+        # Admission is closed and pending was just proven empty, so this final
+        # group-only observation cannot admit another nested session.
         return True
     try:
         kill_process_group(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        return _wait_for_process_until(process, deadline=deadline)
+        return _wait_for_posix_process_group_exit(
+            process,
+            kill_process_group=kill_process_group,
+            deadline=deadline,
+            scope=scope,
+        )
     except OSError:
         return False
     return _wait_for_posix_process_group_exit(
         process,
         kill_process_group=kill_process_group,
         deadline=deadline,
+        scope=scope,
     )
 
 
@@ -614,11 +672,18 @@ def wait_for_owned_tree_exit(
     )
     if kill_process_group is None:
         return False
-    return _wait_for_posix_process_group_exit(
+    if owner.posix_scope is not None:
+        owner.posix_scope.cleanup_deadline = deadline
+        owner.posix_scope.close_admission(deadline=deadline)
+    empty = _wait_for_posix_process_group_exit(
         owner.process,
         kill_process_group=kill_process_group,
         deadline=deadline,
+        scope=owner.posix_scope,
     )
+    if owner.posix_scope is not None:
+        owner.posix_scope.proven_empty = empty
+    return empty
 
 
 def _diagnostic_supports_nonblocking(descriptor: int) -> bool:
@@ -742,12 +807,25 @@ def terminate_owned_tree(
 
     if owner.windows_job is not None:
         return _terminate_windows_tree(owner, deadline=deadline)
-    return _terminate_posix_process_group(owner.process, deadline=deadline)
+    if owner.posix_scope is not None:
+        owner.posix_scope.cleanup_deadline = deadline
+    empty = _terminate_posix_process_group(
+        owner.process, deadline=deadline, scope=owner.posix_scope
+    )
+    if owner.posix_scope is not None:
+        owner.posix_scope.proven_empty = empty
+    return empty
 
 
 def close_owner(owner: OwnedProcess) -> bool:
     job = owner.windows_job
     if job is None:
+        if owner.posix_scope is not None:
+            try:
+                owner.posix_scope.close(deadline=owner.posix_scope.cleanup_deadline)
+            except Exception as error:
+                report_diagnostic(str(error))
+                return False
         return True
     try:
         job.close()

@@ -62,6 +62,11 @@
   必須 abort merge 並保留 task branch。若無法證明 owned process cleanup，這是明確
   例外：不得讓仍存活的 hook 與 abort 競爭，保留 candidate 與 task 待確認及安全處理。
   已成功建立的 merge commit 不因後續中斷或清理失敗而回滾。
+- Canonical POSIX nested owner 必須在啟動新 session 前登記清理責任；外層先關閉
+  admission，只有內層證明自身 group 與所有 nested obligations 已清空，才能
+  強制終止該 owner 或回報整棵樹清空。Lock 等待共用原 deadline，不以延長 grace
+  取代 ownership 證據。內層非預期死亡或 ledger 不可驗證時保留 candidate、task
+  與 scope，不能把外層 group 清空當作巢狀清理成功。
 - Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
   統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 no-op／
   `--cleanup-only` 都需要 repository-local `.venv`；缺少時先執行

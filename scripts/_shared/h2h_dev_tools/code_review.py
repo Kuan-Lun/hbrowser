@@ -258,13 +258,17 @@ Otherwise use changes_requested. Write summary and findings in Traditional Chine
 """
 
 
-def _stop(process: subprocess.Popen[bytes]) -> None:
+def _stop(owner: process_control.OwnedProcess) -> None:
     # Online review admits only POSIX. Its group can outlive a successful leader;
     # use the shared bounded group oracle before publishing any passing receipt.
-    if not process_control.terminate_owned_tree(
-        process_control.OwnedProcess(process), deadline=time.monotonic() + 5
-    ):
-        raise ReviewError("Codex process-group cleanup could not be proven")
+    try:
+        if not process_control.terminate_owned_tree(
+            owner, deadline=time.monotonic() + 5
+        ):
+            raise ReviewError("Codex process-group cleanup could not be proven")
+    finally:
+        if not process_control.close_owner(owner):
+            raise ReviewError("Codex nested process-scope cleanup could not be proven")
 
 
 def _external_process_owner() -> bool:
@@ -574,6 +578,8 @@ class Reviewer:
     def _execute(
         self, command: list[str], prompt: str, run_directory: Path, timeout: int
     ) -> None:
+        from ._process_scope import PosixScope, ScopeError
+
         externally_owned = _external_process_owner()
         try:
             with (
@@ -582,21 +588,39 @@ class Reviewer:
                 (run_directory / "stderr.log").open("wb") as errors,
             ):
                 process: subprocess.Popen[bytes] | None = None
+                owner: process_control.OwnedProcess | None = None
+                scope: PosixScope | None = None
                 try:
                     # A signal cannot escape between child creation and receipt
                     # of its handle. Deliver it only after this frame owns cleanup.
                     with controller.defer():
-                        process = subprocess.Popen(
-                            command,
-                            cwd=self.repository,
-                            stdin=subprocess.PIPE,
-                            stdout=output,
-                            stderr=errors,
-                            start_new_session=not externally_owned,
-                            # Ownership applies only to this reviewer, never to
-                            # commands/tests which Codex may itself execute.
-                            env=merge_command.without_review_owner(os.environ),
-                        )
+                        environment = merge_command.without_review_owner(os.environ)
+                        if not externally_owned:
+                            scope = PosixScope.create(
+                                deadline=time.monotonic() + timeout
+                            )
+                            environment = scope.environment(environment)
+                        try:
+                            process = subprocess.Popen(
+                                command,
+                                cwd=self.repository,
+                                stdin=subprocess.PIPE,
+                                stdout=output,
+                                stderr=errors,
+                                start_new_session=not externally_owned,
+                                # Commands may inherit cleanup obligations, but
+                                # never the managed review publication authority.
+                                env=environment,
+                            )
+                        except OSError:
+                            if scope is not None:
+                                scope.proven_empty = True
+                                scope.close(deadline=time.monotonic() + 5)
+                            raise
+                        if scope is not None:
+                            owner = process_control.OwnedProcess(
+                                process, posix_scope=scope
+                            )
                     process.communicate(prompt.encode(), timeout=timeout)
                     if process.returncode:
                         raise ReviewError(
@@ -616,7 +640,8 @@ class Reviewer:
                                 if externally_owned:
                                     _stop_direct_child(process)
                                 else:
-                                    _stop(process)
+                                    assert owner is not None
+                                    _stop(owner)
                             finally:
                                 if process.stdin is not None:
                                     process.stdin.close()
@@ -627,6 +652,8 @@ class Reviewer:
                 else error.signal_number
             )
             raise ReviewError(f"Code review interrupted by signal {signum}") from error
+        except ScopeError as error:
+            raise ReviewError("Codex nested ownership could not be proven") from error
 
     def _write_receipt(
         self,
