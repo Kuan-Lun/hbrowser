@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from . import bundle_verify, change_scope
+from . import bundle_verify, change_scope, merge_command
 from . import process as process_control
 
 PROFILE = "h2h-code-review-v2"
@@ -270,6 +270,42 @@ def _stop(process: subprocess.Popen[bytes]) -> None:
         raise ReviewError("Codex did not exit after termination") from error
 
 
+def _external_process_owner() -> bool:
+    """Admit inherited ownership only for the external launcher's direct leader."""
+    value = os.environ.get("H2H_REVIEW_PROCESS_OWNER")
+    if value is None:
+        return False
+    try:
+        owner = int(value)
+    except ValueError as error:
+        raise ReviewError("Invalid review process owner") from error
+    if (
+        os.name != "posix"
+        or owner <= 0
+        or os.getppid() != owner
+        or os.getpgrp() != os.getpid()
+    ):
+        raise ReviewError(
+            "Review process owner does not match the current parent/group"
+        )
+    if os.environ.get("H2H_REVIEW_OWNER_SOURCE") != merge_command.owner_source_digest():
+        raise ReviewError(
+            "Review process owner implementation differs from the candidate"
+        )
+    return True
+
+
+def _stop_direct_child(process: subprocess.Popen[bytes]) -> None:
+    # The external owner controls this entire group, including this reviewer.
+    # Stop only the direct command here; it proves final group cleanup after this
+    # frame exits, including when this Python process is uncatchably killed.
+    process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired as error:
+        raise ReviewError("Codex did not exit after termination") from error
+
+
 @dataclass(frozen=True)
 class Reviewer:
     """Keep candidate, Git metadata and policy operations local to one repository."""
@@ -311,6 +347,7 @@ class Reviewer:
         # Both candidate source and executed implementation belong to the contract.
         executed_paths = {name: Path(__file__).with_name(name) for name in REVIEW_FILES}
         executed_paths["bundle_verify.py"] = Path(bundle_verify.__file__)
+        executed_paths["merge_command.py"] = Path(merge_command.__file__)
         executed_paths["process.py"] = Path(process_control.__file__)
         executed_paths["change_scope.py"] = Path(change_scope.__file__)
         for name, executed_path in executed_paths.items():
@@ -516,6 +553,7 @@ class Reviewer:
     def _execute(
         self, command: list[str], prompt: str, run_directory: Path, timeout: int
     ) -> None:
+        externally_owned = _external_process_owner()
         try:
             with (
                 process_control.controlled_termination_signals() as controller,
@@ -533,7 +571,7 @@ class Reviewer:
                             stdin=subprocess.PIPE,
                             stdout=output,
                             stderr=errors,
-                            start_new_session=True,
+                            start_new_session=not externally_owned,
                         )
                     process.communicate(prompt.encode(), timeout=timeout)
                     if process.returncode:
@@ -551,7 +589,10 @@ class Reviewer:
                         # a timeout, normal exit or the first interruption.
                         with controller.defer():
                             try:
-                                _stop(process)
+                                if externally_owned:
+                                    _stop_direct_child(process)
+                                else:
+                                    _stop(process)
                             finally:
                                 if process.stdin is not None:
                                     process.stdin.close()
@@ -630,13 +671,12 @@ class Reviewer:
         runs = self._directory() / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         run_directory = Path(tempfile.mkdtemp(prefix=f"{target.key[:12]}-", dir=runs))
-        version = subprocess.run(
-            ("codex", "--version"),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout.strip()
+        version_directory = run_directory / "version"
+        version_directory.mkdir()
+        self._execute(["codex", "--version"], "", version_directory, 10)
+        version = (
+            (version_directory / "events.jsonl").read_text(encoding="utf-8").strip()
+        )
         if not version:
             raise ReviewError("Codex did not report its version")
         schema_path = run_directory / "schema.json"

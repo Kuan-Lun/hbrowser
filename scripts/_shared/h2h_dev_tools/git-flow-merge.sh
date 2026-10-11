@@ -110,11 +110,9 @@ restore_after_failure() {
 }
 
 check_owner_cleanup() {
-    if [[ "$active_owner" == process ]]; then
-        if [[ "$1" -eq 125 || ! -f "$active_cleanup_receipt" ]] \
-            || [[ "$(cat "$active_cleanup_receipt")" != owned_tree_empty ]]; then
-            owner_cleanup_failed=1
-        fi
+    if [[ "$1" -eq 125 || ! -f "$active_cleanup_receipt" ]] \
+        || [[ "$(cat "$active_cleanup_receipt")" != owned_tree_empty ]]; then
+        owner_cleanup_failed=1
     fi
 }
 
@@ -130,12 +128,14 @@ run_tracked() {
     local status=0 working_directory=$2
     active_owner=$1
     shift 2
-    if [[ "$active_owner" == process ]]; then
-        command_number=$((command_number + 1))
-        active_cleanup_receipt="$execution_directory/cleanup-$command_number"
-        set -- "$merge_python" -I -B "$merge_launcher" \
-            --cleanup-receipt "$active_cleanup_receipt" "$working_directory" -- "$@"
+    command_number=$((command_number + 1))
+    active_cleanup_receipt="$execution_directory/cleanup-$command_number"
+    set -- "$working_directory" -- "$@"
+    if [[ "$active_owner" == review ]]; then
+        set -- --review "$@"
     fi
+    set -- "$merge_python" -I -B "$merge_launcher" \
+        --cleanup-receipt "$active_cleanup_receipt" "$@"
     # Do not leave a forked supervisor unregistered if a signal arrives between
     # the background launch and assignment of its PID.
     starting_child=1
@@ -288,9 +288,11 @@ fi
 source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 execution_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-merge-owner.XXXXXX")"
 mkdir "$execution_directory/h2h_dev_tools"
-for source_file in __init__.py merge_command.py process.py; do
+owner_source_files="$("$merge_python" -I -B "$source_directory/merge_command.py" --print-source-files)" \
+    || fail 'could not resolve the process owner source closure'
+while IFS= read -r source_file; do
     cp "$source_directory/$source_file" "$execution_directory/h2h_dev_tools/$source_file"
-done
+done <<< "$owner_source_files"
 merge_launcher="$execution_directory/h2h_dev_tools/merge_command.py"
 if [[ -z "$primary_worktree" ]]; then
     git switch "$primary"

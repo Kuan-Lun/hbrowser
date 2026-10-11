@@ -19,7 +19,15 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
     "code-review": frozenset(
-        {"code_review.py", "process.py", "change_scope.py", "review-merge-candidate.sh"}
+        {
+            "code_review.py",
+            "process.py",
+            "change_scope.py",
+            "review-merge-candidate.sh",
+            "merge_command.py",
+            "git-flow-merge.sh",
+            "primary-branch.sh",
+        }
     ),
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),

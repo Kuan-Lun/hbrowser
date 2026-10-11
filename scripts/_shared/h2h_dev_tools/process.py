@@ -53,7 +53,9 @@ class RunnerSignalInterrupt(BaseException):
 
 
 class ProcessOwnershipError(RuntimeError):
-    """The runner could not verify that its managed command process tree exited."""
+    """A command violated ownership; cleanup may still finish before propagation."""
+
+    cleanup_proven: bool = False
 
 
 @dataclass
@@ -756,6 +758,7 @@ def _run_command(
     )
     owner: OwnedProcess | None = None
     tree_empty_proven = False
+    ownership_error: ProcessOwnershipError | None = None
     termination_deadline: float | None = None
     return_code = TERMINATION_FAILED_EXIT_CODE
     try:
@@ -802,7 +805,8 @@ def _run_command(
                     "command leader exited with surviving process-tree members "
                     f"during {phase.label}"
                 )
-                raise ProcessOwnershipError(phase.label)
+                ownership_error = ProcessOwnershipError(phase.label)
+                raise ownership_error
     except KeyboardInterrupt, RunnerSignalInterrupt:
         _report_diagnostic(
             f"command interrupted during {phase.label}; terminating its process tree"
@@ -839,6 +843,8 @@ def _run_command(
                 finally:
                     if not close_owner(owner):
                         raise ProcessOwnershipError(phase.label)
+                if ownership_error is not None:
+                    ownership_error.cleanup_proven = tree_empty_proven
                 print(f"owned_tree_empty={tree_empty_proven}", flush=True)
     finished_at = time.monotonic()
     elapsed = finished_at - started_at
