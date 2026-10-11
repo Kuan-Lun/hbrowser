@@ -754,6 +754,14 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
 
 class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        directory = self.enterContext(TemporaryDirectory())
+        self.enterContext(
+            patch(
+                "hbrowser.gallery.browser.page_diagnostic."
+                "_page_diagnostic_directory_hint",
+                return_value=Path(directory),
+            )
+        )
         self.driver = _TestDriver(headless=True)
         self.logger = Mock()
         self.driver.logger = self.logger
