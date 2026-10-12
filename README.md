@@ -4,6 +4,27 @@ HBrowser 是讓 Python 程式透過瀏覽器操作 E-Hentai／ExHentai 的非同
 你可以用它登入帳號、搜尋圖庫、依 GID 尋找圖庫、提交 H@H 封存下載，以及每日簽到。
 它適合整合進自己的腳本或應用程式；目前沒有獨立的命令列工具。
 
+## 從 0.44 升級
+
+0.45 移除公開模組 `hbrowser.gallery.browser.mapper`，屬於不向後相容的 Python API
+變更。下列匯出不再提供：
+
+- `ZENDRIVER_MAPPER_CLEANUP_INTERVAL_SECONDS`
+- `prune_zendriver_browser_mappers`
+- `prune_zendriver_connection_mapper`
+- `run_zendriver_mapper_janitor`
+- `start_zendriver_mapper_janitor`
+- `stop_zendriver_mapper_janitor`
+
+新的 Zendriver 0.17.1 cohort 已負責 event transaction 清理，因此不保留舊 mapper
+清理函式或相容 shim。若應用程式直接匯入上述名稱，請移除舊 janitor 的啟動、停止與
+定時清理呼叫；瀏覽器生命週期仍透過 `Driver`／`EHDriver`／`ExHDriver` 的
+`async with` 管理。依賴 prune 回傳計數或自訂排程的程式需要人工調整，無法靠通用
+的一次性程式改寫保證原本語義。
+
+這項 API 移除不改變儲存資料格式，既有 cookie、profile 與下載檔案可保留，不需要
+刪除或重建資料。
+
 ## 開始使用
 
 你需要 Python 3.14 以上版本、E-Hentai 帳號與網路連線。
