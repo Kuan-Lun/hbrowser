@@ -1134,6 +1134,109 @@ close_forwarded_logging()
                     for listener in listeners:
                         listener.close()
 
+    def _assert_failed_sender_preserves_logging_shutdown(
+        self, endpoint: str, token: str, *, failure_stage: str | None = None
+    ) -> None:
+        # Use the real global shutdown registry in a child: closing the pytest
+        # process's unrelated handlers would invalidate its own output/cleanup.
+        child = """
+import json, logging, os, sys
+from unittest.mock import patch
+from hbrowser.gallery.utils import log as log_module
+from hbrowser import configure_forwarded_logging, logging_health
+
+closed = []
+class OtherHandler(logging.Handler):
+    def flush(self):
+        closed.append('flush')
+    def close(self):
+        closed.append('close')
+        super().close()
+other = OtherHandler()
+registered_before = len(logging._handlerList)
+os.environ['HBROWSER_LOG_FORWARD_ENDPOINT'] = sys.argv[1]
+os.environ['HBROWSER_LOG_FORWARD_TOKEN'] = sys.argv[2]
+injected = RuntimeError('sender initialization failed')
+if sys.argv[3] in ('queue', 'thread'):
+    target = ('hbrowser.gallery.utils._log_forwarding.queue.Queue'
+              if sys.argv[3] == 'queue' else 'threading.Thread.start')
+    with patch(target, side_effect=injected):
+        configure_forwarded_logging()
+else:
+    configure_forwarded_logging()
+assert logging_health().forwarding_degraded
+assert logging_health().forwarding_operation == 'forward-configure'
+assert log_module._FORWARDING_HANDLER is None
+# This saved exception deliberately keeps the failed constructor traceback alive.
+assert log_module._LOG_FORWARDING_FAILURE is not None
+cause = log_module._LOG_FORWARDING_FAILURE.__cause__
+assert cause is not None
+if sys.argv[3] in ('queue', 'thread'):
+    assert cause is injected
+else:
+    assert type(cause).__name__ == 'ForwardingConfigurationError'
+    assert str(cause) == ('forwarding token is invalid' if sys.argv[2] == 'invalid'
+                          else 'forwarding endpoint is invalid')
+registered_after = len(logging._handlerList)
+shutdown_error = None
+try:
+    logging.shutdown()
+except BaseException as error:
+    shutdown_error = type(error).__name__ + ': ' + str(error)
+print(json.dumps({'registered_before': registered_before,
+                  'registered_after': registered_after,
+                  'shutdown_error': shutdown_error,
+                  'other_closed': other._closed, 'operations': closed}))
+"""
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                child,
+                endpoint,
+                token,
+                failure_stage or "invalid-capability",
+            ),
+            cwd=root,
+            env=os.environ | {"PYTHONPATH": str(root)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertIsNone(evidence["shutdown_error"], evidence)
+        self.assertTrue(evidence["other_closed"], evidence)
+        self.assertEqual(evidence["operations"], ["flush", "close"], evidence)
+        self.assertEqual(
+            evidence["registered_before"] + (failure_stage == "thread"),
+            evidence["registered_after"],
+            evidence,
+        )
+        self.assertNotIn("Exception ignored", result.stderr)
+
+    def test_invalid_token_does_not_register_a_partial_sender(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown("127.0.0.1:1", "invalid")
+
+    def test_invalid_endpoint_does_not_register_a_partial_sender(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "not-loopback:1", "1" * 64
+        )
+
+    def test_sender_queue_failure_does_not_register_a_partial_handler(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="queue"
+        )
+
+    def test_sender_thread_failure_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="thread"
+        )
+
     def test_sender_constructor_thread_failure_can_close_partial_handler(self) -> None:
         handler = ForwardingHandler.__new__(ForwardingHandler)
         with patch.object(Thread, "start", side_effect=RuntimeError("no thread")):

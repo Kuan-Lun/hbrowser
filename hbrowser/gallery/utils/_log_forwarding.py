@@ -253,7 +253,6 @@ class ForwardingHandler(logging.Handler):
         failure_callback: FailureCallback | None = None,
         _failure_recorder: FailureCallback | None = None,
     ) -> None:
-        super().__init__(logging.DEBUG)
         self._token = _validate_token(token)
         self._failure_callback = failure_callback
         self._failure_recorder = _failure_recorder
@@ -267,6 +266,10 @@ class ForwardingHandler(logging.Handler):
         self._socket: socket.socket | None = None
         self._enabled = True
         self._worker_survived_fork = False
+        # Handler.__init__ publishes a weak reference to logging.shutdown.
+        # Validate and establish all close state before that publication; a
+        # retained constructor traceback must never expose a partial handler.
+        super().__init__(logging.DEBUG)
         try:
             self._worker = threading.Thread(
                 target=self._run,
