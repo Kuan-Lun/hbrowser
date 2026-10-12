@@ -113,6 +113,72 @@ class _DriverTurnstileSolver:
         return receipt.result.turnstile_token
 
 
+def _finish_driver_exit(
+    primary_error: BaseException | None,
+    diagnostic_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Keep unresolved process ownership observable across cancellation."""
+
+    errors = tuple(
+        error
+        for error in (primary_error, diagnostic_error, cleanup_error)
+        if error is not None
+    )
+    ownership_error = next(
+        (error for error in errors if isinstance(error, ProcessOwnershipError)), None
+    )
+    if ownership_error is not None:
+        for error in errors:
+            if error is not ownership_error:
+                ownership_error.add_note(
+                    f"Additional driver exit failure: {type(error).__name__}: {error}"
+                )
+        if ownership_error is primary_error:
+            return
+        raise ownership_error
+
+    secondary_errors = tuple(
+        error for error in (diagnostic_error, cleanup_error) if error is not None
+    )
+    cancellation_error = next(
+        (
+            error
+            for error in secondary_errors
+            if isinstance(error, asyncio.CancelledError)
+        ),
+        None,
+    )
+    if cancellation_error is not None:
+        if primary_error is not None:
+            cancellation_error.add_note(
+                "Browser session was already exiting after: "
+                f"{type(primary_error).__name__}"
+            )
+        for secondary_error in secondary_errors:
+            if secondary_error is not cancellation_error:
+                cancellation_error.add_note(
+                    "Additional driver shutdown failure: "
+                    f"{type(secondary_error).__name__}: {secondary_error}"
+                )
+        raise cancellation_error
+    if primary_error is not None:
+        for secondary_error in secondary_errors:
+            primary_error.add_note(
+                "Driver shutdown also failed: "
+                f"{type(secondary_error).__name__}: {secondary_error}"
+            )
+        return
+    if secondary_errors:
+        primary, *secondary = secondary_errors
+        for secondary_error in secondary:
+            primary.add_note(
+                "Additional driver shutdown failure: "
+                f"{type(secondary_error).__name__}: {secondary_error}"
+            )
+        raise primary
+
+
 class Driver(ABC):
     """
     Gallery Driver 抽象基類
@@ -300,20 +366,7 @@ class Driver(ABC):
                 except BaseException as error:
                     diagnostic_error = error
         if not self._owns_browser or self.browser is None:
-            if isinstance(diagnostic_error, asyncio.CancelledError):
-                if primary_error is not None:
-                    diagnostic_error.add_note(
-                        "Browser session was already exiting after: "
-                        f"{type(primary_error).__name__}"
-                    )
-                raise diagnostic_error
-            if primary_error is not None and diagnostic_error is not None:
-                primary_error.add_note(
-                    "Driver diagnostic also failed: "
-                    f"{type(diagnostic_error).__name__}: {diagnostic_error}"
-                )
-            elif diagnostic_error is not None:
-                raise diagnostic_error
+            _finish_driver_exit(primary_error, diagnostic_error, None)
             return
         self.logger.info("Closing browser")
         cleanup_error: BaseException | None = None
@@ -326,45 +379,7 @@ class Driver(ABC):
                 type(error).__name__,
             )
 
-        secondary_errors = tuple(
-            error for error in (diagnostic_error, cleanup_error) if error is not None
-        )
-        cancellation_error = next(
-            (
-                error
-                for error in secondary_errors
-                if isinstance(error, asyncio.CancelledError)
-            ),
-            None,
-        )
-        if cancellation_error is not None:
-            if primary_error is not None:
-                cancellation_error.add_note(
-                    "Browser session was already exiting after: "
-                    f"{type(primary_error).__name__}"
-                )
-            for secondary_error in secondary_errors:
-                if secondary_error is not cancellation_error:
-                    cancellation_error.add_note(
-                        "Additional driver shutdown failure: "
-                        f"{type(secondary_error).__name__}: {secondary_error}"
-                    )
-            raise cancellation_error
-        if primary_error is not None:
-            for secondary_error in secondary_errors:
-                primary_error.add_note(
-                    "Driver shutdown also failed: "
-                    f"{type(secondary_error).__name__}: {secondary_error}"
-                )
-            return
-        if secondary_errors:
-            primary, *secondary = secondary_errors
-            for secondary_error in secondary:
-                primary.add_note(
-                    "Additional driver shutdown failure: "
-                    f"{type(secondary_error).__name__}: {secondary_error}"
-                )
-            raise primary
+        _finish_driver_exit(primary_error, diagnostic_error, cleanup_error)
 
     @staticmethod
     async def _write_page_diagnostic(

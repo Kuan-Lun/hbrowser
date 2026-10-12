@@ -29,6 +29,7 @@ from ..utils.protocol import (
     _ZendriverQuiescenceChanged,
     _ZendriverRetirement,
 )
+from ._task_settlement import wait_owned_task_completion
 from .chrome_manager import ChromePaths, create_chrome_install_staging_root
 from .process import (
     OwnedProcess,
@@ -531,17 +532,7 @@ async def _settle_owned_startup_task[T](
 ) -> tuple[T, asyncio.CancelledError | None]:
     """Keep awaiting startup after cancellation so its resource is recoverable."""
 
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            if task.done() and (current_task is None or current_task.cancelling() == 0):
-                break
-            if current_task is None or current_task.cancelling() == 0:
-                raise
-            if caller_cancellation is None:
-                caller_cancellation = error
+    caller_cancellation = await wait_owned_task_completion(task, caller_cancellation)
     try:
         result = task.result()
     except BaseException as startup_error:
@@ -1884,8 +1875,9 @@ async def _await_cleanup_deferring_caller_cancellation(
                 "atexit ownership remains registered"
             )
             if caller_cancellation is not None:
-                caller_cancellation.add_note(str(timeout_error))
-                raise caller_cancellation
+                timeout_error.add_note(
+                    "Caller cancellation also occurred during browser shutdown"
+                )
             raise timeout_error
         try:
             await asyncio.wait((cleanup_task,), timeout=remaining)
@@ -1900,6 +1892,11 @@ async def _await_cleanup_deferring_caller_cancellation(
         try:
             cleanup_task.result()
         except BaseException as cleanup_error:
+            if isinstance(cleanup_error, ProcessOwnershipError):
+                cleanup_error.add_note(
+                    "Caller cancellation also occurred during browser shutdown"
+                )
+                raise
             caller_cancellation.add_note(
                 "Browser cleanup also failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"

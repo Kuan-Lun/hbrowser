@@ -19,6 +19,7 @@ from ..utils.diagnostic import (
     _bounded_page_diagnostic_content,
 )
 from ._page_diagnostic_transport import send_payload
+from ._task_settlement import wait_owned_task_completion
 from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
 
 _DIAGNOSTIC_WORKER_MODULE = "hbrowser.gallery.browser._page_diagnostic_worker"
@@ -55,24 +56,7 @@ async def _settle_task[T](
 ) -> tuple[T | None, BaseException | None, asyncio.CancelledError | None]:
     """Wait through caller cancellation so no ownership thread is detached."""
 
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            if task.done() and (current_task is None or current_task.cancelling() == 0):
-                break
-            if current_task is None or current_task.cancelling() == 0:
-                raise
-            if cancellation is None:
-                cancellation = error
-        except BaseException:
-            if not task.done():
-                raise
-            # Collect task failure below alongside any cancellation already
-            # received by this waiter, just as for an already-completed task.
-            break
+    cancellation = await wait_owned_task_completion(task)
     try:
         return task.result(), None, cancellation
     except BaseException as error:

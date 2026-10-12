@@ -82,6 +82,7 @@ def test_pytest_entries_do_not_inherit_candidate_git_authority(
         "test_tor_cleanup.py",
         "test_diagnostics.py",
         "test_page_diagnostic_transport.py",
+        "test_driver_shutdown_priority.py",
     ):
         (repository / "tests" / name).write_text("def test_process_fixture(): pass\n")
     state = tmp_path / "children"
