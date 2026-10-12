@@ -1366,3 +1366,174 @@ def test_first_diagnostic_does_not_start_a_resource_tracker(tmp_path: Path) -> N
         timeout=15,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+class DiagnosticCancellationOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def _wait_started(self, started: threading.Event) -> None:
+        async with asyncio.timeout(1):
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+    async def test_settle_normalizes_pending_and_completed_task_results(self) -> None:
+        for completed in (False, True):
+            for failure in (None, TimeoutError("ordinary startup failure")):
+                with self.subTest(completed=completed, failure=failure):
+                    release = asyncio.Event()
+
+                    async def operation(
+                        release: asyncio.Event = release,
+                        failure: TimeoutError | None = failure,
+                    ) -> int:
+                        await release.wait()
+                        if failure is not None:
+                            raise failure
+                        return 7
+
+                    target = asyncio.create_task(operation())
+                    if completed:
+                        release.set()
+                        await asyncio.gather(target, return_exceptions=True)
+                    waiter = asyncio.create_task(
+                        page_diagnostic_module._settle_task(target)
+                    )
+                    await asyncio.sleep(0)
+                    release.set()
+                    try:
+                        value, error, cancellation = await waiter
+                        self.assertEqual(value, 7 if failure is None else None)
+                        self.assertIs(error, failure)
+                        self.assertIsNone(cancellation)
+                    finally:
+                        release.set()
+                        await asyncio.gather(target, waiter, return_exceptions=True)
+
+    async def test_inner_task_cancellation_is_a_task_result_not_caller_cancellation(
+        self,
+    ) -> None:
+        async def operation() -> None:
+            raise asyncio.CancelledError("inner operation stopped")
+
+        target = asyncio.create_task(operation())
+        value, error, cancellation = await page_diagnostic_module._settle_task(target)
+        self.assertIsNone(value)
+        self.assertIsInstance(error, asyncio.CancelledError)
+        self.assertIsNone(cancellation)
+
+    async def test_driver_preserves_cancellation_before_clean_startup_failure(
+        self,
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        failure = TimeoutError("startup deadline expired after successful cleanup")
+
+        def start(*_args: object, **_kwargs: object) -> None:
+            started.set()
+            if not release.wait(1):
+                raise AssertionError("test did not release startup")
+            raise failure
+
+        driver = _TestDriver(headless=True)
+        driver.logger = Mock()
+        with patch.object(page_diagnostic_module, "start_owned_process", start):
+            task = asyncio.create_task(
+                driver.save_page_diagnostic("driver_error", "synthetic page")
+            )
+            try:
+                await self._wait_started(started)
+                task.cancel("caller stopped")
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_completed_startup_ownership_error_remains_primary_on_cancellation(
+        self,
+    ) -> None:
+        failure = ProcessOwnershipError("startup cleanup is unproven")
+        settle = page_diagnostic_module._settle_task
+
+        async def cancel_on_completion(
+            task: asyncio.Task[object],
+        ) -> tuple[object | None, BaseException | None, asyncio.CancelledError | None]:
+            waiter = asyncio.current_task()
+            assert waiter is not None
+            task.add_done_callback(lambda _done: waiter.cancel("late caller cancel"))
+            return await settle(task)
+
+        with (
+            patch.object(
+                page_diagnostic_module,
+                "start_owned_process",
+                side_effect=failure,
+            ),
+            patch.object(
+                page_diagnostic_module, "_settle_task", side_effect=cancel_on_completion
+            ),
+        ):
+            task = asyncio.create_task(
+                page_diagnostic_module.write_page_diagnostic_owned(
+                    "driver_error", "synthetic page", deadline=Deadline.after(5)
+                )
+            )
+            with self.assertRaises(ProcessOwnershipError) as raised:
+                await task
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(
+            any("cancellation" in note for note in getattr(failure, "__notes__", ()))
+        )
+
+    async def test_shutdown_settles_success_or_ownership_failure_after_cancellation(
+        self,
+    ) -> None:
+        for failure in (None, ProcessOwnershipError("shutdown cleanup is unproven")):
+            with self.subTest(failure=failure):
+                started = threading.Event()
+                release = threading.Event()
+
+                def shutdown(
+                    *_args: object,
+                    failure: ProcessOwnershipError | None = failure,
+                    started: threading.Event = started,
+                    release: threading.Event = release,
+                    **_kwargs: object,
+                ) -> int:
+                    started.set()
+                    if not release.wait(1):
+                        raise AssertionError("test did not release shutdown")
+                    if failure is not None:
+                        raise failure
+                    return 0
+
+                with patch.object(
+                    page_diagnostic_module, "_shutdown_owned_worker", shutdown
+                ):
+                    task = asyncio.create_task(
+                        page_diagnostic_module._settle_owned_worker(
+                            Mock(), deadline=Deadline.after(5), force=True
+                        )
+                    )
+                    try:
+                        await self._wait_started(started)
+                        task.cancel("caller stopped during shutdown")
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        release.set()
+                        if failure is None:
+                            self.assertIsInstance(await task, asyncio.CancelledError)
+                        else:
+                            with self.assertRaises(ProcessOwnershipError) as raised:
+                                await task
+                            self.assertIs(raised.exception, failure)
+                            self.assertTrue(
+                                any(
+                                    "cancellation" in note
+                                    for note in getattr(failure, "__notes__", ())
+                                )
+                            )
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)

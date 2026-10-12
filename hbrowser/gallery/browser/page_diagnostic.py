@@ -67,6 +67,12 @@ async def _settle_task[T](
                 raise
             if cancellation is None:
                 cancellation = error
+        except BaseException:
+            if not task.done():
+                raise
+            # Collect task failure below alongside any cancellation already
+            # received by this waiter, just as for an already-completed task.
+            break
     try:
         return task.result(), None, cancellation
     except BaseException as error:
@@ -315,7 +321,14 @@ async def write_page_diagnostic_owned(
         )
         owner, startup_error, startup_cancellation = await _settle_task(startup_task)
         if startup_error is not None:
-            if startup_cancellation is not None:
+            if isinstance(startup_error, ProcessOwnershipError):
+                if startup_cancellation is not None:
+                    startup_error.add_note(
+                        "Diagnostic worker startup was also interrupted by "
+                        "caller cancellation"
+                    )
+                primary_error = startup_error
+            elif startup_cancellation is not None:
                 startup_cancellation.add_note(
                     "Diagnostic worker startup also failed: "
                     f"{type(startup_error).__name__}"
