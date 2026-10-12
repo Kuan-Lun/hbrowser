@@ -609,30 +609,6 @@ async def _await_browser_start(
     return task.result()
 
 
-async def _terminate_owned_tor_after_cancellation(
-    tor_process: Any,
-    cancellation: asyncio.CancelledError,
-    *,
-    deadline: Deadline,
-) -> None:
-    cleanup_task = asyncio.create_task(
-        asyncio.to_thread(
-            terminate_tor_process,
-            tor_process,
-            deadline=deadline,
-        )
-    )
-    try:
-        _, settled_cancellation = await _settle_owned_startup_task(
-            cleanup_task,
-            cancellation,
-        )
-    except asyncio.CancelledError:
-        raise
-    assert settled_cancellation is not None
-    raise settled_cancellation
-
-
 async def _cleanup_browser_after_startup_failure(
     browser: Any,
     startup_error: BaseException,
@@ -1051,33 +1027,32 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         browser_startup_deadline.expires_at - _BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS
     )
 
-    use_tor = should_use_tor()
     tor_process: OwnedProcess | None = None
     socks_port: int | None = None
     proxy_extension: str | None = None
     profile_directory: str | None = None
     private_paths_are_owned = False
-    if use_tor:
-        socks_port = find_available_port(TOR_SOCKS_PORT)
-        tor_start_task = asyncio.create_task(
-            asyncio.to_thread(
-                start_tor_with_retry,
-                socks_port,
-                deadline=browser_startup_work_deadline,
-            )
-        )
-        tor_process, tor_start_cancellation = await _settle_owned_startup_task(
-            tor_start_task
-        )
-        if tor_start_cancellation is not None:
-            await _terminate_owned_tor_after_cancellation(
-                tor_process,
-                tor_start_cancellation,
-                deadline=browser_startup_deadline,
-            )
-
     try:
+        # Select the effective route before admitting any external process.
+        # The residential extension already has priority in _build_config;
+        # its validation and actual materialization are this decision's input.
         proxy_extension = configure_proxy()
+        use_tor = proxy_extension is None and should_use_tor()
+        if use_tor:
+            socks_port = find_available_port(TOR_SOCKS_PORT)
+            tor_start_task = asyncio.create_task(
+                asyncio.to_thread(
+                    start_tor_with_retry,
+                    socks_port,
+                    deadline=browser_startup_work_deadline,
+                )
+            )
+            tor_process, tor_start_cancellation = await _settle_owned_startup_task(
+                tor_start_task
+            )
+            if tor_start_cancellation is not None:
+                raise tor_start_cancellation
+
         if proxy_extension is not None:
             connection = "residential proxy"
         elif use_tor:

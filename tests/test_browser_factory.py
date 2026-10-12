@@ -1082,6 +1082,139 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["post-setup"])
         register_atexit.assert_called_once_with(browser)
 
+    async def test_only_the_selected_proxy_route_can_start_tor(self) -> None:
+        from hbrowser.gallery.browser import proxy as proxy_module
+
+        cases = (
+            (True, None, False),
+            (True, "1", False),
+            (True, "0", False),
+            (False, None, True),
+            (False, "0", False),
+        )
+        for residential, use_tor_setting, expected_tor in cases:
+            with self.subTest(residential=residential, use_tor=use_tor_setting):
+                page = _tab()
+                browser = _Browser(page, tabs=[page])
+                browser.start = AsyncMock(return_value=browser)  # type: ignore[attr-defined]
+                environment: dict[str, str] = {}
+                if residential:
+                    environment.update(
+                        RP_USERNAME="synthetic",
+                        RP_PASSWORD="probe",
+                        RP_DNS="proxy:8080",
+                    )
+                if use_tor_setting is not None:
+                    environment["USE_TOR"] = use_tor_setting
+                tor_process = Mock(spec=OwnedProcess)
+                with (
+                    tempfile.TemporaryDirectory() as profile,
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        tor_module, "_find_tor_binary", return_value="/tor"
+                    ) as find_tor,
+                    patch.object(
+                        factory, "_configured_chrome_executable", return_value="/chrome"
+                    ),
+                    patch.object(
+                        proxy_module, "_create_proxy_extension", return_value="/proxy"
+                    ),
+                    patch.object(
+                        factory,
+                        "tempfile",
+                        SimpleNamespace(mkdtemp=Mock(return_value=profile)),
+                    ),
+                    patch.object(
+                        factory, "find_available_port", return_value=9150
+                    ) as find_port,
+                    patch.object(
+                        factory,
+                        "start_tor_with_retry",
+                        return_value=tor_process,
+                        side_effect=(
+                            None
+                            if expected_tor
+                            else RuntimeError("unused Tor bootstrap must not run")
+                        ),
+                    ) as start_tor,
+                    patch.object(
+                        factory, "_build_config", return_value=object()
+                    ) as build_config,
+                    patch.object(
+                        factory,
+                        "_construct_owned_browser_async",
+                        new=AsyncMock(return_value=browser),
+                    ),
+                    patch.object(factory, "_register_browser_atexit"),
+                    patch.object(
+                        factory, "_post_create_setup", new=AsyncMock()
+                    ) as setup,
+                ):
+                    result = await factory.create_browser()
+                self.assertEqual(result, (browser, page))
+                extension = "/proxy" if residential else None
+                build_config.assert_called_once_with(
+                    True,
+                    extension,
+                    profile,
+                    expected_tor,
+                    9150 if expected_tor else None,
+                    "/chrome",
+                )
+                setup.assert_awaited_once_with(
+                    browser,
+                    page,
+                    expected_tor,
+                    proxy_extension=extension,
+                    deadline=unittest.mock.ANY,
+                )
+                self.assertIs(
+                    getattr(browser, "_tor_process", None),
+                    tor_process if expected_tor else None,
+                )
+                if residential:
+                    find_tor.assert_not_called()
+                if expected_tor:
+                    start_tor.assert_called_once_with(9150, deadline=unittest.mock.ANY)
+                    find_port.assert_called_once()
+                else:
+                    start_tor.assert_not_called()
+                    find_port.assert_not_called()
+
+    async def test_invalid_residential_proxy_rejects_before_tor_admission(self) -> None:
+        for environment in (
+            {"RP_DNS": "proxy:8080"},
+            {
+                "RP_DNS": "proxy:invalid",
+                "RP_USERNAME": "probe",
+                "RP_PASSWORD": "synthetic",
+            },
+        ):
+            with self.subTest(environment_keys=tuple(environment)):
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(
+                        factory, "_configured_chrome_executable", return_value="/chrome"
+                    ),
+                    patch.object(
+                        tor_module, "_find_tor_binary", return_value="/tor"
+                    ) as find_tor,
+                    patch.object(factory, "find_available_port", return_value=9150),
+                    patch.object(
+                        factory,
+                        "start_tor_with_retry",
+                        side_effect=RuntimeError("unused Tor bootstrap must not run"),
+                    ) as start_tor,
+                    patch.object(
+                        factory, "_construct_owned_browser_async", new=AsyncMock()
+                    ) as construct,
+                    self.assertRaises(ValueError),
+                ):
+                    await factory.create_browser()
+                find_tor.assert_not_called()
+                start_tor.assert_not_called()
+                construct.assert_not_awaited()
+
     async def test_residential_proxy_is_verified_before_browser_publication(
         self,
     ) -> None:
@@ -1210,7 +1343,9 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=delayed_tor_start,
             ) as start_tor,
             patch.object(factory, "terminate_tor_process") as terminate_tor,
-            patch.object(factory, "configure_proxy") as configure_proxy,
+            patch.object(
+                factory, "configure_proxy", return_value=None
+            ) as configure_proxy,
         ):
             create_task = asyncio.create_task(factory._create_browser(True))
             while not tor_started.is_set():
@@ -1233,7 +1368,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             cleanup_deadline.expires_at - work_deadline.expires_at,
             factory._BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS,
         )
-        configure_proxy.assert_not_called()
+        configure_proxy.assert_called_once_with()
 
     async def test_constructor_cancellation_reaps_process_before_returning(
         self,
