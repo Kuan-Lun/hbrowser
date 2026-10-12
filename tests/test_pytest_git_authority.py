@@ -75,7 +75,12 @@ def test_pytest_entries_do_not_inherit_candidate_git_authority(
         "import pytest\n" + "def test_selected_profile():\n    pass\n"
     )
     (repository / "tests").mkdir()
-    for name in ("test_owned_process.py", "test_browser_factory.py"):
+    for name in (
+        "test_owned_process.py",
+        "test_browser_factory.py",
+        "test_runtime_test_owner.py",
+        "test_tor_cleanup.py",
+    ):
         (repository / "tests" / name).write_text("def test_process_fixture(): pass\n")
     state = tmp_path / "children"
     state.mkdir()
