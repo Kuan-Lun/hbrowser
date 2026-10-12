@@ -6,8 +6,7 @@ from bs4 import BeautifulSoup
 
 from ..utils import (
     Deadline,
-    ZendriverOperationTimeout,
-    is_browser_generation_error,
+    PageStateTimeout,
     wait_for_selector,
     wait_for_zendriver,
 )
@@ -107,11 +106,7 @@ class CaptchaDetector:
                 _ANY_WIDGET_CSS,
                 deadline=detection_deadline,
             )
-        except ZendriverOperationTimeout:
-            raise
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
+        except PageStateTimeout:
             return ChallengeDetection(url=url, kind="none")
 
         attrs = dict(dynamic_widget.attrs)

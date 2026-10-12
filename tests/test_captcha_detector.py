@@ -1,12 +1,20 @@
 import asyncio
+import logging
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from hbrowser.gallery.captcha import CaptchaDetector
-from hbrowser.gallery.utils import ZendriverOperationTimeout, wait_for_zendriver
+from zendriver.core.connection import ProtocolException
+
+from hbrowser.gallery.captcha import CaptchaDetector, LoginChallengeHandler
+from hbrowser.gallery.captcha.page_challenge import PageChallengeHandler
+from hbrowser.gallery.utils import (
+    PageStateTimeout,
+    ZendriverOperationTimeout,
+    wait_for_zendriver,
+)
 from hbrowser.gallery.utils import deadline as deadline_module
 
 
@@ -54,6 +62,17 @@ class _AbsentDynamicWidgetPage(_Page):
         # Host scheduling must not decide whether this query is issued.
         self.now += 3.0
         return None
+
+
+class _FailedDynamicQueryPage(_Page):
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__("<html></html>")
+        self.failure = failure
+        self.query_count = 0
+
+    async def query_selector(self, _selector: str) -> None:
+        self.query_count += 1
+        raise self.failure
 
 
 class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
@@ -150,3 +169,97 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
             owner=page,
         )
         self.assertEqual(result, "healthy")
+
+    async def test_dynamic_dom_failures_never_mean_absent(self) -> None:
+        for error in (
+            ProtocolException({"code": -32000, "message": "Could not find node"}),
+            LookupError("DOM document could not be resolved"),
+            RuntimeError("DOM query failed"),
+            TimeoutError("non-semantic transport timeout"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                page = _FailedDynamicQueryPage(error)
+                with self.assertRaises(type(error)) as raised:
+                    await CaptchaDetector().detect(page)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(page.query_count, 1)
+
+    async def test_explicit_missing_widget_timeout_is_absent(self) -> None:
+        page = _FailedDynamicQueryPage(PageStateTimeout("widget was absent"))
+        detection = await CaptchaDetector().detect(page)
+        self.assertEqual(detection.kind, "none")
+        self.assertEqual(page.query_count, 1)
+
+    async def test_dynamic_query_cancellation_propagates(self) -> None:
+        page = _FailedDynamicQueryPage(asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await CaptchaDetector().detect(page)
+        self.assertEqual(page.query_count, 1)
+
+    async def test_dynamic_turnstile_is_detected(self) -> None:
+        page = _Page("<html></html>")
+        page.selections["div.cf-turnstile[data-sitekey]"] = _Element(
+            {"class": "cf-turnstile", "data-sitekey": "dynamic-sitekey"}
+        )
+        detection = await CaptchaDetector().detect(page)
+        self.assertEqual(detection.kind, "turnstile_widget")
+        self.assertEqual(detection.sitekey, "dynamic-sitekey")
+
+    async def test_static_recaptcha_is_detected(self) -> None:
+        page = _Page('<div class="g-recaptcha" data-sitekey="static-sitekey"></div>')
+        detection = await CaptchaDetector().detect(page)
+        self.assertEqual(detection.kind, "recaptcha_v2")
+        self.assertEqual(detection.sitekey, "static-sitekey")
+
+    async def test_login_does_not_skip_challenge_after_selector_failure(self) -> None:
+        error = ProtocolException({"code": -32000, "message": "Could not find node"})
+        page = _FailedDynamicQueryPage(error)
+        handler = LoginChallengeHandler(
+            detector=CaptchaDetector(),
+            logger=logging.getLogger("test-captcha-login-read-failure"),
+            headless=False,
+            manual_timeout=30,
+            turnstile_tabs=15,
+            automatic_solver=None,
+        )
+        with self.assertRaises(ProtocolException) as raised:
+            await handler.resolve(page)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(page.query_count, 1)
+
+    async def test_manual_resolution_does_not_accept_failed_widget_query(self) -> None:
+        for kind, html in (
+            (
+                "turnstile_widget",
+                '<div class="cf-turnstile" data-sitekey="site"></div>',
+            ),
+            ("recaptcha_v2", '<div class="g-recaptcha" data-sitekey="site"></div>'),
+        ):
+            with self.subTest(kind=kind):
+                error = ProtocolException(
+                    {"code": -32000, "message": "Could not find node"}
+                )
+                page = _FailedDynamicQueryPage(error)
+                page.html = html
+
+                async def diagnostic(
+                    _kind: str, bound_page: _FailedDynamicQueryPage = page
+                ) -> None:
+                    # A navigation replaces the initial widget's static HTML;
+                    # the actual dynamic query now fails instead of proving absence.
+                    bound_page.html = "<html></html>"
+
+                handler = PageChallengeHandler(
+                    detector=CaptchaDetector(),
+                    logger=logging.getLogger("test-captcha-manual-read-failure"),
+                    headless=False,
+                    manual_timeout=30,
+                    automatic_solver=None,
+                    apply_identity=AsyncMock(),
+                    navigate=AsyncMock(),
+                    save_diagnostic=diagnostic,
+                )
+                with self.assertRaises(ProtocolException) as raised:
+                    await handler.resolve(page, page.url)
+                self.assertIs(raised.exception, error)
+                self.assertEqual(page.query_count, 1)
