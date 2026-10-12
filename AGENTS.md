@@ -193,6 +193,16 @@
   selectors、Git environment boundary 與 process ownership。手動需要相同來源
   保證時使用 `.venv/bin/python scripts/pytest-source.py <pytest arguments>`；
   普通 `pytest` 僅為手動便利入口，不承諾排除既有 bytecode。
+- Canonical pytest 入口另以 repository-local adapter，於 runtime 新 session
+  啟動前登記測試清理責任。私有 lifecycle observer 僅回報真實 runtime owner
+  與 private-cleanup worker 的生命週期；shipped runtime 不依賴 toolkit。
+  取消後停止一般 admission，所有復原共用自取消起五秒的 deadline；既有責任
+  中所需的 cleanup worker 可完成清理。只有全部 owner 的真實 receipt 與巢狀
+  scope 清空後才解除外層 obligation；強制殺死 pytest、未知啟動結果或逾時
+  必須 fail closed。成功後仍保留 sealed observer，拒絕 atexit／背景執行緒
+  再啟動新 session。獨立 runtime test harness 由 canonical toolkit owner 管理，
+  並明確繼承 scope；純 Mock spawn 只在確切 mock context 免除 observer，不能
+  豁免 mock owner 其後真正啟動的 cleanup worker。此契約不涵蓋任意 daemon。
 - dependency audit可連網，但 hooks只驗證本機 receipt，不在 commit過程
   連網。
 - GitHub Actions只呼叫相同 scripts，並保留 trusted publishing、平台特有

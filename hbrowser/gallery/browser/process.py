@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 # The private cleanup worker intentionally imports this module as a top-level
 # script dependency, while ordinary runtime imports use the package context.
 if TYPE_CHECKING or __package__:
+    from . import _process_observation
     from ._process_control import (
         PROVEN_CLEANUP_FAILURE_EXIT_CODE,
         PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
@@ -33,8 +34,10 @@ if TYPE_CHECKING or __package__:
         StartRequest,
         deadline_to_monotonic_ns,
     )
+    from ._process_observation import ProcessObservation
 else:
     # Direct-script cleanup workers resolve sibling modules from this directory.
+    import _process_observation  # type: ignore[import-not-found]  # Direct script sibling.
     from _process_control import (  # type: ignore[import-not-found]
         PROVEN_CLEANUP_FAILURE_EXIT_CODE,
         PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
@@ -44,6 +47,7 @@ else:
         StartRequest,
         deadline_to_monotonic_ns,
     )
+    from _process_observation import ProcessObservation  # type: ignore[import-not-found]  # Direct script sibling.
 
 _STARTUP_TIMEOUT_SECONDS: Final = 10.0
 _PROCESS_WAIT_TIMEOUT_SECONDS: Final = 15.0
@@ -162,6 +166,7 @@ class _ProvisionalProcessOwner:
     status_guard: _PrivateDirectory
     cleanup_guards: tuple[_PrivateDirectory, ...]
     windows_job: _WindowsJob | None = None
+    observation: ProcessObservation | None = None
 
 
 _PROVISIONAL_OWNERS: dict[int, _ProvisionalProcessOwner] = {}
@@ -554,7 +559,7 @@ def _cleanup_provisional_owner(
     """Reap a start-gated supervisor that never transferred ownership."""
 
     cleanup_deadline = min(
-        deadline,
+        _process_observation.cleanup_deadline(deadline),
         time.monotonic() + _PRIVATE_CLEANUP_TIMEOUT_SECONDS,
     )
     supervisor = owner.supervisor
@@ -590,6 +595,8 @@ def _cleanup_provisional_owner(
     for guard in (owner.status_guard, *owner.cleanup_guards):
         guard.remove(deadline=cleanup_deadline)
     _release_provisional_owner(owner)
+    if owner.observation is not None:
+        owner.observation.complete(deadline=cleanup_deadline)
 
 
 def _cleanup_provisional_owners_at_exit() -> None:
@@ -624,8 +631,10 @@ class OwnedProcess:
         stderr_drain: _BoundedPipeDrain | None,
         status_directory: Path | _PrivateDirectory,
         cleanup_paths: Sequence[Path | _PrivateDirectory],
+        observation: ProcessObservation | None = None,
     ) -> None:
         self._supervisor = supervisor
+        self._observation = observation
         self._target_process_group = target_process_group
         self._windows_job = windows_job
         self._stdout_drain = stdout_drain
@@ -1032,7 +1041,7 @@ class OwnedProcess:
             wait_timeout = float(timeout)
 
         deadline = self._join_shutdown_attempt(
-            time.monotonic() + wait_timeout,
+            _process_observation.cleanup_deadline(time.monotonic() + wait_timeout),
             allow_expired_immediate_check=wait_timeout == 0,
         )
         acquired = False
@@ -1221,7 +1230,7 @@ class OwnedProcess:
             )
         immediate_check = not any(timeout > 0 for timeout in timeouts)
         deadline = self._join_shutdown_attempt(
-            ownership_policy_deadline,
+            _process_observation.cleanup_deadline(ownership_policy_deadline),
             allow_expired_immediate_check=immediate_check,
         )
         tree_deadline = min(tree_policy_deadline, deadline)
@@ -1422,6 +1431,8 @@ class OwnedProcess:
             phase="process ownership receipt",
         ):
             self._closed = True
+        if self._observation is not None:
+            self._observation.complete(deadline=deadline)
         try:
             atexit.unregister(self._atexit_cleanup)
         except Exception:
@@ -1600,6 +1611,7 @@ class _ActivePrivateDirectoryCleanup:
     windows_job: _WindowsJob | None = None
     windows_job_assigned: bool = False
     worker_diagnostic: str | None = None
+    observation: ProcessObservation | None = None
 
 
 _PRIVATE_DIRECTORY_CLEANUP_LOCK = threading.Lock()
@@ -1714,6 +1726,8 @@ def _release_reaped_private_directory_cleanup(
     if process is not None:
         _capture_private_directory_cleanup_diagnostic(active)
     _release_active_private_directory_cleanup(active)
+    if active.observation is not None:
+        active.observation.complete(deadline=deadline)
 
 
 def _force_reap_private_directory_cleanup(
@@ -1728,6 +1742,8 @@ def _force_reap_private_directory_cleanup(
             windows_job.close()
             active.windows_job = None
         _release_active_private_directory_cleanup(active)
+        if active.observation is not None:
+            active.observation.complete(deadline=deadline)
         return
     if process.poll() is None:
         windows_job = active.windows_job
@@ -1765,9 +1781,10 @@ def _spawn_private_directory_cleanup(
     work_deadline: float,
     ownership_deadline: float,
 ) -> _ActivePrivateDirectoryCleanup:
-    active = _ActivePrivateDirectoryCleanup(guard=guard)
-    _register_active_private_directory_cleanup(active)
+    observation = _process_observation.admit(recovery=True, deadline=ownership_deadline)
+    active = _ActivePrivateDirectoryCleanup(guard=guard, observation=observation)
     try:
+        _register_active_private_directory_cleanup(active)
         platform_name = _ownership_platform()
         executable, environment = _supervisor_launch_context(platform_name)
         if platform_name == "nt":
@@ -1792,6 +1809,13 @@ def _spawn_private_directory_cleanup(
             **_supervisor_creation_options(),
         )
         active.process = process
+        if observation is not None:
+            observation.bind(
+                lambda deadline: _force_reap_private_directory_cleanup(
+                    active, deadline=deadline
+                ),
+                deadline=ownership_deadline,
+            )
         if active.windows_job is not None:
             active.windows_job.assign(process)
             active.windows_job_assigned = True
@@ -1812,6 +1836,9 @@ def _spawn_private_directory_cleanup(
             )
             raise ownership_error from cleanup_error
         raise
+    finally:
+        if observation is not None:
+            observation.finish_start(deadline=ownership_deadline)
 
 
 def _start_private_directory_cleanup(
@@ -1844,6 +1871,7 @@ def _remove_private_directory_owned(
     if not math.isfinite(absolute_deadline):
         raise ValueError("Private cleanup deadline must be finite")
 
+    absolute_deadline = _process_observation.cleanup_deadline(absolute_deadline)
     _register_pending_private_directory(guard)
     operation_lock = _private_directory_operation_lock(guard)
     remaining = max(0.0, absolute_deadline - time.monotonic())
@@ -1993,12 +2021,12 @@ def _read_supervisor_status(
         raise TimeoutError("Process supervisor READY deadline already expired")
 
     def require_ready_budget() -> None:
-        if time.monotonic() >= ready_deadline:
+        if time.monotonic() >= _process_observation.cleanup_deadline(ready_deadline):
             raise TimeoutError(
                 "Process supervisor did not launch target before its READY deadline"
             )
 
-    while time.monotonic() < ready_deadline:
+    while time.monotonic() < _process_observation.cleanup_deadline(ready_deadline):
         if status_path.is_file():
             status = status_path.read_text(encoding="utf-8").strip()
             require_ready_budget()
@@ -2091,7 +2119,10 @@ def start_owned_process(
     cleanup_reserve = min(_PRIVATE_CLEANUP_TIMEOUT_SECONDS, total_budget / 2.0)
 
     def remaining() -> float:
-        return max(0.0, overall_deadline - time.monotonic())
+        return max(
+            0.0,
+            _process_observation.cleanup_deadline(overall_deadline) - time.monotonic(),
+        )
 
     def startup_phase_timeout() -> float:
         available = remaining() - cleanup_reserve
@@ -2101,17 +2132,24 @@ def start_owned_process(
             )
         return min(effective_startup_timeout, available)
 
-    status_directory = Path(tempfile.mkdtemp(prefix="hbrowser-process-owner-"))
+    observation = _process_observation.admit(recovery=False, deadline=overall_deadline)
+    try:
+        status_directory = Path(tempfile.mkdtemp(prefix="hbrowser-process-owner-"))
+    except BaseException:
+        if observation is not None:
+            observation.complete(deadline=overall_deadline)
+            observation.finish_start(deadline=overall_deadline)
+        raise
     status_path = status_directory / "status"
     windows_job: _WindowsJob | None = None
     supervisor: subprocess.Popen[bytes] | None = None
     owner: OwnedProcess | None = None
     provisional_owner: _ProvisionalProcessOwner | None = None
-    platform_name = _ownership_platform()
     status_guard: _PrivateDirectory | None = None
     cleanup_guards: tuple[_PrivateDirectory, ...] = ()
     cleanup_guard_list: list[_PrivateDirectory] = []
     try:
+        platform_name = _ownership_platform()
         status_guard = _PrivateDirectory.capture(status_directory)
         for path in cleanup_paths:
             cleanup_guard_list.append(_PrivateDirectory.capture(Path(path)))
@@ -2145,8 +2183,17 @@ def start_owned_process(
             supervisor=supervisor,
             status_guard=status_guard,
             cleanup_guards=cleanup_guards,
+            observation=observation,
         )
         _register_provisional_owner(provisional_owner)
+        if observation is not None:
+            provisional = provisional_owner
+            observation.bind(
+                lambda deadline: _cleanup_provisional_owner(
+                    provisional, deadline=deadline
+                ),
+                deadline=overall_deadline,
+            )
         if platform_name == "nt":
             windows_job = _WindowsJob.create()
             provisional_owner.windows_job = windows_job
@@ -2161,7 +2208,22 @@ def start_owned_process(
             stderr_drain=None,
             status_directory=status_guard,
             cleanup_paths=cleanup_guards,
+            observation=observation,
         )
+        if observation is not None:
+            observed_owner = owner
+
+            def observed_cleanup(deadline: float) -> None:
+                observed_owner.shutdown(
+                    graceful_timeout=0,
+                    terminate_timeout=1,
+                    kill_timeout=1,
+                    cleanup_timeout=5,
+                    deadline=deadline,
+                )
+                observation.complete(deadline=deadline)
+
+            observation.bind(observed_cleanup, deadline=overall_deadline)
         _release_provisional_owner(provisional_owner)
         provisional_owner = None
         windows_job = None
@@ -2293,7 +2355,14 @@ def start_owned_process(
                 f"Startup failure type: {type(startup_error).__name__}"
             )
             raise ownership_error from private_cleanup_error
+        if observation is not None and (
+            supervisor is None or supervisor.poll() is not None
+        ):
+            observation.complete(deadline=overall_deadline)
         raise
+    finally:
+        if observation is not None:
+            observation.finish_start(deadline=overall_deadline)
 
 
 def start_owned_browser_process(

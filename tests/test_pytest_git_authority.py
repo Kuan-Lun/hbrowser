@@ -45,8 +45,18 @@ def test_pytest_entries_do_not_inherit_candidate_git_authority(
     repository = tmp_path / "repository"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("check-full.sh", "check-process-ownership.sh", "pytest-source.py"):
+    for name in (
+        "check-full.sh",
+        "check-process-ownership.sh",
+        "pytest-source.py",
+        "runtime_test_owner.py",
+    ):
         shutil.copy2(_ROOT / "scripts" / name, scripts / name)
+    shutil.copytree(
+        _ROOT / "hbrowser",
+        repository / "hbrowser",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     shutil.copytree(
         _ROOT / "scripts/_shared",
         scripts / "_shared",

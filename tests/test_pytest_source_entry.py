@@ -46,6 +46,14 @@ def _checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(_ROOT / "scripts/pytest-source.py", scripts / "pytest-source.py")
+    shutil.copy2(
+        _ROOT / "scripts/runtime_test_owner.py", scripts / "runtime_test_owner.py"
+    )
+    shutil.copytree(
+        _ROOT / "hbrowser",
+        root / "hbrowser",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     shutil.copytree(
         _ROOT / "scripts/_shared",
         scripts / "_shared",
@@ -142,3 +150,42 @@ def test_pytest_source_entry_ignores_cached_bootstrap_and_preserves_cli_status(
         assert "1 failed, 1 passed" in result.stdout
     else:
         assert "1 deselected" in result.stdout
+
+
+def test_pytest_adapter_bootstrap_never_uses_adjacent_timestamp_cache(
+    tmp_path: Path,
+) -> None:
+    root, environment = _checkout(tmp_path)
+    adapter = root / "scripts/runtime_test_owner.py"
+    stale = tmp_path / "stale-adapter.py"
+    prefix = b"raise RuntimeError('STALE OWNER ADAPTER')\n"
+    stale.write_bytes(prefix + b" " * (adapter.stat().st_size - len(prefix)))
+    timestamp = adapter.stat().st_mtime_ns
+    os.utime(stale, ns=(timestamp, timestamp))
+    cache = (
+        adapter.parent
+        / "__pycache__"
+        / f"{adapter.stem}.{sys.implementation.cache_tag}.pyc"
+    )
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    py_compile.compile(
+        str(stale),
+        cfile=str(cache),
+        dfile=str(adapter),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    old = _run(root, environment, "-B", "-c", "import runtime_test_owner")
+    assert old.returncode != 0
+    assert "STALE OWNER ADAPTER" in old.stderr
+    current = _run(
+        root,
+        environment,
+        "-B",
+        "scripts/pytest-source.py",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+    )
+    assert current.returncode == 0, current.stdout + current.stderr
+    assert "1 passed" in current.stdout
