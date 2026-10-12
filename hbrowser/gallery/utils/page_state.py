@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
 from zendriver import cdp
+from zendriver.core.connection import ProtocolException
 
 from .deadline import Deadline
 from .mutation import wait_for_zendriver_mutation
@@ -289,6 +291,43 @@ async def _finish_navigation(
     )
 
 
+async def _serialize_navigation_url(
+    page: Any, url: str, main_frame_id: str, deadline: Deadline
+) -> str:
+    """Match Chrome's URL serialization without using the page's globals."""
+
+    command_timeout = _command_timeout(deadline)
+    context_id = await wait_for_zendriver(
+        page.send(
+            cdp.page.create_isolated_world(
+                cdp.page.FrameId(main_frame_id),
+                world_name="hbrowser.navigation-url",
+            )
+        ),
+        timeout=command_timeout,
+        owner=page,
+    )
+    command_timeout = _command_timeout(deadline)
+    result, error = await wait_for_zendriver(
+        page.send(
+            cdp.runtime.evaluate(
+                f"new URL({json.dumps(url)}).href",
+                context_id=context_id,
+                return_by_value=True,
+            )
+        ),
+        timeout=command_timeout,
+        owner=page,
+    )
+    _require_deadline(deadline, "Navigation URL serialization")
+    if error is not None:
+        raise ProtocolException(error)
+    serialized = result.value
+    if not isinstance(serialized, str) or not serialized:
+        raise TypeError("Chrome did not return a serialized navigation URL")
+    return serialized
+
+
 async def navigate_and_wait(
     page: Any,
     url: str,
@@ -344,9 +383,16 @@ async def navigate_and_wait(
             raise RuntimeError("Page navigation became a download")
         if str(frame_id) != main_frame_id:
             raise RuntimeError("Chrome navigated an unexpected frame")
+        expected_url = (
+            await _serialize_navigation_url(
+                page, url, main_frame_id, operation_deadline
+            )
+            if loader_id is None
+            else None
+        )
         observer.expect_loader(
             None if loader_id is None else str(loader_id),
-            same_document_url=url,
+            same_document_url=expected_url,
         )
         return await _finish_navigation(
             page,

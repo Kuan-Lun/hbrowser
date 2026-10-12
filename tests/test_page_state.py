@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import unittest
 from collections import defaultdict, deque
@@ -10,7 +11,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from zendriver import cdp
-from zendriver.core.connection import Connection, Transaction
+from zendriver.core.connection import Connection, ProtocolException, Transaction
 
 from hbrowser.gallery.utils import (
     Deadline,
@@ -44,6 +45,9 @@ class _EventPage:
         self.emit_stale_while_enabling = False
         self.queue_stale_while_enabling = False
         self.delay_same_document = 0.0
+        self.serialized_navigation_url: str | None = None
+        self.navigation_event_url: str | None = None
+        self.navigation_requests: list[str] = []
         self.reload_payload: dict[str, Any] | None = None
         self.selector_results: list[Any] = []
         self.selector_queries = 0
@@ -97,8 +101,31 @@ class _EventPage:
                 if self.queue_stale_while_enabling:
                     self._schedule(self._emit_cross_document("queued-stale-loader"))
                 return None
+            case "Page.createIsolatedWorld":
+                assert payload["params"]["frameId"] == "main-frame"
+                assert payload["params"]["worldName"] == "hbrowser.navigation-url"
+                return cdp.runtime.ExecutionContextId(123)
+            case "Runtime.evaluate":
+                assert payload["params"]["contextId"] == 123
+                assert payload["params"]["returnByValue"] is True
+                expression = payload["params"]["expression"]
+                requested_url = json.loads(
+                    expression.removeprefix("new URL(").removesuffix(").href")
+                )
+                return (
+                    SimpleNamespace(
+                        value=self.serialized_navigation_url or requested_url
+                    ),
+                    None,
+                )
             case "Page.navigate":
-                self.url = payload["params"]["url"]
+                requested_url = payload["params"]["url"]
+                self.navigation_requests.append(requested_url)
+                self.url = (
+                    self.navigation_event_url
+                    or self.serialized_navigation_url
+                    or requested_url
+                )
                 loader_id = self.navigation_loader
                 if self.emit_navigation:
                     if loader_id is None:
@@ -370,6 +397,92 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(time.monotonic() - started, 0.02)
         self.assertIsNone(receipt.loader_id)
         self.assertEqual(receipt.url, "https://example.test/old#new-fragment")
+
+    async def test_same_document_uses_browser_serialized_url(self) -> None:
+        for requested, serialized in (
+            ("https://example.test#fragment", "https://example.test/#fragment"),
+            ("https://EXAMPLE.test:443/#fragment", "https://example.test/#fragment"),
+            ("https://example.test/a/../#fragment", "https://example.test/#fragment"),
+            ("https://example.test/#a b", "https://example.test/#a%20b"),
+            ('https://example.test/#a"b', "https://example.test/#a%22b"),
+        ):
+            with self.subTest(requested=requested):
+                page = _EventPage()
+                page.navigation_loader = None
+                page.serialized_navigation_url = serialized
+                receipt = await navigate_and_wait(
+                    page, requested, deadline=Deadline.after(0.5)
+                )
+                self.assertEqual(receipt.url, serialized)
+                self.assertEqual(page.navigation_requests, [requested])
+                self.assertFalse(any(page.handlers.values()))
+
+    async def test_same_document_does_not_accept_a_different_serialized_fragment(
+        self,
+    ) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        page.serialized_navigation_url = "https://example.test/#expected"
+        page.navigation_event_url = "https://example.test/#other"
+        with self.assertRaises(PageStateTimeout):
+            await navigate_and_wait(
+                page, "https://example.test#expected", deadline=Deadline.after(0.03)
+            )
+        self.assertFalse(any(page.handlers.values()))
+
+    async def test_same_document_rejects_invalid_serialization(self) -> None:
+        for value, error in (
+            (None, None),
+            ("", None),
+            (123, None),
+            (None, {"message": "serialization failed"}),
+        ):
+            with self.subTest(value=value, error=error):
+                page = _EventPage()
+                page.navigation_loader = None
+
+                async def send(
+                    command: Any,
+                    result_value: Any = value,
+                    result_error: Any = error,
+                    target: _EventPage = page,
+                ) -> Any:
+                    payload = next(command)
+                    if payload["method"] == "Runtime.evaluate":
+                        return SimpleNamespace(value=result_value), result_error
+                    return await _EventPage.send(target, iter((payload,)))
+
+                expected_error = ProtocolException if error else TypeError
+                with (
+                    patch.object(page, "send", new=send),
+                    self.assertRaises(expected_error),
+                ):
+                    await navigate_and_wait(
+                        page,
+                        "https://example.test/#fragment",
+                        deadline=Deadline.after(1),
+                    )
+                self.assertFalse(any(page.handlers.values()))
+
+    async def test_same_document_rejects_serialization_after_deadline(self) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        with self.assertRaisesRegex(PageStateTimeout, "serialization.*deadline"):
+            await navigate_and_wait(
+                page,
+                "https://example.test/#fragment",
+                deadline=_ExpiredAfterCommandDeadline(),  # type: ignore[arg-type]
+            )
+        self.assertFalse(any(page.handlers.values()))
+
+    async def test_cross_document_navigation_does_not_serialize_url(self) -> None:
+        page = _EventPage()
+        with patch.object(page_state_module, "_serialize_navigation_url") as serialize:
+            receipt = await navigate_and_wait(
+                page, "https://example.test/new", deadline=Deadline.after(1)
+            )
+        self.assertEqual(receipt.loader_id, "new-loader")
+        serialize.assert_not_called()
 
     async def test_reload_guards_the_previous_loader_and_waits_for_new_one(
         self,
