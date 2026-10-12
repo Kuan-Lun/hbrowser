@@ -2610,7 +2610,7 @@ class TorProcessCleanupTests(unittest.TestCase):
             graceful_timeout=0,
             terminate_timeout=5,
             kill_timeout=5,
-            deadline=None,
+            deadline=unittest.mock.ANY,
         )
 
     def test_owned_tor_uses_bounded_shutdown_policy(self) -> None:
@@ -2696,24 +2696,20 @@ class TorProcessCleanupTests(unittest.TestCase):
     def test_bootstrap_timeout_terminates_and_reaps_process(self) -> None:
         process = self._owned_process(stdout=[])
         process.poll.return_value = None
-        deadline = Mock(
-            expires_at=time.monotonic() + 1.0,
-            expired=True,
-        )
-        deadline.remaining.return_value = 1.0
+        now = [99.0]
+        deadline = Deadline(100.0)
+
+        def start_process(*_args: object, **_kwargs: object) -> Mock:
+            # Bootstrap's reserved deadline expires while cleanup still has time.
+            now[0] = 99.75
+            return process
+
         with (
-            patch.object(
-                tor_module,
-                "start_owned_process",
-                return_value=process,
-            ),
-            patch(
-                "hbrowser.gallery.browser.tor.Deadline.after",
-                return_value=deadline,
-            ),
+            patch.object(tor_module, "start_owned_process", side_effect=start_process),
+            patch.object(time, "monotonic", side_effect=lambda: now[0]),
             self.assertRaisesRegex(RuntimeError, "failed to bootstrap"),
         ):
-            tor_module._start_tor_process(9150)
+            tor_module._start_tor_process(9150, deadline=deadline)
 
         process.shutdown.assert_called_once_with(
             graceful_timeout=0,
@@ -2834,7 +2830,7 @@ class TorProcessCleanupTests(unittest.TestCase):
                 terminate_process.call_args_list,
                 [
                     call(process, deadline=unittest.mock.ANY),
-                    call(process, deadline=None),
+                    call(process, deadline=unittest.mock.ANY),
                 ],
             )
 
@@ -2902,11 +2898,11 @@ class TorProcessCleanupTests(unittest.TestCase):
             graceful_timeout=0,
             terminate_timeout=5,
             kill_timeout=5,
-            deadline=None,
+            deadline=unittest.mock.ANY,
         )
         second_process.shutdown.assert_called_once_with(
             graceful_timeout=0,
             terminate_timeout=5,
             kill_timeout=5,
-            deadline=None,
+            deadline=unittest.mock.ANY,
         )

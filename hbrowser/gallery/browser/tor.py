@@ -11,6 +11,8 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
 
@@ -23,8 +25,10 @@ logger = logging.getLogger(__name__)
 TOR_SOCKS_PORT = 9150
 _TOR_PROCESS_CLEANUP_ATTRIBUTE = "_hbrowser_tor_process_cleanup"
 _TOR_BOOTSTRAP_TIMEOUT_SECONDS = 120.0
-# Allow five seconds each for termination, force-kill, and private-path cleanup.
-_TOR_BOOTSTRAP_CLEANUP_RESERVE_SECONDS = 15.0
+# Match shutdown: no graceful wait, then five seconds each for termination,
+# force-kill, and private-path cleanup. State-lock waits share this total.
+_TOR_PROCESS_CLEANUP_TIMEOUT_SECONDS = 15.0
+_TOR_BOOTSTRAP_CLEANUP_RESERVE_SECONDS = _TOR_PROCESS_CLEANUP_TIMEOUT_SECONDS
 _TOR_MAX_RETRIES = 3
 _TOR_MAX_RETRY_WAIT_SECONDS = 5.0
 
@@ -70,28 +74,50 @@ class _TorProcessAtexitCleanup:
             self._registered = True
 
     def cleanup(self, *, deadline: Deadline | None = None) -> None:
-        """Reap normally, then release the durable atexit registration."""
-        self._reap(deadline)
-        self._unregister()
+        """Reap and unregister within the caller's deadline (15 seconds by default)."""
+        self._reap(deadline, unregister=True)
 
-    def _reap(self, deadline: Deadline | None) -> None:
-        with self._lock:
-            if self._tor_process is None:
-                return
-            _terminate_tor_process(self._tor_process, deadline=deadline)
-            self._tor_process = None
-
-    def _unregister(self) -> None:
-        with self._lock:
-            if not self._registered:
-                return
-            self._registered = False
+    @contextmanager
+    def _state_before(self, deadline: Deadline) -> Iterator[None]:
+        if not self._lock.acquire(timeout=deadline.remaining()):
+            raise ProcessOwnershipError(
+                "Tor cleanup deadline expired waiting for state"
+            )
         try:
-            atexit.unregister(self)
-        except Exception:
-            # The exact process reference was already released. A stale no-op
-            # callback is preferable to reporting an unproven process cleanup.
-            logger.exception("Failed to unregister completed Tor cleanup callback")
+            if deadline.expired:
+                raise ProcessOwnershipError(
+                    "Tor cleanup deadline expired entering state"
+                )
+            yield
+        finally:
+            self._lock.release()
+
+    def _reap(self, deadline: Deadline | None, *, unregister: bool = False) -> None:
+        operation_deadline = (
+            Deadline.after(_TOR_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            if deadline is None
+            else deadline
+        )
+        with self._state_before(operation_deadline):
+            tor_process = self._tor_process
+        if tor_process is not None:
+            # OwnedProcess already serializes concurrent shutdown attempts under
+            # their deadlines. Holding our state lock here would hide that bound.
+            _terminate_tor_process(tor_process, deadline=operation_deadline)
+        with self._state_before(operation_deadline):
+            # A late completion retains the reference and registration for retry,
+            # even when the underlying owner has already proved its tree empty.
+            self._tor_process = None
+            unregister_callback = unregister and self._registered
+            if unregister_callback:
+                self._registered = False
+        if unregister_callback:
+            try:
+                atexit.unregister(self)
+            except Exception:
+                # The process is proven reaped. A stale no-op callback is safer
+                # than reporting its process cleanup as unproven.
+                logger.exception("Failed to unregister completed Tor cleanup callback")
 
 
 def _terminate_tor_process(
