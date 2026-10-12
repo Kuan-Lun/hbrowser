@@ -691,14 +691,18 @@ class LogForwardingReceiver:
     ) -> tuple[bool, str, ForwardedRecord | None]:
         try:
             decoded = json.loads(payload.decode("utf-8"))
-        except UnicodeDecodeError, json.JSONDecodeError:
+        except ValueError, RecursionError:
+            # UTF-8/JSON syntax, integer limits and nesting limits are all
+            # untrusted-frame failures; connection identity is checked by the
+            # receiver even when this frame cannot establish authentication.
             return False, "noise", None
         if not isinstance(decoded, dict):
             return False, "noise", None
         supplied_token = decoded.get("token")
-        authenticated = isinstance(supplied_token, str) and hmac.compare_digest(
-            supplied_token,
-            self._token,
+        authenticated = (
+            isinstance(supplied_token, str)
+            and supplied_token.isascii()
+            and hmac.compare_digest(supplied_token, self._token)
         )
         if not authenticated:
             return False, "noise", None
@@ -756,6 +760,10 @@ class LogForwardingReceiver:
                         client,
                     )
                     if not authenticated:
+                        if client.authenticated:
+                            raise ForwardingProtocolError(
+                                "authenticated forwarding frame is invalid"
+                            )
                         return
                     match frame_type:
                         case "close":

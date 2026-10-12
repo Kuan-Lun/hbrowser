@@ -896,6 +896,84 @@ close_forwarded_logging()
         self.assertTrue(health.forwarding_degraded)
         self.assertEqual(health.forwarding_operation, "forward-protocol")
 
+    def test_invalid_frames_respect_sticky_connection_authentication(self) -> None:
+        for authenticated in (False, True):
+            for malformed in (
+                "invalid-utf8",
+                "invalid-json",
+                "nonobject",
+                "missing-token",
+                "wrong-token",
+                "nonascii-token",
+                "deep-json",
+                "oversized-integer",
+            ):
+                with self.subTest(authenticated=authenticated, malformed=malformed):
+                    self._assert_invalid_frame_health(authenticated, malformed)
+
+    def _assert_invalid_frame_health(self, authenticated: bool, malformed: str) -> None:
+        with (
+            _isolated_logging_state_for_testing(),
+            TemporaryDirectory() as directory_name,
+            patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+        ):
+            configure_logging(console_level=LogLevel.CRITICAL)
+            receiver = start_log_forwarding_receiver()
+            assert receiver is not None
+            capability = receiver.child_environment()
+            token = capability["HBROWSER_LOG_FORWARD_TOKEN"]
+            host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(":", 1)
+            wrong_token = "0" * 64 if token != "0" * 64 else "1" * 64
+            payloads = {
+                "invalid-utf8": b"\xff",
+                "invalid-json": b"{",
+                "nonobject": b"[]",
+                "missing-token": b'{"type":"close"}',
+                "wrong-token": json.dumps({"token": wrong_token}).encode(),
+                "nonascii-token": json.dumps({"token": "非ASCII"}).encode(),
+                "deep-json": b"[" * 2000 + b"0" + b"]" * 2000,
+                "oversized-integer": b"1" * 5000,
+            }
+            client_thread: Thread | None = None
+
+            def client_started() -> bool:
+                nonlocal client_thread
+                with receiver._clients_lock:
+                    clients = tuple(receiver._clients)
+                if not clients or clients[0].thread is None:
+                    return False
+                client_thread = clients[0].thread
+                return True
+
+            with socket.create_connection(
+                (host, int(raw_port)), timeout=2
+            ) as connection:
+                self.assertTrue(_wait_until(client_started))
+                with connection.makefile("rb") as stream:
+                    if authenticated:
+                        connection.sendall(
+                            _raw_forwarding_frame({"token": token, "type": "hello"})
+                        )
+                        header = stream.read(4)
+                        self.assertEqual(len(header), 4)
+                        size = struct.unpack(">I", header)[0]
+                        self.assertEqual(stream.read(size), b'{"type":"ready"}')
+                    payload = payloads[malformed]
+                    connection.sendall(struct.pack(">I", len(payload)) + payload)
+                    # EOF is emitted by the real receiver after rejecting this
+                    # frame; observe health only after its client thread exits.
+                    self.assertEqual(stream.read(1), b"")
+            assert client_thread is not None
+            client_thread.join(timeout=2)
+            self.assertFalse(client_thread.is_alive())
+            with receiver._clients_lock:
+                self.assertFalse(receiver._clients)
+            health = logging_health()
+            self.assertFalse(health.trace_degraded)
+            self.assertEqual(health.forwarding_degraded, authenticated)
+            if authenticated:
+                self.assertEqual(health.forwarding_operation, "forward-protocol")
+
     def test_close_drains_authenticated_client_before_segment_close(self) -> None:
         original_accept = LogForwardingReceiver._accept_connections
 
