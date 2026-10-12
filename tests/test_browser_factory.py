@@ -580,6 +580,111 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_failed_launch_preserves_owned_private_paths(self) -> None:
+        for settlement in (1, 2):
+            with self.subTest(settlement=settlement):
+                await self._assert_failed_launch_retains_paths(settlement)
+
+    async def _assert_failed_launch_retains_paths(self, settlement: int) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile, extension = root / "profile", root / "extension"
+            profile.mkdir()
+            extension.mkdir()
+            (extension / "credentials").write_text("synthetic", encoding="utf-8")
+            started, release = threading.Event(), threading.Event()
+            failure = ProcessOwnershipError("startup cleanup could not prove exit")
+
+            def fail_launch(*_: object, **__: object) -> None:
+                started.set()
+                if not release.wait(2):
+                    raise AssertionError("test launch barrier was not released")
+                raise failure
+
+            real_settle = factory._settle_owned_startup_task
+            settlements = 0
+
+            async def cancel_at_settlement(
+                task: asyncio.Task[Any],
+                cancellation: asyncio.CancelledError | None = None,
+            ) -> tuple[Any, asyncio.CancelledError | None]:
+                nonlocal settlements
+                settlements += 1
+                if settlements == settlement:
+                    waiter = asyncio.current_task()
+                    assert waiter is not None
+
+                    def cancel_waiter(completed: asyncio.Task[Any]) -> None:
+                        if settlement == 1:
+                            self.assertIs(completed.exception(), failure)
+                        else:
+                            self.assertIsNone(completed.exception())
+                        waiter.cancel()
+
+                    # Register before shield's done callback: either the real
+                    # launch thread has failed, or independent cleanup finished,
+                    # but its waiting caller has not resumed yet.
+                    task.add_done_callback(cancel_waiter)
+                return await real_settle(task, cancellation)
+
+            with (
+                patch.object(
+                    factory, "_configured_chrome_executable", return_value="/chrome"
+                ),
+                patch.object(factory, "should_use_tor", return_value=False),
+                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(
+                    factory,
+                    "tempfile",
+                    SimpleNamespace(mkdtemp=lambda **_: str(profile)),
+                ),
+                patch.object(factory, "_build_config", return_value=object()),
+                patch.object(
+                    factory,
+                    "_prepare_owned_browser_launch",
+                    return_value=(Path("/chrome"), []),
+                ),
+                patch.object(
+                    factory, "start_owned_browser_process", side_effect=fail_launch
+                ),
+                patch.object(
+                    factory,
+                    "_settle_owned_startup_task",
+                    side_effect=cancel_at_settlement,
+                ),
+            ):
+                creation = asyncio.create_task(factory._create_browser(True))
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                    release.set()
+                    try:
+                        await creation
+                    except BaseException as error:
+                        observed_error = error
+                    else:
+                        self.fail("failed launch was published")
+                finally:
+                    release.set()
+                    if not creation.done():
+                        creation.cancel()
+                        await asyncio.gather(creation, return_exceptions=True)
+            self.assertTrue(profile.is_dir(), "unresolved owner lost its profile")
+            self.assertEqual((extension / "credentials").read_text(), "synthetic")
+            self.assertIs(observed_error, failure)
+            self.assertTrue(any("cancel" in note.lower() for note in failure.__notes__))
+
+    async def test_settled_nonownership_failure_retains_cancellation(self) -> None:
+        async def fail() -> None:
+            raise ValueError("startup was rejected before owning resources")
+
+        task = asyncio.create_task(fail())
+        await asyncio.gather(task, return_exceptions=True)
+        cancellation = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await factory._settle_owned_startup_task(task, cancellation)
+        self.assertIs(raised.exception, cancellation)
+        self.assertTrue(any("ValueError" in note for note in cancellation.__notes__))
+
     async def test_uncertain_chrome_constructor_retains_transferred_private_paths(
         self,
     ) -> None:

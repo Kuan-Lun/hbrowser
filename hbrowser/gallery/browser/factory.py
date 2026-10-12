@@ -546,6 +546,14 @@ async def _settle_owned_startup_task[T](
         result = task.result()
     except BaseException as startup_error:
         if caller_cancellation is not None:
+            if isinstance(startup_error, ProcessOwnershipError):
+                # Cancellation is not an empty-tree receipt. Callers use this
+                # ownership failure to retain resources still held by Chrome
+                # or its startup worker, even if no owner was returned yet.
+                startup_error.add_note(
+                    "Caller cancellation also occurred during owned startup"
+                )
+                raise
             caller_cancellation.add_note(
                 f"Cancelled startup also failed: {type(startup_error).__name__}"
             )
@@ -1161,7 +1169,11 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             )
             raise ownership_error from tor_cleanup_error
         if cleanup_cancellation is not None:
-            raise cleanup_cancellation
+            if not isinstance(construction_error, ProcessOwnershipError):
+                raise cleanup_cancellation
+            construction_error.add_note(
+                "Caller cancellation also occurred during independent startup cleanup"
+            )
         raise construction_error.with_traceback(construction_error.__traceback__)
 
     _attach_tor_process(browser, tor_process)
