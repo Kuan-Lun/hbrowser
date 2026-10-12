@@ -4,6 +4,27 @@ HBrowser 是讓 Python 程式透過瀏覽器操作 E-Hentai／ExHentai 的非同
 你可以用它登入帳號、搜尋圖庫、依 GID 尋找圖庫、提交 H@H 封存下載，以及每日簽到。
 它適合整合進自己的腳本或應用程式；目前沒有獨立的命令列工具。
 
+## 從 0.44 升級
+
+0.45 移除公開模組 `hbrowser.gallery.browser.mapper`，屬於不向後相容的 Python API
+變更。下列匯出不再提供：
+
+- `ZENDRIVER_MAPPER_CLEANUP_INTERVAL_SECONDS`
+- `prune_zendriver_browser_mappers`
+- `prune_zendriver_connection_mapper`
+- `run_zendriver_mapper_janitor`
+- `start_zendriver_mapper_janitor`
+- `stop_zendriver_mapper_janitor`
+
+新的 Zendriver 0.17.1 cohort 已負責 event transaction 清理，因此不保留舊 mapper
+清理函式或相容 shim。若應用程式直接匯入上述名稱，請移除舊 janitor 的啟動、停止與
+定時清理呼叫；瀏覽器生命週期仍透過 `Driver`／`EHDriver`／`ExHDriver` 的
+`async with` 管理。依賴 prune 回傳計數或自訂排程的程式需要人工調整，無法靠通用
+的一次性程式改寫保證原本語義。
+
+這項 API 移除不改變儲存資料格式，既有 cookie、profile 與下載檔案可保留，不需要
+刪除或重建資料。
+
 ## 開始使用
 
 你需要 Python 3.14 以上版本、E-Hentai 帳號與網路連線。
@@ -160,12 +181,20 @@ match await driver.punchin():
 | 環境變數 | 用途 |
 | --- | --- |
 | `HBROWSER_CHROME_EXECUTABLE` | 指定 Chrome 執行檔的絕對路徑，略過自動安裝；必須是可執行的檔案。 |
+| `RP_DNS`、`RP_USERNAME`、`RP_PASSWORD` | 住宅 HTTP 代理的 `host:port` 與認證；三者須一起提供。 |
 | `USE_TOR` | `0` 停用 Tor，`1` 啟用 Tor；未設定時自動偵測。 |
 | `TOR_BINARY_PATH` | 自動偵測不到 Tor 時，指定其執行檔路徑。 |
 | `FLARESOLVERR_URL` | 選用的 FlareSolverr `/v1` 端點，例如 `http://127.0.0.1:8191/v1`。 |
 
 FlareSolverr 可協助處理支援的 Cloudflare 與登入驗證；它必須與 HBrowser 使用相同的
 對外網路路徑。啟用 Tor 或住宅代理時，HBrowser 會停用 FlareSolverr 整合。
+
+住宅代理使用 Manifest V3 擴充功能。請使用支援命令列載入 unpacked extension 的
+Chrome for Testing 或 Chromium；Chrome branded builds 自 137 起移除
+[`--load-extension`](https://groups.google.com/a/chromium.org/g/chromium-extensions/c/1-g8EFx2BBY/m/S0ET5wPjCAAJ)，
+因此這類指定執行檔不能用於住宅代理。HBrowser 在任何網路導航前，先核對本次
+擴充功能的認證 listener 與 Chrome 實際代理設定，再驗證出口 IP。擴充功能未載入、
+設定未生效或驗證失敗時會清理並拒絕啟動，不退回直接連線或 Manifest V2。
 
 Driver 預設 `headless=True`。無法自動完成驗證時，這個模式會失敗；需要人工操作時改用
 `headless=False`。人工驗證預設等待 180 秒，可以在建立 driver 時設定
@@ -215,6 +244,16 @@ FlareSolverr，並移除日誌中的私人資訊。問題可提交到
 工具快照，包含版本與逐檔雜湊；不要直接修改。一般開發仍使用
 `scripts/check-fast.sh`、`scripts/check-full.sh` 與 `scripts/git-flow-merge.sh`，
 不需要 sibling checkout、安裝共用工具套件或在每次 commit 時連網。
+
+程式變更合併時需要本機 `.venv` 與 PATH 中已登入的 `codex`。合併腳本會先
+審查真正的 candidate，再執行離線 gate；首次審查涵蓋完整專案，通過並合併後
+才可使用增量審查。新 checkout 缺少本機紀錄或審查基準失效時會重新完整審查。
+純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
+大型專案的首次審查可明確延長至一小時：
+
+```bash
+H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600 scripts/git-flow-merge.sh
+```
 
 更新時，在獨立工具環境安裝明確選定的 `h2h-dev-tools` wheel 或版本，再執行：
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hbrowser"
-version = "0.44.2"
+version = "0.45.0"
 description = "A tool for browsing tasks on e-h/exh-websites."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -17,9 +17,9 @@ dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
     "httpx>=0.28.1",
     "websockets>=17.0.1",
-    # hbrowser's browser lifecycle has been verified against this exact
-    # Zendriver cohort; upgrades require the ownership/lifecycle suite.
-    "zendriver==0.16.0",
+    # Flat CDP sessions, event dispatch and shutdown are verified against this
+    # exact Zendriver cohort; upgrades require the ownership/lifecycle suite.
+    "zendriver==0.17.1",
 ]
 
 classifiers = [
@@ -75,6 +75,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 
 [tool.h2h.version]
+dedicated-release-commit = true
 development-paths = [
     ".Codex/**",
     ".claude/**",
@@ -98,4 +99,4 @@ development-paths = [
 release-paths = ["LICENSE", "hbrowser/**"]
 
 [tool.h2h-dev-tools]
-components = ["distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-flow", "hooks", "primary-branch", "version-policy"]
+components = ["code-review", "distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-environment", "git-flow", "hooks", "primary-branch", "pytest", "version-policy"]

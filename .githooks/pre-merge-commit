@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
-repository_root="$(git rev-parse --show-toplevel)"
-cd "$repository_root"
+repository_root="$(git rev-parse --show-toplevel && printf '.')"
+repository_root="${repository_root%.}"
+repository_root="${repository_root%$'\n'}"
+CDPATH= cd "$repository_root"
 
 primary="$(scripts/detect-primary-branch.sh)"
 current="$(git branch --show-current)"
@@ -12,14 +14,17 @@ current="$(git branch --show-current)"
     exit 1
 }
 
-scripts/check-version.py --index
+.venv/bin/python scripts/check-version.py --index
+candidate_tree="$(git write-tree)"
 profile="$(.venv/bin/python scripts/check_change_scope.py --index --base HEAD)"
 case "$profile" in
     documentation)
         exec .venv/bin/python scripts/check-docs.py --index --base HEAD
         ;;
     full)
-        exec scripts/check-full.sh
+        .venv/bin/python scripts/review-code.py verify --index --expected-tree "$candidate_tree"
+        scripts/check-full.sh
+        .venv/bin/python scripts/review-code.py verify --index --expected-tree "$candidate_tree"
         ;;
     *)
         printf 'Unrecognized check profile: %s\n' "$profile" >&2

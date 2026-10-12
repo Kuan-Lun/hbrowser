@@ -2,8 +2,9 @@
 set -euo pipefail
 
 repo_root=${1:?repository root is required}
-resource_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$repo_root"
+resource_dir="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CDPATH= cd "$repo_root"
+repo_root=$PWD
 
 existing_hooks_path="$(git config --get core.hooksPath || true)"
 if [[ -n "$existing_hooks_path" && "$existing_hooks_path" != ".githooks" ]]; then
@@ -24,8 +25,8 @@ if [[ -z "$existing_hooks_path" ]]; then
     done
 fi
 
-git config --local core.hooksPath .githooks
 primary="$(bash "$resource_dir/primary-branch.sh" "$repo_root")"
+git config --local core.hooksPath .githooks
 git config --local "branch.$primary.mergeOptions" --no-ff
 git config --local "branch.$primary.rebase" false
 git config --local pull.rebase false

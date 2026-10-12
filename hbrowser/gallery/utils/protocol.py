@@ -64,7 +64,6 @@ class _ZendriverLifecycle:
     protocol_retirement_complete: bool = False
     browser_cleanup_complete: bool = False
     tor_cleanup_complete: bool = False
-    janitor_cleanup_complete: bool = False
     shutdown_complete: bool = False
 
     def begin_retirement(self) -> None:
@@ -437,18 +436,11 @@ class _ZendriverRetirement:
     def mark_tor_cleanup_complete(self) -> None:
         self.lifecycle.tor_cleanup_complete = True
 
-    def janitor_cleanup_is_complete(self) -> bool:
-        return self.lifecycle.janitor_cleanup_complete
-
-    def mark_janitor_cleanup_complete(self) -> None:
-        self.lifecycle.janitor_cleanup_complete = True
-
     def mark_complete(self) -> None:
         if not (
             self.lifecycle.protocol_retirement_complete
             and self.lifecycle.browser_cleanup_complete
             and self.lifecycle.tor_cleanup_complete
-            and self.lifecycle.janitor_cleanup_complete
         ):
             raise RuntimeError("Zendriver shutdown cannot complete before all cleanup")
         self.lifecycle.shutdown_complete = True

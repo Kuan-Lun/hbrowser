@@ -10,16 +10,76 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar, cast
 from unittest.mock import ANY, Mock, call, patch
 
+import runtime_test_owner
 import zendriver as zd
+from _shared.h2h_dev_tools import process as command_process
 
 from hbrowser.gallery.browser import _directory_cleanup_worker as cleanup_worker_module
 from hbrowser.gallery.browser import _process_control as control_module
+from hbrowser.gallery.browser import _process_observation
 from hbrowser.gallery.browser import _process_supervisor as supervisor_module
 from hbrowser.gallery.browser import process as process_module
+
+
+@contextmanager
+def _mock_popen(**options: Any) -> Iterator[Mock]:
+    # Only the fully mocked spawn boundary is exempt. In particular, a mock
+    # OwnedProcess may still launch a REAL private-cleanup worker outside this
+    # context; that worker must remain observed.
+    with (
+        patch.object(subprocess, "Popen", **options) as mocked,
+        patch.object(_process_observation, "observer", None),
+    ):
+        yield mocked
+
+
+def _runtime_harness_source(source: str) -> str:
+    entry = Path(__file__).resolve().parents[1] / "scripts/pytest-source.py"
+    return (
+        "import runpy\n"
+        f"boundary = runpy.run_path({str(entry)!r})\n"
+        f"boundary['adapter'].run(lambda: exec({source!r}, "
+        "{'__name__': '__main__'}))\n"
+    )
+
+
+@contextmanager
+def _owned_harness(
+    command: command_process.ProcessCommand,
+) -> Iterator[command_process.OwnedProcess]:
+    registry = runtime_test_owner._current()
+    deadline = time.monotonic() + 10
+    observation = registry.admit(recovery=False, deadline=deadline)
+    owner: command_process.OwnedProcess | None = None
+
+    def cleanup(deadline: float) -> None:
+        assert owner is not None
+        if not command_process.terminate_owned_tree(owner, deadline=deadline):
+            raise RuntimeError("Harness process tree remains owned")
+        if not command_process.close_owner(owner):
+            raise RuntimeError("Harness process owner could not close")
+        observation.complete(deadline=deadline)
+
+    try:
+        try:
+            owner = command_process.start_owned_process(
+                command,
+                deadline=deadline,
+                signal_controller=None,
+            )
+            observation.bind(cleanup, deadline=deadline)
+        finally:
+            observation.finish_start(deadline=deadline)
+        yield owner
+    finally:
+        if owner is not None and not observation.completed:
+            cleanup(registry.cleanup_deadline(time.monotonic() + 6))
 
 
 def _pid_exists(pid: int) -> bool:
@@ -516,6 +576,27 @@ class ProcessControlProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "POSIX process ownership contract")
 class PosixOwnedProcessTests(unittest.TestCase):
+    def test_supervisor_preflight_tests_preserve_process_signal_handlers(self) -> None:
+        for name in (
+            "test_missing_waitid_primitive_fails_before_target_popen",
+            "test_missing_trusted_ps_fails_before_target_popen",
+            "test_unusable_ps_fails_before_target_popen",
+        ):
+            with self.subTest(test=name):
+                previous = {
+                    signum: signal.getsignal(signum)
+                    for signum in (signal.SIGINT, signal.SIGTERM)
+                }
+                try:
+                    result = unittest.TestResult()
+                    PosixOwnedProcessTests(name).run(result)
+                    self.assertTrue(result.wasSuccessful(), result.errors)
+                    for signum, handler in previous.items():
+                        self.assertIs(signal.getsignal(signum), handler)
+                finally:
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+
     def test_start_reader_leaves_same_write_control_tail_for_cancel_barrier(
         self,
     ) -> None:
@@ -667,7 +748,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     "_start_control_watcher",
                     return_value=initial_drain,
                 ),
-                patch.object(subprocess, "Popen", side_effect=launch_target),
+                _mock_popen(side_effect=launch_target),
                 patch.object(
                     supervisor_module,
                     "_posix_target_has_exit_receipt",
@@ -806,7 +887,8 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     "_posix_exit_receipts_supported",
                     return_value=False,
                 ),
-                patch.object(subprocess, "Popen") as popen,
+                patch.object(signal, "signal"),
+                _mock_popen() as popen,
             ):
                 result = supervisor_module.main(
                     (str(status_path), "--", sys.executable, "-c", "pass")
@@ -842,7 +924,8 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     return_value=True,
                 ),
                 patch.object(supervisor_module, "_POSIX_PS_EXECUTABLE", None),
-                patch.object(subprocess, "Popen") as popen,
+                patch.object(signal, "signal"),
+                _mock_popen() as popen,
             ):
                 result = supervisor_module.main(
                     (str(status_path), "--", sys.executable, "-c", "pass")
@@ -898,7 +981,8 @@ class PosixOwnedProcessTests(unittest.TestCase):
                         return_value=(None if run_effect is not None else failure),
                         side_effect=run_effect,
                     ),
-                    patch.object(subprocess, "Popen") as popen,
+                    patch.object(signal, "signal"),
+                    _mock_popen() as popen,
                 ):
                     result = supervisor_module.main(
                         (str(status_path), "--", sys.executable, "-c", "pass")
@@ -947,7 +1031,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                     "_start_control_watcher",
                     return_value=initial_drain,
                 ),
-                patch.object(subprocess, "Popen", return_value=target),
+                _mock_popen(return_value=target),
                 patch.object(
                     supervisor_module,
                     "_write_status",
@@ -1006,7 +1090,7 @@ class PosixOwnedProcessTests(unittest.TestCase):
                 patch.object(time, "monotonic_ns", side_effect=lambda: clock[0]),
                 patch.object(signal, "signal"),
                 patch.object(supervisor_module, "_start_control_watcher") as watcher,
-                patch.object(subprocess, "Popen") as popen,
+                _mock_popen() as popen,
             ):
                 result = supervisor_module.main(
                     (str(status_path), "--", sys.executable, "-c", "pass")
@@ -1039,6 +1123,89 @@ class PosixOwnedProcessTests(unittest.TestCase):
                 ["-c", "pass"],
             )
             self.assertEqual(process.wait(timeout=5), 0)
+
+    def _write_startup_child_hook(self, directory: Path) -> None:
+        (directory / "sitecustomize.py").write_text(
+            "import os, pathlib, subprocess, sys\n"
+            "child = subprocess.Popen(\n"
+            "    [sys.executable, '-E', '-S', '-c', 'import time; time.sleep(30)'],\n"
+            "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL)\n"
+            "pathlib.Path(__file__).with_name(f'startup-{os.getpid()}').write_text(\n"
+            "    str(child.pid), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+    def _reap_startup_probe_children(self, directory: Path) -> None:
+        # Old-code negative controls deliberately reveal unowned helpers. Only
+        # the exact PIDs recorded by this disposable hook are cleaned here.
+        for marker in directory.glob("startup-*"):
+            pid = int(marker.read_text(encoding="utf-8"))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.assertTrue(_wait_for_pid_exit(pid), f"Probe helper {pid} survived")
+
+    def test_supervisor_and_cleanup_skip_python_startup_hooks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-startup-hooks-") as directory:
+            root = Path(directory)
+            self._write_startup_child_hook(root)
+            with patch.dict(os.environ, {"PYTHONPATH": str(root)}):
+                owner = process_module.start_owned_process(
+                    sys.executable,
+                    ["-E", "-S", "-c", "pass"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    self.assertEqual(owner.wait(timeout=5), 0)
+                    unexpected = list(root.glob("startup-*"))
+                    live = [
+                        int(path.read_text(encoding="utf-8"))
+                        for path in unexpected
+                        if _pid_exists(int(path.read_text(encoding="utf-8")))
+                    ]
+                    self.assertEqual(
+                        unexpected, [], f"Unowned startup children: {live}"
+                    )
+                finally:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                        )
+                    self._reap_startup_probe_children(root)
+
+    def test_target_startup_hooks_keep_their_environment_and_owned_group(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-target-hooks-") as directory:
+            root = Path(directory)
+            self._write_startup_child_hook(root)
+            with patch.dict(os.environ, {"PYTHONPATH": str(root)}):
+                owner = process_module.start_owned_process(
+                    sys.executable,
+                    ["-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    marker = root / f"startup-{owner.target_pid}"
+                    deadline = time.monotonic() + 5
+                    while not marker.is_file() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(marker.is_file(), "Target lost its Python config")
+                    helper_pid = int(marker.read_text(encoding="utf-8"))
+                    self.assertEqual(os.getpgid(helper_pid), owner.target_pid)
+                    owner.shutdown(
+                        graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                    )
+                    self.assertTrue(_wait_for_pid_exit(helper_pid))
+                    self.assertEqual(list(root.glob("startup-*")), [marker])
+                finally:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0, terminate_timeout=3, kill_timeout=3
+                        )
+                    self._reap_startup_probe_children(root)
 
     def test_target_inherits_sanitized_supervisor_environment(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -2260,19 +2427,22 @@ finally:
     owner.terminate()
     owner.wait(timeout=5)
 """
-            harness = subprocess.Popen(
-                [
+            command = command_process.ProcessCommand(
+                "terminal SIGINT runtime harness",
+                (
                     sys.executable,
                     "-c",
-                    harness_script,
+                    _runtime_harness_source(harness_script),
                     str(identity),
                     str(harness_signal),
                     str(target_signal),
                     str(stop_file),
-                ],
-                start_new_session=True,
+                ),
+                Path(__file__).resolve().parents[1],
+                environment=dict(os.environ),
             )
-            try:
+            with _owned_harness(command) as harness_owner:
+                harness = harness_owner.process
                 deadline = time.monotonic() + 5
                 while not identity.is_file() and time.monotonic() < deadline:
                     time.sleep(0.02)
@@ -2291,10 +2461,6 @@ finally:
                 self.assertEqual(harness.wait(timeout=7), 0)
                 self.assertTrue(_wait_for_pid_exit(owner_pid))
                 self.assertTrue(_wait_for_pid_exit(target_pid))
-            finally:
-                if harness.poll() is None:
-                    harness.terminate()
-                    harness.wait(timeout=7)
 
     def test_target_launch_failure_proves_absence_and_removes_private_data(
         self,
@@ -2345,6 +2511,68 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     key,
                     process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS,
                 )
+
+    def test_removed_directory_retry_must_reap_its_existing_cleanup_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-removed-retry-") as directory:
+            private_directory = Path(directory) / "profile"
+            private_directory.mkdir()
+            guard = process_module._PrivateDirectory.capture(private_directory)
+            process = Mock(stdin=Mock(), stderr=None, returncode=0)
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            job = Mock()
+            failure = process_module.ProcessOwnershipError("Job still owns a child")
+            job.wait_empty.side_effect = [failure, failure, None]
+            active = process_module._ActivePrivateDirectoryCleanup(
+                guard=guard,
+                process=process,
+                windows_job=job,
+                windows_job_assigned=True,
+            )
+            process_module._register_pending_private_directory(guard)
+            process_module._register_active_private_directory_cleanup(active)
+            private_directory.rmdir()  # The old worker finished its filesystem work.
+            try:
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    process_module._release_reaped_private_directory_cleanup(
+                        active, deadline=time.monotonic() + 2
+                    )
+                with (
+                    patch.object(
+                        process_module, "_spawn_private_directory_cleanup"
+                    ) as spawn,
+                    self.assertRaises(process_module.ProcessOwnershipError) as raised,
+                ):
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIs(raised.exception, failure)
+                self.assertIs(
+                    process_module._active_private_directory_cleanup(guard), active
+                )
+                self.assertIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+                job.close.assert_not_called()
+                spawn.assert_not_called()
+
+                with patch.object(
+                    process_module, "_spawn_private_directory_cleanup"
+                ) as spawn:
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                self.assertNotIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+                self.assertEqual(job.wait_empty.call_count, 3)
+                job.close.assert_called_once_with()
+                self.assertEqual(process.wait.call_count, 2)
+                spawn.assert_not_called()
+            finally:
+                process_module._release_active_private_directory_cleanup(active)
+                process_module._release_pending_private_directory(guard)
 
     def test_parent_channel_eof_is_a_terminal_worker_signal(self) -> None:
         read_descriptor, write_descriptor = os.pipe()
@@ -2404,15 +2632,15 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         "_ownership_platform",
                         return_value="posix",
                     ),
-                    patch.object(subprocess, "Popen", return_value=process) as popen,
+                    _mock_popen(return_value=process) as popen,
                     self.assertRaises(process_module.ProcessOwnershipError) as raised,
                 ):
                     guard.remove(deadline=time.monotonic() + 2)
 
                 command = popen.call_args.args[0]
                 self.assertEqual(
-                    command[1],
-                    str(process_module._PRIVATE_CLEANUP_WORKER_PATH),
+                    command[1:4],
+                    ["-E", "-S", str(process_module._PRIVATE_CLEANUP_WORKER_PATH)],
                 )
                 self.assertNotIn("-m", command)
                 self.assertIn(
@@ -2455,7 +2683,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     "_supervisor_creation_options",
                     return_value={},
                 ),
-                patch.object(subprocess, "Popen", return_value=process),
+                _mock_popen(return_value=process),
                 patch.object(process_module._WindowsJob, "create", return_value=job),
                 self.assertRaisesRegex(OSError, "assignment failed"),
             ):
@@ -2590,7 +2818,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         "_ownership_platform",
                         return_value="posix",
                     ),
-                    patch.object(subprocess, "Popen", return_value=slow_process),
+                    _mock_popen(return_value=slow_process),
                     self.assertRaisesRegex(
                         process_module.ProcessOwnershipError,
                         "exceeded its work deadline during filesystem cleanup",
@@ -3578,7 +3806,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
                 ),
             ),
-            patch.object(subprocess, "Popen", side_effect=launch_supervisor),
+            _mock_popen(side_effect=launch_supervisor),
             patch.object(
                 process_module._WindowsJob,
                 "create",
@@ -3606,10 +3834,10 @@ class ProcessPolicyTests(unittest.TestCase):
         assert isinstance(command, list)
         self.assertEqual(command[0], r"C:\Python314\python.exe")
         self.assertEqual(
-            command[1:4],
-            ["-m", "hbrowser.gallery.browser._process_supervisor", ANY],
+            command[1:5],
+            ["-E", "-S", str(process_module._SUPERVISOR_PATH), ANY],
         )
-        self.assertEqual(command[4:], ["--", "browser"])
+        self.assertEqual(command[5:], ["--", "browser"])
         self.assertEqual(
             options["env"],
             {"__PYVENV_LAUNCHER__": (r"C:\workspace\.venv\Scripts\python.exe")},
@@ -3649,7 +3877,7 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(
                 process_module, "_supervisor_creation_options", return_value={}
             ),
-            patch.object(subprocess, "Popen", return_value=supervisor),
+            _mock_popen(return_value=supervisor),
             patch.object(process_module._WindowsJob, "create", return_value=job),
             patch.object(
                 process_module,
@@ -3690,7 +3918,7 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     process_module, "_supervisor_creation_options", return_value={}
                 ),
-                patch.object(subprocess, "Popen", return_value=supervisor),
+                _mock_popen(return_value=supervisor),
                 patch.object(atexit, "register"),
                 patch.object(
                     process_module,
@@ -3753,7 +3981,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     "_supervisor_creation_options",
                     return_value={},
                 ),
-                patch.object(subprocess, "Popen", return_value=supervisor),
+                _mock_popen(return_value=supervisor),
                 patch.object(atexit, "register"),
                 patch.object(
                     process_module,
@@ -3805,7 +4033,7 @@ class ProcessPolicyTests(unittest.TestCase):
                         "_supervisor_creation_options",
                         return_value={},
                     ),
-                    patch.object(subprocess, "Popen", return_value=supervisor),
+                    _mock_popen(return_value=supervisor),
                     patch.object(
                         process_module._WindowsJob,
                         "create",
@@ -4305,7 +4533,7 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     process_module, "_supervisor_creation_options", return_value={}
                 ),
-                patch.object(subprocess, "Popen", return_value=supervisor),
+                _mock_popen(return_value=supervisor),
                 patch.object(os, "kill"),
                 patch.object(atexit, "register"),
                 self.assertRaises(process_module.ProcessOwnershipError) as raised,
@@ -4347,7 +4575,7 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     process_module, "_supervisor_creation_options", return_value={}
                 ),
-                patch.object(subprocess, "Popen", return_value=supervisor),
+                _mock_popen(return_value=supervisor),
                 patch.object(
                     process_module,
                     "_read_supervisor_status",
@@ -4467,6 +4695,8 @@ class WindowsPrivateDirectoryIntegrationTests(unittest.TestCase):
             lock_ready = root / "message-db-lock-ready"
             lock_script = r"""
 import ctypes
+from collections.abc import Iterator
+from contextlib import contextmanager
 import pathlib
 import sys
 import time
@@ -4551,33 +4781,52 @@ class WindowsVenvOwnedProcessTests(unittest.TestCase):
                 timeout=60,
             )
             venv_python = venv_path / "Scripts" / "python.exe"
+            marker = Path(directory) / "startup-hook"
+            hook_root = Path(directory) / "python-startup"
+            hook_root.mkdir()
+            (hook_root / "sitecustomize.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
             harness = """
+import os
+import pathlib
 import sys
 
 from hbrowser.gallery.browser.process import start_owned_process
 
 assert sys.executable.lower() != sys._base_executable.lower()
+os.environ["PYTHONPATH"] = sys.argv[1]
 owner = start_owned_process(
     sys._base_executable,
-    ["-c", "import time; time.sleep(30)"],
+    ["-E", "-S", "-c", "import time; time.sleep(30)"],
 )
 assert owner.target_pid is not None
 owner.terminate()
 owner.wait(timeout=10)
+assert not pathlib.Path(sys.argv[2]).exists()
 """
-            result = subprocess.run(
-                [str(venv_python), "-c", harness],
-                cwd=Path(__file__).resolve().parents[1],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            with tempfile.TemporaryFile() as output:
+                command = command_process.ProcessCommand(
+                    "Windows venv runtime harness",
+                    (
+                        str(venv_python),
+                        "-c",
+                        _runtime_harness_source(harness),
+                        str(hook_root),
+                        str(marker),
+                    ),
+                    Path(__file__).resolve().parents[1],
+                    environment=dict(os.environ),
+                    stdout=output,
+                    stderr=output,
+                )
+                with _owned_harness(command) as owner:
+                    returncode = owner.process.wait(timeout=30)
+                output.seek(0)
+                diagnostic = output.read().decode("utf-8", errors="replace")
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
+        self.assertEqual(returncode, 0, diagnostic)
 
 
 if __name__ == "__main__":

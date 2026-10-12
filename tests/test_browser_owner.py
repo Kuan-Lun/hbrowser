@@ -3,7 +3,8 @@ import unittest
 from collections.abc import Awaitable, Callable
 from dataclasses import FrozenInstanceError, dataclass
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from typing import Any
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import (
@@ -17,6 +18,7 @@ from hbrowser.gallery.browser import (
 from hbrowser.gallery.browser import owner as owner_module
 from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
 from hbrowser.gallery.utils import deadline as deadline_module
+from hbrowser.gallery.utils.page_state import PageStateTimeout
 
 
 @dataclass(slots=True)
@@ -30,6 +32,162 @@ class _FakeBrowser:
 
 
 class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_navigation_of_existing_tab_retires_generation(self) -> None:
+        owner, browser, closer, _ = self._owner(
+            tab_navigator=AsyncMock(
+                side_effect=BrowserMutationOutcomeUnknownError("unknown")
+            )
+        )
+        await owner.start()
+        try:
+            with self.assertRaises(BrowserMutationOutcomeUnknownError):
+                await owner.main_tab.navigate("https://example.test/")
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(AsyncMock())
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_existing_tab_navigation_ack_without_readiness_retires_owner(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        methods: list[str] = []
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            methods.append(payload["method"])
+            match payload["method"]:
+                case "Page.getFrameTree":
+                    return SimpleNamespace(
+                        frame=SimpleNamespace(id_="main", loader_id="old")
+                    )
+                case "Page.setLifecycleEventsEnabled":
+                    return None
+                case "Page.navigate":
+                    return "main", "new", None, False
+                case _:
+                    raise AssertionError(payload)
+
+        tab = SimpleNamespace(
+            browser=browser,
+            target_id="main-target",
+            websocket=object(),
+            mapper={},
+            send=send,
+            add_handler=Mock(),
+            remove_handlers=Mock(),
+        )
+        closer = AsyncMock()
+        owner: BrowserOwner[SimpleNamespace, SimpleNamespace] = BrowserOwner(
+            browser_factory=AsyncMock(return_value=(browser, tab)),
+            browser_closer=closer,
+            target_id_getter=lambda item: item.target_id,
+        )
+        await owner.start()
+        try:
+            with (
+                patch.object(owner_module, "_TAB_NAVIGATION_DEADLINE_SECONDS", 0.02),
+                self.assertRaises(PageStateTimeout),
+            ):
+                await owner.main_tab.navigate("https://example.test/new")
+            self.assertIn("Page.navigate", methods)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            mutation = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(mutation)
+            mutation.assert_not_awaited()
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_unknown_tab_creation_retires_existing_transports(self) -> None:
+        owner, browser, closer, tab_factory = self._owner()
+        tab_factory.side_effect = BrowserMutationOutcomeUnknownError("unknown")
+        await owner.start()
+        try:
+            with self.assertRaises(BrowserMutationOutcomeUnknownError):
+                await owner.open_tab("new")
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            self.assertEqual(len(owner.tabs), 1)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(AsyncMock())
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_unknown_initial_navigation_retires_all_owned_transports(
+        self,
+    ) -> None:
+        failures = (
+            ZendriverOperationTimeout(timeout_seconds=1),
+            PageStateTimeout("target readiness not confirmed"),
+            BrowserMutationOutcomeUnknownError("navigation outcome unknown"),
+            asyncio.CancelledError(),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                navigator = AsyncMock(side_effect=failure)
+                owner, browser, closer, _ = self._owner(
+                    extra_tabs=[_FakeTab("new-target")], tab_navigator=navigator
+                )
+                await owner.start()
+                try:
+                    with self.assertRaises(type(failure)):
+                        await owner.open_tab("new", url="https://example.test/")
+                    self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                    mutation = AsyncMock()
+                    for transport in owner.tabs:
+                        with self.assertRaises(TabTransportUnavailableError):
+                            await transport.execute(mutation)
+                    mutation.assert_not_awaited()
+                    with self.assertRaises(BrowserOwnerStateError):
+                        await owner.open_tab("later")
+                    closer.assert_not_awaited()
+                finally:
+                    await owner.close()
+                closer.assert_awaited_once_with(browser, ANY)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_created_target_missing_from_inventory_retires_owner(self) -> None:
+        main = _FakeTab("main-target")
+        browser = SimpleNamespace(targets=[])
+        connection = SimpleNamespace(
+            _owner=browser,
+            websocket=object(),
+            mapper={},
+            add_handler=Mock(),
+            remove_handlers=Mock(),
+            send=AsyncMock(return_value="created-target"),
+        )
+        browser.connection = connection
+        closer = AsyncMock()
+        owner: BrowserOwner[SimpleNamespace, _FakeTab] = BrowserOwner(
+            browser_factory=AsyncMock(return_value=(browser, main)),
+            browser_closer=closer,
+            target_id_getter=lambda tab: tab.target_id,
+        )
+        await owner.start()
+        try:
+            with (
+                patch.object(owner_module, "_TAB_OPEN_DEADLINE_SECONDS", 0.02),
+                self.assertRaises(PageStateTimeout),
+            ):
+                await owner.open_tab("unconfirmed")
+            connection.send.assert_awaited_once()
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            mutation = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(mutation)
+            with self.assertRaises(BrowserOwnerStateError):
+                await owner.open_tab("unconfirmed")
+            mutation.assert_not_awaited()
+            self.assertEqual(len(owner.tabs), 1)
+        finally:
+            await owner.close()
+        closer.assert_awaited_once_with(browser, ANY)
+
     def _owner(
         self,
         *,
@@ -530,6 +688,9 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(TabBindingError, "already bound to role"):
             await owner.open_tab("isekai")
+        self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+        with self.assertRaises(TabTransportUnavailableError):
+            await owner.main_tab.execute(AsyncMock())
 
     async def test_failed_main_tab_binding_closes_launched_browser(self) -> None:
         main = _FakeTab("")

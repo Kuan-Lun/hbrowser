@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -120,6 +121,13 @@ class FlareSolverrSessionOwnershipError(FlareSolverrError):
         super().__init__("FlareSolverr session ownership remains unresolved")
 
 
+class FlareSolverrTransportOwnershipError(FlareSolverrError):
+    """The HTTP transport did not provide a completed cleanup receipt."""
+
+    def __init__(self) -> None:
+        super().__init__("FlareSolverr HTTP transport ownership remains unresolved")
+
+
 @dataclass(frozen=True)
 class FlareSolverrResult:
     """The reusable parts of a successful FlareSolverr response."""
@@ -148,7 +156,31 @@ class FlareSolverrResult:
 
     @staticmethod
     def _cookie_to_cdp_param(cookie: dict[str, Any]) -> cdp.network.CookieParam:
+        if not all(isinstance(cookie.get(key), str) for key in ("name", "value")):
+            raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        for key in ("domain", "path"):
+            value = cookie.get(key)
+            if value is not None and not isinstance(value, str):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        for key in ("secure", "httpOnly"):
+            value = cookie.get(key)
+            if value is not None and not isinstance(value, bool):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+        same_site = cookie.get("sameSite")
+        if same_site is not None and (
+            not isinstance(same_site, str) or same_site not in ("", *_SAME_SITE_MAP)
+        ):
+            raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
         expiry = cookie.get("expiry", cookie.get("expires"))
+        if expiry is not None:
+            if isinstance(expiry, bool) or not isinstance(expiry, int | float):
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
+            try:
+                finite_expiry = math.isfinite(expiry)
+            except OverflowError:
+                finite_expiry = False
+            if not finite_expiry:
+                raise FlareSolverrProtocolError("FlareSolverr returned invalid cookies")
         return cdp.network.CookieParam(
             name=cookie["name"],
             value=cookie["value"],
@@ -156,7 +188,7 @@ class FlareSolverrResult:
             path=cookie.get("path"),
             secure=cookie.get("secure"),
             http_only=cookie.get("httpOnly"),
-            same_site=_SAME_SITE_MAP.get(cookie.get("sameSite", "")),
+            same_site=_SAME_SITE_MAP.get(same_site or ""),
             expires=(
                 cdp.network.TimeSinceEpoch(expiry) if expiry and expiry > 0 else None
             ),
@@ -538,13 +570,19 @@ class FlareSolverrClient:
             )
         self.endpoint = str(parsed_endpoint)
         self._http: httpx.AsyncClient | None = None
+        self._closing = False
+        self._exit_active = False
+        self._transport_close_error: FlareSolverrTransportOwnershipError | None = None
         self._owned_session_ids: set[str] = set()
         self._uncertain_create_ids: set[str] = set()
         self._uncertain_destroy_ids: set[str] = set()
         self._uncertain_request_ids: set[str] = set()
 
     async def __aenter__(self) -> Self:
+        if self._http is not None or self._owned_session_ids:
+            raise RuntimeError("FlareSolverrClient still owns its previous lifecycle")
         self._http = httpx.AsyncClient()
+        self._closing = False
         return self
 
     async def __aexit__(
@@ -553,41 +591,63 @@ class FlareSolverrClient:
         exc_value: BaseException | None,
         traceback: Any,
     ) -> None:
+        if self._exit_active:
+            raise RuntimeError("FlareSolverrClient cleanup is already in progress")
+        self._exit_active = True
+        self._closing = True
+        try:
+            await self._close_lifecycle()
+        finally:
+            self._exit_active = False
+
+    async def _close_lifecycle(self) -> None:
+        if self._transport_close_error is not None:
+            # HTTPX sets its CLOSED state before awaiting pool cleanup. A second
+            # aclose may silently do nothing after interruption, so it cannot
+            # clear a prior uncertainty or release our retained reference.
+            raise self._transport_close_error
         if self._http is None:
             if self._owned_session_ids:
                 raise FlareSolverrSessionOwnershipError(min(self._owned_session_ids))
             return
 
-        client = self._http
         cleanup_error: BaseException | None = None
         cleanup_deadline = Deadline.after(_SESSION_LIFECYCLE_TIMEOUT_SECONDS)
+        session_deadline = cleanup_deadline.bounded(
+            max(0.0, cleanup_deadline.remaining() - _TRANSPORT_PHASE_TIMEOUT_SECONDS)
+        )
         for session_id in sorted(self._owned_session_ids):
             try:
-                await self._destroy_session_id(
-                    session_id,
-                    deadline=cleanup_deadline,
-                )
+                await self._destroy_session_id(session_id, deadline=session_deadline)
             except BaseException as error:
                 if cleanup_error is None:
                     cleanup_error = error
-        self._http = None
         try:
-            remaining = cleanup_deadline.remaining()
+            await self._close_transport(deadline=cleanup_deadline)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+
+    async def _close_transport(self, *, deadline: Deadline) -> None:
+        client = self._http
+        assert client is not None
+        try:
+            remaining = deadline.remaining()
             if remaining <= 0:
                 raise TimeoutError
             await asyncio.wait_for(
                 client.aclose(),
                 timeout=min(_TRANSPORT_PHASE_TIMEOUT_SECONDS, remaining),
             )
-            if cleanup_deadline.remaining() <= 0:
-                raise TimeoutError
-        except TimeoutError:
-            logger.warning(
-                "FlareSolverr HTTP transport close exceeded %.1f seconds",
-                _TRANSPORT_PHASE_TIMEOUT_SECONDS,
-            )
-        if cleanup_error is not None:
-            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+        except BaseException as error:
+            self._transport_close_error = FlareSolverrTransportOwnershipError()
+            logger.warning("FlareSolverr HTTP transport cleanup remains unresolved")
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise self._transport_close_error from None
+        self._http = None
 
     def session(
         self,
@@ -615,6 +675,8 @@ class FlareSolverrClient:
         deadline: Deadline | None = None,
     ) -> FlareSolverrSession:
         """Start one persistent FlareSolverr browser."""
+        if self._closing:
+            raise RuntimeError("FlareSolverrClient is closing or closed")
         if self._http is None:
             raise RuntimeError("FlareSolverrClient must be used as an async context")
         parent_deadline = (
@@ -862,6 +924,8 @@ class FlareSolverrClient:
         turnstile_tabs: int | None = None,
         deadline: Deadline | None = None,
     ) -> FlareSolverrResult:
+        if self._closing:
+            raise RuntimeError("FlareSolverrClient is closing or closed")
         if session_id in self._uncertain_destroy_ids:
             raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_request_ids:
@@ -933,6 +997,8 @@ class FlareSolverrClient:
             user_agent=user_agent,
             turnstile_token=token if isinstance(token, str) and token else None,
         )
+        # Reject malformed external identity data before publishing a usable solve.
+        result.to_cdp_cloudflare_cookie_params()
         _require_flaresolverr_deadline(operation_deadline)
         self._uncertain_request_ids.discard(session_id)
         return result

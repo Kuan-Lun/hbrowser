@@ -39,7 +39,7 @@ from ..exceptions import (
     SearchRateLimitError,
 )
 from .browser.ban_handler import check_ban_status
-from .browser.mapper import prune_zendriver_connection_mapper
+from .browser.process import ProcessOwnershipError
 from .driver_base import Driver
 from .models import Tag
 from .punchin_models import PunchInComplete, PunchInResult, RandomEncounterFound
@@ -79,6 +79,50 @@ _SEARCH_DOCUMENT_READY_STATES = frozenset({"interactive", "complete"})
 def _require_active_deadline(deadline: Deadline | None, description: str) -> None:
     if deadline is not None and deadline.remaining() <= 0:
         raise TimeoutError(f"{description} completed after its deadline")
+
+
+async def _wait_for_archive_document(page: Any, *, deadline: Deadline) -> None:
+    """Require the popup's real document before an optional-link absence read."""
+
+    try:
+        while not deadline.expired:
+            try:
+                snapshot = await wait_for_zendriver(
+                    page.evaluate(
+                        "({url: window.location.href, readyState: document.readyState})"
+                    ),
+                    timeout=min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining()),
+                    owner=page,
+                )
+            except ProtocolException as error:
+                if not _is_transient_context_error(error):
+                    raise
+                await asyncio.sleep(min(0.1, deadline.remaining()))
+                continue
+            _require_active_deadline(deadline, "Archive popup document read")
+            if not isinstance(snapshot, dict):
+                raise ValueError("Archive popup returned an invalid document snapshot")
+            url = snapshot.get("url")
+            ready_state = snapshot.get("readyState")
+            if not isinstance(url, str) or not isinstance(ready_state, str):
+                raise ValueError("Archive popup document fields are invalid")
+            if urlsplit(url).scheme in {"http", "https"} and ready_state in {
+                "interactive",
+                "complete",
+            }:
+                return
+            await asyncio.sleep(min(0.1, deadline.remaining()))
+        raise TimeoutError("Archive popup document did not become ready")
+    except BaseException as error:
+        _begin_zendriver_retirement(page)
+        if isinstance(error, asyncio.CancelledError) or is_browser_generation_error(
+            error
+        ):
+            raise
+        raise ArchiveDownloadOutcomeUnknownError(
+            "Archive download outcome is unknown because its popup document "
+            "did not become ready; refusing replay"
+        ) from None
 
 
 async def _wait_for_archive_mutation[ResultT](
@@ -281,6 +325,16 @@ def _looks_like_random_encounter_url(href: str) -> bool:
 def _parse_punch_in_result(html_content: str) -> PunchInResult:
     """Classify the random-encounter state of one check-in document."""
     soup = BeautifulSoup(html_content, "html.parser")
+    # Absence of an encounter is meaningful only in a recognizable news page.
+    # Challenge, login, error and partial documents must never imply completion.
+    title = soup.title.get_text().strip() if soup.title is not None else ""
+    if (
+        not title.startswith("E-Hentai Galleries")
+        or len(soup.select("#newsouter #newsinner")) != 1
+        or soup.select_one('#nb a[href="https://e-hentai.org/news.php"]') is None
+        or soup.select_one("#newsinner #nt") is None
+    ):
+        raise RuntimeError("Daily check-in did not return a recognized news document")
     event_panes = soup.select("#eventpane")
     if not event_panes:
         return PunchInComplete()
@@ -568,6 +622,14 @@ class EHDriver(Driver):
             raise RuntimeError(
                 "Daily check-in document changed after lifecycle confirmation"
             )
+        if snapshot.url != "https://e-hentai.org/news.php":
+            raise RuntimeError("Daily check-in document has an untrusted URL")
+        if (
+            check_ban_status(snapshot.html).should_wait
+            or self._is_challenge_page(snapshot)
+            or self._is_authentication_page(snapshot)
+        ):
+            raise RuntimeError("Daily check-in document is blocked or unauthenticated")
         return snapshot.html
 
     async def _read_raw_page_snapshot(
@@ -733,6 +795,8 @@ class EHDriver(Driver):
         )
         try:
             diagnostic_path = await self._save_search_diagnostic(snapshot.html)
+        except ProcessOwnershipError:
+            raise
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
@@ -785,7 +849,7 @@ class EHDriver(Driver):
         )
 
     @staticmethod
-    def _is_challenge_page(snapshot: _SearchPageSnapshot) -> bool:
+    def _is_challenge_page(snapshot: _SearchPageSnapshot | _RawPageSnapshot) -> bool:
         title = snapshot.title.casefold()
         html = snapshot.html.casefold()
         return (
@@ -802,7 +866,9 @@ class EHDriver(Driver):
         )
 
     @staticmethod
-    def _is_authentication_page(snapshot: _SearchPageSnapshot) -> bool:
+    def _is_authentication_page(
+        snapshot: _SearchPageSnapshot | _RawPageSnapshot,
+    ) -> bool:
         try:
             hostname = urlsplit(snapshot.url).hostname
         except ValueError:
@@ -1356,7 +1422,6 @@ class EHDriver(Driver):
         return await self._download(gallery, deadline=control_deadline)
 
     async def _download(self, gallery: GalleryURLParser, *, deadline: Deadline) -> bool:
-        prune_zendriver_connection_mapper(self.page)
 
         await self.get(gallery.url, deadline=deadline)
         try:
@@ -1450,6 +1515,7 @@ class EHDriver(Driver):
             ) from None
 
         if not new_tab:
+            _begin_zendriver_retirement(gallery_tab)
             self.logger.warning(
                 "Archive download tab did not appear after click; not replaying: "
                 "gid=%d",
@@ -1463,6 +1529,7 @@ class EHDriver(Driver):
         self.page = new_tab
         deferred_operation_error: BaseException | None = None
         terminal_cleanup_error: BaseException | None = None
+        outcome_unknown = False
         try:
             await _wait_for_archive_mutation(
                 new_tab.activate(),
@@ -1473,8 +1540,10 @@ class EHDriver(Driver):
                     "refusing further browser mutations"
                 ),
             )
-            # "Original" is optional. One immediate bounded query is evidence;
-            # waiting ten seconds for absence would only stack a semantic phase.
+            # Target inventory and activation do not prove the popup has loaded.
+            # Keep document readiness under the existing click/popup deadline.
+            await _wait_for_archive_document(new_tab, deadline=popup_deadline)
+            # "Original" is optional only after the real document is ready.
             original_links = await wait_for_zendriver(
                 self.page.xpath("//a[contains(text(), 'Original')]", timeout=0.05),
                 timeout=_PAGE_READ_TIMEOUT_SECONDS,
@@ -1562,12 +1631,12 @@ class EHDriver(Driver):
             # Closing or activating another tab would compound that uncertainty.
             raise
         except asyncio.CancelledError:
-            # wait_for_zendriver tombstones a generation when its caller abandons
-            # live work. Never issue cleanup commands on that generation.
+            # Cancellation may happen between protocol calls, including the
+            # status-poll sleep. The archive operation is still unresolved.
+            _begin_zendriver_retirement(new_tab)
             raise
-        except BaseException as operation_error:
-            if is_browser_generation_error(operation_error):
-                raise
+        except (ClientOfflineException, InsufficientFundsException) as operation_error:
+            # These explicit server responses prove that no archive was queued.
             try:
                 await self._close_archive_tab_and_restore(gallery_tab, new_tab)
             except BaseException as cleanup_error:
@@ -1589,9 +1658,24 @@ class EHDriver(Driver):
                     deferred_operation_error = operation_error
             else:
                 deferred_operation_error = operation_error
+        except BaseException as operation_error:
+            _begin_zendriver_retirement(new_tab)
+            if (
+                isinstance(operation_error, ProcessOwnershipError)
+                or is_browser_generation_error(operation_error)
+                or not isinstance(operation_error, Exception)
+            ):
+                raise
+            outcome_unknown = True
         else:
             await self._close_archive_tab_and_restore(gallery_tab, new_tab)
 
+        if outcome_unknown:
+            # Leave the exception handler before raising, so sensitive CDP
+            # payloads cannot escape through implicit exception context.
+            raise ArchiveDownloadOutcomeUnknownError(
+                "Archive download outcome is unknown after click; refusing replay"
+            ) from None
         if terminal_cleanup_error is not None:
             raise terminal_cleanup_error from None
         if deferred_operation_error is not None:

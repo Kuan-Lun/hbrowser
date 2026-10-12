@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
 import shutil
 import socket
 import tempfile
@@ -12,12 +13,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from zendriver import cdp
 
 from ..utils import (
     Deadline,
     is_browser_generation_error,
     navigate_and_wait,
     wait_for_selector,
+    wait_for_zendriver,
 )
 from .process import ProcessOwnershipError
 
@@ -101,26 +104,17 @@ def _create_proxy_extension(
     Returns:
         只屬於本次瀏覽器 generation 的擴充功能目錄
     """
-    manifest_json = """
-{
-    "version": "1.0.0",
-    "manifest_version": 2,
-    "name": "Chrome Proxy",
-    "permissions": [
-        "proxy",
-        "tabs",
-        "unlimitedStorage",
-        "storage",
-        "<all_urls>",
-        "webRequest",
-        "webRequestBlocking"
-    ],
-    "background": {
-        "scripts": ["background.js"]
-    },
-    "minimum_chrome_version":"22.0.0"
-}
-"""
+    manifest_json = json.dumps(
+        {
+            "version": "1.0.0",
+            "manifest_version": 3,
+            "name": "HBrowser Proxy",
+            "permissions": ["proxy", "webRequest", "webRequestAuthProvider"],
+            "host_permissions": ["<all_urls>"],
+            "background": {"service_worker": "background.js"},
+        }
+    )
+    verification_token = secrets.token_hex(32)
 
     proxy_host_literal = json.dumps(proxy_host)
     proxy_user_literal = json.dumps(proxy_user)
@@ -138,22 +132,56 @@ var config = {{
         }}
       }};
 
-chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
-
-function callbackFn(details) {{
-    return {{
+function callbackFn(details, callback) {{
+    const challenger = details.challenger;
+    if (details.isProxy !== true || !challenger ||
+        typeof challenger.host !== "string" ||
+        challenger.host.toLowerCase() !== {proxy_host_literal}.toLowerCase() ||
+        challenger.port !== {proxy_port}) {{
+        callback({{}});
+        return;
+    }}
+    callback({{
         authCredentials: {{
             username: {proxy_user_literal},
             password: {proxy_pass_literal}
         }}
-    }};
+    }});
 }}
 
 chrome.webRequest.onAuthRequired.addListener(
             callbackFn,
             {{urls: ["<all_urls>"]}},
-            ['blocking']
+            ['asyncBlocking']
 );
+const configurationApplied = new Promise(resolve => {{
+    chrome.proxy.settings.set({{value: config, scope: "regular"}}, () => {{
+        resolve(!chrome.runtime.lastError);
+    }});
+}});
+// A private generation nonce prevents accepting another extension's receipt.
+// Re-read Chrome's effective setting; successful set() alone is insufficient.
+globalThis.hbrowserProxyReady = async token => {{
+    if (token !== {json.dumps(verification_token)} ||
+        !(await configurationApplied) ||
+        !chrome.webRequest.onAuthRequired.hasListener(callbackFn)) {{
+        return false;
+    }}
+    return new Promise(resolve => chrome.proxy.settings.get(
+        {{incognito: false}}, details => {{
+            const value = details && details.value;
+            const rules = value && value.rules;
+            const server = rules && rules.singleProxy;
+            resolve(!chrome.runtime.lastError &&
+                details.levelOfControl === "controlled_by_this_extension" &&
+                value.mode === "fixed_servers" && !!server &&
+                server.scheme === "http" &&
+                server.host.toLowerCase() === {proxy_host_literal}.toLowerCase() &&
+                server.port === {proxy_port} &&
+                JSON.stringify(rules.bypassList) === JSON.stringify(["localhost"]));
+        }}
+    ));
+}};
 """
 
     # 創建臨時目錄
@@ -165,6 +193,9 @@ chrome.webRequest.onAuthRequired.addListener(
 
         background_path = plugin_dir / "background.js"
         background_path.write_text(background_js, encoding="utf-8")
+        (plugin_dir / "verification-token").write_text(
+            verification_token, encoding="ascii"
+        )
         return str(plugin_dir)
     except BaseException as creation_error:
         try:
@@ -187,12 +218,10 @@ def configure_proxy() -> str | None:
     Returns:
         proxy extension 路徑，或 None
     """
-    rp_username = os.getenv("RP_USERNAME")
-    rp_password = os.getenv("RP_PASSWORD")
-    rp_dns = os.getenv("RP_DNS")
-
-    if not (rp_username and rp_password and rp_dns):
+    credentials = _residential_proxy_credentials()
+    if credentials is None:
         return None
+    rp_username, rp_password, rp_dns = credentials
 
     if ":" in rp_dns:
         proxy_host, proxy_port = rp_dns.split(":", 1)
@@ -219,9 +248,24 @@ def configure_proxy() -> str | None:
     return proxy_extension
 
 
+def _residential_proxy_credentials() -> tuple[str, str, str] | None:
+    """Treat an entirely empty configuration as disabled; reject partial input."""
+
+    username = os.getenv("RP_USERNAME")
+    password = os.getenv("RP_PASSWORD")
+    endpoint = os.getenv("RP_DNS")
+    if not any((username, password, endpoint)):
+        return None
+    if not username or not password or not endpoint:
+        raise ValueError(
+            "RP_USERNAME, RP_PASSWORD and RP_DNS must be provided together"
+        )
+    return username, password, endpoint
+
+
 def has_residential_proxy() -> bool:
-    """檢查是否有設定住宅代理環境變數。"""
-    return all(os.getenv(k) for k in ("RP_USERNAME", "RP_PASSWORD", "RP_DNS"))
+    """Return whether complete credentials are configured, rejecting partial input."""
+    return _residential_proxy_credentials() is not None
 
 
 def find_available_port(start: int = 9150) -> int:
@@ -234,6 +278,59 @@ def find_available_port(start: int = 9150) -> int:
             except OSError:
                 continue
     raise RuntimeError(f"No available port found in range {start}-{start + 99}")
+
+
+async def verify_residential_proxy(
+    browser: Any,
+    extension_directory: str,
+    *,
+    deadline: Deadline,
+) -> None:
+    """Verify the private extension and Chrome's effective proxy without navigation."""
+
+    token = (Path(extension_directory) / "verification-token").read_text(
+        encoding="ascii"
+    )
+    if len(token) != 64 or any(
+        character not in "0123456789abcdef" for character in token
+    ):
+        raise ProxyVerificationError(
+            "Residential proxy verification identity is invalid"
+        )
+    verification_deadline = deadline.bounded(_PROXY_PAGE_DEADLINE_SECONDS)
+    expression = (
+        "typeof globalThis.hbrowserProxyReady === 'function' && "
+        f"globalThis.hbrowserProxyReady({json.dumps(token)})"
+    )
+    while not verification_deadline.expired:
+        for target in tuple(browser.targets):
+            if target.type_ != "service_worker" or not target.url.startswith(
+                "chrome-extension://"
+            ):
+                continue
+            _require_proxy_deadline(verification_deadline, "extension verification")
+            result, error = await wait_for_zendriver(
+                target.send(
+                    cdp.runtime.evaluate(
+                        expression,
+                        await_promise=True,
+                        return_by_value=True,
+                    )
+                ),
+                timeout=min(5.0, verification_deadline.remaining()),
+                owner=target,
+            )
+            _require_proxy_deadline(verification_deadline, "extension receipt")
+            if error is not None:
+                raise ProxyVerificationError(
+                    "Residential proxy extension failed verification"
+                )
+            if result.value is True:
+                return
+        await asyncio.sleep(min(0.1, verification_deadline.remaining()))
+    raise ProxyVerificationError(
+        "Residential proxy extension did not establish its configuration"
+    )
 
 
 async def verify_proxy_ip(

@@ -29,11 +29,8 @@ from ..utils.protocol import (
     _ZendriverQuiescenceChanged,
     _ZendriverRetirement,
 )
+from ._task_settlement import wait_owned_task_completion
 from .chrome_manager import ChromePaths, create_chrome_install_staging_root
-from .mapper import (
-    start_zendriver_mapper_janitor,
-    stop_zendriver_mapper_janitor,
-)
 from .process import (
     OwnedProcess,
     ProcessOwnershipError,
@@ -44,8 +41,8 @@ from .process import (
 from .proxy import (
     configure_proxy,
     find_available_port,
-    has_residential_proxy,
     verify_proxy_ip,
+    verify_residential_proxy,
 )
 from .tor import (
     TOR_SOCKS_PORT,
@@ -68,7 +65,6 @@ _PROCESS_OWNERSHIP_START_TIMEOUT_SECONDS = 10.0
 _CONNECTION_CLOSE_TIMEOUT_SECONDS = 5.0
 _CONNECTION_LISTENER_STOP_TIMEOUT_SECONDS = 2.0
 _STOP_TASK_CANCEL_TIMEOUT_SECONDS = 2.0
-_JANITOR_STOP_TIMEOUT_SECONDS = 2.0
 _BROWSER_PROCESS_NATURAL_EXIT_SECONDS = 3.0
 _BROWSER_PROCESS_TERMINATE_WAIT_SECONDS = 3.0
 _BROWSER_PROCESS_KILL_WAIT_SECONDS = 3.0
@@ -405,9 +401,13 @@ async def _post_create_setup(
     page: zd.Tab,
     use_tor: bool,
     *,
+    proxy_extension: str | None = None,
     deadline: Deadline,
 ) -> None:
     from zendriver import cdp
+
+    if proxy_extension is not None:
+        await verify_residential_proxy(browser, proxy_extension, deadline=deadline)
 
     command_timeout = min(
         _PAGE_SETUP_MUTATION_TIMEOUT_SECONDS,
@@ -422,7 +422,7 @@ async def _post_create_setup(
         operation="Browser geolocation reset",
     )
 
-    if use_tor and not has_residential_proxy():
+    if use_tor or proxy_extension is not None:
         await verify_proxy_ip(browser, page, deadline=deadline)
 
 
@@ -532,21 +532,19 @@ async def _settle_owned_startup_task[T](
 ) -> tuple[T, asyncio.CancelledError | None]:
     """Keep awaiting startup after cancellation so its resource is recoverable."""
 
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            if task.done() and (current_task is None or current_task.cancelling() == 0):
-                break
-            if current_task is None or current_task.cancelling() == 0:
-                raise
-            if caller_cancellation is None:
-                caller_cancellation = error
+    caller_cancellation = await wait_owned_task_completion(task, caller_cancellation)
     try:
         result = task.result()
     except BaseException as startup_error:
         if caller_cancellation is not None:
+            if isinstance(startup_error, ProcessOwnershipError):
+                # Cancellation is not an empty-tree receipt. Callers use this
+                # ownership failure to retain resources still held by Chrome
+                # or its startup worker, even if no owner was returned yet.
+                startup_error.add_note(
+                    "Caller cancellation also occurred during owned startup"
+                )
+                raise
             caller_cancellation.add_note(
                 f"Cancelled startup also failed: {type(startup_error).__name__}"
             )
@@ -600,30 +598,6 @@ async def _await_browser_start(
             "Browser cold-start lifecycle completed after its shared deadline"
         )
     return task.result()
-
-
-async def _terminate_owned_tor_after_cancellation(
-    tor_process: Any,
-    cancellation: asyncio.CancelledError,
-    *,
-    deadline: Deadline,
-) -> None:
-    cleanup_task = asyncio.create_task(
-        asyncio.to_thread(
-            terminate_tor_process,
-            tor_process,
-            deadline=deadline,
-        )
-    )
-    try:
-        _, settled_cancellation = await _settle_owned_startup_task(
-            cleanup_task,
-            cancellation,
-        )
-    except asyncio.CancelledError:
-        raise
-    assert settled_cancellation is not None
-    raise settled_cancellation
 
 
 async def _cleanup_browser_after_startup_failure(
@@ -1044,33 +1018,32 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         browser_startup_deadline.expires_at - _BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS
     )
 
-    use_tor = should_use_tor()
     tor_process: OwnedProcess | None = None
     socks_port: int | None = None
     proxy_extension: str | None = None
     profile_directory: str | None = None
     private_paths_are_owned = False
-    if use_tor:
-        socks_port = find_available_port(TOR_SOCKS_PORT)
-        tor_start_task = asyncio.create_task(
-            asyncio.to_thread(
-                start_tor_with_retry,
-                socks_port,
-                deadline=browser_startup_work_deadline,
-            )
-        )
-        tor_process, tor_start_cancellation = await _settle_owned_startup_task(
-            tor_start_task
-        )
-        if tor_start_cancellation is not None:
-            await _terminate_owned_tor_after_cancellation(
-                tor_process,
-                tor_start_cancellation,
-                deadline=browser_startup_deadline,
-            )
-
     try:
+        # Select the effective route before admitting any external process.
+        # The residential extension already has priority in _build_config;
+        # its validation and actual materialization are this decision's input.
         proxy_extension = configure_proxy()
+        use_tor = proxy_extension is None and should_use_tor()
+        if use_tor:
+            socks_port = find_available_port(TOR_SOCKS_PORT)
+            tor_start_task = asyncio.create_task(
+                asyncio.to_thread(
+                    start_tor_with_retry,
+                    socks_port,
+                    deadline=browser_startup_work_deadline,
+                )
+            )
+            tor_process, tor_start_cancellation = await _settle_owned_startup_task(
+                tor_start_task
+            )
+            if tor_start_cancellation is not None:
+                raise tor_start_cancellation
+
         if proxy_extension is not None:
             connection = "residential proxy"
         elif use_tor:
@@ -1094,22 +1067,28 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         )
 
         logger.debug("Initializing browser")
-        browser = await _construct_owned_browser_async(
-            config,
-            cleanup_paths=tuple(
-                path
-                for path in (profile_directory, proxy_extension)
-                if path is not None
-            ),
-            startup_deadline=browser_startup_work_deadline,
-        )
+        try:
+            browser = await _construct_owned_browser_async(
+                config,
+                cleanup_paths=tuple(
+                    path
+                    for path in (profile_directory, proxy_extension)
+                    if path is not None
+                ),
+                startup_deadline=browser_startup_work_deadline,
+            )
+        except ProcessOwnershipError:
+            # Only Chrome construction receives these paths. Its unresolved
+            # owner retains them for safe cleanup; an installer failure has
+            # no authority over this independent private generation material.
+            private_paths_are_owned = True
+            raise
         private_paths_are_owned = True
         _require_browser_process_owner(browser)
     except BaseException as construction_error:
         private_paths = (
             ()
             if private_paths_are_owned
-            or isinstance(construction_error, ProcessOwnershipError)
             else tuple(
                 path
                 for path in (profile_directory, proxy_extension)
@@ -1156,7 +1135,11 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             )
             raise ownership_error from tor_cleanup_error
         if cleanup_cancellation is not None:
-            raise cleanup_cancellation
+            if not isinstance(construction_error, ProcessOwnershipError):
+                raise cleanup_cancellation
+            construction_error.add_note(
+                "Caller cancellation also occurred during independent startup cleanup"
+            )
         raise construction_error.with_traceback(construction_error.__traceback__)
 
     _attach_tor_process(browser, tor_process)
@@ -1190,9 +1173,9 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             browser,
             page,
             use_tor,
+            proxy_extension=proxy_extension,
             deadline=browser_attach_deadline,
         )
-        start_zendriver_mapper_janitor(browser)
         logger.info("Browser ready (%s, %s)", mode, connection)
     except BaseException as startup_error:
         await _cleanup_browser_after_startup_failure(
@@ -1462,25 +1445,6 @@ def _raise_browser_shutdown_errors(
         f"Primary shutdown failure: {type(primary).__name__}: {primary}"
     )
     raise ownership_error from primary
-
-
-async def _stop_mapper_janitor(
-    browser: Any,
-    retirement: _ZendriverRetirement,
-    *,
-    deadline: Deadline,
-) -> list[BaseException]:
-    if retirement.janitor_cleanup_is_complete():
-        return []
-    completed, errors = await _bounded_shutdown_awaitable(
-        stop_zendriver_mapper_janitor(browser),
-        timeout=_JANITOR_STOP_TIMEOUT_SECONDS,
-        description="Zendriver mapper janitor stop",
-        deadline=deadline,
-    )
-    if completed and not errors:
-        retirement.mark_janitor_cleanup_complete()
-    return errors
 
 
 async def _await_browser_stop_task(
@@ -1789,7 +1753,6 @@ def _mark_shutdown_complete_if_ready(
         retirement.protocol_is_retired()
         and retirement.browser_cleanup_is_complete()
         and retirement.tor_cleanup_is_complete()
-        and retirement.janitor_cleanup_is_complete()
     ):
         _release_browser_atexit(browser)
         retirement.mark_complete()
@@ -1805,11 +1768,7 @@ async def _stop_browser_cleanup(
 ) -> None:
     """Run the first bounded shutdown attempt for one browser generation."""
 
-    errors = await _stop_mapper_janitor(
-        browser,
-        retirement,
-        deadline=deadline,
-    )
+    errors: list[BaseException] = []
     initial_browser_errors = await _ensure_browser_cleanup(
         browser,
         retirement,
@@ -1871,11 +1830,7 @@ async def _retry_browser_retirement(
     """Retry incomplete resource cleanup without reviving the generation."""
 
     retirement.capture_connections(connections)
-    errors = await _stop_mapper_janitor(
-        browser,
-        retirement,
-        deadline=deadline,
-    )
+    errors: list[BaseException] = []
     errors.extend(
         await _retire_protocol_operations(
             browser,
@@ -1920,8 +1875,9 @@ async def _await_cleanup_deferring_caller_cancellation(
                 "atexit ownership remains registered"
             )
             if caller_cancellation is not None:
-                caller_cancellation.add_note(str(timeout_error))
-                raise caller_cancellation
+                timeout_error.add_note(
+                    "Caller cancellation also occurred during browser shutdown"
+                )
             raise timeout_error
         try:
             await asyncio.wait((cleanup_task,), timeout=remaining)
@@ -1936,6 +1892,11 @@ async def _await_cleanup_deferring_caller_cancellation(
         try:
             cleanup_task.result()
         except BaseException as cleanup_error:
+            if isinstance(cleanup_error, ProcessOwnershipError):
+                cleanup_error.add_note(
+                    "Caller cancellation also occurred during browser shutdown"
+                )
+                raise
             caller_cancellation.add_note(
                 "Browser cleanup also failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
@@ -2023,7 +1984,7 @@ async def _stop_browser(
         retirement.replace_completed_shutdown_task(cleanup_task)
     await _await_cleanup_deferring_caller_cancellation(
         cleanup_task,
-        shutdown_deadline,
+        Deadline(min(proposed_deadline.expires_at, shutdown_deadline.expires_at)),
     )
 
 

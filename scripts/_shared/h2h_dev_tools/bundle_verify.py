@@ -14,23 +14,42 @@ from typing import TypedDict, cast
 
 BUNDLE_DIRECTORY = Path("scripts/_shared/h2h_dev_tools")
 MANIFEST_NAME = "manifest.json"
-BASE_FILES = frozenset({"__init__.py", "bundle_verify.py"})
+BASE_FILES = frozenset({"__init__.py", "bundle_verify.py", "source_loader.py"})
+_MERGE_REVIEW_FILES = frozenset(
+    {
+        "code_review.py",
+        "process.py",
+        "_process_scope.py",
+        "change_scope.py",
+        "review-merge-candidate.sh",
+        "merge_command.py",
+        "git-flow-merge.sh",
+        "primary-branch.sh",
+    }
+)
 COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
+    "code-review": _MERGE_REVIEW_FILES,
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),
     "version-policy": frozenset({"dependency_manifest.py", "version_policy.py"}),
     "publish-version": frozenset({"publish_version.py"}),
-    "process": frozenset({"process.py"}),
+    "process": frozenset({"process.py", "_process_scope.py"}),
+    "pytest": frozenset({"pytest_source.py"}),
     "distribution-check": frozenset({"distribution_check.py"}),
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),
     "primary-branch": frozenset({"primary-branch.sh"}),
-    "git-flow": frozenset({"primary-branch.sh", "git-flow-merge.sh"}),
-    "hooks": frozenset({"primary-branch.sh", "install-git-hooks.sh"}),
-    "environment": frozenset({"rebuild-env.sh"}),
+    "git-flow": _MERGE_REVIEW_FILES,
+    "git-environment": frozenset({"git_environment.py"}),
+    "hooks": frozenset(
+        {"primary-branch.sh", "install-git-hooks.sh", "commit-message.sh"}
+    ),
+    "environment": frozenset(
+        {"rebuild-env.sh", "resolve-sources.sh", "environment.py"}
+    ),
 }
 
 
@@ -149,8 +168,8 @@ def _read_manifest(path: Path) -> BundleManifest:
     return validate_manifest(document)
 
 
-def validate_manifest(document: object) -> BundleManifest:
-    """Accept only the complete schema and safe, explicitly owned filenames."""
+def _manifest_fields(document: object) -> BundleManifest:
+    """Validate schema data without granting ownership to its declared filenames."""
     if not isinstance(document, dict) or set(document) != {
         "schema_version",
         "components",
@@ -167,11 +186,16 @@ def validate_manifest(document: object) -> BundleManifest:
     version = document["toolkit_version"]
     if not isinstance(version, str) or _VERSION.fullmatch(version) is None:
         raise BundleError("Bundle toolkit version must be X.Y.Z")
-    files = document["files"]
-    if not isinstance(files, dict) or set(files) != component_files(
-        document["components"]
+    components = document["components"]
+    if (
+        not isinstance(components, list)
+        or not all(isinstance(name, str) for name in components)
+        or components != sorted(set(components))
     ):
-        raise BundleError("Bundle manifest must declare the complete source file set")
+        raise BundleError("Bundle components must be unique, sorted names")
+    files = document["files"]
+    if not isinstance(files, dict) or not all(isinstance(name, str) for name in files):
+        raise BundleError("Bundle source files must be a filename mapping")
     if not all(
         isinstance(value, str) and _SHA256.fullmatch(value) for value in files.values()
     ):
@@ -179,6 +203,14 @@ def validate_manifest(document: object) -> BundleManifest:
     if document["payload_sha256"] != payload_digest(files):
         raise BundleError("Bundle payload fingerprint does not match its file manifest")
     return cast(BundleManifest, document)
+
+
+def validate_manifest(document: object) -> BundleManifest:
+    """Accept only the current component graph's complete source file set."""
+    manifest = _manifest_fields(document)
+    if set(manifest["files"]) != component_files(manifest["components"]):
+        raise BundleError("Bundle manifest must declare the complete source file set")
+    return manifest
 
 
 def cache_files(directory: Path, files: frozenset[str]) -> tuple[Path, ...]:

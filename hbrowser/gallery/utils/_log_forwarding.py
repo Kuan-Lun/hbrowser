@@ -250,11 +250,12 @@ class ForwardingHandler(logging.Handler):
         endpoint: str,
         token: str,
         *,
-        failure_callback: FailureCallback,
+        failure_callback: FailureCallback | None = None,
+        _failure_recorder: FailureCallback | None = None,
     ) -> None:
-        super().__init__(logging.DEBUG)
         self._token = _validate_token(token)
         self._failure_callback = failure_callback
+        self._failure_recorder = _failure_recorder
         self._endpoint = _parse_endpoint(endpoint)
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=_MAX_QUEUED_RECORDS)
         self._stop_requested = threading.Event()
@@ -264,13 +265,26 @@ class ForwardingHandler(logging.Handler):
         self._failure_reported = False
         self._socket: socket.socket | None = None
         self._enabled = True
-        self._worker = threading.Thread(
-            target=self._run,
-            name="hbrowser-log-forwarding-send",
-            daemon=True,
-        )
-        self._worker_survived_fork = True
-        self._worker.start()
+        self._worker_survived_fork = False
+        # Handler.__init__ publishes a weak reference to logging.shutdown.
+        # Validate and establish all close state before that publication; a
+        # retained constructor traceback must never expose a partial handler.
+        super().__init__(logging.DEBUG)
+        try:
+            self._worker = threading.Thread(
+                target=self._run,
+                name="hbrowser-log-forwarding-send",
+                daemon=True,
+            )
+            self._worker.start()
+            self._worker_survived_fork = True
+        except Exception:
+            self._worker_survived_fork = False
+            self._enabled = False
+            self._stop_requested.set()
+            self._stopped.set()
+            logging.Handler.close(self)
+            raise
 
     @staticmethod
     def _receive_ready(connection: socket.socket) -> None:
@@ -362,9 +376,17 @@ class ForwardingHandler(logging.Handler):
                 return
             self._failure_reported = True
 
+        # The composition's private recorder only latches in-memory health;
+        # it must not depend on starting another thread under resource pressure.
+        if self._failure_recorder is not None:
+            self._failure_recorder(stage, error)
+        callback = self._failure_callback
+        if callback is None:
+            return
+
         def report() -> None:
             try:
-                self._failure_callback(stage, error)
+                callback(stage, error)
             except Exception:
                 pass
 
@@ -498,10 +520,12 @@ class LogForwardingReceiver:
         self,
         *,
         delivery_callback: DeliveryCallback,
-        failure_callback: FailureCallback,
+        failure_callback: FailureCallback | None = None,
+        _failure_recorder: FailureCallback | None = None,
     ) -> None:
         self._delivery_callback = delivery_callback
         self._failure_callback = failure_callback
+        self._failure_recorder = _failure_recorder
         self._token = secrets.token_hex(32)
         self._stopping = threading.Event()
         self._stopped = False
@@ -527,20 +551,33 @@ class LogForwardingReceiver:
             raise
         self._listener = listener
         self._endpoint = f"{_LOOPBACK_HOST}:{address[1]}"
-        self._accept_thread = threading.Thread(
-            target=self._accept_connections,
-            name="hbrowser-log-forwarding-accept",
-            daemon=True,
-        )
-        self._accept_thread.start()
+        try:
+            self._accept_thread = threading.Thread(
+                target=self._accept_connections,
+                name="hbrowser-log-forwarding-accept",
+                daemon=True,
+            )
+            self._accept_thread.start()
+        except Exception:
+            self._stopping.set()
+            self._stopped = True
+            self._delivery_enabled = False
+            listener.close()
+            raise
 
     def _report_failure(self, stage: str, error: BaseException) -> None:
         if self._discarded:
             return
 
+        if self._failure_recorder is not None:
+            self._failure_recorder(stage, error)
+        callback = self._failure_callback
+        if callback is None:
+            return
+
         def report() -> None:
             try:
-                self._failure_callback(stage, error)
+                callback(stage, error)
             except Exception:
                 pass
 
@@ -574,25 +611,42 @@ class LogForwardingReceiver:
                 continue
             except OSError as error:
                 if not self._stopping.is_set():
+                    self._stopping.set()
+                    self._listener.close()
                     self._report_failure("forward-accept", error)
                 return
             if address[0] != _LOOPBACK_HOST:
                 connection.close()
                 continue
-            connection.settimeout(_SOCKET_TIMEOUT_SECONDS)
             client = _ClientConnection(connection, time.monotonic())
-            client.thread = threading.Thread(
-                target=self._serve_client,
-                args=(client,),
-                name="hbrowser-log-forwarding-client",
-                daemon=True,
-            )
-            with self._clients_lock:
-                if len(self._clients) >= _MAX_CLIENTS:
+            try:
+                connection.settimeout(_SOCKET_TIMEOUT_SECONDS)
+                client.thread = threading.Thread(
+                    target=self._serve_client,
+                    args=(client,),
+                    name="hbrowser-log-forwarding-client",
+                    daemon=True,
+                )
+                with self._clients_lock:
+                    if len(self._clients) >= _MAX_CLIENTS:
+                        connection.close()
+                        continue
+                    self._clients.add(client)
+                client.thread.start()
+            except Exception as error:
+                self._stopping.set()
+                with self._clients_lock:
+                    self._clients.discard(client)
+                try:
                     connection.close()
-                    continue
-                self._clients.add(client)
-            client.thread.start()
+                except OSError:
+                    pass
+                try:
+                    self._listener.close()
+                except OSError:
+                    pass
+                self._report_failure("forward-accept", error)
+                return
 
     def _read_exact(self, client: _ClientConnection, byte_count: int) -> bytes:
         received = bytearray()
@@ -640,14 +694,18 @@ class LogForwardingReceiver:
     ) -> tuple[bool, str, ForwardedRecord | None]:
         try:
             decoded = json.loads(payload.decode("utf-8"))
-        except UnicodeDecodeError, json.JSONDecodeError:
+        except ValueError, RecursionError:
+            # UTF-8/JSON syntax, integer limits and nesting limits are all
+            # untrusted-frame failures; connection identity is checked by the
+            # receiver even when this frame cannot establish authentication.
             return False, "noise", None
         if not isinstance(decoded, dict):
             return False, "noise", None
         supplied_token = decoded.get("token")
-        authenticated = isinstance(supplied_token, str) and hmac.compare_digest(
-            supplied_token,
-            self._token,
+        authenticated = (
+            isinstance(supplied_token, str)
+            and supplied_token.isascii()
+            and hmac.compare_digest(supplied_token, self._token)
         )
         if not authenticated:
             return False, "noise", None
@@ -705,6 +763,10 @@ class LogForwardingReceiver:
                         client,
                     )
                     if not authenticated:
+                        if client.authenticated:
+                            raise ForwardingProtocolError(
+                                "authenticated forwarding frame is invalid"
+                            )
                         return
                     match frame_type:
                         case "close":

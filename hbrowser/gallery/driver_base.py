@@ -31,6 +31,7 @@ from .browser import (
 from .browser.ban_handler import handle_ban_decorator
 from .browser.flaresolverr import MAX_FLARESOLVERR_SESSION_ATTEMPTS
 from .browser.page_diagnostic import write_page_diagnostic_owned
+from .browser.process import ProcessOwnershipError
 from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandler
 from .captcha.constants import MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
 from .challenge_policy import validate_turnstile_tabs
@@ -46,6 +47,7 @@ from .utils import (
     wait_for_zendriver,
 )
 from .utils.mutation import wait_for_zendriver_mutation
+from .utils.protocol import _begin_zendriver_retirement
 
 _PAGE_DIAGNOSTIC_CAPTURE_TIMEOUT_SECONDS = 5.0
 _PAGE_DIAGNOSTIC_TOTAL_TIMEOUT_SECONDS = 5.0
@@ -109,6 +111,72 @@ class _DriverTurnstileSolver:
         await self._driver._apply_flaresolverr_receipt(receipt)
         self._session.mark_identity_applied(receipt)
         return receipt.result.turnstile_token
+
+
+def _finish_driver_exit(
+    primary_error: BaseException | None,
+    diagnostic_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Keep unresolved process ownership observable across cancellation."""
+
+    errors = tuple(
+        error
+        for error in (primary_error, diagnostic_error, cleanup_error)
+        if error is not None
+    )
+    ownership_error = next(
+        (error for error in errors if isinstance(error, ProcessOwnershipError)), None
+    )
+    if ownership_error is not None:
+        for error in errors:
+            if error is not ownership_error:
+                ownership_error.add_note(
+                    f"Additional driver exit failure: {type(error).__name__}: {error}"
+                )
+        if ownership_error is primary_error:
+            return
+        raise ownership_error
+
+    secondary_errors = tuple(
+        error for error in (diagnostic_error, cleanup_error) if error is not None
+    )
+    cancellation_error = next(
+        (
+            error
+            for error in secondary_errors
+            if isinstance(error, asyncio.CancelledError)
+        ),
+        None,
+    )
+    if cancellation_error is not None:
+        if primary_error is not None:
+            cancellation_error.add_note(
+                "Browser session was already exiting after: "
+                f"{type(primary_error).__name__}"
+            )
+        for secondary_error in secondary_errors:
+            if secondary_error is not cancellation_error:
+                cancellation_error.add_note(
+                    "Additional driver shutdown failure: "
+                    f"{type(secondary_error).__name__}: {secondary_error}"
+                )
+        raise cancellation_error
+    if primary_error is not None:
+        for secondary_error in secondary_errors:
+            primary_error.add_note(
+                "Driver shutdown also failed: "
+                f"{type(secondary_error).__name__}: {secondary_error}"
+            )
+        return
+    if secondary_errors:
+        primary, *secondary = secondary_errors
+        for secondary_error in secondary:
+            primary.add_note(
+                "Additional driver shutdown failure: "
+                f"{type(secondary_error).__name__}: {secondary_error}"
+            )
+        raise primary
 
 
 class Driver(ABC):
@@ -199,6 +267,10 @@ class Driver(ABC):
             raise ValueError("page must not be None")
         if type(owns_browser) is not bool:
             raise TypeError("owns_browser must be a bool")
+        if getattr(page, "browser", None) is not browser:
+            raise DriverBrowserBindingError(
+                "page must belong to the browser receiving the driver binding"
+            )
 
         if self._browser_bound:
             if (
@@ -212,22 +284,40 @@ class Driver(ABC):
                 "ownership mode"
             )
 
+        self._require_unbound_browser_state()
+        navigator = handle_ban_decorator(page)
+        self.browser = browser
+        self.page = page
+        self.myget = navigator
+        self._owns_browser = owns_browser
+        self._browser_bound = True
+
+    def _require_unbound_browser_state(self) -> None:
+        if self._browser_bound:
+            raise DriverBrowserBindingError("driver already has a browser binding")
         if self.browser is not None or self.page is not None or self.myget is not None:
             raise DriverBrowserBindingError(
                 "driver browser state was assigned without bind_existing_browser"
             )
 
-        self.browser = browser
-        self.page = page
-        self.myget = handle_ban_decorator(page)
-        self._owns_browser = owns_browser
-        self._browser_bound = True
-
     async def _init_browser(self) -> None:
-        if self._browser_bound:
-            raise DriverBrowserBindingError("driver already has a browser binding")
+        self._require_unbound_browser_state()
         browser, page = await create_browser(headless=self.headless)
-        self.bind_existing_browser(browser, page, owns_browser=True)
+        try:
+            self.bind_existing_browser(browser, page, owns_browser=True)
+        except BaseException as binding_error:
+            try:
+                await stop_browser(
+                    browser,
+                    deadline=Deadline.after(_DRIVER_EXIT_TOTAL_DEADLINE_SECONDS),
+                )
+            except BaseException as cleanup_error:
+                cleanup_error.add_note(
+                    "New browser binding failed before ownership transfer: "
+                    f"{type(binding_error).__name__}"
+                )
+                raise cleanup_error from binding_error
+            raise
         await self.get(self.url["Forums"])
 
     async def __aenter__(self) -> Self:
@@ -276,20 +366,7 @@ class Driver(ABC):
                 except BaseException as error:
                     diagnostic_error = error
         if not self._owns_browser or self.browser is None:
-            if isinstance(diagnostic_error, asyncio.CancelledError):
-                if primary_error is not None:
-                    diagnostic_error.add_note(
-                        "Browser session was already exiting after: "
-                        f"{type(primary_error).__name__}"
-                    )
-                raise diagnostic_error
-            if primary_error is not None and diagnostic_error is not None:
-                primary_error.add_note(
-                    "Driver diagnostic also failed: "
-                    f"{type(diagnostic_error).__name__}: {diagnostic_error}"
-                )
-            elif diagnostic_error is not None:
-                raise diagnostic_error
+            _finish_driver_exit(primary_error, diagnostic_error, None)
             return
         self.logger.info("Closing browser")
         cleanup_error: BaseException | None = None
@@ -302,45 +379,7 @@ class Driver(ABC):
                 type(error).__name__,
             )
 
-        secondary_errors = tuple(
-            error for error in (diagnostic_error, cleanup_error) if error is not None
-        )
-        cancellation_error = next(
-            (
-                error
-                for error in secondary_errors
-                if isinstance(error, asyncio.CancelledError)
-            ),
-            None,
-        )
-        if cancellation_error is not None:
-            if primary_error is not None:
-                cancellation_error.add_note(
-                    "Browser session was already exiting after: "
-                    f"{type(primary_error).__name__}"
-                )
-            for secondary_error in secondary_errors:
-                if secondary_error is not cancellation_error:
-                    cancellation_error.add_note(
-                        "Additional driver shutdown failure: "
-                        f"{type(secondary_error).__name__}: {secondary_error}"
-                    )
-            raise cancellation_error
-        if primary_error is not None:
-            for secondary_error in secondary_errors:
-                primary_error.add_note(
-                    "Driver shutdown also failed: "
-                    f"{type(secondary_error).__name__}: {secondary_error}"
-                )
-            return
-        if secondary_errors:
-            primary, *secondary = secondary_errors
-            for secondary_error in secondary:
-                primary.add_note(
-                    "Additional driver shutdown failure: "
-                    f"{type(secondary_error).__name__}: {secondary_error}"
-                )
-            raise primary
+        _finish_driver_exit(primary_error, diagnostic_error, cleanup_error)
 
     @staticmethod
     async def _write_page_diagnostic(
@@ -407,9 +446,9 @@ class Driver(ABC):
                 content,
                 deadline=operation_deadline,
             )
-        except BaseException as error:
-            if isinstance(error, asyncio.CancelledError):
-                raise
+        except asyncio.CancelledError, ProcessOwnershipError:
+            raise
+        except Exception as error:
             self.logger.warning(
                 "Failed to save %s page diagnostic: error_type=%s",
                 kind,
@@ -530,43 +569,50 @@ class Driver(ABC):
         self,
         result: FlareSolverrResult,
     ) -> None:
-        if result.user_agent:
-            identity_failed = False
+        cookie_params = result.to_cdp_cloudflare_cookie_params()
+        try:
+            if result.user_agent:
+                identity_failed = False
+                try:
+                    await wait_for_zendriver_mutation(
+                        self.page.send(
+                            cdp.network.set_user_agent_override(
+                                user_agent=result.user_agent
+                            )
+                        ),
+                        timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
+                        owner=self.page,
+                        operation="Browser user-agent override",
+                    )
+                except BrowserMutationOutcomeUnknownError:
+                    identity_failed = True
+                if identity_failed:
+                    raise BrowserIdentityApplyException(
+                        "Could not apply the FlareSolverr browser identity"
+                    )
+            if not cookie_params:
+                return
+            cookie_apply_failed = False
             try:
                 await wait_for_zendriver_mutation(
-                    self.page.send(
-                        cdp.network.set_user_agent_override(
-                            user_agent=result.user_agent
-                        )
-                    ),
+                    self.page.send(cdp.network.set_cookies(cookie_params)),
                     timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
                     owner=self.page,
-                    operation="Browser user-agent override",
+                    operation="Browser cookie replacement",
                 )
             except BrowserMutationOutcomeUnknownError:
-                identity_failed = True
-            if identity_failed:
+                cookie_apply_failed = True
+            if cookie_apply_failed:
+                # CDP protocol errors may contain cookie values in their params.
                 raise BrowserIdentityApplyException(
-                    "Could not apply the FlareSolverr browser identity"
+                    "Could not apply the FlareSolverr Cloudflare cookies"
                 )
-        cookie_params = result.to_cdp_cloudflare_cookie_params()
-        if not cookie_params:
-            return
-        cookie_apply_failed = False
-        try:
-            await wait_for_zendriver_mutation(
-                self.page.send(cdp.network.set_cookies(cookie_params)),
-                timeout=_IDENTITY_MUTATION_TIMEOUT_SECONDS,
-                owner=self.page,
-                operation="Browser cookie replacement",
-            )
-        except BrowserMutationOutcomeUnknownError:
-            cookie_apply_failed = True
-        if cookie_apply_failed:
-            # CDP protocol errors may contain cookie values in their params.
-            raise BrowserIdentityApplyException(
-                "Could not apply the FlareSolverr Cloudflare cookies"
-            )
+        except BaseException:
+            # Identity is one semantic transition across multiple CDP commands.
+            # A later local failure must not leave an accepted UA reusable with
+            # the previous cookies, even when no protocol await is active.
+            _begin_zendriver_retirement(self.page)
+            raise
 
     async def login(self) -> None:
         """Authenticate on Forums without choosing a post-login destination.

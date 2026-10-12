@@ -10,16 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
 from zendriver import cdp
+from zendriver.core.connection import ProtocolException
 
 from .deadline import Deadline
 from .mutation import wait_for_zendriver_mutation
-from .protocol import MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS, wait_for_zendriver
+from .protocol import (
+    MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS,
+    _begin_zendriver_retirement,
+    _resolve_owner,
+    wait_for_zendriver,
+)
 
 ZENDRIVER_COMMAND_TIMEOUT_SECONDS = MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS
 DEFAULT_NAVIGATION_DEADLINE_SECONDS = 10.0
@@ -34,6 +42,20 @@ _DOCUMENT_SNAPSHOT_SCRIPT = """(() => ({
 
 class PageStateTimeout(TimeoutError):
     """A healthy transport did not expose the requested semantic page state."""
+
+
+@contextmanager
+def _navigation_completion(browser: Any) -> Iterator[None]:
+    """Require semantic completion after ACK for the captured generation."""
+
+    try:
+        yield
+    except BaseException:
+        # A live transport and a successful command reply do not settle the
+        # document mutation. Keep the original browser terminal even if a tab
+        # owner was rebound while its navigation was completing.
+        _begin_zendriver_retirement(browser)
+        raise
 
 
 def _page_state_deadline(deadline: Deadline | None) -> Deadline:
@@ -289,6 +311,43 @@ async def _finish_navigation(
     )
 
 
+async def _serialize_navigation_url(
+    page: Any, url: str, main_frame_id: str, deadline: Deadline
+) -> str:
+    """Match Chrome's URL serialization without using the page's globals."""
+
+    command_timeout = _command_timeout(deadline)
+    context_id = await wait_for_zendriver(
+        page.send(
+            cdp.page.create_isolated_world(
+                cdp.page.FrameId(main_frame_id),
+                world_name="hbrowser.navigation-url",
+            )
+        ),
+        timeout=command_timeout,
+        owner=page,
+    )
+    command_timeout = _command_timeout(deadline)
+    result, error = await wait_for_zendriver(
+        page.send(
+            cdp.runtime.evaluate(
+                f"new URL({json.dumps(url)}).href",
+                context_id=context_id,
+                return_by_value=True,
+            )
+        ),
+        timeout=command_timeout,
+        owner=page,
+    )
+    _require_deadline(deadline, "Navigation URL serialization")
+    if error is not None:
+        raise ProtocolException(error)
+    serialized = result.value
+    if not isinstance(serialized, str) or not serialized:
+        raise TypeError("Chrome did not return a serialized navigation URL")
+    return serialized
+
+
 async def navigate_and_wait(
     page: Any,
     url: str,
@@ -300,14 +359,16 @@ async def navigate_and_wait(
     operation_deadline = _page_state_deadline(deadline)
     if not _supports_cdp_events(page):
         command_timeout = _command_timeout(operation_deadline)
+        original_browser, _ = _resolve_owner(page)
         await wait_for_zendriver_mutation(
             page.get(url),
             timeout=command_timeout,
             owner=page,
             operation="Page navigation",
         )
-        _require_deadline(operation_deadline, "Page navigation")
-        return NavigationReceipt("", None, url, "complete")
+        with _navigation_completion(original_browser):
+            _require_deadline(operation_deadline, "Page navigation")
+            return NavigationReceipt("", None, url, "complete")
 
     main_frame_id, previous_loader_id = await _main_frame_identity(
         page,
@@ -327,6 +388,7 @@ async def navigate_and_wait(
         await asyncio.sleep(0)
         observer.arm()
         command_timeout = _command_timeout(operation_deadline)
+        original_browser, _ = _resolve_owner(page)
         (
             frame_id,
             loader_id,
@@ -338,22 +400,30 @@ async def navigate_and_wait(
             owner=page,
             operation="Page navigation",
         )
-        if error_text:
-            raise RuntimeError("Chrome rejected page navigation")
-        if is_download:
-            raise RuntimeError("Page navigation became a download")
-        if str(frame_id) != main_frame_id:
-            raise RuntimeError("Chrome navigated an unexpected frame")
-        observer.expect_loader(
-            None if loader_id is None else str(loader_id),
-            same_document_url=url,
-        )
-        return await _finish_navigation(
-            page,
-            observer,
-            operation_deadline,
-            description="Page navigation",
-        )
+        with _navigation_completion(original_browser):
+            if error_text:
+                raise RuntimeError("Chrome rejected page navigation")
+            if is_download:
+                raise RuntimeError("Page navigation became a download")
+            if str(frame_id) != main_frame_id:
+                raise RuntimeError("Chrome navigated an unexpected frame")
+            expected_url = (
+                await _serialize_navigation_url(
+                    page, url, main_frame_id, operation_deadline
+                )
+                if loader_id is None
+                else None
+            )
+            observer.expect_loader(
+                None if loader_id is None else str(loader_id),
+                same_document_url=expected_url,
+            )
+            return await _finish_navigation(
+                page,
+                observer,
+                operation_deadline,
+                description="Page navigation",
+            )
     finally:
         observer.remove()
 
@@ -368,14 +438,16 @@ async def reload_and_wait(
     operation_deadline = _page_state_deadline(deadline)
     if not _supports_cdp_events(page):
         command_timeout = _command_timeout(operation_deadline)
+        original_browser, _ = _resolve_owner(page)
         await wait_for_zendriver_mutation(
             page.reload(),
             timeout=command_timeout,
             owner=page,
             operation="Page reload",
         )
-        _require_deadline(operation_deadline, "Page reload")
-        return NavigationReceipt("", None, "", "complete")
+        with _navigation_completion(original_browser):
+            _require_deadline(operation_deadline, "Page reload")
+            return NavigationReceipt("", None, "", "complete")
 
     main_frame_id, previous_loader_id = await _main_frame_identity(
         page,
@@ -394,6 +466,7 @@ async def reload_and_wait(
         await asyncio.sleep(0)
         observer.arm()
         command_timeout = _command_timeout(operation_deadline)
+        original_browser, _ = _resolve_owner(page)
         await wait_for_zendriver_mutation(
             page.send(
                 cdp.page.reload(
@@ -409,12 +482,13 @@ async def reload_and_wait(
             owner=page,
             operation="Page reload",
         )
-        return await _finish_navigation(
-            page,
-            observer,
-            operation_deadline,
-            description="Page reload",
-        )
+        with _navigation_completion(original_browser):
+            return await _finish_navigation(
+                page,
+                observer,
+                operation_deadline,
+                description="Page reload",
+            )
     finally:
         observer.remove()
 
@@ -448,8 +522,9 @@ async def open_tab_and_wait(
             owner=connection if connection is not None else browser,
             operation="Browser tab creation",
         )
-        _require_deadline(operation_deadline, "Browser tab creation")
-        return target
+        with _navigation_completion(browser):
+            _require_deadline(operation_deadline, "Browser tab creation")
+            return target
     event_connection = cast(Any, connection)
 
     changed = asyncio.Event()
@@ -476,31 +551,32 @@ async def open_tab_and_wait(
                 operation="Browser tab creation",
             )
         )
-        while True:
-            _require_deadline(operation_deadline, "Browser target discovery")
-            target = _browser_target(browser, target_id)
-            if target is not None:
-                if hasattr(target, "browser"):
-                    target.browser = browser
-                return target
-            remaining = operation_deadline.remaining()
-            if remaining <= 0:
-                raise PageStateTimeout(
-                    "Created browser target did not enter the target inventory"
-                )
-            changed.clear()
-            # Target events are authoritative.  A short reconciliation yield
-            # covers handler scheduling order inside Zendriver's dispatcher.
-            wait_seconds = min(0.05, remaining)
-            change_task = asyncio.create_task(changed.wait())
-            try:
-                await asyncio.wait((change_task,), timeout=wait_seconds)
-            finally:
-                if not change_task.done():
-                    change_task.cancel()
-                    await asyncio.gather(change_task, return_exceptions=True)
-            if target_id not in observed_target_ids:
-                continue
+        with _navigation_completion(browser):
+            while True:
+                _require_deadline(operation_deadline, "Browser target discovery")
+                target = _browser_target(browser, target_id)
+                if target is not None:
+                    if hasattr(target, "browser"):
+                        target.browser = browser
+                    return target
+                remaining = operation_deadline.remaining()
+                if remaining <= 0:
+                    raise PageStateTimeout(
+                        "Created browser target did not enter the target inventory"
+                    )
+                changed.clear()
+                # Target events are authoritative.  A short reconciliation yield
+                # covers handler scheduling order inside Zendriver's dispatcher.
+                wait_seconds = min(0.05, remaining)
+                change_task = asyncio.create_task(changed.wait())
+                try:
+                    await asyncio.wait((change_task,), timeout=wait_seconds)
+                finally:
+                    if not change_task.done():
+                        change_task.cancel()
+                        await asyncio.gather(change_task, return_exceptions=True)
+                if target_id not in observed_target_ids:
+                    continue
     finally:
         event_connection.remove_handlers(cdp.target.TargetCreated, on_target)
         event_connection.remove_handlers(cdp.target.TargetInfoChanged, on_target)
@@ -523,14 +599,16 @@ async def mutate_and_wait_for_navigation[ResultT](
             operation_deadline,
             command_timeout,
         )
+        original_browser, _ = _resolve_owner(owner)
         result = await wait_for_zendriver_mutation(
             mutation(),
             timeout=effective_command_timeout,
             owner=owner,
             operation=operation,
         )
-        _require_deadline(operation_deadline, operation)
-        return result, None
+        with _navigation_completion(original_browser):
+            _require_deadline(operation_deadline, operation)
+            return result, None
 
     main_frame_id, previous_loader_id = await _main_frame_identity(
         page,
@@ -552,19 +630,21 @@ async def mutate_and_wait_for_navigation[ResultT](
             operation_deadline,
             command_timeout,
         )
+        original_browser, _ = _resolve_owner(owner)
         result = await wait_for_zendriver_mutation(
             mutation(),
             timeout=effective_command_timeout,
             owner=owner,
             operation=operation,
         )
-        receipt = await _finish_navigation(
-            page,
-            observer,
-            operation_deadline,
-            description=operation,
-        )
-        return result, receipt
+        with _navigation_completion(original_browser):
+            receipt = await _finish_navigation(
+                page,
+                observer,
+                operation_deadline,
+                description=operation,
+            )
+            return result, receipt
     finally:
         observer.remove()
 
@@ -651,17 +731,8 @@ async def _wait_for_dom_query(
     async def on_dom_change(_event: Any, _connection: Any = None) -> None:
         changed.set()
 
-    if supports_events:
-        for event_type in _DOM_CHANGE_EVENTS:
-            page.add_handler(event_type, on_dom_change)
+    observing = False
     try:
-        if supports_events:
-            await _run_dom_command(
-                page,
-                lambda: page.send(cdp.dom.enable()),
-                deadline=deadline,
-                description="DOM event subscription",
-            )
         while True:
             changed.clear()
             element = await _run_dom_command(
@@ -684,6 +755,20 @@ async def _wait_for_dom_query(
                 raise PageStateTimeout(
                     f"{description} did not appear before its deadline"
                 )
+            if supports_events and not observing:
+                # A normal initial query settles the previous lifecycle subscription.
+                # Install only if still missing, then immediately re-query so a DOM
+                # change during installation cannot be lost between observers.
+                observing = True
+                for event_type in _DOM_CHANGE_EVENTS:
+                    page.add_handler(event_type, on_dom_change)
+                await _run_dom_command(
+                    page,
+                    lambda: page.send(cdp.dom.enable()),
+                    deadline=deadline,
+                    description="DOM event subscription",
+                )
+                continue
             # CDP DOM mutation events are delivered immediately for materialized
             # nodes.  Reconciliation covers browser versions that do not emit an
             # event until their subtree has first been requested.
@@ -693,7 +778,7 @@ async def _wait_for_dom_query(
                 description=description,
             )
     finally:
-        if supports_events:
+        if observing:
             for event_type in _DOM_CHANGE_EVENTS:
                 page.remove_handlers(event_type, on_dom_change)
 

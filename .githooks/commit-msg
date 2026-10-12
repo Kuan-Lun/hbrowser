@@ -2,16 +2,9 @@
 
 set -euo pipefail
 
-message_file=$1
-first_line="$(sed -n '1p' "$message_file")"
-
-if [[ "$first_line" == Merge\ * ]]; then
-    exit 0
-fi
-
+repository_root="$(git rev-parse --show-toplevel && printf '.')"
+repository_root="${repository_root%.}"
+repository_root="${repository_root%$'\n'}"
 pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?(!)?: .+'
-if [[ ! "$first_line" =~ $pattern ]]; then
-    printf 'Commit message must follow Conventional Commits: %s\n' \
-        "$first_line" >&2
-    exit 1
-fi
+exec bash "$repository_root/scripts/_shared/h2h_dev_tools/commit-message.sh" \
+    "$repository_root" "$1" "$pattern"

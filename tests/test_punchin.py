@@ -24,11 +24,20 @@ ENCOUNTER = (
 ENCOUNTER_URL = f"https://hentaiverse.org/?s=Battle&ss=ba&encounter={ENCOUNTER}"
 
 
+def _news_page(content: str = "News content") -> str:
+    return (
+        "<html><head><title>E-Hentai Galleries</title></head><body>"
+        '<div id="newsouter"><div id="newsinner">'
+        '<nav id="nb"><a href="https://e-hentai.org/news.php">News</a></nav>'
+        f'<main id="nt">{content}</main></div></div></body></html>'
+    )
+
+
 def _event_page(*hrefs: str) -> str:
     anchors = "".join(
         f'<a href="{escape(href, quote=True)}">Encounter</a>' for href in hrefs
     )
-    return f'<html><body><div id="eventpane">{anchors}</div></body></html>'
+    return _news_page(f'<div id="eventpane">{anchors}</div>')
 
 
 class RandomEncounterURLTests(unittest.TestCase):
@@ -98,6 +107,21 @@ class RandomEncounterURLTests(unittest.TestCase):
 
 
 class PunchInDocumentTests(unittest.TestCase):
+    def test_error_login_challenge_and_partial_documents_cannot_complete(self) -> None:
+        documents = [
+            "",
+            "<html><title>Bad Gateway</title><body>502</body></html>",
+            "<html><title>Just a moment...</title><body>Checking</body></html>",
+            '<html><title>Login</title><input name="password"></html>',
+            '<html><title>E-Hentai Galleries</title><div id="nt">News</div></html>',
+        ]
+        for document in documents:
+            with (
+                self.subTest(document=document),
+                self.assertRaisesRegex(RuntimeError, "recognized news document"),
+            ):
+                _parse_punch_in_result(document)
+
     def test_realistic_news_fixture_returns_the_random_encounter(self) -> None:
         html_content = (FIXTURE_DIR / "ehentai_news_random_encounter.html").read_text(
             encoding="utf-8"
@@ -113,10 +137,8 @@ class PunchInDocumentTests(unittest.TestCase):
         )
 
     def test_ignores_hentaiverse_links_outside_the_event_pane(self) -> None:
-        html_content = (
-            '<html><body><nav><a href="'
-            f"{escape(ENCOUNTER_URL, quote=True)}"
-            '">HentaiVerse</a></nav></body></html>'
+        html_content = _news_page(
+            f'<nav><a href="{escape(ENCOUNTER_URL, quote=True)}">HentaiVerse</a></nav>'
         )
 
         self.assertEqual(_parse_punch_in_result(html_content), PunchInComplete())
@@ -205,7 +227,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         async def get_content(**_kwargs: object) -> str:
             events.append("content")
             return (
-                "<html><body>Initial news</body></html>"
+                _news_page("Initial news")
                 if events.count("content") == 1
                 else encounter_content
             )
@@ -243,7 +265,7 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(ENCOUNTER, str(driver.logger.mock_calls))
 
     async def test_opt_in_capture_saves_initial_and_reloaded_documents(self) -> None:
-        initial_content = "<html><body>Initial news</body></html>"
+        initial_content = _news_page("Initial news")
         reloaded_content = _event_page(ENCOUNTER_URL)
         driver = EHDriver(headless=True)
         driver.get = AsyncMock()  # type: ignore[method-assign]
@@ -283,8 +305,8 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         )
         driver._read_stable_punchin_document = AsyncMock(  # type: ignore[method-assign]
             side_effect=[
-                "<html><body>Initial news</body></html>",
-                "<html><body>Reloaded news</body></html>",
+                _news_page("Initial news"),
+                _news_page("Reloaded news"),
             ]
         )
         driver._current_loader_id = AsyncMock(  # type: ignore[method-assign]
@@ -311,8 +333,77 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "content was not a string"):
             await driver.punchin()
 
+    async def test_reload_error_page_does_not_report_completed(self) -> None:
+        driver = EHDriver(headless=True)
+        logger = Mock()
+        with (
+            patch.object(driver, "get", new=AsyncMock()),
+            patch.object(
+                driver, "_current_loader_id", new=AsyncMock(return_value="old")
+            ),
+            patch.object(
+                driver,
+                "_read_stable_punchin_document",
+                new=AsyncMock(
+                    side_effect=[_news_page(), "<html>502 Bad Gateway</html>"]
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "recognized news document"),
+        ):
+            driver.page = SimpleNamespace(reload=AsyncMock())
+            driver.logger = logger
+            await driver.punchin()
+        self.assertNotIn("Daily check-in completed", str(logger.mock_calls))
+
 
 class PunchInDocumentReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_redirects_and_challenges_even_with_news_markup(self) -> None:
+        snapshots = [
+            _RawPageSnapshot(
+                url=url,
+                title="E-Hentai Galleries",
+                ready_state="complete",
+                html=_news_page(),
+                query_value=None,
+            )
+            for url in (
+                "https://forums.e-hentai.org/index.php?act=Login",
+                "https://e-hentai.org.example/news.php",
+                "http://e-hentai.org/news.php",
+                "https://user@e-hentai.org/news.php",
+                "https://e-hentai.org/news.php?redirect=1",
+            )
+        ]
+        snapshots.extend(
+            _RawPageSnapshot(
+                url="https://e-hentai.org/news.php",
+                title=title,
+                ready_state="complete",
+                html=_news_page(content),
+                query_value=None,
+            )
+            for title, content in (
+                ("Just a moment...", "News"),
+                ("E-Hentai Galleries", '<div id="challenge-form"></div>'),
+                ("E-Hentai Galleries", "You are not logged in"),
+            )
+        )
+        for snapshot in snapshots:
+            with self.subTest(snapshot=snapshot):
+                driver = EHDriver(headless=True)
+                with (
+                    patch.object(
+                        driver, "_current_loader_id", new=AsyncMock(return_value="new")
+                    ),
+                    patch.object(
+                        driver,
+                        "_read_raw_page_snapshot",
+                        new=AsyncMock(return_value=snapshot),
+                    ),
+                    self.assertRaises(RuntimeError),
+                ):
+                    await driver._read_stable_punchin_document(previous_loader_id="old")
+
     async def test_rejects_previous_loader_without_polling(self) -> None:
         driver = EHDriver(headless=True)
         driver._current_loader_id = AsyncMock(  # type: ignore[method-assign]

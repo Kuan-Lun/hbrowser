@@ -106,18 +106,35 @@ def format_wait_message(wait_seconds: int, wait_until: datetime) -> str:
     return f"IP banned, waiting {remaining} (until {wait_until_str}) to retry..."
 
 
-async def _wait_out_ban(wait_seconds: int) -> None:
-    """以一小時為單位睡眠等待，每小時記一次目前還剩多久。"""
-    while wait_seconds > _HOUR_SECONDS:
-        await asyncio.sleep(_HOUR_SECONDS)
-        wait_seconds -= _HOUR_SECONDS
-        wait_until = datetime.now() + timedelta(seconds=wait_seconds)
-        logger.info(format_wait_message(wait_seconds, wait_until))
-    # This is a server-declared ban duration, not a CDP command watchdog.
-    await asyncio.sleep(wait_seconds)
+async def _wait_out_ban(
+    wait_seconds: int,
+    *,
+    deadline: Deadline | None = None,
+) -> None:
+    """Wait for the server ban without extending an explicit caller deadline."""
+    remaining_wait = float(wait_seconds)
+    while remaining_wait > 0:
+        sleep_seconds = min(remaining_wait, _HOUR_SECONDS)
+        if deadline is not None:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                raise TimeoutError("IP ban wait exceeded the caller deadline")
+            sleep_seconds = min(sleep_seconds, remaining)
+        await asyncio.sleep(sleep_seconds)
+        if deadline is not None and deadline.expired:
+            raise TimeoutError("IP ban wait exceeded the caller deadline")
+        remaining_wait -= sleep_seconds
+        if remaining_wait > 0:
+            wait_until = datetime.now() + timedelta(seconds=remaining_wait)
+            logger.info(format_wait_message(int(remaining_wait), wait_until))
 
 
-async def _retry_until_unbanned(page: Any, source: str) -> None:
+async def _retry_until_unbanned(
+    page: Any,
+    source: str,
+    *,
+    deadline: Deadline | None = None,
+) -> None:
     status = check_ban_status(source)
     is_first = True
     while status.is_banned:
@@ -136,10 +153,14 @@ async def _retry_until_unbanned(page: Any, source: str) -> None:
         wait_until = datetime.now() + timedelta(seconds=wait_seconds)
         logger.warning(format_wait_message(wait_seconds, wait_until))
 
-        await _wait_out_ban(wait_seconds)
+        await _wait_out_ban(wait_seconds, deadline=deadline)
 
         logger.info("Retrying connection")
-        retry_deadline = Deadline.after(_PAGE_NAVIGATION_DEADLINE_SECONDS)
+        retry_deadline = (
+            Deadline.after(_PAGE_NAVIGATION_DEADLINE_SECONDS)
+            if deadline is None
+            else deadline.bounded(_PAGE_NAVIGATION_DEADLINE_SECONDS)
+        )
         await reload_and_wait(
             page,
             deadline=retry_deadline,
@@ -234,6 +255,6 @@ def handle_ban_decorator(
                 "no evidence supports treating it as an IP ban"
             )
         if status.is_banned:
-            await _retry_until_unbanned(page, source)
+            await _retry_until_unbanned(page, source, deadline=deadline)
 
     return myget

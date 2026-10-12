@@ -468,6 +468,94 @@ class LoggerConfigurationTests(IsolatedLoggingTestCase):
 
 
 class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
+    def test_child_entry_rejects_active_parent_without_changing_its_resources(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _SystemTemporaryDirectory() as directory_name,
+                _isolated_logging_state_for_testing(),
+                patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+            ):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                receiver = start_log_forwarding_receiver()
+                self.assertIsNotNone(receiver)
+                assert receiver is not None
+                handler = log_module._PROCESS_LOG_HANDLER
+                assert handler is not None
+                logger = setup_logger("hbrowser.tests.parent_conflict")
+                handlers = tuple(logger.handlers)
+                before_health = logging_health()
+                capability = receiver.child_environment()
+                with patch.dict(os.environ, capability):
+                    with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                        operation()
+                    for key, value in capability.items():
+                        self.assertEqual(os.environ.get(key), value)
+                self.assertEqual(tuple(logger.handlers), handlers)
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                self.assertIs(log_module._PROCESS_LOG_HANDLER, handler)
+                self.assertIs(log_module._LOG_FORWARDING_RECEIVER, receiver)
+                logger.info("parent remains usable after rejected child entry")
+                self.assertEqual(
+                    [event["message"] for event in _read_events(Path(directory_name))],
+                    ["parent remains usable after rejected child entry"],
+                )
+                close_logging()
+                self.assertFalse(handler._worker.is_alive())
+                self.assertFalse(receiver._accept_thread.is_alive())
+                self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
+                self.assertIsNone(log_module._LOG_FORWARDING_RECEIVER)
+
+    def test_child_entry_rejects_closed_parent_without_creating_child_state(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _SystemTemporaryDirectory() as directory_name,
+                _isolated_logging_state_for_testing(),
+                patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+            ):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                close_logging()
+                before_health = logging_health()
+                with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                    operation()
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                close_logging()
+
+    def test_child_entry_rejects_parent_after_strict_sink_startup_failure(
+        self,
+    ) -> None:
+        for operation in (configure_forwarded_logging, close_forwarded_logging):
+            with (
+                self.subTest(operation=operation.__name__),
+                _isolated_logging_state_for_testing(),
+                patch.object(
+                    log_module,
+                    "get_log_dir",
+                    side_effect=OSError(errno.EACCES, "denied"),
+                ),
+                patch("hbrowser.gallery.utils.log.os.write"),
+            ):
+                with self.assertRaises(LogPersistenceError):
+                    configure_logging()
+                before_health = logging_health()
+                with self.assertRaisesRegex(RuntimeError, "parent logging"):
+                    operation()
+                self.assertEqual(logging_health(), before_health)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CONFIGURED)
+                self.assertFalse(log_module._FORWARDED_LOGGING_CLOSED)
+                with self.assertRaises(LogPersistenceError):
+                    close_logging()
+                self.assertTrue(log_module._LOGGING_CLOSED)
+
     @staticmethod
     def _child_environment(receiver: LogForwardingReceiver) -> dict[str, str]:
         environment = os.environ.copy()
@@ -524,30 +612,64 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
     ) -> None:
         ready_payload = b'{"type":"ready"}'
 
-        def connected_socket() -> Mock:
+        @contextmanager
+        def connected_handler() -> Iterator[tuple[ForwardingHandler, Mock, Mock]]:
             connection = Mock()
             connection.recv.side_effect = [
                 struct.pack(">I", len(ready_payload)),
                 ready_payload,
             ]
-            return connection
+            connection_started = Event()
+            connection_allowed = Event()
+            handshake_complete = Event()
+            receive_ready = ForwardingHandler._receive_ready
+            failure_callback = Mock()
+
+            def connect(*_args: object, **_kwargs: object) -> Mock:
+                connection_started.set()
+                if not connection_allowed.wait(timeout=2):
+                    raise TimeoutError("test did not release the pending connection")
+                return connection
+
+            def complete_handshake(peer: socket.socket) -> None:
+                receive_ready(peer)
+                handshake_complete.set()
+
+            with (
+                patch(
+                    "hbrowser.gallery.utils._log_forwarding.socket.create_connection",
+                    side_effect=connect,
+                ),
+                patch.object(
+                    ForwardingHandler, "_receive_ready", side_effect=complete_handshake
+                ),
+            ):
+                handler = ForwardingHandler(
+                    "127.0.0.1:43210",
+                    "a" * 64,
+                    failure_callback=failure_callback,
+                )
+                try:
+                    self.assertTrue(connection_started.wait(timeout=2))
+                    connection.sendall.assert_not_called()
+                    connection_allowed.set()
+                    self.assertTrue(handshake_complete.wait(timeout=2))
+                    connection.sendall.assert_called_once()
+                    failure_callback.assert_not_called()
+                    yield handler, connection, failure_callback
+                finally:
+                    connection_allowed.set()
+                    handler.close_forwarding()
+                self.assertFalse(handler._worker.is_alive())
 
         for method_name, expected_stage in (
             ("emit", "forward-send"),
             ("close", "forward-close"),
         ):
-            with self.subTest(method_name=method_name):
-                connection = connected_socket()
-                failure_callback = Mock()
-                with patch(
-                    "hbrowser.gallery.utils._log_forwarding.socket.create_connection",
-                    return_value=connection,
-                ):
-                    handler = ForwardingHandler(
-                        "127.0.0.1:43210",
-                        "a" * 64,
-                        failure_callback=failure_callback,
-                    )
+            with (
+                self.subTest(method_name=method_name),
+                connected_handler() as (handler, connection, failure_callback),
+            ):
                 connection.sendall.side_effect = OSError(
                     errno.EPIPE,
                     "private transport detail",
@@ -567,7 +689,6 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                 self.assertTrue(_wait_until(failure_was_reported))
                 failure_callback.assert_called_once()
                 self.assertEqual(failure_callback.call_args.args[0], expected_stage)
-                handler.close_forwarding()
 
     def test_forwarding_close_fences_an_in_progress_record_encode(self) -> None:
         delivered: list[object] = []
@@ -775,8 +896,95 @@ close_forwarded_logging()
         self.assertTrue(health.forwarding_degraded)
         self.assertEqual(health.forwarding_operation, "forward-protocol")
 
+    def test_invalid_frames_respect_sticky_connection_authentication(self) -> None:
+        for authenticated in (False, True):
+            for malformed in (
+                "invalid-utf8",
+                "invalid-json",
+                "nonobject",
+                "missing-token",
+                "wrong-token",
+                "nonascii-token",
+                "deep-json",
+                "oversized-integer",
+            ):
+                with self.subTest(authenticated=authenticated, malformed=malformed):
+                    self._assert_invalid_frame_health(authenticated, malformed)
+
+    def _assert_invalid_frame_health(self, authenticated: bool, malformed: str) -> None:
+        with (
+            _isolated_logging_state_for_testing(),
+            TemporaryDirectory() as directory_name,
+            patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+        ):
+            configure_logging(console_level=LogLevel.CRITICAL)
+            receiver = start_log_forwarding_receiver()
+            assert receiver is not None
+            capability = receiver.child_environment()
+            token = capability["HBROWSER_LOG_FORWARD_TOKEN"]
+            host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(":", 1)
+            wrong_token = "0" * 64 if token != "0" * 64 else "1" * 64
+            payloads = {
+                "invalid-utf8": b"\xff",
+                "invalid-json": b"{",
+                "nonobject": b"[]",
+                "missing-token": b'{"type":"close"}',
+                "wrong-token": json.dumps({"token": wrong_token}).encode(),
+                "nonascii-token": json.dumps({"token": "非ASCII"}).encode(),
+                "deep-json": b"[" * 2000 + b"0" + b"]" * 2000,
+                "oversized-integer": b"1" * 5000,
+            }
+            client_thread: Thread | None = None
+
+            def client_started() -> bool:
+                nonlocal client_thread
+                with receiver._clients_lock:
+                    clients = tuple(receiver._clients)
+                if not clients or clients[0].thread is None:
+                    return False
+                client_thread = clients[0].thread
+                return True
+
+            with socket.create_connection(
+                (host, int(raw_port)), timeout=2
+            ) as connection:
+                self.assertTrue(_wait_until(client_started))
+                with connection.makefile("rb") as stream:
+                    if authenticated:
+                        connection.sendall(
+                            _raw_forwarding_frame({"token": token, "type": "hello"})
+                        )
+                        header = stream.read(4)
+                        self.assertEqual(len(header), 4)
+                        size = struct.unpack(">I", header)[0]
+                        self.assertEqual(stream.read(size), b'{"type":"ready"}')
+                    payload = payloads[malformed]
+                    connection.sendall(struct.pack(">I", len(payload)) + payload)
+                    # EOF is emitted by the real receiver after rejecting this
+                    # frame; observe health only after its client thread exits.
+                    self.assertEqual(stream.read(1), b"")
+            assert client_thread is not None
+            client_thread.join(timeout=2)
+            self.assertFalse(client_thread.is_alive())
+            with receiver._clients_lock:
+                self.assertFalse(receiver._clients)
+            health = logging_health()
+            self.assertFalse(health.trace_degraded)
+            self.assertEqual(health.forwarding_degraded, authenticated)
+            if authenticated:
+                self.assertEqual(health.forwarding_operation, "forward-protocol")
+
     def test_close_drains_authenticated_client_before_segment_close(self) -> None:
-        with TemporaryDirectory() as directory_name:
+        original_accept = LogForwardingReceiver._accept_connections
+
+        def delayed_accept(receiver: LogForwardingReceiver) -> None:
+            time.sleep(0.1)
+            original_accept(receiver)
+
+        with (
+            TemporaryDirectory() as directory_name,
+            patch.object(LogForwardingReceiver, "_accept_connections", delayed_accept),
+        ):
             directory = Path(directory_name)
             with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
                 configure_logging(console_level=LogLevel.CRITICAL)
@@ -808,6 +1016,15 @@ close_forwarded_logging()
                     connection.sendall(
                         _raw_forwarding_frame(
                             {
+                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
+                                "type": "hello",
+                            }
+                        )
+                    )
+                    ForwardingHandler._receive_ready(connection)
+                    connection.sendall(
+                        _raw_forwarding_frame(
+                            {
                                 "record": record,
                                 "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "record",
@@ -827,6 +1044,254 @@ close_forwarded_logging()
             [event["message"] for event in events], ["drained before close"]
         )
         self.assertFalse(logging_health().forwarding_degraded)
+
+    def _client_thread_start_failure(self, *, reporting_thread_fails: bool) -> None:
+        original_start = Thread.start
+        failures: list[str] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name == "hbrowser-log-forwarding-client" or (
+                reporting_thread_fails
+                and thread.name
+                in {
+                    "hbrowser-log-forwarding-receiver-failure",
+                    "hbrowser-log-health-diagnostic",
+                }
+            ):
+                failures.append(thread.name)
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        with TemporaryDirectory() as directory_name:
+            with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                receiver = start_log_forwarding_receiver()
+                assert receiver is not None
+                host, port = receiver.endpoint.split(":", 1)
+                connection: socket.socket | None = None
+                try:
+                    with patch.object(Thread, "start", start):
+                        connection = socket.create_connection((host, int(port)), 2)
+                        self.assertTrue(
+                            _wait_until(lambda: not receiver._accept_thread.is_alive())
+                        )
+                        self.assertFalse(receiver._clients)
+                        self.assertTrue(logging_health().forwarding_degraded)
+                        self.assertEqual(
+                            logging_health().forwarding_operation, "forward-accept"
+                        )
+                        if reporting_thread_fails:
+                            self.assertIn("hbrowser-log-health-diagnostic", failures)
+                        with self.assertRaisesRegex(RuntimeError, "stopping"):
+                            receiver.child_environment()
+                        connection.settimeout(1)
+                        self.assertEqual(connection.recv(1), b"")
+                finally:
+                    if connection is not None:
+                        connection.close()
+                    # Clean the intentional old-source leak after a red assertion.
+                    with receiver._clients_lock:
+                        abandoned = tuple(receiver._clients)
+                        receiver._clients.clear()
+                    for client in abandoned:
+                        client.connection.close()
+                    receiver.close()
+
+    def test_client_thread_start_failure_closes_socket_and_latches_health(self) -> None:
+        self._client_thread_start_failure(reporting_thread_fails=False)
+
+    def test_client_start_health_survives_failure_notifier_start_failure(self) -> None:
+        self._client_thread_start_failure(reporting_thread_fails=True)
+
+    def test_receiver_constructor_thread_failure_closes_listener(self) -> None:
+        original_start = Thread.start
+        original_socket = socket.socket
+        listeners: list[socket.socket] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name == "hbrowser-log-forwarding-accept":
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        def new_socket(*args: Any, **kwargs: Any) -> socket.socket:
+            listener = original_socket(*args, **kwargs)
+            listeners.append(listener)
+            return listener
+
+        with TemporaryDirectory() as directory_name:
+            with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                try:
+                    with (
+                        patch.object(Thread, "start", start),
+                        patch.object(socket, "socket", new_socket),
+                    ):
+                        self.assertIsNone(start_log_forwarding_receiver())
+                    self.assertTrue(listeners)
+                    self.assertTrue(all(item.fileno() == -1 for item in listeners))
+                    self.assertTrue(logging_health().forwarding_degraded)
+                finally:
+                    for listener in listeners:
+                        listener.close()
+
+    def _assert_failed_sender_preserves_logging_shutdown(
+        self, endpoint: str, token: str, *, failure_stage: str | None = None
+    ) -> None:
+        # Use the real global shutdown registry in a child: closing the pytest
+        # process's unrelated handlers would invalidate its own output/cleanup.
+        child = """
+import json, logging, os, sys
+from unittest.mock import patch
+from hbrowser.gallery.utils import log as log_module
+from hbrowser import configure_forwarded_logging, logging_health
+
+closed = []
+class OtherHandler(logging.Handler):
+    def flush(self):
+        closed.append('flush')
+    def close(self):
+        closed.append('close')
+        super().close()
+other = OtherHandler()
+registered_before = len(logging._handlerList)
+os.environ['HBROWSER_LOG_FORWARD_ENDPOINT'] = sys.argv[1]
+os.environ['HBROWSER_LOG_FORWARD_TOKEN'] = sys.argv[2]
+injected = RuntimeError('sender initialization failed')
+if sys.argv[3] in ('queue', 'thread'):
+    target = ('hbrowser.gallery.utils._log_forwarding.queue.Queue'
+              if sys.argv[3] == 'queue' else 'threading.Thread.start')
+    with patch(target, side_effect=injected):
+        configure_forwarded_logging()
+else:
+    configure_forwarded_logging()
+assert logging_health().forwarding_degraded
+assert logging_health().forwarding_operation == 'forward-configure'
+assert log_module._FORWARDING_HANDLER is None
+# This saved exception deliberately keeps the failed constructor traceback alive.
+assert log_module._LOG_FORWARDING_FAILURE is not None
+cause = log_module._LOG_FORWARDING_FAILURE.__cause__
+assert cause is not None
+if sys.argv[3] in ('queue', 'thread'):
+    assert cause is injected
+else:
+    assert type(cause).__name__ == 'ForwardingConfigurationError'
+    assert str(cause) == ('forwarding token is invalid' if sys.argv[2] == 'invalid'
+                          else 'forwarding endpoint is invalid')
+registered_after = len(logging._handlerList)
+shutdown_error = None
+try:
+    logging.shutdown()
+except BaseException as error:
+    shutdown_error = type(error).__name__ + ': ' + str(error)
+print(json.dumps({'registered_before': registered_before,
+                  'registered_after': registered_after,
+                  'shutdown_error': shutdown_error,
+                  'other_closed': other._closed, 'operations': closed}))
+"""
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                child,
+                endpoint,
+                token,
+                failure_stage or "invalid-capability",
+            ),
+            cwd=root,
+            env=os.environ | {"PYTHONPATH": str(root)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertIsNone(evidence["shutdown_error"], evidence)
+        self.assertTrue(evidence["other_closed"], evidence)
+        self.assertEqual(evidence["operations"], ["flush", "close"], evidence)
+        self.assertEqual(
+            evidence["registered_before"] + (failure_stage == "thread"),
+            evidence["registered_after"],
+            evidence,
+        )
+        self.assertNotIn("Exception ignored", result.stderr)
+
+    def test_invalid_token_does_not_register_a_partial_sender(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown("127.0.0.1:1", "invalid")
+
+    def test_invalid_endpoint_does_not_register_a_partial_sender(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "not-loopback:1", "1" * 64
+        )
+
+    def test_sender_queue_failure_does_not_register_a_partial_handler(self) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="queue"
+        )
+
+    def test_sender_thread_failure_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="thread"
+        )
+
+    def test_sender_constructor_thread_failure_can_close_partial_handler(self) -> None:
+        handler = ForwardingHandler.__new__(ForwardingHandler)
+        with patch.object(Thread, "start", side_effect=RuntimeError("no thread")):
+            with self.assertRaisesRegex(RuntimeError, "no thread"):
+                ForwardingHandler.__init__(
+                    handler, "127.0.0.1:1", "1" * 64, failure_callback=lambda *_: None
+                )
+        try:
+            handler.close_forwarding()
+            self.assertTrue(handler._stopped.is_set())
+        finally:
+            # Keep the intentional old partial object from breaking atexit.
+            handler._worker_survived_fork = False
+            handler._stopped.set()
+            logging.Handler.close(handler)
+
+    def test_sender_health_does_not_require_failure_notifier_thread(self) -> None:
+        original_start = Thread.start
+        failed_starts: list[str] = []
+
+        def start(thread: Thread) -> None:
+            if thread.name in {
+                "hbrowser-log-forwarding-failure",
+                "hbrowser-log-health-diagnostic",
+            }:
+                failed_starts.append(thread.name)
+                raise RuntimeError("thread capacity exhausted")
+            original_start(thread)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HBROWSER_LOG_FORWARD_ENDPOINT": "127.0.0.1:1",
+                    "HBROWSER_LOG_FORWARD_TOKEN": os.urandom(32).hex(),
+                },
+            ),
+            patch.object(Thread, "start", start),
+            patch.object(
+                socket,
+                "create_connection",
+                side_effect=ConnectionRefusedError(errno.ECONNREFUSED, "unavailable"),
+            ),
+        ):
+            try:
+                configure_forwarded_logging()
+                self.assertTrue(
+                    _wait_until(lambda: logging_health().forwarding_degraded)
+                )
+                self.assertEqual(
+                    logging_health().forwarding_operation, "forward-configure"
+                )
+                self.assertIn("hbrowser-log-health-diagnostic", failed_starts)
+            finally:
+                close_forwarded_logging()
 
     def test_receiver_close_is_bounded_when_delivery_callback_never_returns(
         self,

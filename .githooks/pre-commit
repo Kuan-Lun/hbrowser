@@ -2,8 +2,14 @@
 
 set -euo pipefail
 
-repository_root="$(git rev-parse --show-toplevel)"
-cd "$repository_root"
+repository_root="$(git rev-parse --show-toplevel && printf '.')"
+repository_root="${repository_root%.}"
+repository_root="${repository_root%$'\n'}"
+CDPATH= cd "$repository_root"
+
+if git rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
+    exec .githooks/pre-merge-commit
+fi
 
 primary="$(scripts/detect-primary-branch.sh)"
 current="$(git branch --show-current)"

@@ -185,7 +185,7 @@ def _bounded_page_diagnostic_content(content: str) -> bytes:
     if maximum_bytes <= 0:
         raise OSError("Page diagnostic byte limits must be positive")
 
-    # This preparation runs in the parent before shared-memory handoff. Keep it
+    # This preparation runs in the parent before authenticated payload handoff. Keep it
     # a fixed-size local-memory phase; target-filesystem work remains entirely
     # inside the killable worker.
     source_was_truncated = len(content) > _PAGE_DIAGNOSTIC_MAX_INPUT_CHARACTERS

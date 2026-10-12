@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
-repository_root="$(git rev-parse --show-toplevel)"
-cd "$repository_root"
+repository_root="$(git rev-parse --show-toplevel && printf '.')"
+repository_root="${repository_root%.}"
+repository_root="${repository_root%$'\n'}"
+CDPATH= cd "$repository_root"
 
 primary="$(scripts/detect-primary-branch.sh)"
 rebased_branch="${2:-$(git symbolic-ref --quiet HEAD || true)}"

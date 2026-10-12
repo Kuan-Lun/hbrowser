@@ -6,10 +6,13 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("offline_code_review_cli")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MERGE_SCRIPT = _PROJECT_ROOT / "scripts" / "git-flow-merge.sh"
@@ -89,6 +92,15 @@ def _initialize_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     hooks = repository / ".githooks"
     hooks.mkdir()
     shutil.copy2(_REBASE_HOOK, hooks / _REBASE_HOOK.name)
+    for name in ("review-merge-candidate.sh", "check_change_scope.py"):
+        shutil.copy2(_PROJECT_ROOT / "scripts" / name, scripts / name)
+    _write_executable(
+        hooks / "pre-commit",
+        "#!/usr/bin/env bash\n"
+        "if git rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then\n"
+        "    exec .githooks/pre-merge-commit\n"
+        "fi\n",
+    )
     _write_executable(
         hooks / "pre-merge-commit",
         """#!/usr/bin/env bash
@@ -110,12 +122,23 @@ fi
 """,
     )
 
+    shutil.copy2(_PROJECT_ROOT / "AGENTS.md", repository / "AGENTS.md")
+    shutil.copy2(_PROJECT_ROOT / "pyproject.toml", repository / "pyproject.toml")
+    shutil.copy2(_PROJECT_ROOT / "scripts/review-code.py", scripts / "review-code.py")
+    (repository / ".gitignore").write_text(".venv/\n__pycache__/\n")
     (repository / "payload.txt").write_text("base\n")
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", "test: initial state")
     initial_oid = _git_stdout(repository, "rev-parse", "HEAD")
     _run(repository, "scripts/install-git-hooks.sh")
+    _install_test_python(repository)
     return repository, initial_oid, tmp_path / "gate.log"
+
+
+def _install_test_python(repository: Path) -> None:
+    python = repository / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
 
 
 def _run_merge_script(
@@ -183,6 +206,7 @@ def test_ancestor_noop_removes_linked_task_worktree(tmp_path: Path) -> None:
         str(task_worktree),
         "main",
     )
+    _install_test_python(task_worktree)
     (repository / "payload.txt").write_text("primary advanced\n")
     _git(repository, "add", "payload.txt")
     _git(repository, "commit", "-m", "test: advance primary")
@@ -217,6 +241,7 @@ def test_git_subprocesses_discard_hook_local_environment(
         str(task_worktree),
         "main",
     )
+    _install_test_python(task_worktree)
 
     result = _run_merge_script(task_worktree, gate_log)
 
@@ -343,8 +368,9 @@ def test_noop_revalidates_task_oid_after_switch(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Git ref changed during cleanup" in result.stderr
-    assert _git_stdout(repository, "branch", "--show-current") == "main"
+    assert _git_stdout(repository, "branch", "--show-current") == _TASK_BRANCH
     assert _git_stdout(repository, "rev-parse", _TASK_BRANCH) == moved_oid
+    assert _git_stdout(repository, "rev-parse", "main") == initial_oid
     assert not gate_log.exists()
 
 
@@ -360,6 +386,7 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
         str(task_worktree),
         "main",
     )
+    _install_test_python(task_worktree)
     (task_worktree / "payload.txt").write_text("task change\n")
     _git(task_worktree, "add", "payload.txt")
     _git(task_worktree, "commit", "-m", "test: task change")

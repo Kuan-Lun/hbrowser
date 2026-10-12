@@ -10,7 +10,6 @@ import secrets
 import subprocess
 import sys
 from asyncio import Task
-from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 from ..utils.deadline import Deadline
@@ -19,6 +18,8 @@ from ..utils.diagnostic import (
     _PAGE_DIAGNOSTIC_KIND_PATTERN,
     _bounded_page_diagnostic_content,
 )
+from ._page_diagnostic_transport import send_payload
+from ._task_settlement import wait_owned_task_completion
 from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
 
 _DIAGNOSTIC_WORKER_MODULE = "hbrowser.gallery.browser._page_diagnostic_worker"
@@ -55,18 +56,7 @@ async def _settle_task[T](
 ) -> tuple[T | None, BaseException | None, asyncio.CancelledError | None]:
     """Wait through caller cancellation so no ownership thread is detached."""
 
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            current_task = asyncio.current_task()
-            if task.done() and (current_task is None or current_task.cancelling() == 0):
-                break
-            if current_task is None or current_task.cancelling() == 0:
-                raise
-            if cancellation is None:
-                cancellation = error
+    cancellation = await wait_owned_task_completion(task)
     try:
         return task.result(), None, cancellation
     except BaseException as error:
@@ -131,7 +121,88 @@ async def _settle_owned_worker(
     return cancellation
 
 
-def _read_and_validate_receipt(
+async def _read_frame(
+    owner: OwnedProcess, *, deadline: Deadline, require_eof: bool = False
+) -> bytes:
+    """Read bounded raw pipe bytes without a blocking thread or buffered read."""
+    output = owner.stdout
+    if output is None:
+        raise RuntimeError("Page diagnostic worker receipt pipe is unavailable")
+    descriptor = output.fileno()
+    os.set_blocking(descriptor, False)
+    encoded = bytearray()
+    while True:
+        if deadline.expired:
+            raise TimeoutError(
+                "Page diagnostic worker frame exceeded its work deadline"
+            )
+        try:
+            chunk = os.read(
+                descriptor, _DIAGNOSTIC_RECEIPT_MAX_BYTES + 1 - len(encoded)
+            )
+        except BlockingIOError:
+            await asyncio.sleep(min(_DIAGNOSTIC_POLL_SECONDS, deadline.remaining()))
+            continue
+        if deadline.expired:
+            raise TimeoutError("Page diagnostic frame arrived after its deadline")
+        if not chunk:
+            raise RuntimeError("Page diagnostic worker frame was truncated")
+        encoded.extend(chunk)
+        if len(encoded) > _DIAGNOSTIC_RECEIPT_MAX_BYTES:
+            raise RuntimeError("Page diagnostic worker frame exceeded its size limit")
+        if b"\n" in encoded:
+            if not encoded.endswith(b"\n") or encoded.count(b"\n") != 1:
+                raise RuntimeError("Page diagnostic worker returned excess frame bytes")
+            if require_eof:
+                try:
+                    trailing = os.read(descriptor, 1)
+                except BlockingIOError:
+                    raise RuntimeError(
+                        "Page diagnostic final receipt pipe remains open"
+                    ) from None
+                if trailing:
+                    raise RuntimeError("Page diagnostic receipt has trailing bytes")
+                if deadline.expired:
+                    raise TimeoutError("Page diagnostic receipt EOF arrived too late")
+            return bytes(encoded)
+
+
+async def _transfer_payload(
+    owner: OwnedProcess, payload: bytes, *, nonce: str, deadline: Deadline
+) -> None:
+    encoded = await _read_frame(owner, deadline=deadline)
+    try:
+        ready: object = json.loads(encoded)
+    except json.JSONDecodeError, UnicodeDecodeError:
+        raise RuntimeError(
+            "Page diagnostic worker returned invalid READY JSON"
+        ) from None
+    if (
+        not isinstance(ready, dict)
+        or set(ready) != {"schema", "phase", "nonce", "size", "port", "capability"}
+        or type(ready["schema"]) is not int
+        or ready["schema"] != _RECEIPT_SCHEMA
+        or ready["phase"] != "ready"
+        or ready["nonce"] != nonce
+        or type(ready["size"]) is not int
+        or ready["size"] != len(payload)
+        or type(ready["port"]) is not int
+        or not 1 <= ready["port"] <= 65535
+        or not isinstance(ready["capability"], str)
+        or len(ready["capability"]) != 64
+        or any(value not in "0123456789abcdef" for value in ready["capability"])
+    ):
+        raise RuntimeError("Page diagnostic worker returned invalid READY authority")
+    await send_payload(
+        ready["port"],
+        bytes.fromhex(ready["capability"]),
+        nonce,
+        payload,
+        deadline=deadline.expires_at,
+    )
+
+
+async def _read_and_validate_receipt(
     owner: OwnedProcess,
     *,
     directory: Path,
@@ -141,20 +212,10 @@ def _read_and_validate_receipt(
 ) -> Path:
     if deadline.expired:
         raise TimeoutError("Page diagnostic receipt arrived after its deadline")
-    output = owner.stdout
-    if output is None:
-        raise RuntimeError("Page diagnostic worker receipt pipe is unavailable")
-    try:
-        encoded_receipt = output.read(_DIAGNOSTIC_RECEIPT_MAX_BYTES + 1)
-    finally:
-        output.close()
-    if deadline.expired:
-        raise TimeoutError("Page diagnostic receipt read completed after its deadline")
-    if len(encoded_receipt) > _DIAGNOSTIC_RECEIPT_MAX_BYTES:
-        raise RuntimeError("Page diagnostic worker receipt exceeded its size limit")
+    encoded_receipt = await _read_frame(owner, deadline=deadline, require_eof=True)
     try:
         receipt: object = json.loads(encoded_receipt)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError, UnicodeDecodeError:
         raise RuntimeError("Page diagnostic worker returned invalid JSON") from None
     if deadline.expired:
         raise TimeoutError(
@@ -208,23 +269,11 @@ async def write_page_diagnostic_owned(
         )
 
     nonce = secrets.token_hex(16)
-    payload_memory = SharedMemory(create=True, size=max(1, len(prepared_content)))
     owner: OwnedProcess | None = None
     primary_error: BaseException | None = None
     result: Path | None = None
     receipt_pipe_owner: OwnedProcess | None = None
     try:
-        payload_buffer = payload_memory.buf
-        if payload_buffer is None:
-            raise RuntimeError("Page diagnostic shared memory is unavailable")
-        try:
-            payload_buffer[: len(prepared_content)] = prepared_content
-        finally:
-            del payload_buffer
-        if deadline.expired:
-            raise TimeoutError(
-                "Page diagnostic deadline expired while staging worker payload"
-            )
         work_deadline = Deadline(
             deadline.expires_at - _DIAGNOSTIC_OWNERSHIP_RESERVE_SECONDS
         )
@@ -243,7 +292,6 @@ async def write_page_diagnostic_owned(
                     kind,
                     nonce,
                     repr(work_deadline.expires_at),
-                    payload_memory.name,
                     str(len(prepared_content)),
                 ),
                 stdout=subprocess.PIPE,
@@ -257,7 +305,14 @@ async def write_page_diagnostic_owned(
         )
         owner, startup_error, startup_cancellation = await _settle_task(startup_task)
         if startup_error is not None:
-            if startup_cancellation is not None:
+            if isinstance(startup_error, ProcessOwnershipError):
+                if startup_cancellation is not None:
+                    startup_error.add_note(
+                        "Diagnostic worker startup was also interrupted by "
+                        "caller cancellation"
+                    )
+                primary_error = startup_error
+            elif startup_cancellation is not None:
                 startup_cancellation.add_note(
                     "Diagnostic worker startup also failed: "
                     f"{type(startup_error).__name__}"
@@ -274,6 +329,9 @@ async def write_page_diagnostic_owned(
         if primary_error is None:
             assert owner is not None
             try:
+                await _transfer_payload(
+                    owner, prepared_content, nonce=nonce, deadline=work_deadline
+                )
                 while owner.poll() is None:
                     remaining_work = work_deadline.remaining()
                     if remaining_work <= 0:
@@ -290,7 +348,7 @@ async def write_page_diagnostic_owned(
                 if shutdown_cancellation is not None:
                     raise shutdown_cancellation
                 assert receipt_pipe_owner is not None
-                result = _read_and_validate_receipt(
+                result = await _read_and_validate_receipt(
                     receipt_pipe_owner,
                     directory=directory,
                     kind=kind,
@@ -318,10 +376,6 @@ async def write_page_diagnostic_owned(
                 receipt_pipe_owner.stdout.close()
             except OSError:
                 pass
-        try:
-            payload_memory.close()
-        finally:
-            payload_memory.unlink()
 
         if ownership_error is not None:
             unresolved = ProcessOwnershipError(

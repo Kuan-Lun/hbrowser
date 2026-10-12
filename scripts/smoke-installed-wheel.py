@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import runpy
 import sys
 from importlib.metadata import distribution
 from pathlib import Path
 
-# Isolated execution imports only tool sources, never the repository runtime.
+# Isolated execution loads only verified tool sources, not repository runtime.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _shared.h2h_dev_tools.distribution_check import (
+shared = Path(__file__).resolve().parent / "_shared/h2h_dev_tools"
+runpy.run_path(str(shared / "source_loader.py"))["load_package"](
+    shared, "_shared.h2h_dev_tools"
+)
+
+from _shared.h2h_dev_tools.distribution_check import (  # noqa: E402 - verify snapshot source first.
     check_runtime_requirements,
     check_wheel_origin,
 )

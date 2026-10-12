@@ -18,6 +18,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 from hbrowser import EHDriver
 from hbrowser.gallery import utils as gallery_utils
 from hbrowser.gallery.browser import page_diagnostic as page_diagnostic_module
+from hbrowser.gallery.browser.process import ProcessOwnershipError
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.utils import (
     Deadline,
@@ -58,32 +59,6 @@ def write_page_diagnostic(
         diagnostic_module._bounded_page_diagnostic_content(content),
         deadline=effective_deadline,
     )
-
-
-class _FakeSharedMemory:
-    def __init__(
-        self,
-        name: str | None = None,
-        create: bool = False,
-        size: int = 0,
-        *,
-        track: bool = True,
-    ) -> None:
-        del create, track
-        self.name = "fake-page-diagnostic-memory" if name is None else name
-        self.size = size
-        self.buf: memoryview | None = memoryview(bytearray(size))
-        self.closed = False
-        self.unlinked = False
-
-    def close(self) -> None:
-        if self.buf is not None:
-            self.buf.release()
-            self.buf = None
-        self.closed = True
-
-    def unlink(self) -> None:
-        self.unlinked = True
 
 
 class PageDiagnosticTests(unittest.TestCase):
@@ -497,6 +472,16 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def _owner(self, receipt: bytes = b"") -> Mock:
+        self.enterContext(
+            patch.object(page_diagnostic_module, "_transfer_payload", new=AsyncMock())
+        )
+        self.enterContext(
+            patch.object(
+                page_diagnostic_module,
+                "_read_frame",
+                new=AsyncMock(return_value=receipt),
+            )
+        )
         owner = Mock()
         owner.stdout = io.BytesIO(receipt)
         owner.poll = Mock(return_value=0)
@@ -531,7 +516,7 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 "_page_diagnostic_directory_hint",
                 return_value=Path(directory_name),
             ),
-            patch.object(page_diagnostic_module, "SharedMemory") as shared_memory,
+            patch.object(page_diagnostic_module, "_transfer_payload") as transfer,
             patch.object(
                 page_diagnostic_module,
                 "start_owned_process",
@@ -544,13 +529,12 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 deadline=Deadline.after(0.01),
             )
 
-        shared_memory.assert_not_called()
+        transfer.assert_not_called()
         start_owned_process.assert_not_called()
 
-    async def test_timeout_kills_reaps_and_unlinks_shared_memory(self) -> None:
+    async def test_timeout_kills_reaps_and_closes_pipe(self) -> None:
         owner = self._owner()
         owner.poll.return_value = None
-        payload_memory = _FakeSharedMemory(size=32)
         started_at = time.monotonic()
 
         with (
@@ -559,11 +543,6 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 page_diagnostic_module,
                 "_page_diagnostic_directory_hint",
                 return_value=Path(directory_name),
-            ),
-            patch.object(
-                page_diagnostic_module,
-                "SharedMemory",
-                return_value=payload_memory,
             ),
             patch(
                 "hbrowser.gallery.browser.page_diagnostic.secrets.token_hex",
@@ -590,10 +569,9 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started_at, 0.5)
         owner.kill.assert_called_once_with()
         owner.shutdown.assert_called_once()
-        self.assertTrue(payload_memory.closed)
-        self.assertTrue(payload_memory.unlinked)
+        self.assertTrue(owner.stdout.closed)
 
-    async def test_cancellation_waits_for_force_reap_and_shared_memory(self) -> None:
+    async def test_cancellation_waits_for_force_reap_and_pipe_close(self) -> None:
         owner = self._owner()
         owner.poll.return_value = None
         shutdown_started = threading.Event()
@@ -605,18 +583,12 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
             return 0
 
         owner.shutdown.side_effect = settle_shutdown
-        payload_memory = _FakeSharedMemory(size=32)
         with (
             TemporaryDirectory() as directory_name,
             patch.object(
                 page_diagnostic_module,
                 "_page_diagnostic_directory_hint",
                 return_value=Path(directory_name),
-            ),
-            patch.object(
-                page_diagnostic_module,
-                "SharedMemory",
-                return_value=payload_memory,
             ),
             patch(
                 "hbrowser.gallery.browser.page_diagnostic.secrets.token_hex",
@@ -652,8 +624,7 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         owner.kill.assert_called_once_with()
         owner.shutdown.assert_called_once()
-        self.assertTrue(payload_memory.closed)
-        self.assertTrue(payload_memory.unlinked)
+        self.assertTrue(owner.stdout.closed)
 
     async def test_late_receipt_is_rejected_after_natural_reap(self) -> None:
         owner = self._owner(self._receipt())
@@ -663,7 +634,6 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
             return 0
 
         owner.shutdown.side_effect = late_shutdown
-        payload_memory = _FakeSharedMemory(size=32)
 
         with (
             TemporaryDirectory() as directory_name,
@@ -671,11 +641,6 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 page_diagnostic_module,
                 "_page_diagnostic_directory_hint",
                 return_value=Path(directory_name),
-            ),
-            patch.object(
-                page_diagnostic_module,
-                "SharedMemory",
-                return_value=payload_memory,
             ),
             patch(
                 "hbrowser.gallery.browser.page_diagnostic.secrets.token_hex",
@@ -701,12 +666,10 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         owner.kill.assert_not_called()
         owner.shutdown.assert_called_once()
-        self.assertTrue(payload_memory.closed)
-        self.assertTrue(payload_memory.unlinked)
+        self.assertTrue(owner.stdout.closed)
 
     async def test_malformed_receipt_is_rejected_after_natural_reap(self) -> None:
         owner = self._owner(b"not-json\n")
-        payload_memory = _FakeSharedMemory(size=32)
 
         with (
             TemporaryDirectory() as directory_name,
@@ -714,11 +677,6 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 page_diagnostic_module,
                 "_page_diagnostic_directory_hint",
                 return_value=Path(directory_name),
-            ),
-            patch.object(
-                page_diagnostic_module,
-                "SharedMemory",
-                return_value=payload_memory,
             ),
             patch(
                 "hbrowser.gallery.browser.page_diagnostic.secrets.token_hex",
@@ -748,18 +706,27 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
         owner.shutdown.assert_called_once()
         resolve_path.assert_not_called()
         make_directory.assert_not_called()
-        self.assertTrue(payload_memory.closed)
-        self.assertTrue(payload_memory.unlinked)
+        self.assertTrue(owner.stdout.closed)
 
 
 class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        directory = self.enterContext(TemporaryDirectory())
+        self.enterContext(
+            patch(
+                "hbrowser.gallery.browser.page_diagnostic."
+                "_page_diagnostic_directory_hint",
+                return_value=Path(directory),
+            )
+        )
         self.driver = _TestDriver(headless=True)
         self.logger = Mock()
         self.driver.logger = self.logger
         page = Mock()
+        browser = Mock()
+        page.browser = browser
         page.get_content = AsyncMock(return_value="<html>failure</html>")
-        self.driver.bind_existing_browser(Mock(), page, owns_browser=True)
+        self.driver.bind_existing_browser(browser, page, owns_browser=True)
 
     async def test_exit_keeps_each_error_page_and_logs_safe_error_types(self) -> None:
         try:
@@ -902,6 +869,22 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 await save_task
 
         self.assertTrue(finished.is_set())
+
+    async def test_unresolved_diagnostic_worker_ownership_is_not_best_effort(
+        self,
+    ) -> None:
+        failure = ProcessOwnershipError("diagnostic worker ownership unresolved")
+        next_action = AsyncMock()
+        with patch.object(
+            self.driver, "_write_page_diagnostic", new=AsyncMock(side_effect=failure)
+        ):
+            with self.assertRaises(ProcessOwnershipError) as raised:
+                await self.driver.save_page_diagnostic("driver_error", "content")
+                await next_action()
+
+        self.assertIs(raised.exception, failure)
+        next_action.assert_not_awaited()
+        self.logger.warning.assert_not_called()
 
     async def test_owned_worker_timeout_is_reported(self) -> None:
         with patch.object(
@@ -1153,3 +1136,404 @@ class DriverExitDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             "Browser session was already exiting after: ValueError",
             raised.exception.__notes__,
         )
+
+
+class DiagnosticPipeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ready_frame_reads_partial_raw_pipe_without_blocking(self) -> None:
+        reader, writer = os.pipe()
+        with os.fdopen(reader, "rb") as stream:
+            owner = Mock(stdout=stream)
+
+            async def publish() -> None:
+                os.write(writer, b'{"schema":')
+                await asyncio.sleep(0.01)
+                os.write(writer, b"1}\n")
+
+            publisher = asyncio.create_task(publish())
+            try:
+                frame = await page_diagnostic_module._read_frame(
+                    owner, deadline=Deadline.after(1)
+                )
+                await publisher
+                self.assertEqual(frame, b'{"schema":1}\n')
+            finally:
+                os.close(writer)
+                publisher.cancel()
+                await asyncio.gather(publisher, return_exceptions=True)
+
+    async def test_raw_pipe_rejects_truncated_oversize_and_excess_frames(self) -> None:
+        for content, message in (
+            (b'{"schema":', "truncated"),
+            (b"x" * 4097, "size limit"),
+            (b"{}\n{}\n", "excess frame"),
+        ):
+            with self.subTest(message=message):
+                reader, writer = os.pipe()
+                with os.fdopen(reader, "rb") as stream:
+                    os.set_blocking(writer, False)
+
+                    async def publish(
+                        content: bytes = content, writer: int = writer
+                    ) -> None:
+                        try:
+                            offset = 0
+                            while offset < len(content):
+                                try:
+                                    written = os.write(
+                                        writer, content[offset : offset + 1024]
+                                    )
+                                except BlockingIOError:
+                                    await asyncio.sleep(0)
+                                    continue
+                                offset += written
+                                await asyncio.sleep(0)
+                        finally:
+                            os.close(writer)
+
+                    publisher = asyncio.create_task(publish())
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            await page_diagnostic_module._read_frame(
+                                Mock(stdout=stream), deadline=Deadline.after(1)
+                            )
+                    finally:
+                        publisher.cancel()
+                        await asyncio.gather(publisher, return_exceptions=True)
+
+    async def test_open_pipe_timeout_and_cancellation_do_not_start_reader_thread(
+        self,
+    ) -> None:
+        reader, writer = os.pipe()
+        with os.fdopen(reader, "rb") as stream:
+            try:
+                with self.assertRaises(TimeoutError):
+                    await page_diagnostic_module._read_frame(
+                        Mock(stdout=stream), deadline=Deadline.after(0.02)
+                    )
+                task = asyncio.create_task(
+                    page_diagnostic_module._read_frame(
+                        Mock(stdout=stream), deadline=Deadline.after(1)
+                    )
+                )
+                await asyncio.sleep(0)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                os.close(writer)
+
+    async def test_final_receipt_rejects_trailing_bytes_in_a_separate_raw_read(
+        self,
+    ) -> None:
+        reader, writer = os.pipe()
+        frame = b'{"schema":1}\n'
+        real_read = os.read
+        with os.fdopen(reader, "rb") as stream:
+            os.write(writer, frame + b"extra")
+            os.close(writer)
+            with (
+                patch.object(
+                    os,
+                    "read",
+                    side_effect=lambda fd, size: real_read(fd, min(size, len(frame))),
+                ),
+                self.assertRaisesRegex(RuntimeError, "trailing bytes"),
+            ):
+                await page_diagnostic_module._read_frame(
+                    Mock(stdout=stream), deadline=Deadline.after(1), require_eof=True
+                )
+
+    async def test_final_receipt_requires_eof_but_ready_does_not(self) -> None:
+        reader, writer = os.pipe()
+        with os.fdopen(reader, "rb") as stream:
+            try:
+                os.write(writer, b"{}\n")
+                with self.assertRaisesRegex(RuntimeError, "remains open"):
+                    await page_diagnostic_module._read_frame(
+                        Mock(stdout=stream),
+                        deadline=Deadline.after(1),
+                        require_eof=True,
+                    )
+            finally:
+                os.close(writer)
+
+    async def test_ready_authority_mismatch_never_opens_payload_socket(self) -> None:
+        nonce = "1" * 32
+        valid: dict[str, object] = {
+            "schema": 1,
+            "phase": "ready",
+            "nonce": nonce,
+            "size": 4,
+            "port": 12345,
+            "capability": "2" * 64,
+        }
+        invalid = [
+            valid | {"schema": True},
+            valid | {"phase": "complete"},
+            valid | {"nonce": "3" * 32},
+            valid | {"size": True},
+            valid | {"size": 5},
+            valid | {"port": True},
+            valid | {"port": 0},
+            valid | {"port": 65536},
+            valid | {"capability": "z" * 64},
+            valid | {"capability": "2" * 62},
+            valid | {"host": "127.0.0.1"},
+        ]
+        for frame in invalid:
+            with (
+                self.subTest(frame=frame),
+                patch.object(
+                    page_diagnostic_module,
+                    "_read_frame",
+                    new=AsyncMock(return_value=json.dumps(frame).encode() + b"\n"),
+                ),
+                patch.object(
+                    page_diagnostic_module, "send_payload", new=AsyncMock()
+                ) as send,
+                self.assertRaisesRegex(RuntimeError, "invalid READY authority"),
+            ):
+                await page_diagnostic_module._transfer_payload(
+                    Mock(), b"page", nonce=nonce, deadline=Deadline.after(1)
+                )
+            send.assert_not_awaited()
+
+
+def test_first_diagnostic_does_not_start_a_resource_tracker(tmp_path: Path) -> None:
+    """A fresh interpreter exercises real worker cleanup, including on OLD failure."""
+    import subprocess
+    import sys
+    from textwrap import dedent
+
+    root = Path(__file__).resolve().parents[1]
+    entry = root / "scripts/pytest-source.py"
+    source = dedent(
+        """
+        import asyncio
+        from multiprocessing import resource_tracker
+        from pathlib import Path
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import page_diagnostic as diagnostic
+        from hbrowser.gallery.utils.deadline import Deadline
+        tracker = resource_tracker._resource_tracker
+        assert tracker._pid is None
+        owners = []
+        real_start = diagnostic.start_owned_process
+        def record_start(*args, **kwargs):
+            owner = real_start(*args, **kwargs)
+            owners.append(owner)
+            return owner
+        async def check():
+            with patch.object(diagnostic, 'start_owned_process', record_start):
+                path = await diagnostic.write_page_diagnostic_owned(
+                    'driver_error', 'synthetic page', deadline=Deadline.after(5))
+            assert path.read_text() == 'synthetic page'
+            assert owners and all(
+                owner._closed and owner._supervisor.poll() is not None
+                for owner in owners)
+            assert tracker._pid is None, 'diagnostic started an unowned tracker'
+        try:
+            boundary['adapter'].run(lambda: asyncio.run(check()))
+        finally:
+            tracker._stop()
+        """
+    )
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "PYTHONPATH": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HBROWSER_LOG_DIR": str(tmp_path / "diagnostics"),
+    }
+    for name in ("SystemRoot", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    scope = "H2H_PRIVATE_POSIX_PROCESS_SCOPE"
+    if scope in os.environ:
+        environment[scope] = os.environ[scope]
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            f"import runpy\nboundary=runpy.run_path({str(entry)!r})\n" + source,
+        ),
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+class DiagnosticCancellationOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def _wait_started(self, started: threading.Event) -> None:
+        async with asyncio.timeout(1):
+            while not started.is_set():
+                await asyncio.sleep(0)
+
+    async def test_settle_normalizes_pending_and_completed_task_results(self) -> None:
+        for completed in (False, True):
+            for failure in (None, TimeoutError("ordinary startup failure")):
+                with self.subTest(completed=completed, failure=failure):
+                    release = asyncio.Event()
+
+                    async def operation(
+                        release: asyncio.Event = release,
+                        failure: TimeoutError | None = failure,
+                    ) -> int:
+                        await release.wait()
+                        if failure is not None:
+                            raise failure
+                        return 7
+
+                    target = asyncio.create_task(operation())
+                    if completed:
+                        release.set()
+                        await asyncio.gather(target, return_exceptions=True)
+                    waiter = asyncio.create_task(
+                        page_diagnostic_module._settle_task(target)
+                    )
+                    await asyncio.sleep(0)
+                    release.set()
+                    try:
+                        value, error, cancellation = await waiter
+                        self.assertEqual(value, 7 if failure is None else None)
+                        self.assertIs(error, failure)
+                        self.assertIsNone(cancellation)
+                    finally:
+                        release.set()
+                        await asyncio.gather(target, waiter, return_exceptions=True)
+
+    async def test_inner_task_cancellation_is_a_task_result_not_caller_cancellation(
+        self,
+    ) -> None:
+        async def operation() -> None:
+            raise asyncio.CancelledError("inner operation stopped")
+
+        target = asyncio.create_task(operation())
+        value, error, cancellation = await page_diagnostic_module._settle_task(target)
+        self.assertIsNone(value)
+        self.assertIsInstance(error, asyncio.CancelledError)
+        self.assertIsNone(cancellation)
+
+    async def test_driver_preserves_cancellation_before_clean_startup_failure(
+        self,
+    ) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        failure = TimeoutError("startup deadline expired after successful cleanup")
+
+        def start(*_args: object, **_kwargs: object) -> None:
+            started.set()
+            if not release.wait(1):
+                raise AssertionError("test did not release startup")
+            raise failure
+
+        driver = _TestDriver(headless=True)
+        driver.logger = Mock()
+        with patch.object(page_diagnostic_module, "start_owned_process", start):
+            task = asyncio.create_task(
+                driver.save_page_diagnostic("driver_error", "synthetic page")
+            )
+            try:
+                await self._wait_started(started)
+                task.cancel("caller stopped")
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_completed_startup_ownership_error_remains_primary_on_cancellation(
+        self,
+    ) -> None:
+        failure = ProcessOwnershipError("startup cleanup is unproven")
+        settle = page_diagnostic_module._settle_task
+
+        async def cancel_on_completion(
+            task: asyncio.Task[object],
+        ) -> tuple[object | None, BaseException | None, asyncio.CancelledError | None]:
+            waiter = asyncio.current_task()
+            assert waiter is not None
+            task.add_done_callback(lambda _done: waiter.cancel("late caller cancel"))
+            return await settle(task)
+
+        with (
+            patch.object(
+                page_diagnostic_module,
+                "start_owned_process",
+                side_effect=failure,
+            ),
+            patch.object(
+                page_diagnostic_module, "_settle_task", side_effect=cancel_on_completion
+            ),
+        ):
+            task = asyncio.create_task(
+                page_diagnostic_module.write_page_diagnostic_owned(
+                    "driver_error", "synthetic page", deadline=Deadline.after(5)
+                )
+            )
+            with self.assertRaises(ProcessOwnershipError) as raised:
+                await task
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(
+            any("cancellation" in note for note in getattr(failure, "__notes__", ()))
+        )
+
+    async def test_shutdown_settles_success_or_ownership_failure_after_cancellation(
+        self,
+    ) -> None:
+        for failure in (None, ProcessOwnershipError("shutdown cleanup is unproven")):
+            with self.subTest(failure=failure):
+                started = threading.Event()
+                release = threading.Event()
+
+                def shutdown(
+                    *_args: object,
+                    failure: ProcessOwnershipError | None = failure,
+                    started: threading.Event = started,
+                    release: threading.Event = release,
+                    **_kwargs: object,
+                ) -> int:
+                    started.set()
+                    if not release.wait(1):
+                        raise AssertionError("test did not release shutdown")
+                    if failure is not None:
+                        raise failure
+                    return 0
+
+                with patch.object(
+                    page_diagnostic_module, "_shutdown_owned_worker", shutdown
+                ):
+                    task = asyncio.create_task(
+                        page_diagnostic_module._settle_owned_worker(
+                            Mock(), deadline=Deadline.after(5), force=True
+                        )
+                    )
+                    try:
+                        await self._wait_started(started)
+                        task.cancel("caller stopped during shutdown")
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        release.set()
+                        if failure is None:
+                            self.assertIsInstance(await task, asyncio.CancelledError)
+                        else:
+                            with self.assertRaises(ProcessOwnershipError) as raised:
+                                await task
+                            self.assertIs(raised.exception, failure)
+                            self.assertTrue(
+                                any(
+                                    "cancellation" in note
+                                    for note in getattr(failure, "__notes__", ())
+                                )
+                            )
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)

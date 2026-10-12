@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import unittest
 from collections import defaultdict, deque
@@ -10,6 +11,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from zendriver import cdp
+from zendriver.core.connection import Connection, ProtocolException, Transaction
 
 from hbrowser.gallery.utils import (
     Deadline,
@@ -17,11 +19,13 @@ from hbrowser.gallery.utils import (
     mutate_and_wait_for_navigation,
     mutate_and_wait_for_new_tab,
     navigate_and_wait,
+    open_tab_and_wait,
     reload_and_wait,
     wait_for_selector,
     wait_for_zendriver,
 )
 from hbrowser.gallery.utils import page_state as page_state_module
+from hbrowser.gallery.utils import window as window_module
 from hbrowser.gallery.utils.protocol import (
     ZendriverOperationTimeout,
     ZendriverOwnerRetiredError,
@@ -42,6 +46,9 @@ class _EventPage:
         self.emit_stale_while_enabling = False
         self.queue_stale_while_enabling = False
         self.delay_same_document = 0.0
+        self.serialized_navigation_url: str | None = None
+        self.navigation_event_url: str | None = None
+        self.navigation_requests: list[str] = []
         self.reload_payload: dict[str, Any] | None = None
         self.selector_results: list[Any] = []
         self.selector_queries = 0
@@ -95,8 +102,31 @@ class _EventPage:
                 if self.queue_stale_while_enabling:
                     self._schedule(self._emit_cross_document("queued-stale-loader"))
                 return None
+            case "Page.createIsolatedWorld":
+                assert payload["params"]["frameId"] == "main-frame"
+                assert payload["params"]["worldName"] == "hbrowser.navigation-url"
+                return cdp.runtime.ExecutionContextId(123)
+            case "Runtime.evaluate":
+                assert payload["params"]["contextId"] == 123
+                assert payload["params"]["returnByValue"] is True
+                expression = payload["params"]["expression"]
+                requested_url = json.loads(
+                    expression.removeprefix("new URL(").removesuffix(").href")
+                )
+                return (
+                    SimpleNamespace(
+                        value=self.serialized_navigation_url or requested_url
+                    ),
+                    None,
+                )
             case "Page.navigate":
-                self.url = payload["params"]["url"]
+                requested_url = payload["params"]["url"]
+                self.navigation_requests.append(requested_url)
+                self.url = (
+                    self.navigation_event_url
+                    or self.serialized_navigation_url
+                    or requested_url
+                )
                 loader_id = self.navigation_loader
                 if self.emit_navigation:
                     if loader_id is None:
@@ -183,6 +213,131 @@ class _ExpiresDuringCommandDeadline:
 
 
 class PageStateTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    async def _trigger_navigation(
+        operation: str, page: _EventPage, deadline: Deadline
+    ) -> None:
+        if operation == "navigate":
+            await navigate_and_wait(page, "https://example.test/new", deadline=deadline)
+        elif operation == "reload":
+            await reload_and_wait(page, deadline=deadline)
+        else:
+            await mutate_and_wait_for_navigation(
+                page,
+                AsyncMock(return_value="accepted click"),
+                owner=SimpleNamespace(_tab=page),
+                operation="Login click",
+                deadline=deadline,
+            )
+
+    async def test_unfinished_acknowledged_navigation_rejects_later_work(self) -> None:
+        for operation in ("navigate", "reload", "click"):
+            with self.subTest(operation=operation):
+                page = _EventPage()
+                page.emit_navigation = False
+                with self.assertRaises(PageStateTimeout):
+                    await self._trigger_navigation(
+                        operation, page, Deadline.after(0.02)
+                    )
+                later_work = AsyncMock()
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await wait_for_zendriver(later_work(), timeout=1, owner=page)
+                later_work.assert_not_awaited()
+                self.assertFalse(any(page.handlers.values()))
+
+    async def test_cancelled_navigation_retires_its_original_generation(self) -> None:
+        for operation in ("navigate", "reload", "click"):
+            with self.subTest(operation=operation):
+                page = _EventPage()
+                page.emit_navigation = False
+                original_browser = page.browser
+                replacement = SimpleNamespace()
+                waiting = asyncio.Event()
+                original_wait = page_state_module._NavigationObserver.wait
+
+                async def wait_for_lifecycle(
+                    observer: Any,
+                    *args: Any,
+                    _waiting: asyncio.Event = waiting,
+                    _wait: Any = original_wait,
+                    **kwargs: Any,
+                ) -> None:
+                    _waiting.set()
+                    await _wait(observer, *args, **kwargs)
+
+                with patch.object(
+                    page_state_module._NavigationObserver,
+                    "wait",
+                    new=wait_for_lifecycle,
+                ):
+                    task = asyncio.create_task(
+                        self._trigger_navigation(operation, page, Deadline.after(5))
+                    )
+                    try:
+                        await asyncio.wait_for(waiting.wait(), timeout=1)
+                        page.browser = replacement
+                        task.cancel("abandon acknowledged navigation")
+                        with self.assertRaises(asyncio.CancelledError) as raised:
+                            await task
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertEqual(
+                    raised.exception.args, ("abandon acknowledged navigation",)
+                )
+                later_work = AsyncMock()
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await wait_for_zendriver(
+                        later_work(), timeout=1, owner=original_browser
+                    )
+                later_work.assert_not_awaited()
+                await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=replacement)
+                self.assertFalse(any(page.handlers.values()))
+
+    async def test_failed_navigation_snapshot_retires_generation(self) -> None:
+        page = _EventPage()
+        page.ready_state = "loading"
+        with self.assertRaises(PageStateTimeout):
+            await navigate_and_wait(
+                page, "https://example.test/new", deadline=Deadline.after(1)
+            )
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_navigation_setup_failure_does_not_retire_generation(self) -> None:
+        page = _EventPage()
+        with (
+            patch.object(
+                page_state_module,
+                "_enable_lifecycle_events",
+                side_effect=ValueError("invalid local setup"),
+            ),
+            self.assertRaisesRegex(ValueError, "invalid local setup"),
+        ):
+            await navigate_and_wait(
+                page, "https://example.test/new", deadline=Deadline.after(1)
+            )
+        self.assertFalse(page.navigation_requests)
+        self.assertFalse(any(page.handlers.values()))
+        await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_created_target_without_inventory_retires_generation(self) -> None:
+        browser = SimpleNamespace(targets=[])
+        connection = _EventPage()
+        connection.browser = browser
+        browser.connection = connection
+        accepted = AsyncMock(return_value="created-target")
+        with (
+            patch.object(connection, "send", new=accepted),
+            self.assertRaises(PageStateTimeout),
+        ):
+            await open_tab_and_wait(browser, deadline=Deadline.after(0.02))
+        accepted.assert_awaited_once()
+        self.assertFalse(any(connection.handlers.values()))
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
+
     async def test_new_tab_mutation_late_ack_is_not_accepted(self) -> None:
         mutation = AsyncMock(return_value="ack")
         browser = SimpleNamespace(connection=None, tabs=[])
@@ -201,12 +356,58 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
                 cast(Any, browser),
                 set(),
                 mutation,
-                owner=object(),
+                owner=browser,
                 operation="Popup click",
                 deadline=_RemainingDeadline(1.0, 0.0),  # type: ignore[arg-type]
             )
 
         mutation.assert_awaited_once_with()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
+
+    async def test_cancelled_popup_wait_retires_original_generation(self) -> None:
+        page = _EventPage()
+        browser = page.browser
+        browser.connection = page
+        browser.tabs = []
+        replacement_browser = SimpleNamespace()
+        waiting = asyncio.Event()
+        original_wait = window_module._wait_for_inventory_change
+
+        async def wait_for_inventory(*args: Any, **kwargs: Any) -> Any:
+            waiting.set()
+            return await original_wait(*args, **kwargs)
+
+        mutation = AsyncMock(return_value="ack")
+        with patch.object(
+            window_module, "_wait_for_inventory_change", side_effect=wait_for_inventory
+        ):
+            task = asyncio.create_task(
+                mutate_and_wait_for_new_tab(
+                    cast(Any, browser),
+                    set(),
+                    mutation,
+                    owner=page,
+                    operation="Popup click",
+                    deadline=Deadline.after(5),
+                )
+            )
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            # Retirement must remain bound to the original browser even when
+            # a page owner is rebound after its mutation acknowledgement.
+            page.browser = replacement_browser
+            task.cancel("caller cancellation")
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await task
+
+        self.assertEqual(raised.exception.args, ("caller cancellation",))
+        mutation.assert_awaited_once_with()
+        self.assertTrue(all(not handlers for handlers in page.handlers.values()))
+        new_work = AsyncMock()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(new_work(), timeout=1, owner=browser)
+        new_work.assert_not_awaited()
+        await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=replacement_browser)
 
     async def test_fallback_navigation_rejects_a_late_command_success(self) -> None:
         browser = SimpleNamespace()
@@ -223,6 +424,8 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
                 "https://example.test/new",
                 deadline=_ExpiredAfterCommandDeadline(),  # type: ignore[arg-type]
             )
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
 
     async def test_done_lifecycle_future_is_rejected_after_deadline(self) -> None:
         future = asyncio.get_running_loop().create_future()
@@ -272,13 +475,9 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
                 deadline=Deadline.after(0.03),
             )
 
-        # A semantic state timeout leaves the proven transport generation usable.
-        result = await wait_for_zendriver(
-            asyncio.sleep(0, result="healthy"),
-            timeout=0.1,
-            owner=page,
-        )
-        self.assertEqual(result, "healthy")
+        # A healthy transport is not proof that its document mutation settled.
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=0.1, owner=page)
 
     async def test_queued_setup_event_is_drained_before_trigger(self) -> None:
         page = _EventPage()
@@ -306,6 +505,7 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
             )
 
         mutation.assert_not_awaited()
+        await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
 
     async def test_same_document_ack_waits_for_matching_event(self) -> None:
         page = _EventPage()
@@ -323,6 +523,95 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(receipt.loader_id)
         self.assertEqual(receipt.url, "https://example.test/old#new-fragment")
 
+    async def test_same_document_uses_browser_serialized_url(self) -> None:
+        for requested, serialized in (
+            ("https://example.test#fragment", "https://example.test/#fragment"),
+            ("https://EXAMPLE.test:443/#fragment", "https://example.test/#fragment"),
+            ("https://example.test/a/../#fragment", "https://example.test/#fragment"),
+            ("https://example.test/#a b", "https://example.test/#a%20b"),
+            ('https://example.test/#a"b', "https://example.test/#a%22b"),
+        ):
+            with self.subTest(requested=requested):
+                page = _EventPage()
+                page.navigation_loader = None
+                page.serialized_navigation_url = serialized
+                receipt = await navigate_and_wait(
+                    page, requested, deadline=Deadline.after(0.5)
+                )
+                self.assertEqual(receipt.url, serialized)
+                self.assertEqual(page.navigation_requests, [requested])
+                self.assertFalse(any(page.handlers.values()))
+                await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_same_document_does_not_accept_a_different_serialized_fragment(
+        self,
+    ) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        page.serialized_navigation_url = "https://example.test/#expected"
+        page.navigation_event_url = "https://example.test/#other"
+        with self.assertRaises(PageStateTimeout):
+            await navigate_and_wait(
+                page, "https://example.test#expected", deadline=Deadline.after(0.03)
+            )
+        self.assertFalse(any(page.handlers.values()))
+
+    async def test_same_document_rejects_invalid_serialization(self) -> None:
+        for value, error in (
+            (None, None),
+            ("", None),
+            (123, None),
+            (None, {"message": "serialization failed"}),
+        ):
+            with self.subTest(value=value, error=error):
+                page = _EventPage()
+                page.navigation_loader = None
+
+                async def send(
+                    command: Any,
+                    result_value: Any = value,
+                    result_error: Any = error,
+                    target: _EventPage = page,
+                ) -> Any:
+                    payload = next(command)
+                    if payload["method"] == "Runtime.evaluate":
+                        return SimpleNamespace(value=result_value), result_error
+                    return await _EventPage.send(target, iter((payload,)))
+
+                expected_error = ProtocolException if error else TypeError
+                with (
+                    patch.object(page, "send", new=send),
+                    self.assertRaises(expected_error),
+                ):
+                    await navigate_and_wait(
+                        page,
+                        "https://example.test/#fragment",
+                        deadline=Deadline.after(1),
+                    )
+                self.assertFalse(any(page.handlers.values()))
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_same_document_rejects_serialization_after_deadline(self) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        with self.assertRaisesRegex(PageStateTimeout, "serialization.*deadline"):
+            await navigate_and_wait(
+                page,
+                "https://example.test/#fragment",
+                deadline=_ExpiredAfterCommandDeadline(),  # type: ignore[arg-type]
+            )
+        self.assertFalse(any(page.handlers.values()))
+
+    async def test_cross_document_navigation_does_not_serialize_url(self) -> None:
+        page = _EventPage()
+        with patch.object(page_state_module, "_serialize_navigation_url") as serialize:
+            receipt = await navigate_and_wait(
+                page, "https://example.test/new", deadline=Deadline.after(1)
+            )
+        self.assertEqual(receipt.loader_id, "new-loader")
+        serialize.assert_not_called()
+
     async def test_reload_guards_the_previous_loader_and_waits_for_new_one(
         self,
     ) -> None:
@@ -333,6 +622,101 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         assert page.reload_payload is not None
         self.assertEqual(page.reload_payload["params"]["loaderId"], "old-loader")
         self.assertEqual(receipt.loader_id, "reload-loader")
+
+    async def test_selector_after_navigation_settles_real_zendriver_handlers(
+        self,
+    ) -> None:
+        for initially_missing in (False, True):
+            with self.subTest(initially_missing=initially_missing):
+                connection = Connection("ws://offline.invalid")
+                connection.websocket = cast(Any, object())
+                connection.listener = cast(Any, SimpleNamespace(running=True))
+                element = object()
+                results = deque([None, element] if initially_missing else [element])
+
+                async def transport(
+                    transaction: Transaction[Any],
+                    target: Connection = connection,
+                ) -> None:
+                    response = (
+                        {"result": {"type": "number", "value": 1}}
+                        if transaction.method == "Runtime.evaluate"
+                        else {}
+                    )
+                    transaction(result=response)
+                    assert transaction.id is not None
+                    target.mapper.pop(transaction.id)
+
+                async def query(
+                    _selector: str,
+                    target: Connection = connection,
+                    matches: deque[object] = results,
+                ) -> object | None:
+                    await target.send(cdp.runtime.evaluate("1", return_by_value=True))
+                    return matches.popleft()
+
+                async def observed(_event: object) -> None:
+                    pass
+
+                cast(Any, connection).query_selector = query
+                with patch.object(connection, "_send_transaction", new=transport):
+                    # Real registration/removal establishes the old domain state.
+                    connection.add_handler(cdp.page.LifecycleEvent, observed)
+                    await connection.send(
+                        cdp.runtime.evaluate("1", return_by_value=True)
+                    )
+                    connection.remove_handlers(cdp.page.LifecycleEvent, observed)
+                    self.assertIn(cdp.page, connection.enabled_domains)
+                    result = await wait_for_selector(
+                        connection, "#ready", deadline=Deadline.after(1)
+                    )
+                self.assertIs(result, element)
+                self.assertFalse(connection.mapper)
+
+    async def test_missing_selector_cleanup_covers_timeout_and_cancellation(
+        self,
+    ) -> None:
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                page = _EventPage()
+                subscribed = asyncio.Event()
+
+                async def send(
+                    command: Any,
+                    target: _EventPage = page,
+                    signal: asyncio.Event = subscribed,
+                ) -> Any:
+                    result = await _EventPage.send(target, command)
+                    if any(
+                        target.handlers[event]
+                        for event in page_state_module._DOM_CHANGE_EVENTS
+                    ):
+                        signal.set()
+                    return result
+
+                with (
+                    patch.object(page, "send", new=send),
+                    patch.object(
+                        page, "query_selector", new=AsyncMock(return_value=None)
+                    ),
+                ):
+                    task = asyncio.create_task(
+                        wait_for_selector(
+                            page,
+                            "#missing",
+                            deadline=Deadline.after(0.04),
+                        )
+                    )
+                    await asyncio.wait_for(subscribed.wait(), timeout=1)
+                    if cancel:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        with self.assertRaises(PageStateTimeout):
+                            await task
+                for event in page_state_module._DOM_CHANGE_EVENTS:
+                    self.assertEqual(page.handlers[event], [])
 
     async def test_selector_uses_dom_signal_and_immediate_queries(self) -> None:
         page = _EventPage()

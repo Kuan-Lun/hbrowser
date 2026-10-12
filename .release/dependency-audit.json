@@ -1,21 +1,21 @@
 {
-  "checked_at": "2026-09-17T14:25:40+00:00",
-  "manifest_sha256": "7e1bd91d63fc9fade8852a062d3f10e36560f9979985f49abd2d0da27f680ee0",
+  "checked_at": "2026-10-12T02:40:01+00:00",
+  "manifest_sha256": "970e526b78cf92cbb1b63190fd16b54ef154578860c2ba68e35b4fc322ab2b37",
   "node": [
     {
       "declared": ">=0.18.1",
-      "latest": "0.23.2",
+      "latest": "0.23.3",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.44.2",
+  "project_version": "0.45.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.0",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -70,7 +70,7 @@
     {
       "declared": "websockets>=17.0.1",
       "group": "runtime",
-      "latest": "17.1",
+      "latest": "17.2",
       "latest_satisfies": true,
       "name": "websockets",
       "python_3_14": true,
@@ -79,9 +79,9 @@
       "url": "https://pypi.org/project/websockets/"
     },
     {
-      "declared": "zendriver==0.16.0",
+      "declared": "zendriver==0.17.1",
       "group": "runtime",
-      "latest": "0.16.0",
+      "latest": "0.17.1",
       "latest_satisfies": true,
       "name": "zendriver",
       "python_3_14": true,
@@ -103,7 +103,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.0",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -114,7 +114,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.3.1",
+      "latest": "2.4.0",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -147,7 +147,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.8",
+      "latest": "0.17.0",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all 13 direct Python dependency entries (build, runtime, development, including the shared hatchling requirement) and the Node markdownlint-cli2 dependency against a fresh PyPI/npm registry discovery, including candidates outside declared bounds. All candidates satisfy the existing constraints and support Python 3.14. All runtime dependencies and Node remain unchanged, including the explicitly verified zendriver 0.16.0 cohort. Relative to the prior receipt, build advanced from 1.6.0 to 1.6.1 and Ruff from 0.16.6 to 0.16.8. Reviewed https://build.pypa.io/en/stable/changelog.html (the 1.6.1 Windows symlink-detection regression fix) and https://github.com/astral-sh/ruff/releases/tag/0.16.7 plus https://github.com/astral-sh/ruff/releases/tag/0.16.8 (lint/fixer and Python-version-aware rule corrections). Installed both candidates in the repository-local Python 3.14 environment. The complete fast gate passes with Ruff 0.16.8 without rule/configuration exceptions, and build 1.6.1 successfully builds the project sdist and its wheel. uv pip check and Node dependency inspection pass. All 255 focused existing browser/challenge/DOM/forwarding/diagnostic/version-contract tests pass in the environment that permits their offline localhost/shared-memory resources. Changes are equivalent pattern-matching dispatch refactors; exported API, protocol validation, side-effect ordering, data formats, and dependency constraints are unchanged. The official full merge gate separately validates the complete offline suite and built-wheel import.",
+    "note": "Reviewed every direct Python build/runtime/development and Node dependency using fresh PyPI/npm discovery including versions beyond bounds. Candidate runtime cohort uses Zendriver 0.17.1 and websockets 17.2. Reviewed https://github.com/cdpdriver/zendriver/blob/main/CHANGELOG.md: 0.17 flat CDP sessions share the browser transport, fixed retained event transactions and canceled-response handling, with 0.17.1 readyState timeout fixes. Removed hbrowser's obsolete 0.16 mapper-pruning background task and its duplicate retirement state; public driver ownership and cancellation contract stays intact. Added real pinned Zendriver event dispatch (1000 events and a late canceled reply), flat-session routing, shared transport close, pending-command failure and terminal listener regressions without Chrome/network. Full offline suite: 748 passed, 2 platform-specific skips, 205 subtests in 89.04 seconds; strict mypy and complete fast gate pass. Native Windows notification execution is not covered on this macOS host; payload isolation is tested offline. Reviewed https://websockets.readthedocs.io/en/stable/project/changelog.html for 17.2 shutdown/compression/header fixes; installed candidate passes lifecycle tests. Reviewed hatchling 1.32.4 (https://hatch.pypa.io/dev/history/hatchling/) build hook interface revert, mypy 2.4.0 (https://mypy.readthedocs.io/en/stable/changelog.html) native parser/checking changes, Ruff 0.17.0 (https://github.com/astral-sh/ruff/releases/tag/0.17.0) stabilized rules/formatter/default-target changes; repository remains explicit py314 and needs no rule relaxation. Reviewed markdownlint-cli2 0.23.3 dependency-only update at https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.23.3/CHANGELOG.md; repository-local candidate passes. Build 1.6.1 and unchanged runtime dependencies retain their previously reviewed ranges. Built 0.44.3 sdist and wheel with isolated Hatchling 1.32.4; clean Python 3.14 environment installed the explicit candidate wheel plus dev extra through normal dependency resolution, uv pip check and isolated installed-wheel runtime-requirement smoke pass. Every installed hbrowser Python source matches both candidate wheel and source. Final whole-project code review and merge gate remain separate required evidence. This 0.45.0 candidate corrects the compatibility classification: removal of the non-underscored hbrowser.gallery.browser.mapper module removes its six explicitly exported names and is breaking. No compatibility shim is retained. Original runtime dependency ranges and validated cohort are unchanged. Earlier 0.44.3 wheel and native evidence remain historical; final 0.45.0 wheel source/METADATA and fresh normal resolution will be separately verified. No stored-data format changes arise from this Python API removal.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
