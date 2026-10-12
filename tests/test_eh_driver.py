@@ -1909,6 +1909,82 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             self, browser=browser, owner=gallery_page, exact_connection=archive_page
         )
 
+    async def test_status_timeout_preserves_diagnostic_ownership_error(self) -> None:
+        for failure in (
+            ProcessOwnershipError("diagnostic cleanup unproven"),
+            OSError("ordinary diagnostic I/O failure"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                original_cause = RuntimeError("independent cleanup proof failed")
+                failure.__cause__ = original_cause
+                gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+                driver = EHDriver(headless=True)
+                driver.logger = Mock()
+                archive_link = SimpleNamespace(click=AsyncMock())
+                gallery_page = SimpleNamespace(
+                    mapper={},
+                    target=SimpleNamespace(target_id="gallery"),
+                    xpath=AsyncMock(side_effect=[[], [archive_link]]),
+                )
+                archive_page = SimpleNamespace(
+                    websocket=object(),
+                    mapper={},
+                    target=SimpleNamespace(target_id="archive"),
+                    evaluate=AsyncMock(
+                        return_value={
+                            "url": "https://exhentai.org/archiver.php",
+                            "readyState": "complete",
+                        }
+                    ),
+                    activate=AsyncMock(),
+                    xpath=AsyncMock(return_value=[]),
+                    get_content=AsyncMock(side_effect=TimeoutError),
+                    close=AsyncMock(),
+                )
+                browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+                gallery_page.browser = browser
+                archive_page.browser = browser
+                driver.browser = browser
+                driver.page = gallery_page
+                # Isolate gallery navigation from the post-click diagnostic path.
+                driver.get = AsyncMock()  # type: ignore[method-assign]
+                expected_error = (
+                    ProcessOwnershipError
+                    if isinstance(failure, ProcessOwnershipError)
+                    else ArchiveDownloadOutcomeUnknownError
+                )
+                with (
+                    patch(
+                        "hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab",
+                        new=AsyncMock(side_effect=_popup_after_mutation(archive_page)),
+                    ),
+                    patch.object(
+                        driver,
+                        "_write_page_diagnostic",
+                        new=AsyncMock(side_effect=failure),
+                    ) as write_diagnostic,
+                    patch.object(
+                        driver, "_close_archive_tab_and_restore", new=AsyncMock()
+                    ) as restore,
+                    self.assertRaises(expected_error) as raised,
+                ):
+                    await driver.download(gallery)
+                if isinstance(failure, ProcessOwnershipError):
+                    self.assertIs(raised.exception, failure)
+                    self.assertIs(raised.exception.__cause__, original_cause)
+                write_diagnostic.assert_awaited_once_with(
+                    "download_timeout", "", deadline=ANY
+                )
+                restore.assert_not_awaited()
+                archive_page.close.assert_not_awaited()
+                archive_link.click.assert_awaited_once()
+                await _assert_generation_rejects_new_work(
+                    self,
+                    browser=browser,
+                    owner=gallery_page,
+                    exact_connection=archive_page,
+                )
+
     async def test_status_poll_cancellation_retires_entire_browser_generation(
         self,
     ) -> None:

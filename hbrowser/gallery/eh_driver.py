@@ -1660,8 +1660,10 @@ class EHDriver(Driver):
                 deferred_operation_error = operation_error
         except BaseException as operation_error:
             _begin_zendriver_retirement(new_tab)
-            if is_browser_generation_error(operation_error) or not isinstance(
-                operation_error, Exception
+            if (
+                isinstance(operation_error, ProcessOwnershipError)
+                or is_browser_generation_error(operation_error)
+                or not isinstance(operation_error, Exception)
             ):
                 raise
             outcome_unknown = True
