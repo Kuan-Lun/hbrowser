@@ -18,4 +18,6 @@ fi
     tests/test_owned_process.py \
     tests/test_browser_factory.py \
     tests/test_runtime_test_owner.py \
-    tests/test_tor_cleanup.py
+    tests/test_tor_cleanup.py \
+    tests/test_diagnostics.py \
+    tests/test_page_diagnostic_transport.py
