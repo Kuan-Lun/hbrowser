@@ -11,6 +11,7 @@ on:
       - pyproject.toml
       - scripts/check-process-ownership.sh
       - scripts/pytest-source.py
+      - scripts/runtime_test_owner.py
       - scripts/check-publish-version.py
       - scripts/install-ci-dependencies.py
       - scripts/_shared/**

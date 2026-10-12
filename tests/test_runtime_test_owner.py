@@ -100,7 +100,7 @@ def test_expired_admission_and_stable_callback_transfer_are_rejected() -> None:
 
 def test_starting_background_owner_handoffs_before_cleanup() -> None:
     _ok("""
-        import os, sys, threading, time
+        import sys, threading, time
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         registry = a._current()
@@ -136,12 +136,7 @@ def test_starting_background_owner_handoffs_before_cleanup() -> None:
         assert not failures, failures
         assert len(owners) == 1 and owners[0]._closed
         assert not thread.is_alive()
-        try:
-            os.kill(owners[0].pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise AssertionError('supervisor survived proof')
+        assert owners[0]._supervisor.poll() is not None
     """)
 
 
@@ -268,13 +263,13 @@ def test_pytest_term_stops_later_tests_and_waits_for_runtime_receipts(
 
 def test_signal_during_starting_defers_until_runtime_owner_is_bound() -> None:
     _ok("""
-        import os, signal, sys
+        import signal, sys
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         original = process._read_supervisor_status
-        pids = []
+        owners = []
         def cancel(owner, *args, **kwargs):
-            pids.append(owner.pid)
+            owners.append(owner)
             signal.raise_signal(signal.SIGTERM)
             assert a._current().cancelled == signal.SIGTERM
             return original(owner, *args, **kwargs)
@@ -286,14 +281,10 @@ def test_signal_during_starting_defers_until_runtime_owner_is_bound() -> None:
                 assert error.code == 143
             else:
                 raise AssertionError('startup cancellation was lost')
-        assert pids and a._current().finished
-        for pid in pids:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pass
-            else:
-                raise AssertionError('startup owner survived cleanup')
+        assert owners and a._current().finished
+        for owner in owners:
+            assert owner._closed
+            assert owner._supervisor.poll() is not None
     """)
 
 
