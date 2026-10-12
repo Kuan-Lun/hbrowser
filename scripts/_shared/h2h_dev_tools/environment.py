@@ -40,7 +40,7 @@ def source_requirement(assignment: str, *, source_base: Path | None = None) -> s
         if local.is_dir():
             if not (local / "pyproject.toml").is_file():
                 raise ValueError(f"Local project has no pyproject.toml: {local}")
-            return f"-e {package} @ {local.as_uri()}"
+            return f"{package} @ {local.as_uri()}"
         if not local.is_file():
             raise ValueError(
                 f"Local source must be a project or distribution file: {local}"

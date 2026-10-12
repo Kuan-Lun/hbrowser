@@ -245,6 +245,11 @@ FlareSolverr，並移除日誌中的私人資訊。問題可提交到
 `scripts/check-fast.sh`、`scripts/check-full.sh` 與 `scripts/git-flow-merge.sh`，
 不需要 sibling checkout、安裝共用工具套件或在每次 commit 時連網。
 
+重建開發環境使用 `uv >=0.13.0` 與 `scripts/rebuild-env.sh`。HBrowser 自身維持
+editable 安裝；明確以 `--source package=/path/to/checkout` 提供的依賴則建置成
+一般套件安裝，修改依賴原始碼後須重新執行重建命令才會生效。升級 uv 後重跑
+原命令即可將舊 editable 依賴改為一般安裝，無須刪除瀏覽器 profile 或下載資料。
+
 程式變更合併時需要本機 `.venv` 與 PATH 中已登入的 `codex`。合併腳本會先
 審查真正的 candidate，再執行離線 gate；首次審查涵蓋完整專案，通過並合併後
 才可使用增量審查。新 checkout 缺少本機紀錄或審查基準失效時會重新完整審查。
