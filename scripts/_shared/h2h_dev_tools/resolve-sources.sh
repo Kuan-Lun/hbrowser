@@ -5,6 +5,18 @@ set -euo pipefail
 requirements=${1:?output requirements file is required}
 shift
 source_directory="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Require the resolver version verified for encoded local project URLs before
+# creating any Python environment or clearing the caller's existing environment.
+uv_version="$(uv --version)" || {
+    printf '%s\n' 'resolve-sources: uv >=0.13.0 is required; upgrade uv and retry.' >&2
+    exit 2
+}
+if [[ ! "$uv_version" =~ ^uv\ ([0-9]+)\.([0-9]+)\.([0-9]+)($|[[:space:]]) ]] \
+    || ! (( 10#${BASH_REMATCH[1]} > 0 || 10#${BASH_REMATCH[2]} >= 13 )); then
+    printf 'resolve-sources: uv >=0.13.0 is required; found %s. Upgrade uv and retry.\n' "$uv_version" >&2
+    exit 2
+fi
+
 bootstrap_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-environment.XXXXXX")"
 trap 'rm -rf "$bootstrap_directory"' EXIT
 
