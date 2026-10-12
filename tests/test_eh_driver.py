@@ -35,6 +35,7 @@ from hbrowser import (
     SearchRateLimitError,
     SearchRequest,
 )
+from hbrowser.gallery.browser.process import ProcessOwnershipError
 from hbrowser.gallery.eh_driver import (
     _SEARCH_PAGE_SNAPSHOT_SCRIPT,
     EHDriver,
@@ -667,6 +668,41 @@ class SearchNavigationTests(unittest.IsolatedAsyncioTestCase):
         lifecycle = getattr(browser, _LIFECYCLE_ATTRIBUTE, None)
         if lifecycle is not None:
             self.assertFalse(lifecycle.retired)
+
+    async def test_loading_timeout_preserves_diagnostic_process_ownership(
+        self,
+    ) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        html = _result_page(query, GID_349189_GALLERY)
+        driver = _HarnessExHDriver()
+        driver.page.current_document = _Document(
+            url=search_url,
+            html_reads=(html,),
+            ready_state_reads=("loading",),
+        )
+        ownership_error = ProcessOwnershipError("diagnostic cleanup unproven")
+        ownership_error.add_note("original unresolved diagnostic worker")
+        with (
+            patch.object(
+                driver,
+                "_write_page_diagnostic",
+                new=AsyncMock(side_effect=ownership_error),
+            ) as write_diagnostic,
+            self.assertRaises(ProcessOwnershipError) as raised,
+        ):
+            await driver._read_stable_search_page(
+                search_url,
+                query,
+                deadline=_ScriptedDeadline(*([1.0] * 7), 0.0),  # type: ignore[arg-type]
+            )
+
+        write_diagnostic.assert_awaited_once_with("search_error", html, deadline=ANY)
+        self.assertIs(raised.exception, ownership_error)
+        self.assertEqual(
+            raised.exception.__notes__, ["original unresolved diagnostic worker"]
+        )
+        self.assertEqual(driver.get_urls, [])
 
     async def test_stable_snapshot_preserves_the_actual_gallery_page(self) -> None:
         target_url = _search_url("gid:349189")

@@ -39,6 +39,7 @@ from ..exceptions import (
     SearchRateLimitError,
 )
 from .browser.ban_handler import check_ban_status
+from .browser.process import ProcessOwnershipError
 from .driver_base import Driver
 from .models import Tag
 from .punchin_models import PunchInComplete, PunchInResult, RandomEncounterFound
@@ -794,6 +795,8 @@ class EHDriver(Driver):
         )
         try:
             diagnostic_path = await self._save_search_diagnostic(snapshot.html)
+        except ProcessOwnershipError:
+            raise
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
