@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-20T15:13:35+00:00",
+  "checked_at": "2026-10-20T15:44:56+00:00",
   "manifest_sha256": "970e526b78cf92cbb1b63190fd16b54ef154578860c2ba68e35b4fc322ab2b37",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.45.1",
+  "project_version": "0.45.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Refreshed every direct build, runtime, development and Node dependency against PyPI/npm, including candidates beyond bounds, for the isolated 0.45.1 browser-retirement fix. Direct requirements are unchanged. Compared with the primary 0.45.0 audit, all discovered versions are unchanged except websockets 17.3 and Ruff 0.17.1. Reviewed https://websockets.readthedocs.io/en/stable/project/changelog.html: 17.3 fixes fragmented-receive cancellation races and authentication handling and improves connection termination. Reviewed https://github.com/astral-sh/ruff/releases/tag/0.17.1: parser/dedent, annotation and comprehension fixes plus mutable-container rule updates. A freshly rebuilt repository-local environment normally resolved websockets 17.3, Ruff 0.17.1 and the unchanged exact Zendriver 0.17.1 cohort. Protocol, page-state and browser-factory regressions passed 143 cases, including concurrent disposal, cancelled cleanup waiters, eager task factories completed-shutdown idempotence and atexit release after a failed initial drain; commit-time Ruff lint/format, strict mypy and Markdown checks passed without relaxed rules. The retained Zendriver pin and other unchanged bounds keep the rationale recorded by the primary audit. npm markdownlint-cli2 remains 0.23.3. This receipt is dependency evidence only; exact-candidate code review, full gate and installed-wheel smoke remain separate required checks. Native Windows execution, live accounts and production deployment are not covered.",
+    "note": "Refreshed every direct build, runtime, development and Node dependency against PyPI/npm, including candidates beyond bounds, for the independent 0.45.2 logging-directory failure fix. Direct requirements are unchanged from primary 0.45.1. The freshly rebuilt repository-local environment normally resolved the same direct cohort as that primary audit: Zendriver 0.17.1, websockets 17.3, Ruff 0.17.1, mypy 2.4.0, pytest 9.1.1 and markdownlint-cli2 0.23.3. The full logging regression suite passed 87 tests covering normal logging, initialization failures, required and optional file sinks, redaction, retries and shutdown. Commit-time Ruff lint/format, strict mypy and Markdown checks passed without relaxed rules. Unchanged exact Zendriver and other dependency bounds retain the rationale reviewed for primary 0.45.1; the browser retirement changes are already independently reviewed and merged at cbf436b4bdeae8b08aab5ed106aa204da6d775b9. This receipt is dependency evidence only; exact-candidate code review, full gate and installed-wheel smoke remain separate required checks. Native Windows execution, live accounts and production deployment are not covered.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
