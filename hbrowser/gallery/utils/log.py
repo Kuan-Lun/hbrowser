@@ -1665,34 +1665,27 @@ def configure_logging(
             _FILE_SINK_ATTEMPTED = True
             try:
                 directory = get_log_dir()
-            except OSError as error:
-                directory_failure = LogPersistenceError("configure", error)
-                _record_persistence_failure(directory_failure)
+                process_handler = _AppendOnlyJsonlHandler(
+                    directory,
+                    segment_bytes=segment_bytes,
+                    level=file_level.number,
+                )
+            except LogPersistenceError as persistence_failure:
+                _record_persistence_failure(persistence_failure)
                 if require_file_sink:
-                    raise directory_failure from error
+                    raise
+            except Exception as error:
+                configuration_failure = LogPersistenceError("configure", error)
+                _record_persistence_failure(configuration_failure)
+                if require_file_sink:
+                    raise configuration_failure from error
             else:
-                try:
-                    process_handler = _AppendOnlyJsonlHandler(
-                        directory,
-                        segment_bytes=segment_bytes,
-                        level=file_level.number,
-                    )
-                except LogPersistenceError as persistence_failure:
-                    _record_persistence_failure(persistence_failure)
-                    if require_file_sink:
-                        raise
-                except Exception as error:
-                    configuration_failure = LogPersistenceError("configure", error)
-                    _record_persistence_failure(configuration_failure)
-                    if require_file_sink:
-                        raise configuration_failure from error
-                else:
-                    setattr(
-                        process_handler,
-                        _MANAGED_PROCESS_HANDLER_ATTRIBUTE,
-                        True,
-                    )
-                    _PROCESS_LOG_HANDLER = process_handler
+                setattr(
+                    process_handler,
+                    _MANAGED_PROCESS_HANDLER_ATTRIBUTE,
+                    True,
+                )
+                _PROCESS_LOG_HANDLER = process_handler
         elif process_handler is not None:
             requested_directory = _log_dir_path()
             if requested_directory != process_handler.directory:

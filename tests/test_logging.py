@@ -362,6 +362,80 @@ class LoggerConfigurationTests(IsolatedLoggingTestCase):
         self.assertFalse(log_module._LOGGING_CONFIGURED)
         self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
 
+    def _assert_directory_failure_is_latched(self, *, required: bool) -> None:
+        for operation, error in (
+            ("expanduser", RuntimeError("private home could not be resolved")),
+            ("mkdir", ValueError("private directory contains a null byte")),
+            ("mkdir", OSError(errno.EACCES, "private directory is inaccessible")),
+        ):
+            with (
+                self.subTest(operation=operation, error=type(error).__name__),
+                _isolated_logging_state_for_testing(),
+                TemporaryDirectory() as directory_name,
+            ):
+                directory = Path(directory_name)
+                repaired = directory / "repaired"
+                output = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+                    patch("hbrowser.gallery.utils.log.sys.stdout", output),
+                ):
+                    logger = setup_logger(f"hbrowser.tests.path_failure.{id(self)}")
+                    with patch.object(Path, operation, side_effect=error) as failed:
+                        if required:
+                            with self.assertRaises(LogPersistenceError) as initial:
+                                configure_logging(require_file_sink=True)
+                            self.assertIs(initial.exception.__cause__, error)
+                        else:
+                            configure_logging(require_file_sink=False)
+                            logger.error("console remains available")
+                        self.assertEqual(failed.call_count, 1)
+
+                    health = logging_health()
+                    self.assertTrue(health.trace_degraded)
+                    self.assertEqual(health.operation, "configure")
+                    self.assertEqual(health.error_type, type(error).__name__)
+                    self.assertNotIn("private", repr(health))
+                    with self.assertRaises(LogPersistenceError) as latched:
+                        raise_for_log_persistence_failure()
+                    self.assertIs(latched.exception.__cause__, error)
+                    self.assertNotIn("private", str(latched.exception))
+
+                    with (
+                        patch.dict(os.environ, {"HBROWSER_LOG_DIR": str(repaired)}),
+                        patch.object(log_module, "get_log_dir") as retry,
+                    ):
+                        if not required:
+                            configure_logging(require_file_sink=False)
+                            logger.error("console still available after retry")
+                        with self.assertRaises(LogPersistenceError) as repeated:
+                            configure_logging(require_file_sink=True)
+                        retry.assert_not_called()
+                    self.assertIs(repeated.exception, latched.exception)
+                    self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
+                    self.assertFalse(repaired.exists())
+                    if not required:
+                        with self.assertRaises(LogPersistenceError) as direct:
+                            log_to_process_file(logger, LogLevel.ERROR, "must surface")
+                        self.assertIs(direct.exception, latched.exception)
+                    for _attempt in range(2):
+                        with self.assertRaises(LogPersistenceError) as closed:
+                            close_logging()
+                        self.assertIs(closed.exception, latched.exception)
+                    if not required:
+                        self.assertIn("console remains available", output.getvalue())
+                        self.assertIn(
+                            "console still available after retry", output.getvalue()
+                        )
+
+    def test_required_directory_failure_remains_failed_after_path_repair(self) -> None:
+        self._assert_directory_failure_is_latched(required=True)
+
+    def test_optional_directory_failure_keeps_console_and_rejects_required_retry(
+        self,
+    ) -> None:
+        self._assert_directory_failure_is_latched(required=False)
+
     def test_optional_file_sink_failure_keeps_console_and_latches_health(
         self,
     ) -> None:
