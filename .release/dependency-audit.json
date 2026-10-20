@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-12T02:40:01+00:00",
+  "checked_at": "2026-10-20T15:13:35+00:00",
   "manifest_sha256": "970e526b78cf92cbb1b63190fd16b54ef154578860c2ba68e35b4fc322ab2b37",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.45.0",
+  "project_version": "0.45.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -70,7 +70,7 @@
     {
       "declared": "websockets>=17.0.1",
       "group": "runtime",
-      "latest": "17.2",
+      "latest": "17.3",
       "latest_satisfies": true,
       "name": "websockets",
       "python_3_14": true,
@@ -147,7 +147,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.0",
+      "latest": "0.17.1",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct Python build/runtime/development and Node dependency using fresh PyPI/npm discovery including versions beyond bounds. Candidate runtime cohort uses Zendriver 0.17.1 and websockets 17.2. Reviewed https://github.com/cdpdriver/zendriver/blob/main/CHANGELOG.md: 0.17 flat CDP sessions share the browser transport, fixed retained event transactions and canceled-response handling, with 0.17.1 readyState timeout fixes. Removed hbrowser's obsolete 0.16 mapper-pruning background task and its duplicate retirement state; public driver ownership and cancellation contract stays intact. Added real pinned Zendriver event dispatch (1000 events and a late canceled reply), flat-session routing, shared transport close, pending-command failure and terminal listener regressions without Chrome/network. Full offline suite: 748 passed, 2 platform-specific skips, 205 subtests in 89.04 seconds; strict mypy and complete fast gate pass. Native Windows notification execution is not covered on this macOS host; payload isolation is tested offline. Reviewed https://websockets.readthedocs.io/en/stable/project/changelog.html for 17.2 shutdown/compression/header fixes; installed candidate passes lifecycle tests. Reviewed hatchling 1.32.4 (https://hatch.pypa.io/dev/history/hatchling/) build hook interface revert, mypy 2.4.0 (https://mypy.readthedocs.io/en/stable/changelog.html) native parser/checking changes, Ruff 0.17.0 (https://github.com/astral-sh/ruff/releases/tag/0.17.0) stabilized rules/formatter/default-target changes; repository remains explicit py314 and needs no rule relaxation. Reviewed markdownlint-cli2 0.23.3 dependency-only update at https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.23.3/CHANGELOG.md; repository-local candidate passes. Build 1.6.1 and unchanged runtime dependencies retain their previously reviewed ranges. Built 0.44.3 sdist and wheel with isolated Hatchling 1.32.4; clean Python 3.14 environment installed the explicit candidate wheel plus dev extra through normal dependency resolution, uv pip check and isolated installed-wheel runtime-requirement smoke pass. Every installed hbrowser Python source matches both candidate wheel and source. Final whole-project code review and merge gate remain separate required evidence. This 0.45.0 candidate corrects the compatibility classification: removal of the non-underscored hbrowser.gallery.browser.mapper module removes its six explicitly exported names and is breaking. No compatibility shim is retained. Original runtime dependency ranges and validated cohort are unchanged. Earlier 0.44.3 wheel and native evidence remain historical; final 0.45.0 wheel source/METADATA and fresh normal resolution will be separately verified. No stored-data format changes arise from this Python API removal.",
+    "note": "Refreshed every direct build, runtime, development and Node dependency against PyPI/npm, including candidates beyond bounds, for the isolated 0.45.1 browser-retirement fix. Direct requirements are unchanged. Compared with the primary 0.45.0 audit, all discovered versions are unchanged except websockets 17.3 and Ruff 0.17.1. Reviewed https://websockets.readthedocs.io/en/stable/project/changelog.html: 17.3 fixes fragmented-receive cancellation races and authentication handling and improves connection termination. Reviewed https://github.com/astral-sh/ruff/releases/tag/0.17.1: parser/dedent, annotation and comprehension fixes plus mutable-container rule updates. A freshly rebuilt repository-local environment normally resolved websockets 17.3, Ruff 0.17.1 and the unchanged exact Zendriver 0.17.1 cohort. Protocol, page-state and browser-factory regressions passed 143 cases, including concurrent disposal, cancelled cleanup waiters, eager task factories completed-shutdown idempotence and atexit release after a failed initial drain; commit-time Ruff lint/format, strict mypy and Markdown checks passed without relaxed rules. The retained Zendriver pin and other unchanged bounds keep the rationale recorded by the primary audit. npm markdownlint-cli2 remains 0.23.3. This receipt is dependency evidence only; exact-candidate code review, full gate and installed-wheel smoke remain separate required checks. Native Windows execution, live accounts and production deployment are not covered.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
