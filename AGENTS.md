@@ -30,6 +30,44 @@
   清理與任務無關的 legacy code。
 - generated output 不得直接修改；必須修改 generator 或 source 後重新產生。
 
+## 任務收斂與可審查交付
+
+- 品質優先適用於已授權的交付範圍，不代表持續擴張目標。開始實作或範圍
+  明顯改變時，在對話或既有任務紀錄列出交付物、必要驗收、相依性與完成條件；
+  歷史結果與目前阻擋事項分開記錄，不為此另建文件或驗證框架。
+- 本專案不建立 PR；由 Codex code review 審查真正的 merge candidate。審查內容、
+  變更說明與交付品質仍採 PR／CL 標準，不能以直接合併省略作者自閱或必要驗收。
+- 一次 merge 視為一個 PR／CL，應有單一、完整且可說明的目的，包含相關測試、
+  必要文件及新介面的實際用法；合入後仍可正常建置與使用。依功能與契約拆分，
+  不為縮短差異而留下未使用 API、失效中間版本或不完整的 schema／轉換工具。
+- 大型搬移、機械式重構與行為修正原則上分開交付；直接支援本次修正的局部
+  重構可一起處理。生成快照與手寫差異分開說明，但兩者仍須驗證。不能合理
+  拆分的大變更，實作前須說明不可分的相依性、審查順序與驗收範圍。
+- 正式送審前先自閱完整差異，排除意外修改，並完成既有工具可離線確認的
+  環境、版本與檢查前置條件；這些預檢不取代正式 exact-candidate gate。
+- 分支開發審計須涵蓋實際基準到候選的完整差異，不只看最後一個 commit。
+  要求比對目前遠端主支時，記錄即時查證的 ref／SHA，納入本機 primary 已合併
+  但未推送的修改，並另列未提交變更；快取 ref 不得冒充即時查證結果。
+  遠端操作仍遵守既有授權規則，沒有 remote 時明確回報。
+- 新發現先核實觸發條件、影響及與本次交付的關係。已確認的阻擋缺陷納入修復；
+  未證實的風險、個人偏好與無關改善不得自動擴張任務。共用抽象須有既存重複
+  機制及實際呼叫點，不以未來可能需要為由新增通用框架。
+- 共用工具先在來源 repository 收斂並通過既有 review／gate，再集中同步
+  consumers。必要的候選相容性試驗可先隔離執行；共用來源尚有阻擋問題時，
+  停止排程依賴它的最終審查，不反覆全面同步每次中間修正。
+- 同一任務內，同類原因連續兩次阻止整合時，先分析共同根因、工作範圍與修正邊界，再重試；
+  不以增加 timeout、重跑次數或新驗證層代替處理根因。候選與驗收範圍固定後
+  才做最終整合；再有變更時，明確判斷受影響證據，避免重跑無關的手動驗收。
+- 上述規則不豁免首次全專案審查、exact-candidate gate、已確認 finding 或
+  process cleanup 要求。品質標準是完成必要修正並改善可維護性，不是無限追求
+  完美；不得以工期或差異過大為由偽造通過或略過必要檢查。
+
+本節參考 [Google Small CLs][small-cls] 與 [Code Review Standard][review-standard]；
+以本檔列明的交付與安全要求為準，不照搬外部流程或硬性行數限制。
+
+[small-cls]: https://google.github.io/eng-practices/review/developer/small-cls.html
+[review-standard]: https://google.github.io/eng-practices/review/reviewer/standard.html
+
 ## 工作樹與 Git
 
 - 唯讀分析不建立 branch。
@@ -38,8 +76,13 @@
   建立專用 task branch；不得為尚未開始修改的下游或預備工作預先建立 branch。
 - 不得 stash、reset、clean、覆寫或混入既有使用者修改。
 - 工作樹不乾淨時，從 committed primary 建立獨立 worktree。
-- task branch 可包含多個邏輯 Conventional Commits。避免巨大 commit；小而
-  內聚的任務仍可只有一個 commit。
+- Task branch 以已完成的邏輯變更組織 commits，數量服從可審查的交付邊界；
+  不把每次工具操作、對話輪次或同一缺陷的追加修補各自當成必須提交的單位。
+  不以 commit 數或行數單獨判定品質，也不得只 squash 巨大差異掩蓋多個目的。
+- 整理尚未分享的本機 task 時，優先保留原 branch 與證據，另建 replacement
+  branch／worktree，按邏輯單元重建並重驗；不得混入既有使用者修改、改寫
+  primary 或已分享的歷史。新 candidate 仍須正常 review／gate，不移植舊 receipt；
+  原 branch 若非 primary 祖先則保留，不以 force delete 偽裝安全清理。
 - Primary 不得 rebase；`pre-rebase` hook 必須拒絕目前或明確指定的 primary。
   `scripts/install-git-hooks.sh` 設定 `pull.rebase=false`、primary 的
   `branch.<primary>.rebase=false` 與 `pull.ff=only`；pull 只可 fast-forward，
@@ -84,9 +127,21 @@
 ## 提交格式
 
 - 所有非 merge commit 必須符合 Conventional Commits。
+- Conventional Commits 規定訊息格式，不保證變更可審查。每個 commit 應表達
+  一個完整邏輯變更，相關回歸測試隨同提交。交付前檢查 commits 是否可獨立理解，
+  合併同一邏輯變更的中間嘗試與 fixup；不為壓低 commit 數改寫已完整的邏輯變更，
+  也不要求保存每次失敗的提交。整理仍遵守上述歷史保護。
+- 標題說明具體結果；必要的本文說明問題、原因、設計取捨與驗證。Merge 前
+  核對描述仍符合最終完整差異，不能只寫「fix review」或「phase N」。
+  直接合併同樣需要可獨立理解的變更說明，不依賴對話紀錄補足設計理由。
 - Breaking change 使用 `type!:` 或 `BREAKING CHANGE:` footer。
 - project version 更新使用獨立 commit：
   `chore(release): bump version to X.Y.Z`。
+
+提交原則參考 [Git SubmittingPatches][git-patches] 與 [Google CL descriptions][cl-descriptions]。
+
+[git-patches]: https://git-scm.com/docs/SubmittingPatches
+[cl-descriptions]: https://google.github.io/eng-practices/review/developer/cl-descriptions.html
 
 ## 版本政策
 
