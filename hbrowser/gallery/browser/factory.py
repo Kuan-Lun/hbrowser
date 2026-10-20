@@ -1953,6 +1953,8 @@ async def _stop_browser(
             retirement.owned_connections(),
         )
         retirement.capture_connections(initial_connections)
+        # Bind ownership before cleanup can finalize, even when the caller's
+        # event loop uses an eager task factory.
         cleanup_task = asyncio.create_task(
             _stop_browser_cleanup(
                 browser,
@@ -1961,7 +1963,8 @@ async def _stop_browser(
                 getattr(browser, "_tor_process", None),
                 run_blocking_cleanup,
                 shutdown_deadline,
-            )
+            ),
+            eager_start=False,
         )
         retirement.bind_shutdown_task(cleanup_task)
     elif cleanup_task.done():
@@ -1979,7 +1982,8 @@ async def _stop_browser(
                 getattr(browser, "_tor_process", None),
                 run_blocking_cleanup,
                 shutdown_deadline,
-            )
+            ),
+            eager_start=False,
         )
         retirement.replace_completed_shutdown_task(cleanup_task)
     await _await_cleanup_deferring_caller_cancellation(

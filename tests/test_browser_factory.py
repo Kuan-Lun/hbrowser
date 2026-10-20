@@ -2123,6 +2123,28 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         target.listener.cancel.assert_not_called()
         self.assertEqual(target.mapper, {})
 
+    async def test_completed_late_future_preserves_idempotent_shutdown(self) -> None:
+        browser = SimpleNamespace(
+            connection=None,
+            targets=[],
+            _tor_process=None,
+            stop=AsyncMock(),
+        )
+        _bind_browser_process_owner(browser)
+        await factory.stop_browser(browser)
+        retirement = _begin_zendriver_retirement(browser)
+        completed: asyncio.Future[None] = asyncio.Future()
+        completed.set_result(None)
+
+        with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+            await wait_for_zendriver(completed, timeout=1, owner=browser)
+
+        self.assertIsNone(rejected.exception.__cause__)
+        self.assertTrue(retirement.is_complete())
+        with patch.object(Deadline, "expired", new=True):
+            await factory.stop_browser(browser)
+        browser.stop.assert_awaited_once_with()
+
     async def test_completed_shutdown_reopens_for_new_exact_connection(
         self,
     ) -> None:
@@ -2517,6 +2539,85 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             allow_stop = True
             operation.cancel()
             await operation
+
+    async def test_late_protocol_completion_still_requires_atexit_release(self) -> None:
+        loop = asyncio.get_running_loop()
+        previous_factory = loop.get_task_factory()
+        try:
+            for eager in (False, True):
+                with self.subTest(eager=eager):
+                    loop.set_task_factory(asyncio.eager_task_factory if eager else None)
+                    await self._assert_late_completion_releases_atexit()
+        finally:
+            loop.set_task_factory(previous_factory)
+
+    async def _assert_late_completion_releases_atexit(self) -> None:
+        browser = _OwnedBrowser()
+        # This synthetic operation has no transport or pending Browser.start.
+        del browser.connection
+        release = asyncio.Event()
+
+        async def stubborn_operation() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        operation = asyncio.create_task(stubborn_operation())
+        await asyncio.sleep(0)
+        registered_instances: set[object] = {browser}
+        try:
+            with (
+                patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+                patch(
+                    "hbrowser.gallery.browser.factory.asyncio_atexit.unregister"
+                ) as unregister,
+                patch.object(
+                    zd.util,
+                    "get_registered_instances",
+                    return_value=registered_instances,
+                ),
+            ):
+                factory._register_browser_atexit(cast(zd.Browser, browser))
+                cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+                with self.assertRaises(ZendriverOperationTimeout):
+                    await wait_for_zendriver(operation, timeout=0, owner=browser)
+                with (
+                    patch(
+                        "hbrowser.gallery.utils.protocol._OPERATION_DRAIN_TIMEOUT_SECONDS",
+                        0.01,
+                    ),
+                    self.assertRaises(ProcessOwnershipError),
+                ):
+                    await factory.stop_browser(browser)
+                retirement = _begin_zendriver_retirement(browser)
+                self.assertTrue(retirement.browser_cleanup_is_complete())
+                self.assertTrue(retirement.tor_cleanup_is_complete())
+                release.set()
+                await operation
+                self.assertTrue(retirement.protocol_is_retired())
+                self.assertFalse(retirement.is_complete())
+                self.assertIs(cleanup.browser, browser)
+                unregister.assert_not_called()
+                failed_task = retirement.existing_shutdown_task()
+
+                await factory.stop_browser(browser)
+
+                self.assertTrue(retirement.is_complete())
+                successful_task = retirement.existing_shutdown_task()
+                self.assertIsNot(successful_task, failed_task)
+                assert successful_task is not None
+                self.assertTrue(successful_task.done())
+                self.assertIsNone(successful_task.exception())
+                self.assertIsNone(cleanup.browser)
+                self.assertNotIn(browser, registered_instances)
+                unregister.assert_called_once_with(cleanup, loop=cleanup.loop)
+                browser.stop.assert_awaited_once_with()
+        finally:
+            release.set()
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 class TorRealDeadlineTests(unittest.TestCase):

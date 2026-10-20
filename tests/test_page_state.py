@@ -365,6 +365,67 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOwnerRetiredError):
             await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
 
+    async def test_acknowledged_popup_inventory_timeout_retires_original_browser(
+        self,
+    ) -> None:
+        for events in (False, True):
+            with self.subTest(events=events):
+                page = _EventPage()
+                browser = page.browser
+                browser.connection = page if events else None
+                browser.tabs = []
+                replacement = SimpleNamespace()
+
+                async def mutate(
+                    page: _EventPage = page, replacement: Any = replacement
+                ) -> str:
+                    page.browser = replacement
+                    return "ack"
+
+                result = await mutate_and_wait_for_new_tab(
+                    cast(Any, browser),
+                    set(),
+                    mutate,
+                    owner=page,
+                    operation="Popup click",
+                    deadline=Deadline.after(0.01),
+                )
+
+                self.assertEqual(result, ("ack", None))
+                self.assertFalse(any(page.handlers.values()))
+                later = AsyncMock()
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await wait_for_zendriver(later(), timeout=1, owner=browser)
+                later.assert_not_awaited()
+                await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=replacement)
+
+    async def test_acknowledged_popup_inventory_success_keeps_generation_live(
+        self,
+    ) -> None:
+        page = _EventPage()
+        browser = page.browser
+        browser.connection = page
+        browser.tabs = []
+        tab = SimpleNamespace(target=SimpleNamespace(target_id="new-tab"))
+
+        async def mutate() -> str:
+            browser.tabs.append(tab)
+            return "ack"
+
+        self.assertEqual(
+            await mutate_and_wait_for_new_tab(
+                cast(Any, browser),
+                set(),
+                mutate,
+                owner=page,
+                operation="Popup click",
+                deadline=Deadline.after(1),
+            ),
+            ("ack", tab),
+        )
+        self.assertFalse(any(page.handlers.values()))
+        await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=browser)
+
     async def test_cancelled_popup_wait_retires_original_generation(self) -> None:
         page = _EventPage()
         browser = page.browser

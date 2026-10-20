@@ -11,6 +11,8 @@ from typing import Any
 
 from websockets.exceptions import ConnectionClosed
 
+from .deadline import Deadline
+
 _LIFECYCLE_ATTRIBUTE = "_hbrowser_zendriver_lifecycle"
 _OPERATION_DRAIN_TIMEOUT_SECONDS = 2.0
 MAX_ZENDRIVER_COMMAND_TIMEOUT_SECONDS = 5.0
@@ -59,12 +61,15 @@ class _ZendriverLifecycle:
     rejected_awaitables: list[Awaitable[Any]] = field(default_factory=list)
     rejected_awaitable_connections: dict[int, Any | None] = field(default_factory=dict)
     rejected_awaitable_owners: dict[int, Any] = field(default_factory=dict)
+    rejected_disposal_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     quiescent_connection_ids: set[int] = field(default_factory=set)
     safe_to_cancel_operations: bool = False
     protocol_retirement_complete: bool = False
     browser_cleanup_complete: bool = False
     tor_cleanup_complete: bool = False
-    shutdown_complete: bool = False
+    # Only the browser lifecycle can certify finalization, including release
+    # of atexit ownership. Late protocol completion cannot establish it.
+    shutdown_finalized: bool = False
 
     def begin_retirement(self) -> None:
         self.capture_connections(self.connections())
@@ -87,7 +92,6 @@ class _ZendriverLifecycle:
     def _reopen_protocol_retirement(self) -> None:
         self.safe_to_cancel_operations = False
         self.protocol_retirement_complete = False
-        self.shutdown_complete = False
 
     def register(
         self,
@@ -117,13 +121,16 @@ class _ZendriverLifecycle:
 
         connection = self._refresh_owner_connection(owner, connection)
         self.capture_connections((connection,))
-        if self._connection_is_safe_to_cancel(connection, owner):
+        if operation.done():
+            _observe_future(operation)
             return False
+        safe_to_cancel = self._connection_is_safe_to_cancel(connection, owner)
         if operation not in self.operations:
             self.operations[operation] = connection
             self.operation_owners[operation] = owner
             operation.add_done_callback(self._observe_completion)
-        return True
+        self.protocol_retirement_complete = False
+        return not safe_to_cancel
 
     def retain_rejected_awaitable(
         self,
@@ -135,13 +142,68 @@ class _ZendriverLifecycle:
 
         connection = self._refresh_owner_connection(owner, connection)
         self.capture_connections((connection,))
-        if self._connection_is_safe_to_cancel(connection, owner):
-            return False
+        safe_to_cancel = self._connection_is_safe_to_cancel(connection, owner)
         if not any(candidate is awaitable for candidate in self.rejected_awaitables):
             self.rejected_awaitables.append(awaitable)
             self.rejected_awaitable_connections[id(awaitable)] = connection
             self.rejected_awaitable_owners[id(awaitable)] = owner
-        return True
+        self.protocol_retirement_complete = False
+        return not safe_to_cancel
+
+    async def dispose_retained_awaitable(self, awaitable: Awaitable[Any]) -> None:
+        """Share one bounded disposal attempt between all cleanup callers."""
+
+        key = id(awaitable)
+        if key not in self.rejected_awaitable_owners:
+            return
+        task = self.rejected_disposal_tasks.get(key)
+        if task is None:
+            # Registration must precede disposal, including with an eager
+            # factory configured by the application embedding this library.
+            task = asyncio.create_task(
+                self._dispose_retained_awaitable(awaitable), eager_start=False
+            )
+            self.rejected_disposal_tasks[key] = task
+            task.add_done_callback(_observe_future)
+        # A cancelled rejection/shutdown waiter must not cancel the cleanup
+        # shared with another caller. Both the task and awaitable stay owned.
+        await asyncio.shield(task)
+
+    async def _dispose_retained_awaitable(self, awaitable: Awaitable[Any]) -> None:
+        key = id(awaitable)
+        try:
+            await _dispose_rejected_awaitable(
+                awaitable,
+                # Work submitted after completed shutdown belongs to a new
+                # bounded rejection cleanup, not the exhausted shutdown call.
+                deadline_expires_at=(
+                    None
+                    if self.shutdown_finalized
+                    else self.shutdown_deadline_expires_at
+                ),
+            )
+            self.rejected_awaitables = [
+                candidate
+                for candidate in self.rejected_awaitables
+                if candidate is not awaitable
+            ]
+            self.rejected_awaitable_connections.pop(key)
+            self.rejected_awaitable_owners.pop(key)
+            self._complete_drained_retirement()
+        finally:
+            # Failed disposal leaves the awaitable registered for an explicit
+            # retry, while concurrent callers observe this same attempt.
+            self.rejected_disposal_tasks.pop(key)
+
+    def _complete_drained_retirement(self) -> None:
+        """Restore completion only when no new transport or work remains."""
+
+        if (
+            self.safe_to_cancel_operations
+            and not self.rejected_awaitables
+            and not self.operations
+        ):
+            self.protocol_retirement_complete = True
 
     def _connection_is_safe_to_cancel(
         self,
@@ -171,10 +233,12 @@ class _ZendriverLifecycle:
             except BaseException:
                 # Completion callbacks must never interfere with Zendriver's
                 # listener. Shutdown's synchronous snapshots retry resolution.
-                pass
+                _observe_future(operation)
+                return
         self.operations.pop(operation, None)
         self.operation_owners.pop(operation, None)
         _observe_future(operation)
+        self._complete_drained_retirement()
 
     @staticmethod
     def _refresh_owner_connection(owner: Any, connection: Any | None) -> Any | None:
@@ -311,27 +375,10 @@ class _ZendriverLifecycle:
         # snapshot now. Work revealed after the first await remains registered
         # for a later close/quiescence pass and is never included below.
         _request_operation_cancellation(operations)
-        rejected_ids = {id(awaitable) for awaitable in rejected_awaitables}
-        self.rejected_awaitables = [
-            awaitable
-            for awaitable in self.rejected_awaitables
-            if id(awaitable) not in rejected_ids
-        ]
-        rejected_metadata = {
-            id(awaitable): (
-                self.rejected_awaitable_connections.pop(id(awaitable)),
-                self.rejected_awaitable_owners.pop(id(awaitable)),
-            )
-            for awaitable in rejected_awaitables
-        }
         for awaitable in rejected_awaitables:
             try:
-                await _dispose_rejected_awaitable(awaitable)
+                await self.dispose_retained_awaitable(awaitable)
             except BaseException as error:
-                connection, owner = rejected_metadata[id(awaitable)]
-                self.rejected_awaitables.append(awaitable)
-                self.rejected_awaitable_connections[id(awaitable)] = connection
-                self.rejected_awaitable_owners[id(awaitable)] = owner
                 errors.append(error)
         pending = await _cancel_and_drain(operations)
         if pending:
@@ -398,7 +445,7 @@ class _ZendriverRetirement:
         """Start one explicit fallback attempt after a completed failed task."""
 
         task = self.lifecycle.shutdown_task
-        if task is None or not task.done() or self.lifecycle.shutdown_complete:
+        if task is None or not task.done() or self.is_complete():
             raise RuntimeError("Zendriver shutdown deadline is not replaceable")
         self.lifecycle.shutdown_deadline_expires_at = expires_at
         return expires_at
@@ -407,14 +454,17 @@ class _ZendriverRetirement:
         existing = self.lifecycle.shutdown_task
         if existing is None or not existing.done():
             raise RuntimeError("Zendriver browser shutdown is not replaceable")
-        if self.lifecycle.shutdown_complete:
+        if self.is_complete():
             raise RuntimeError("Completed Zendriver shutdown cannot be reopened")
         if not existing.cancelled():
             existing.exception()
         self.lifecycle.shutdown_task = task
 
     def is_complete(self) -> bool:
-        return self.lifecycle.shutdown_complete
+        return (
+            self.lifecycle.shutdown_finalized
+            and self.lifecycle.protocol_retirement_complete
+        )
 
     def protocol_is_retired(self) -> bool:
         return self.lifecycle.protocol_retirement_complete
@@ -422,6 +472,12 @@ class _ZendriverRetirement:
     def mark_protocol_retired(self) -> None:
         if not self.lifecycle.safe_to_cancel_operations:
             raise RuntimeError("Zendriver retirement cannot complete before draining")
+        if self.lifecycle.rejected_awaitables or any(
+            not operation.done() for operation in self.lifecycle.operations
+        ):
+            raise _ZendriverQuiescenceChanged(
+                "Zendriver retirement still has pending operation ownership"
+            )
         self.lifecycle.protocol_retirement_complete = True
 
     def browser_cleanup_is_complete(self) -> bool:
@@ -443,7 +499,7 @@ class _ZendriverRetirement:
             and self.lifecycle.tor_cleanup_complete
         ):
             raise RuntimeError("Zendriver shutdown cannot complete before all cleanup")
-        self.lifecycle.shutdown_complete = True
+        self.lifecycle.shutdown_finalized = True
 
     def capture_connections(self, connections: tuple[Any, ...]) -> None:
         self.lifecycle.capture_connections(connections)
@@ -613,7 +669,9 @@ def _request_operation_cancellation(
             operation.cancel()
 
 
-async def _dispose_rejected_awaitable(awaitable: Awaitable[Any]) -> None:
+async def _dispose_rejected_awaitable(
+    awaitable: Awaitable[Any], *, deadline_expires_at: float | None = None
+) -> None:
     """Dispose rejected work after its owning listener has stopped."""
 
     if inspect.iscoroutine(awaitable):
@@ -639,8 +697,26 @@ async def _dispose_rejected_awaitable(awaitable: Awaitable[Any]) -> None:
     if callable(close):
         close()
     done = getattr(awaitable, "done", None)
+    if not callable(done):
+        raise RuntimeError("Rejected awaitable has no verifiable completion state")
+    deadline = Deadline.after(_OPERATION_DRAIN_TIMEOUT_SECONDS)
+    if deadline_expires_at is not None:
+        deadline = Deadline(min(deadline.expires_at, deadline_expires_at))
+    while True:
+        completed = done()
+        if not isinstance(completed, bool):
+            raise RuntimeError("Rejected awaitable completion state must be boolean")
+        if completed:
+            break
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise TimeoutError(
+                "Rejected awaitable did not confirm completion "
+                "before its drain deadline"
+            )
+        await asyncio.sleep(min(0.01, remaining))
     exception = getattr(awaitable, "exception", None)
-    if callable(done) and done() and callable(exception):
+    if callable(exception):
         try:
             exception()
         except BaseException:
@@ -668,7 +744,7 @@ async def _reject_awaitable(
         return
     if lifecycle.retain_rejected_awaitable(awaitable, connection, owner):
         return
-    await _dispose_rejected_awaitable(awaitable)
+    await lifecycle.dispose_retained_awaitable(awaitable)
 
 
 def _validate_zendriver_operation(
