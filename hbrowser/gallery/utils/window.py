@@ -112,6 +112,8 @@ async def mutate_and_wait_for_new_tab[ResultT](
                 existing_tabs,
                 deadline,
             )
+            if tab is None:
+                _begin_zendriver_retirement(browser)
             return result, tab
         except BaseException:
             # Acknowledgement does not settle the popup's semantic outcome.

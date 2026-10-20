@@ -64,6 +64,34 @@ class _RetryingDisposableAwaitable(_DisposableAwaitable):
         self.closed = True
 
 
+class _TaskAwaitable:
+    """Opaque owner of existing work; awaiting it after rejection is forbidden."""
+
+    def __init__(self, task: asyncio.Task[None]) -> None:
+        self.task = task
+        self.cancel_calls = 0
+        self.close_calls = 0
+        self.observed = False
+
+    def __await__(self) -> Generator[None]:
+        yield from ()
+        raise AssertionError("Rejected custom awaitable was scheduled")
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        self.task.cancel()
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def done(self) -> bool:
+        return self.task.done()
+
+    def exception(self) -> BaseException | None:
+        self.observed = True
+        return self.task.exception()
+
+
 class ZendriverTimeoutContractTests(unittest.TestCase):
     def test_timeout_error_has_one_strict_typed_constructor(self) -> None:
         error = ZendriverOperationTimeout(timeout_seconds=2.5)
@@ -401,6 +429,355 @@ class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(awaitable.cancelled)
         self.assertTrue(awaitable.closed)
 
+    async def test_custom_pending_work_retains_authority_until_verified_done(
+        self,
+    ) -> None:
+        for already_retired in (False, True):
+            with self.subTest(already_retired=already_retired):
+                browser = SimpleNamespace()
+                retirement = _begin_zendriver_retirement(browser)
+                if already_retired:
+                    await retirement.retire_operations(quiescent_connections=())
+                    retirement.mark_browser_cleanup_complete()
+                    retirement.mark_tor_cleanup_complete()
+                    retirement.mark_complete()
+                allow_stop = asyncio.Event()
+
+                async def stubborn(stop: asyncio.Event = allow_stop) -> None:
+                    while not stop.is_set():
+                        try:
+                            await stop.wait()
+                        except asyncio.CancelledError:
+                            pass
+
+                task = asyncio.create_task(stubborn())
+                await asyncio.sleep(0)
+                custom = _TaskAwaitable(task)
+                try:
+                    with patch(
+                        "hbrowser.gallery.utils.protocol._OPERATION_DRAIN_TIMEOUT_SECONDS",
+                        0.01,
+                    ):
+                        with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+                            await wait_for_zendriver(custom, timeout=1, owner=browser)
+                        if already_retired:
+                            self.assertIsInstance(
+                                rejected.exception.__cause__, TimeoutError
+                            )
+                        else:
+                            self.assertEqual(custom.cancel_calls, 0)
+                            with self.assertRaises(TimeoutError):
+                                await retirement.retire_operations(
+                                    quiescent_connections=()
+                                )
+                    lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+                    self.assertEqual(lifecycle.rejected_awaitables, [custom])
+                    self.assertIs(
+                        lifecycle.rejected_awaitable_owners[id(custom)], browser
+                    )
+                    self.assertIsNone(
+                        lifecycle.rejected_awaitable_connections[id(custom)]
+                    )
+                    self.assertFalse(task.done())
+                    self.assertFalse(retirement.protocol_is_retired())
+                    self.assertFalse(retirement.is_complete())
+                    with self.assertRaises(RuntimeError):
+                        retirement.mark_complete()
+                    allow_stop.set()
+                    await task
+                    await retirement.retire_operations(quiescent_connections=())
+                    self.assertEqual(lifecycle.rejected_awaitables, [])
+                    self.assertEqual(lifecycle.rejected_awaitable_owners, {})
+                    self.assertTrue(custom.observed)
+                    self.assertTrue(retirement.protocol_is_retired())
+                finally:
+                    allow_stop.set()
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_late_custom_disposal_is_shared_with_shutdown_retry(self) -> None:
+        for cancel_rejection in (False, True):
+            with self.subTest(cancel_rejection=cancel_rejection):
+                browser = SimpleNamespace()
+                retirement = _begin_zendriver_retirement(browser)
+                await retirement.retire_operations(quiescent_connections=())
+                retirement.mark_browser_cleanup_complete()
+                retirement.mark_tor_cleanup_complete()
+                retirement.mark_complete()
+                cancelling = asyncio.Event()
+                release = asyncio.Event()
+
+                async def pending(
+                    started: asyncio.Event = cancelling,
+                    finish: asyncio.Event = release,
+                ) -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        started.set()
+                        await finish.wait()
+
+                operation = asyncio.create_task(pending())
+                await asyncio.sleep(0)
+                custom = _TaskAwaitable(operation)
+                rejection = asyncio.create_task(
+                    wait_for_zendriver(custom, timeout=1, owner=browser)
+                )
+                retry: asyncio.Task[None] | None = None
+                try:
+                    await asyncio.wait_for(cancelling.wait(), timeout=1)
+                    retry = asyncio.create_task(
+                        retirement.retire_operations(quiescent_connections=())
+                    )
+                    await asyncio.sleep(0)
+                    if cancel_rejection:
+                        rejection.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await rejection
+                    self.assertFalse(retirement.is_complete())
+                    self.assertEqual(custom.cancel_calls, 1)
+                    release.set()
+                    await asyncio.wait_for(retry, timeout=1)
+                    if not cancel_rejection:
+                        with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+                            await rejection
+                        self.assertIsNone(rejected.exception.__cause__)
+                    self.assertTrue(operation.done())
+                    self.assertEqual(custom.close_calls, 1)
+                    self.assertTrue(retirement.is_complete())
+                    lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+                    self.assertEqual(lifecycle.rejected_awaitables, [])
+                    self.assertEqual(lifecycle.rejected_disposal_tasks, {})
+                finally:
+                    release.set()
+                    await asyncio.gather(operation, rejection, return_exceptions=True)
+                    if retry is not None:
+                        await asyncio.gather(retry, return_exceptions=True)
+
+    async def test_late_custom_disposal_restores_completed_shutdown(self) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        await retirement.retire_operations(quiescent_connections=())
+        retirement.mark_browser_cleanup_complete()
+        retirement.mark_tor_cleanup_complete()
+        retirement.mark_complete()
+        retirement.bind_shutdown_deadline(0.0)
+        custom = _DisposableAwaitable()
+
+        with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+            await wait_for_zendriver(custom, timeout=1, owner=browser)
+
+        self.assertIsNone(rejected.exception.__cause__)
+        self.assertTrue(custom.closed)
+        self.assertTrue(retirement.protocol_is_retired())
+        self.assertTrue(retirement.is_complete())
+
+    async def test_eager_factory_preserves_disposal_registration_and_retry(
+        self,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            for fail_once in (False, True):
+                with self.subTest(fail_once=fail_once):
+                    browser = SimpleNamespace()
+                    retirement = _begin_zendriver_retirement(browser)
+                    await retirement.retire_operations(quiescent_connections=())
+                    custom = _RetryingDisposableAwaitable(fail_close_once=fail_once)
+                    with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+                        await wait_for_zendriver(custom, timeout=1, owner=browser)
+                    if fail_once:
+                        self.assertIsInstance(
+                            rejected.exception.__cause__, RuntimeError
+                        )
+                        await retirement.retire_operations(quiescent_connections=())
+                    else:
+                        self.assertIsNone(rejected.exception.__cause__)
+                    self.assertEqual(custom.close_calls, 2 if fail_once else 1)
+                    self.assertTrue(retirement.protocol_is_retired())
+                    lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+                    self.assertEqual(lifecycle.rejected_awaitables, [])
+                    self.assertEqual(lifecycle.rejected_disposal_tasks, {})
+        finally:
+            loop.set_task_factory(original_factory)
+
+    async def test_finalized_late_custom_task_can_finish_after_old_deadline(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        await retirement.retire_operations(quiescent_connections=())
+        retirement.mark_browser_cleanup_complete()
+        retirement.mark_tor_cleanup_complete()
+        retirement.mark_complete()
+        retirement.bind_shutdown_deadline(0.0)
+        operation = asyncio.create_task(asyncio.sleep(100))
+        await asyncio.sleep(0)
+        custom = _TaskAwaitable(operation)
+        try:
+            with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+                await wait_for_zendriver(custom, timeout=1, owner=browser)
+            self.assertIsNone(rejected.exception.__cause__)
+            self.assertTrue(operation.cancelled())
+            self.assertTrue(custom.observed)
+            self.assertTrue(retirement.is_complete())
+            lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+            self.assertEqual(lifecycle.rejected_awaitables, [])
+            self.assertEqual(lifecycle.rejected_disposal_tasks, {})
+            self.assertEqual(lifecycle.shutdown_deadline_expires_at, 0.0)
+        finally:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+    async def test_late_future_retains_authority_when_cancellation_does_not_finish(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        await retirement.retire_operations(quiescent_connections=())
+        retirement.mark_browser_cleanup_complete()
+        retirement.mark_tor_cleanup_complete()
+        retirement.mark_complete()
+        release = asyncio.Event()
+
+        async def stubborn() -> None:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        task = asyncio.create_task(stubborn())
+        await asyncio.sleep(0)
+        try:
+            with patch(
+                "hbrowser.gallery.utils.protocol._OPERATION_DRAIN_TIMEOUT_SECONDS", 0.01
+            ):
+                with self.assertRaises(ZendriverOwnerRetiredError) as rejected:
+                    await wait_for_zendriver(task, timeout=1, owner=browser)
+            self.assertIsInstance(rejected.exception.__cause__, TimeoutError)
+            self.assertIn(task, vars(browser)[_LIFECYCLE_ATTRIBUTE].operations)
+            self.assertFalse(retirement.protocol_is_retired())
+            self.assertFalse(retirement.is_complete())
+            release.set()
+            await task
+            self.assertTrue(retirement.is_complete())
+            await retirement.retire_operations(quiescent_connections=())
+            self.assertTrue(retirement.protocol_is_retired())
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_custom_drain_respects_existing_shutdown_deadline(self) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        retirement.bind_shutdown_deadline(0.0)
+        custom = _DisposableAwaitable()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(custom, timeout=1, owner=browser)
+        with (
+            patch.object(custom, "done", return_value=False),
+            patch(
+                "hbrowser.gallery.utils.protocol.asyncio.sleep",
+                side_effect=AssertionError("No budget remains"),
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            await retirement.retire_operations(quiescent_connections=())
+        self.assertFalse(retirement.protocol_is_retired())
+        self.assertEqual(
+            vars(browser)[_LIFECYCLE_ATTRIBUTE].rejected_awaitables, [custom]
+        )
+        await retirement.retire_operations(quiescent_connections=())
+
+    async def test_custom_cooperative_cancellation_is_observed_before_release(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        task = asyncio.create_task(asyncio.sleep(100))
+        await asyncio.sleep(0)
+        custom = _TaskAwaitable(task)
+        try:
+            with self.assertRaises(ZendriverOwnerRetiredError):
+                await wait_for_zendriver(custom, timeout=1, owner=browser)
+            await retirement.retire_operations(quiescent_connections=())
+            self.assertTrue(task.done())
+            self.assertTrue(custom.observed)
+            self.assertEqual(custom.cancel_calls, 1)
+            self.assertEqual(custom.close_calls, 1)
+            self.assertTrue(retirement.protocol_is_retired())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_custom_missing_or_nonboolean_done_cannot_complete_retirement(
+        self,
+    ) -> None:
+        for done in (None, lambda: 1):
+            with self.subTest(done=done):
+                browser = SimpleNamespace()
+                retirement = _begin_zendriver_retirement(browser)
+                custom = _DisposableAwaitable()
+                with patch.object(custom, "done", done):
+                    with self.assertRaises(ZendriverOwnerRetiredError):
+                        await wait_for_zendriver(custom, timeout=1, owner=browser)
+                    with self.assertRaisesRegex(RuntimeError, "completion"):
+                        await retirement.retire_operations(quiescent_connections=())
+                    self.assertFalse(retirement.protocol_is_retired())
+                    self.assertEqual(
+                        vars(browser)[_LIFECYCLE_ATTRIBUTE].rejected_awaitables,
+                        [custom],
+                    )
+                await retirement.retire_operations(quiescent_connections=())
+
+    async def test_late_custom_work_cannot_be_hidden_by_inflight_retirement(
+        self,
+    ) -> None:
+        browser = SimpleNamespace()
+        retirement = _begin_zendriver_retirement(browser)
+        first = _DisposableAwaitable()
+        late = _DisposableAwaitable()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(first, timeout=1, owner=browser)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def dispose(awaitable: Any, **_kwargs: Any) -> None:
+            if awaitable is first:
+                started.set()
+                await release.wait()
+                awaitable.cancel()
+                awaitable.close()
+            else:
+                raise TimeoutError("Late work still pending")
+
+        with patch(
+            "hbrowser.gallery.utils.protocol._dispose_rejected_awaitable",
+            side_effect=dispose,
+        ):
+            task = asyncio.create_task(
+                retirement.retire_operations(quiescent_connections=())
+            )
+            try:
+                await started.wait()
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await wait_for_zendriver(late, timeout=1, owner=browser)
+                release.set()
+                with self.assertRaisesRegex(RuntimeError, "pending"):
+                    await task
+                self.assertFalse(retirement.protocol_is_retired())
+                self.assertEqual(
+                    vars(browser)[_LIFECYCLE_ATTRIBUTE].rejected_awaitables, [late]
+                )
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+        await retirement.retire_operations(quiescent_connections=())
+        self.assertTrue(retirement.protocol_is_retired())
+
     async def test_custom_disposal_failure_keeps_item_and_drains_the_rest(
         self,
     ) -> None:
@@ -443,7 +820,7 @@ class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         disposal_started = asyncio.Event()
         allow_disposal = asyncio.Event()
 
-        async def blocked_disposal(awaitable: Any) -> None:
+        async def blocked_disposal(awaitable: Any, **_kwargs: Any) -> None:
             disposal_started.set()
             await allow_disposal.wait()
             awaitable.cancel()
