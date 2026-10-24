@@ -81,11 +81,102 @@ def _require_active_deadline(deadline: Deadline | None, description: str) -> Non
         raise TimeoutError(f"{description} completed after its deadline")
 
 
-async def _wait_for_archive_document(page: Any, *, deadline: Deadline) -> None:
+def _archive_url_identity(url: str) -> tuple[str, str, str, dict[str, list[str]]]:
+    parts = urlsplit(url)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise ValueError("Invalid archive destination")
+    return (
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        parse_qs(parts.query, keep_blank_values=True),
+    )
+
+
+async def _archive_destination(link: Any, gallery_url: str, deadline: Deadline) -> str:
+    """Read the control's destination without executing its onclick handler."""
+    _require_active_deadline(deadline, "Archive control identity")
+    attributes = await wait_for_zendriver(
+        link.apply(
+            "(el) => ({href: el.getAttribute('href'), "
+            "onclick: el.getAttribute('onclick')})"
+        ),
+        timeout=min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining()),
+        owner=link,
+    )
+    _require_active_deadline(deadline, "Archive control identity")
+    if not isinstance(attributes, dict):
+        raise ValueError("Archive control has no explicit destination")
+    href, onclick = attributes.get("href"), attributes.get("onclick")
+    urls = []
+    if isinstance(href, str) and href and not href.startswith(("#", "javascript:")):
+        urls.append(urljoin(gallery_url, href))
+    if isinstance(onclick, str) and onclick.strip():
+        # The entire handler must be one call with a complete first URL literal.
+        # A quoted substring inside concatenation or another statement does not
+        # establish destination authority. Never evaluate the handler to infer it.
+        call = re.fullmatch(
+            r"\s*(?:return\s+)?"
+            r"(?:[A-Za-z_$][A-Za-z0-9_$]*\.)*[A-Za-z_$][A-Za-z0-9_$]*"
+            r"\s*\(\s*(['\"])(https?://[^'\"\\\s]+)\1"
+            r"(?:\s*,\s*[0-9]+(?:\.[0-9]+)?)*\s*\)\s*;?\s*",
+            onclick,
+        )
+        if call is None:
+            raise ValueError("Archive control has no complete literal destination")
+        urls.append(call.group(2))
+    gallery_origin = _archive_url_identity(gallery_url)[:2]
+    destinations = set(urls)
+    if len(destinations) != 1:
+        raise ValueError("Archive control destination is missing or ambiguous")
+    destination = destinations.pop()
+    identity = _archive_url_identity(destination)
+    if (
+        identity[:2] != gallery_origin
+        or identity[2] == urlsplit(gallery_url).path
+        or not identity[3]
+    ):
+        raise ValueError("Archive control has no gallery-specific destination")
+    return destination
+
+
+@dataclass(frozen=True)
+class _ArchivePopupIdentity:
+    opener_id: str
+    target_id: str
+    destination: str
+    existing_tabs: frozenset[str]
+
+    def require_target(self, page: Any) -> None:
+        target = getattr(page, "target", None)
+        if (
+            getattr(target, "target_id", None) != self.target_id
+            or getattr(target, "opener_id", None) != self.opener_id
+            or self.target_id in self.existing_tabs
+        ):
+            raise ValueError("Archive popup target ownership changed")
+
+    def matches_url(self, url: str) -> bool:
+        expected = _archive_url_identity(self.destination)
+        actual = _archive_url_identity(url)
+        return actual[:3] == expected[:3] and all(
+            actual[3].get(key) == value for key, value in expected[3].items()
+        )
+
+
+async def _wait_for_archive_document(
+    page: Any, *, identity: _ArchivePopupIdentity, deadline: Deadline
+) -> None:
     """Require the popup's real document before an optional-link absence read."""
 
     try:
         while not deadline.expired:
+            identity.require_target(page)
             try:
                 snapshot = await wait_for_zendriver(
                     page.evaluate(
@@ -100,13 +191,16 @@ async def _wait_for_archive_document(page: Any, *, deadline: Deadline) -> None:
                 await asyncio.sleep(min(0.1, deadline.remaining()))
                 continue
             _require_active_deadline(deadline, "Archive popup document read")
+            identity.require_target(page)
             if not isinstance(snapshot, dict):
                 raise ValueError("Archive popup returned an invalid document snapshot")
             url = snapshot.get("url")
             ready_state = snapshot.get("readyState")
             if not isinstance(url, str) or not isinstance(ready_state, str):
                 raise ValueError("Archive popup document fields are invalid")
-            if urlsplit(url).scheme in {"http", "https"} and ready_state in {
+            if url != "about:blank" and not identity.matches_url(url):
+                raise ValueError("Archive popup destination does not match its control")
+            if url != "about:blank" and ready_state in {
                 "interactive",
                 "complete",
             }:
@@ -566,8 +660,14 @@ class EHDriver(Driver):
         self,
         gallery_tab: Any,
         archive_tab: Any,
+        *,
+        identity: _ArchivePopupIdentity,
+        deadline: Deadline,
     ) -> None:
         if self._browser_has_tab(archive_tab):
+            await _wait_for_archive_document(
+                archive_tab, identity=identity, deadline=deadline
+            )
             await self._close_page_safely(archive_tab)
 
         self.page = gallery_tab
@@ -1458,7 +1558,6 @@ class EHDriver(Driver):
             if deadline.remaining() <= 0:
                 raise
 
-        existing_tabs = {t.target.target_id for t in self.browser.tabs}
         gallery_tab = self.page
 
         key_xpath = "//a[contains(text(), 'Archive Download')]"
@@ -1488,6 +1587,12 @@ class EHDriver(Driver):
                 "Archive Download control appeared after its shared deadline"
             )
 
+        destination = await _archive_destination(archive_link, gallery.url, deadline)
+        opener_id = getattr(getattr(gallery_tab, "target", None), "target_id", None)
+        if not isinstance(opener_id, str) or not opener_id:
+            raise ValueError("Archive gallery target has no identity")
+        # No await between capturing inventory and invoking the one click.
+        existing_tabs = {t.target.target_id for t in self.browser.tabs}
         popup_deadline = Deadline.after(_ELEMENT_DEADLINE_SECONDS)
         click_failed_after_invocation = False
         try:
@@ -1498,8 +1603,9 @@ class EHDriver(Driver):
                 owner=archive_link,
                 operation="Archive Download click",
                 deadline=popup_deadline,
+                opener_id=opener_id,
             )
-        except BrowserMutationOutcomeUnknownError as error:
+        except (BrowserMutationOutcomeUnknownError, ValueError) as error:
             self.logger.warning(
                 "Archive Download click failed after invocation; not replaying: "
                 "gid=%d error_type=%s",
@@ -1526,11 +1632,27 @@ class EHDriver(Driver):
                 "refusing replay"
             )
 
-        self.page = new_tab
+        target = new_tab.target
+        if target is None:
+            _begin_zendriver_retirement(self.browser)
+            raise ArchiveDownloadOutcomeUnknownError(
+                "Archive download outcome is unknown because its target disappeared; "
+                "refusing further browser mutations"
+            )
+        identity = _ArchivePopupIdentity(
+            opener_id, target.target_id, destination, frozenset(existing_tabs)
+        )
+        archive_deadline = popup_deadline
         deferred_operation_error: BaseException | None = None
         terminal_cleanup_error: BaseException | None = None
         outcome_unknown = False
         try:
+            # A target may still be about:blank, unrelated, or navigated away.
+            # Read and establish identity before activating or mutating it.
+            await _wait_for_archive_document(
+                new_tab, identity=identity, deadline=popup_deadline
+            )
+            self.page = new_tab
             await _wait_for_archive_mutation(
                 new_tab.activate(),
                 owner=new_tab,
@@ -1540,9 +1662,6 @@ class EHDriver(Driver):
                     "refusing further browser mutations"
                 ),
             )
-            # Target inventory and activation do not prove the popup has loaded.
-            # Keep document readiness under the existing click/popup deadline.
-            await _wait_for_archive_document(new_tab, deadline=popup_deadline)
             # "Original" is optional only after the real document is ready.
             original_links = await wait_for_zendriver(
                 self.page.xpath("//a[contains(text(), 'Original')]", timeout=0.05),
@@ -1550,6 +1669,9 @@ class EHDriver(Driver):
                 owner=self.page,
             )
             if original_links:
+                await _wait_for_archive_document(
+                    new_tab, identity=identity, deadline=popup_deadline
+                )
                 await _wait_for_archive_mutation(
                     original_links[0].click(),
                     owner=original_links[0],
@@ -1564,6 +1686,7 @@ class EHDriver(Driver):
                 # Archive preparation is a server-side semantic operation; CDP
                 # reads stay capped at five seconds under one absolute deadline.
                 status_deadline = Deadline.after(_ARCHIVE_STATUS_DEADLINE_SECONDS)
+                archive_deadline = status_deadline
                 html = ""
                 while not status_deadline.expired:
                     read_timeout = min(
@@ -1638,7 +1761,9 @@ class EHDriver(Driver):
         except (ClientOfflineException, InsufficientFundsException) as operation_error:
             # These explicit server responses prove that no archive was queued.
             try:
-                await self._close_archive_tab_and_restore(gallery_tab, new_tab)
+                await self._close_archive_tab_and_restore(
+                    gallery_tab, new_tab, identity=identity, deadline=archive_deadline
+                )
             except BaseException as cleanup_error:
                 if isinstance(
                     cleanup_error,
@@ -1668,7 +1793,9 @@ class EHDriver(Driver):
                 raise
             outcome_unknown = True
         else:
-            await self._close_archive_tab_and_restore(gallery_tab, new_tab)
+            await self._close_archive_tab_and_restore(
+                gallery_tab, new_tab, identity=identity, deadline=archive_deadline
+            )
 
         if outcome_unknown:
             # Leave the exception handler before raising, so sensitive CDP

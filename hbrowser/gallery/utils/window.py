@@ -19,13 +19,21 @@ _TARGET_SEMANTIC_DEADLINE_SECONDS = 10.0
 _TARGET_RECONCILIATION_SECONDS = 0.05
 
 
-def _new_tab(browser: Any, existing_tabs: set[Any]) -> Any | None:
+def _new_tab(
+    browser: Any, existing_tabs: set[Any], opener_id: str | None
+) -> Any | None:
+    candidates = []
     for tab in getattr(browser, "tabs", ()):
         target = getattr(tab, "target", None)
         target_id = getattr(target, "target_id", None)
         if target_id is not None and target_id not in existing_tabs:
-            return tab
-    return None
+            if opener_id is None:
+                return tab
+            if getattr(target, "opener_id", None) == opener_id:
+                candidates.append(tab)
+    if len(candidates) > 1:
+        raise ValueError("New-tab opener has multiple candidate targets")
+    return candidates[0] if candidates else None
 
 
 async def _wait_for_inventory_change(
@@ -33,11 +41,12 @@ async def _wait_for_inventory_change(
     changed: asyncio.Event,
     existing_tabs: set[Any],
     deadline: Deadline,
+    opener_id: str | None,
 ) -> Any | None:
     while True:
         if deadline.remaining() <= 0:
             return None
-        tab = _new_tab(browser, existing_tabs)
+        tab = _new_tab(browser, existing_tabs, opener_id)
         if tab is not None:
             if deadline.remaining() <= 0:
                 return None
@@ -66,6 +75,7 @@ async def mutate_and_wait_for_new_tab[ResultT](
     owner: Any,
     operation: str,
     deadline: Deadline,
+    opener_id: str | None = None,
 ) -> tuple[ResultT, zd.Tab | None]:
     """Pre-arm target events, invoke one mutation, then resolve the new tab."""
 
@@ -111,6 +121,7 @@ async def mutate_and_wait_for_new_tab[ResultT](
                 changed,
                 existing_tabs,
                 deadline,
+                opener_id,
             )
             if tab is None:
                 _begin_zendriver_retirement(browser)
