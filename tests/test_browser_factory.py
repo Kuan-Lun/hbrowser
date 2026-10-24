@@ -1748,6 +1748,67 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         # clears every callback only after all registered browsers have run.
         unregister_cleanup.assert_not_called()
 
+    async def test_atexit_recovers_shutdown_that_expired_before_task_creation(
+        self,
+    ) -> None:
+        browser = _OwnedBrowser()
+        owner = _bind_browser_process_owner(browser)
+        registered_instances: set[object] = {browser}
+        with (
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.unregister"),
+            patch.object(
+                zd.util,
+                "get_registered_instances",
+                return_value=registered_instances,
+            ),
+        ):
+            factory._register_browser_atexit(cast(zd.Browser, browser))
+            cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+            with self.assertRaises(ProcessOwnershipError):
+                await factory.stop_browser(browser, Deadline(0.0))
+            lifecycle = cast(Any, browser)._hbrowser_zendriver_lifecycle
+            self.assertIsNone(lifecycle.shutdown_task)
+            # An ordinary caller still cannot reset the generation's budget.
+            with self.assertRaises(ProcessOwnershipError):
+                await factory.stop_browser(browser, Deadline.after(1))
+            self.assertEqual(lifecycle.shutdown_deadline_expires_at, 0.0)
+            owner.shutdown.assert_not_called()
+
+            await cleanup()
+
+        browser.stop.assert_awaited_once_with()
+        owner.shutdown.assert_called_once()
+        self.assertIsNone(cleanup.browser)
+        self.assertNotIn(browser, registered_instances)
+        self.assertTrue(_begin_zendriver_retirement(browser).is_complete())
+
+    async def test_atexit_cannot_renew_an_active_cleanup_task(self) -> None:
+        browser = _OwnedBrowser()
+        owner = _bind_browser_process_owner(browser)
+        retirement = _begin_zendriver_retirement(browser)
+        retirement.bind_shutdown_deadline(0.0)
+        release = asyncio.Event()
+
+        async def active_cleanup() -> None:
+            await release.wait()
+
+        task = asyncio.create_task(active_cleanup())
+        retirement.bind_shutdown_task(task)
+        cleanup = factory._BrowserAtexitCleanup(
+            cast(zd.Browser, browser), asyncio.get_running_loop()
+        )
+        try:
+            with self.assertRaises(ProcessOwnershipError):
+                await cleanup()
+            self.assertIs(retirement.existing_shutdown_task(), task)
+            self.assertFalse(task.done())
+            self.assertEqual(retirement.bind_shutdown_deadline(1.0), 0.0)
+            owner.shutdown.assert_not_called()
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_atexit_cleanup_does_not_require_the_default_executor(self) -> None:
         browser = _OwnedBrowser()
         owner = Mock(spec=OwnedProcess)

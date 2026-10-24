@@ -1929,14 +1929,13 @@ async def _stop_browser(
     bound_expires_at = retirement.bind_shutdown_deadline(proposed_deadline.expires_at)
     if (
         renew_expired_atexit_attempt
-        and cleanup_task is not None
-        and cleanup_task.done()
+        and (cleanup_task is None or cleanup_task.done())
         and Deadline(bound_expires_at).expired
         and not retirement.is_complete()
     ):
         # Normal/concurrent close callers cannot reset a generation's budget.
-        # asyncio-atexit owns one explicit new terminal attempt only after the
-        # previous cleanup task has definitively stopped.
+        # asyncio-atexit owns one explicit terminal attempt when cleanup never
+        # started or the previous task definitively stopped. No work may overlap.
         bound_expires_at = retirement.replace_shutdown_deadline(
             proposed_deadline.expires_at
         )

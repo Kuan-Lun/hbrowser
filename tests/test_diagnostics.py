@@ -18,7 +18,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 from hbrowser import EHDriver
 from hbrowser.gallery import utils as gallery_utils
 from hbrowser.gallery.browser import page_diagnostic as page_diagnostic_module
-from hbrowser.gallery.browser.process import ProcessOwnershipError
+from hbrowser.gallery.browser.process import OwnedProcess, ProcessOwnershipError
 from hbrowser.gallery.driver_base import Driver
 from hbrowser.gallery.utils import (
     Deadline,
@@ -459,6 +459,29 @@ class PageDiagnosticTests(unittest.TestCase):
 class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
     _NONCE = "0123456789abcdef0123456789abcdef"
 
+    def test_force_worker_cleanup_bounds_contended_owner_state(self) -> None:
+        # No process is started: exercise the real kill/state-lock boundary with
+        # a lock that deterministically refuses admission and records its budget.
+        owner = OwnedProcess.__new__(OwnedProcess)
+        state_lock = Mock()
+        state_lock.acquire.return_value = False
+        owner._state_lock = state_lock
+        deadline = Deadline.after(0.05)
+        remaining = deadline.remaining()
+
+        with self.assertRaisesRegex(ProcessOwnershipError, "waiting for kill state"):
+            page_diagnostic_module._shutdown_owned_worker(
+                owner,
+                deadline=deadline,
+                force=True,
+            )
+
+        state_lock.acquire.assert_called_once()
+        requested_wait = state_lock.acquire.call_args.kwargs["timeout"]
+        self.assertGreater(requested_wait, 0)
+        self.assertLessEqual(requested_wait, remaining)
+        state_lock.release.assert_not_called()
+
     def _receipt(self) -> bytes:
         return (
             json.dumps(
@@ -560,15 +583,19 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaisesRegex(TimeoutError, "work deadline"),
         ):
+            deadline = Deadline.after(0.05)
             await page_diagnostic_module.write_page_diagnostic_owned(
                 "driver_error",
                 "content",
-                deadline=Deadline.after(0.05),
+                deadline=deadline,
             )
 
         self.assertLess(time.monotonic() - started_at, 0.5)
-        owner.kill.assert_called_once_with()
+        owner.kill.assert_called_once_with(deadline=deadline.expires_at)
         owner.shutdown.assert_called_once()
+        self.assertEqual(
+            owner.shutdown.call_args.kwargs["deadline"], deadline.expires_at
+        )
         self.assertTrue(owner.stdout.closed)
 
     async def test_cancellation_waits_for_force_reap_and_pipe_close(self) -> None:
@@ -605,11 +632,12 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
                 0.2,
             ),
         ):
+            deadline = Deadline.after(1)
             task = asyncio.create_task(
                 page_diagnostic_module.write_page_diagnostic_owned(
                     "driver_error",
                     "content",
-                    deadline=Deadline.after(1),
+                    deadline=deadline,
                 )
             )
             while owner.poll.call_count == 0:
@@ -622,8 +650,11 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-        owner.kill.assert_called_once_with()
+        owner.kill.assert_called_once_with(deadline=deadline.expires_at)
         owner.shutdown.assert_called_once()
+        self.assertEqual(
+            owner.shutdown.call_args.kwargs["deadline"], deadline.expires_at
+        )
         self.assertTrue(owner.stdout.closed)
 
     async def test_late_receipt_is_rejected_after_natural_reap(self) -> None:

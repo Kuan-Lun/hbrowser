@@ -442,10 +442,10 @@ class _ZendriverRetirement:
         return existing
 
     def replace_shutdown_deadline(self, expires_at: float) -> float:
-        """Start one explicit fallback attempt after a completed failed task."""
+        """Start an explicit fallback when cleanup never started or has stopped."""
 
         task = self.lifecycle.shutdown_task
-        if task is None or not task.done() or self.is_complete():
+        if (task is not None and not task.done()) or self.is_complete():
             raise RuntimeError("Zendriver shutdown deadline is not replaceable")
         self.lifecycle.shutdown_deadline_expires_at = expires_at
         return expires_at
