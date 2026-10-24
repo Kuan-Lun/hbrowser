@@ -101,6 +101,47 @@ def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
     return not _pid_exists(pid)
 
 
+@contextmanager
+def _claimed_namespace(
+    guard: process_module._PrivateDirectory,
+) -> Iterator[process_module._PrivateDirectory]:
+    namespace_path = guard.path.parent / f".hbrowser-cleanup-test-{id(guard)}"
+    namespace_path.mkdir(mode=0o700)
+    try:
+        namespace = process_module._PrivateDirectory.capture(namespace_path)
+        guard._claim_inline(namespace, confirmed=False, deadline=time.monotonic() + 2)
+        yield namespace
+    finally:
+        # Fixture rescue only: runtime never deletes an unverified claim.
+        if namespace_path.exists():
+            shutil.rmtree(namespace_path)
+
+
+def _remove_private_inline(
+    guard: process_module._PrivateDirectory, *, deadline: float
+) -> None:
+    if not guard._assert_identity_or_absence():
+        return
+    with _claimed_namespace(guard) as namespace:
+        guard._remove_inline(namespace=namespace, deadline=deadline)
+
+
+def _release_private_fixture(
+    guard: process_module._PrivateDirectory, root: Path
+) -> None:
+    active = process_module._active_private_directory_cleanup(guard)
+    if active is not None:
+        process_module._force_reap_private_directory_cleanup(
+            active, deadline=_process_observation.cleanup_deadline(time.monotonic() + 3)
+        )
+    if process_module._active_private_directory_cleanup(guard) is not None:
+        raise RuntimeError(
+            "Retain fixture while private cleanup ownership is unresolved"
+        )
+    process_module._release_pending_private_directory(guard)
+    shutil.rmtree(root)
+
+
 def _windows_cleanup_error(code: int) -> PermissionError:
     error = PermissionError(f"Windows cleanup error {code}")
     cast(Any, error).winerror = code
@@ -2585,7 +2626,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 ) as exit_process,
                 self.assertRaises(SystemExit),
             ):
-                cleanup_worker_module._exit_when_parent_channel_closes(read_descriptor)
+                cleanup_worker_module._watch_parent_channel(
+                    read_descriptor, threading.Event(), threading.Event()
+                )
         finally:
             os.close(read_descriptor)
 
@@ -2633,6 +2676,13 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         return_value="posix",
                     ),
                     _mock_popen(return_value=process) as popen,
+                    patch.object(
+                        process_module,
+                        "_acknowledge_private_directory_claim",
+                        side_effect=process_module.ProcessOwnershipError(
+                            "worker failed"
+                        ),
+                    ),
                     self.assertRaises(process_module.ProcessOwnershipError) as raised,
                 ):
                     guard.remove(deadline=time.monotonic() + 2)
@@ -2689,6 +2739,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             ):
                 process_module._spawn_private_directory_cleanup(
                     guard,
+                    claim=process_module._PrivateDirectoryClaim(
+                        guard, Path(directory) / ".hbrowser-cleanup-test"
+                    ),
                     work_deadline=time.monotonic() + 1,
                     ownership_deadline=time.monotonic() + 2,
                 )
@@ -2794,6 +2847,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 args: ClassVar[list[str]] = ["cleanup-worker"]
                 returncode: int | None = None
                 stdin = Gate()
+                stdout = None
 
                 def poll(self) -> int | None:
                     return self.returncode
@@ -2819,6 +2873,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         return_value="posix",
                     ),
                     _mock_popen(return_value=slow_process),
+                    patch.object(
+                        process_module, "_acknowledge_private_directory_claim"
+                    ),
                     self.assertRaisesRegex(
                         process_module.ProcessOwnershipError,
                         "exceeded its work deadline during filesystem cleanup",
@@ -2849,36 +2906,38 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     mutation_thread.join(timeout=1)
                 process_module._release_pending_private_directory(guard)
 
-    def test_windows_sharing_violation_retries_and_removes_same_directory(
-        self,
-    ) -> None:
+    def test_windows_sharing_violation_retries_and_removes_same_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-private-retry-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
-            original_rmtree = shutil.rmtree
+            original = process_module._PrivateDirectory._remove_claimed_contents
             attempts = 0
 
-            def transient_rmtree(path: Path) -> None:
+            def transient(
+                instance: process_module._PrivateDirectory,
+                namespace: process_module._PrivateDirectory,
+                *,
+                deadline: float,
+            ) -> None:
                 nonlocal attempts
                 attempts += 1
                 if attempts == 1:
                     raise _windows_cleanup_error(32)
-                original_rmtree(path)
+                original(instance, namespace, deadline=deadline)
 
             with (
+                _claimed_namespace(guard) as namespace,
                 patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=transient_rmtree,
+                    process_module._PrivateDirectory,
+                    "_remove_claimed_contents",
+                    transient,
                 ),
                 patch.object(time, "sleep") as sleep,
             ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
-
+                guard._remove_inline(namespace=namespace, deadline=time.monotonic() + 1)
             self.assertEqual(attempts, 2)
             sleep.assert_called_once_with(
                 process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
@@ -2892,68 +2951,62 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
             cleanup_error = _windows_cleanup_error(33)
-
-            with (
-                patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=cleanup_error,
-                ) as rmtree,
-                patch.object(
-                    time,
-                    "monotonic",
-                    side_effect=[0.0, 0.0, 0.1, 0.3],
-                ),
-                patch.object(time, "sleep") as sleep,
-                self.assertRaises(process_module.ProcessOwnershipError) as raised,
-            ):
-                guard._remove_inline(deadline=0.25)
-
-            self.assertIs(raised.exception.__cause__, cleanup_error)
-            self.assertIn(
-                "winerror=33 attempts=1",
-                "\n".join(raised.exception.__notes__),
-            )
-            rmtree.assert_called_once_with(private_directory)
-            sleep.assert_called_once_with(
-                process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
-            )
-            self.assertTrue(private_directory.is_dir())
+            with _claimed_namespace(guard) as namespace:
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        side_effect=cleanup_error,
+                    ) as remove,
+                    patch.object(time, "monotonic", side_effect=[0.0, 0.1, 0.3]),
+                    patch.object(time, "sleep") as sleep,
+                    self.assertRaises(process_module.ProcessOwnershipError) as raised,
+                ):
+                    guard._remove_inline(namespace=namespace, deadline=0.25)
+                self.assertIs(raised.exception.__cause__, cleanup_error)
+                self.assertIn(
+                    "winerror=33 attempts=1", "\n".join(raised.exception.__notes__)
+                )
+                remove.assert_called_once_with(namespace, deadline=0.25)
+                sleep.assert_called_once_with(
+                    process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
+                )
+                self.assertTrue((namespace.path / "tree").is_dir())
 
     def test_non_windows_or_non_sharing_errors_fail_without_retry(self) -> None:
-        cases = (("posix", 32), ("nt", 5))
-        for platform_name, error_code in cases:
-            with self.subTest(platform_name=platform_name, error_code=error_code):
-                with tempfile.TemporaryDirectory(
+        for platform_name, error_code in (("posix", 32), ("nt", 5)):
+            with (
+                self.subTest(platform=platform_name, code=error_code),
+                tempfile.TemporaryDirectory(
                     prefix="hbrowser-private-policy-"
-                ) as directory:
-                    private_directory = Path(directory) / "profile"
-                    private_directory.mkdir()
-                    guard = process_module._PrivateDirectory.capture(
-                        private_directory,
-                        platform_name=platform_name,
-                    )
-                    cleanup_error = _windows_cleanup_error(error_code)
-
+                ) as directory,
+            ):
+                private_directory = Path(directory) / "profile"
+                private_directory.mkdir()
+                guard = process_module._PrivateDirectory.capture(
+                    private_directory, platform_name=platform_name
+                )
+                cleanup_error = _windows_cleanup_error(error_code)
+                with _claimed_namespace(guard) as namespace:
                     with (
                         patch.object(
-                            shutil,
-                            "rmtree",
+                            process_module._PrivateDirectory,
+                            "_remove_claimed_contents",
                             side_effect=cleanup_error,
-                        ) as rmtree,
+                        ) as remove,
                         patch.object(time, "sleep") as sleep,
                         self.assertRaises(PermissionError) as raised,
                     ):
-                        guard._remove_inline(deadline=time.monotonic() + 1)
-
-                    self.assertIs(raised.exception, cleanup_error)
-                    rmtree.assert_called_once_with(private_directory)
-                    sleep.assert_not_called()
-                    self.assertTrue(private_directory.is_dir())
+                        guard._remove_inline(
+                            namespace=namespace, deadline=time.monotonic() + 1
+                        )
+                    self.assertTrue((namespace.path / "tree").is_dir())
+                self.assertIs(raised.exception, cleanup_error)
+                remove.assert_called_once()
+                sleep.assert_not_called()
 
     def test_retry_revalidates_identity_before_deleting_replacement(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -2961,43 +3014,86 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
         ) as directory:
             root = Path(directory)
             private_directory = root / "profile"
-            displaced_directory = root / "original-profile"
-            replacement_marker = private_directory / "replacement"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
+            original = process_module._PrivateDirectory._remove_claimed_contents
+            calls = 0
+            with _claimed_namespace(guard) as namespace:
+                claimed = namespace.path / "tree"
 
-            def replace_during_backoff(_: float) -> None:
-                private_directory.rename(displaced_directory)
-                private_directory.mkdir()
-                replacement_marker.write_text("keep", encoding="utf-8")
+                def transient(
+                    instance: process_module._PrivateDirectory,
+                    target: process_module._PrivateDirectory,
+                    *,
+                    deadline: float,
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise _windows_cleanup_error(32)
+                    original(instance, target, deadline=deadline)
 
-            with (
-                patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=_windows_cleanup_error(32),
-                ) as rmtree,
-                patch.object(
-                    time,
-                    "sleep",
-                    side_effect=replace_during_backoff,
-                ),
-                self.assertRaisesRegex(
-                    process_module.ProcessOwnershipError,
-                    "identity changed",
-                ),
-            ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
+                def replace(_: float) -> None:
+                    claimed.rename(root / "displaced")
+                    claimed.mkdir()
+                    (claimed / "foreign").write_text("preserve", encoding="utf-8")
 
-            rmtree.assert_called_once_with(private_directory)
-            self.assertEqual(
-                replacement_marker.read_text(encoding="utf-8"),
-                "keep",
-            )
-            self.assertTrue(displaced_directory.is_dir())
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        transient,
+                    ),
+                    patch.object(time, "sleep", side_effect=replace),
+                    self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError, "identity changed"
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertEqual(
+                    (claimed / "foreign").read_text(encoding="utf-8"), "preserve"
+                )
+                self.assertTrue((root / "displaced").is_dir())
+
+    def test_namespace_retry_revalidates_before_root_removal(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-namespace-retry-"
+        ) as directory:
+            root = Path(directory)
+            path = root / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path, platform_name="nt")
+            with _claimed_namespace(guard) as namespace:
+                original_rmdir = Path.rmdir
+
+                def locked_namespace(target: Path) -> None:
+                    if target == namespace.path:
+                        raise _windows_cleanup_error(32)
+                    original_rmdir(target)
+
+                def replace(_: float) -> None:
+                    namespace.path.rename(root / "displaced-namespace")
+                    namespace.path.mkdir()
+                    (namespace.path / "foreign").write_text("keep", encoding="utf-8")
+
+                with (
+                    patch.object(Path, "rmdir", locked_namespace),
+                    patch.object(time, "sleep", replace),
+                    self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError, "identity changed"
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertEqual(
+                    (namespace.path / "foreign").read_text(encoding="utf-8"), "keep"
+                )
+                self.assertTrue((root / "displaced-namespace").is_dir())
 
     def test_directory_removed_during_backoff_is_idempotent_success(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -3006,27 +3102,362 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
-            original_rmtree = shutil.rmtree
+            original = process_module._PrivateDirectory._remove_claimed_contents
+            calls = 0
+            with _claimed_namespace(guard) as namespace:
+
+                def transient(
+                    instance: process_module._PrivateDirectory,
+                    target: process_module._PrivateDirectory,
+                    *,
+                    deadline: float,
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise _windows_cleanup_error(32)
+                    original(instance, target, deadline=deadline)
+
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        transient,
+                    ),
+                    patch.object(
+                        time,
+                        "sleep",
+                        side_effect=lambda _: shutil.rmtree(namespace.path / "tree"),
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertFalse(namespace.path.exists())
+
+    def test_replacement_after_check_is_claimed_but_never_deleted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-claim-race-") as directory:
+            root = Path(directory)
+            path = root / "profile"
+            path.mkdir()
+            (path / "owned").write_text("original", encoding="utf-8")
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = root / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            original_check = (
+                process_module._PrivateDirectory._assert_identity_or_absence
+            )
+            injected = False
+
+            def replace(instance: process_module._PrivateDirectory) -> bool:
+                nonlocal injected
+                present = original_check(instance)
+                if instance is guard and present and not injected:
+                    injected = True
+                    path.rename(root / "original")
+                    path.mkdir()
+                    (path / "foreign").write_text("keep", encoding="utf-8")
+                return present
 
             with (
                 patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=_windows_cleanup_error(32),
-                ) as rmtree,
+                    process_module._PrivateDirectory,
+                    "_assert_identity_or_absence",
+                    replace,
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "identity changed"
+                ) as raised,
+            ):
+                guard._claim_inline(
+                    namespace, confirmed=False, deadline=time.monotonic() + 1
+                )
+            self.assertTrue(injected)
+            self.assertEqual(
+                (namespace.path / "tree/foreign").read_text(encoding="utf-8"), "keep"
+            )
+            self.assertEqual(
+                (root / "original/owned").read_text(encoding="utf-8"), "original"
+            )
+            self.assertIn(
+                str(namespace.path / "tree"), "\n".join(raised.exception.__notes__)
+            )
+
+    def test_original_path_replacement_is_untouched_after_claim(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-claimed-replacement-"
+        ) as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            with _claimed_namespace(guard) as namespace:
+                path.mkdir()
+                (path / "foreign").write_text("keep", encoding="utf-8")
+                guard._remove_inline(namespace=namespace, deadline=time.monotonic() + 1)
+            self.assertEqual((path / "foreign").read_text(encoding="utf-8"), "keep")
+
+    def test_unconfirmed_missing_claim_never_counts_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-missing-claim-") as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = Path(directory) / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            state = process_module._PrivateDirectoryClaim(
+                guard, namespace_path, namespace, started=True
+            )
+            path.rmdir()
+            self.assertFalse(state.complete())
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "lost both"
+            ):
+                guard._claim_inline(
+                    namespace, confirmed=False, deadline=time.monotonic() + 1
+                )
+            namespace_path.rmdir()
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "Unconfirmed"
+            ):
+                state.complete()
+
+    def test_malformed_or_missing_handshake_never_authorizes_deletion(self) -> None:
+        frames = (b"", b"wrong\n", b"ready -1 2\n", b"ready 1 2 extra\n", b"x" * 129)
+        with tempfile.TemporaryDirectory(prefix="hbrowser-handshake-") as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            for frame in frames:
+                with self.subTest(frame=frame):
+                    state = process_module._PrivateDirectoryClaim(
+                        guard, Path(directory) / ".hbrowser-cleanup-test"
+                    )
+                    read_fd, write_fd = os.pipe()
+                    try:
+                        os.write(write_fd, frame)
+                    finally:
+                        os.close(write_fd)
+                    with os.fdopen(read_fd, "rb") as output:
+                        child = Mock(args=["worker"], stdout=output, stdin=Mock())
+                        active = process_module._ActivePrivateDirectoryCleanup(
+                            guard=guard, process=child
+                        )
+                        with self.assertRaises(process_module.ProcessOwnershipError):
+                            process_module._acknowledge_private_directory_claim(
+                                active, state, deadline=time.monotonic() + 1
+                            )
+                        child.stdin.write.assert_not_called()
+                    self.assertFalse(state.confirmed)
+                    self.assertIsNone(state.namespace)
+                    self.assertTrue(path.is_dir())
+
+    def test_claimed_frame_without_matching_root_never_authorizes_deletion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-handshake-missing-"
+        ) as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = Path(directory) / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            state = process_module._PrivateDirectoryClaim(guard, namespace_path)
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(
+                    write_fd, f"ready {namespace.device} {namespace.inode}\n".encode()
+                )
+                with os.fdopen(read_fd, "rb") as output:
+                    child = Mock(args=["worker"], stdout=output, stdin=Mock())
+                    child.stdin.write.side_effect = lambda _: os.write(
+                        write_fd, b"claimed\n"
+                    )
+                    active = process_module._ActivePrivateDirectoryCleanup(
+                        guard=guard, process=child
+                    )
+                    with self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError, "Unconfirmed"
+                    ):
+                        process_module._acknowledge_private_directory_claim(
+                            active, state, deadline=time.monotonic() + 1
+                        )
+                    child.stdin.write.assert_called_once_with(b"claim\n")
+                self.assertFalse(state.confirmed)
+                self.assertTrue(path.is_dir())
+            finally:
+                os.close(write_fd)
+
+    def test_failed_worker_does_not_publish_success_after_material_removal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-failed-removed-"
+        ) as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            child = Mock(
+                args=["worker"], stdin=Mock(), stdout=Mock(), stderr=None, returncode=1
+            )
+            child.poll.return_value = 1
+            child.wait.return_value = 1
+
+            def acknowledge(
+                active: process_module._ActivePrivateDirectoryCleanup,
+                state: process_module._PrivateDirectoryClaim,
+                *,
+                deadline: float,
+            ) -> None:
+                state.path.mkdir()
+                state.namespace = process_module._PrivateDirectory.capture(state.path)
+                guard._claim_inline(state.namespace, confirmed=False, deadline=deadline)
+                state.confirmed = True
+                guard._remove_inline(namespace=state.namespace, deadline=deadline)
+
+            with (
+                _mock_popen(return_value=child),
                 patch.object(
-                    time,
-                    "sleep",
-                    side_effect=lambda _: original_rmtree(private_directory),
+                    process_module, "_acknowledge_private_directory_claim", acknowledge
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "exit_code=1"
                 ),
             ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
+                guard.remove(deadline=time.monotonic() + 2)
+            self.assertFalse(path.exists())
+            self.assertIsNone(process_module._active_private_directory_cleanup(guard))
+            self.assertNotIn(
+                process_module._private_directory_key(guard),
+                process_module._PENDING_PRIVATE_DIRECTORIES,
+            )
 
-            rmtree.assert_called_once_with(private_directory)
-            self.assertFalse(private_directory.exists())
+    def test_worker_interruption_preserves_claim_and_public_replacement(
+        self,
+    ) -> None:
+        for phase in ("after-claim", "before-delete", "after-delete"):
+            with (
+                self.subTest(phase=phase),
+                tempfile.TemporaryDirectory(
+                    prefix="hbrowser-worker-phase-", delete=False
+                ) as directory,
+            ):
+                root = Path(directory)
+                path = root / "profile"
+                path.mkdir()
+                (path / "owned").write_text("original", encoding="utf-8")
+                guard = process_module._PrivateDirectory.capture(path)
+                marker = root / "phase"
+                worker = root / "worker.py"
+                runtime_worker = process_module._PRIVATE_CLEANUP_WORKER_PATH
+                target = (
+                    "_claim_inline"
+                    if phase == "after-claim"
+                    else "_remove_claimed_contents"
+                )
+                worker.write_text(
+                    "import sys, runpy, time\nfrom pathlib import Path\n"
+                    f"sys.path.insert(0, {str(runtime_worker.parent)!r})\n"
+                    "import process\n"
+                    f"original = process._PrivateDirectory.{target}\n"
+                    "def interrupted(self, *args, **kwargs):\n"
+                    + (
+                        "    original(self, *args, **kwargs)\n"
+                        if phase != "before-delete"
+                        else ""
+                    )
+                    + f"    Path({str(marker)!r}).write_text('entered')\n"
+                    "    time.sleep(30)\n"
+                    f"process._PrivateDirectory.{target} = interrupted\n"
+                    f"runpy.run_path({str(runtime_worker)!r}, run_name='__main__')\n",
+                    encoding="utf-8",
+                )
+                try:
+                    with (
+                        patch.object(
+                            process_module, "_PRIVATE_CLEANUP_WORKER_PATH", worker
+                        ),
+                        self.assertRaises(process_module.ProcessOwnershipError),
+                    ):
+                        guard.remove(deadline=time.monotonic() + 1)
+                    self.assertTrue(
+                        marker.is_file(),
+                        "worker must reach the intended interruption boundary",
+                    )
+                    self.assertIsNone(
+                        process_module._active_private_directory_cleanup(guard)
+                    )
+                    state = process_module._PENDING_PRIVATE_DIRECTORIES[
+                        process_module._private_directory_key(guard)
+                    ]
+                    self.assertIsNotNone(state.namespace)
+                    self.assertEqual(state.confirmed, phase != "after-claim")
+                    path.mkdir()
+                    (path / "foreign").write_text("keep", encoding="utf-8")
+                    guard.remove(deadline=time.monotonic() + 3)
+                    self.assertEqual(
+                        (path / "foreign").read_text(encoding="utf-8"), "keep"
+                    )
+                    self.assertFalse(state.path.exists())
+                    self.assertNotIn(
+                        process_module._private_directory_key(guard),
+                        process_module._PENDING_PRIVATE_DIRECTORIES,
+                    )
+                finally:
+                    _release_private_fixture(guard, root)
+
+    def test_interrupted_setup_without_identity_is_not_adopted_on_retry(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-worker-setup-", delete=False
+        ) as directory:
+            root = Path(directory)
+            path = root / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            worker = root / "worker.py"
+            runtime_worker = process_module._PRIVATE_CLEANUP_WORKER_PATH
+            marker = root / "setup"
+            worker.write_text(
+                "import sys, runpy, time\nfrom pathlib import Path\n"
+                f"sys.path.insert(0, {str(runtime_worker.parent)!r})\n"
+                "original = Path.mkdir\n"
+                "def stalled(path, *args, **kwargs):\n"
+                "    original(path, *args, **kwargs)\n"
+                f"    Path({str(marker)!r}).write_text('entered')\n"
+                "    time.sleep(30)\n"
+                "Path.mkdir = stalled\n"
+                f"runpy.run_path({str(runtime_worker)!r}, run_name='__main__')\n",
+                encoding="utf-8",
+            )
+            try:
+                with (
+                    patch.object(
+                        process_module, "_PRIVATE_CLEANUP_WORKER_PATH", worker
+                    ),
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    guard.remove(deadline=time.monotonic() + 1)
+                self.assertTrue(marker.is_file())
+                state = process_module._PENDING_PRIVATE_DIRECTORIES[
+                    process_module._private_directory_key(guard)
+                ]
+                self.assertIsNone(state.namespace)
+                self.assertTrue(state.path.is_dir())
+                self.assertTrue(path.is_dir())
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIsNone(state.namespace)
+                self.assertTrue(state.path.is_dir())
+                self.assertTrue(path.is_dir())
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+            finally:
+                _release_private_fixture(guard, root)
 
 
 class ProcessPolicyTests(unittest.TestCase):
@@ -3544,8 +3975,8 @@ class ProcessPolicyTests(unittest.TestCase):
             with patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ):
                 owner.wait(timeout=1)
@@ -3820,8 +4251,8 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ),
         ):
@@ -3882,8 +4313,8 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ),
             self.assertRaisesRegex(OSError, "assignment failed"),
@@ -3991,8 +4422,8 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     process_module,
                     "_remove_private_directory_owned",
-                    side_effect=lambda guard, *, deadline: guard._remove_inline(
-                        deadline=deadline
+                    side_effect=lambda guard, *, deadline: _remove_private_inline(
+                        guard, deadline=deadline
                     ),
                 ),
                 self.assertRaises(TimeoutError) as raised,
@@ -4133,8 +4564,8 @@ class ProcessPolicyTests(unittest.TestCase):
             with patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ):
                 owner.wait(timeout=1)
@@ -4385,7 +4816,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     raise process_module.ProcessOwnershipError(
                         "private cleanup timed out"
                     ) from cleanup_error
-                guard._remove_inline(deadline=deadline)
+                _remove_private_inline(guard, deadline=deadline)
 
             with (
                 patch.object(
@@ -4459,7 +4890,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     release_started.set()
                     if not allow_release.wait(timeout=2):
                         raise TimeoutError("test did not release private cleanup")
-                guard._remove_inline(deadline=deadline)
+                _remove_private_inline(guard, deadline=deadline)
 
             def shutdown_owner() -> None:
                 try:

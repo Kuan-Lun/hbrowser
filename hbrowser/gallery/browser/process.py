@@ -7,6 +7,7 @@ import ctypes
 import math
 import ntpath
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -15,7 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -255,15 +256,8 @@ class _PrivateDirectory:
 
         _remove_private_directory_owned(self, deadline=deadline)
 
-    def _remove_inline(self, *, deadline: float) -> None:
-        """Worker-only removal with per-attempt identity validation.
-
-        Windows can keep a just-exited Chromium database handle alive briefly.
-        Retry only the two native sharing/lock violations, revalidating the root
-        identity before every attempt and retaining ownership when the deadline
-        expires.
-        """
-
+    def _retry_cleanup(self, operation: Callable[[], None], *, deadline: float) -> None:
+        """Keep native Windows sharing retries within the original deadline."""
         retry_delay = _PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
         last_retryable_error: OSError | None = None
         attempts = 0
@@ -278,18 +272,9 @@ class _PrivateDirectory:
                     "Private generation directory cleanup deadline expired before "
                     "filesystem mutation"
                 )
-            if not self._assert_identity_or_absence():
-                return
-            if time.monotonic() >= deadline:
-                raise ProcessOwnershipError(
-                    "Private generation directory identity proof completed after its "
-                    "cleanup deadline"
-                )
             try:
                 attempts += 1
-                shutil.rmtree(self.path)
-            except FileNotFoundError:
-                return
+                operation()
             except OSError as error:
                 if not self._is_retryable_error(error):
                     raise
@@ -307,15 +292,128 @@ class _PrivateDirectory:
                 )
                 continue
 
-            if not self._assert_identity_or_absence():
-                if time.monotonic() >= deadline:
-                    raise ProcessOwnershipError(
-                        "Private generation directory was removed after its deadline"
-                    )
+            if time.monotonic() >= deadline:
+                raise ProcessOwnershipError(
+                    "Private generation directory cleanup completed after its deadline"
+                )
+            return
+
+    @contextmanager
+    def _open_directory(self) -> Iterator[int]:
+        descriptor = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) != (self.device, self.inode):
+                raise ProcessOwnershipError(
+                    f"Private cleanup directory identity changed: {self.path}"
+                )
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _claimed_directory(self, namespace: _PrivateDirectory) -> _PrivateDirectory:
+        return _PrivateDirectory(
+            namespace.path / "tree", self.device, self.inode, self.platform_name
+        )
+
+    def _claim_inline(
+        self,
+        namespace: _PrivateDirectory,
+        *,
+        confirmed: bool,
+        deadline: float,
+    ) -> None:
+        """Move the public name before destructive traversal, then verify identity."""
+
+        claimed = self._claimed_directory(namespace)
+
+        def claim() -> None:
+            if not namespace._assert_identity_or_absence():
+                raise ProcessOwnershipError("Private cleanup namespace disappeared")
+            if claimed._assert_identity_or_absence():
                 return
-            raise ProcessOwnershipError(
-                "Private generation directory remained after cleanup"
-            )
+            if confirmed:
+                # The parent confirmed this exact root before permitting deletion.
+                return
+            if not self._assert_identity_or_absence():
+                raise ProcessOwnershipError(
+                    "Unconfirmed private cleanup lost both original and claim"
+                )
+            if time.monotonic() >= deadline:
+                raise ProcessOwnershipError("Private cleanup claim deadline expired")
+            if os.name == "posix":
+                with namespace._open_directory() as namespace_fd:
+                    os.rename(self.path, "tree", dst_dir_fd=namespace_fd)
+            else:
+                os.rename(self.path, claimed.path)
+            # A replacement that won the rename race is retained, never deleted
+            # or automatically restored over a later occupant of the public name.
+            if not claimed._assert_identity_or_absence():
+                raise ProcessOwnershipError("Private cleanup claim disappeared")
+
+        try:
+            self._retry_cleanup(claim, deadline=deadline)
+        except BaseException as error:
+            error.add_note(f"Retained private cleanup claim: {claimed.path}")
+            raise
+
+    def _remove_inline(self, *, namespace: _PrivateDirectory, deadline: float) -> None:
+        """Worker-only deletion after the parent acknowledged the exact claim.
+
+        The namespace is private to this cleanup owner. It is not a defence
+        against arbitrary same-user writers entering that namespace. In
+        particular POSIX has no conditional-inode rmdir primitive.
+        """
+
+        claimed = self._claimed_directory(namespace)
+
+        self._retry_cleanup(
+            lambda: self._remove_claimed_contents(namespace, deadline=deadline),
+            deadline=deadline,
+        )
+        if claimed._assert_identity_or_absence():
+            raise ProcessOwnershipError("Private cleanup claim remained after removal")
+
+        def release_namespace() -> None:
+            if not namespace._assert_identity_or_absence():
+                raise ProcessOwnershipError("Private cleanup namespace disappeared")
+            if time.monotonic() >= deadline:
+                raise ProcessOwnershipError(
+                    "Private cleanup namespace deadline expired"
+                )
+            namespace.path.rmdir()
+
+        self._retry_cleanup(release_namespace, deadline=deadline)
+
+    def _remove_claimed_contents(
+        self, namespace: _PrivateDirectory, *, deadline: float
+    ) -> None:
+        claimed = self._claimed_directory(namespace)
+        if not namespace._assert_identity_or_absence():
+            raise ProcessOwnershipError("Private cleanup namespace disappeared")
+        if not claimed._assert_identity_or_absence():
+            return
+        if time.monotonic() >= deadline:
+            raise ProcessOwnershipError("Private cleanup removal deadline expired")
+        if os.name == "posix":
+            with (
+                namespace._open_directory() as namespace_fd,
+                claimed._open_directory() as root_fd,
+            ):
+                with os.scandir(root_fd) as entries:
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            raise ProcessOwnershipError(
+                                "Private cleanup traversal deadline expired"
+                            )
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.name, dir_fd=root_fd)
+                        else:
+                            os.unlink(entry.name, dir_fd=root_fd)
+                # Only the cleanup owner writes names in this namespace.
+                os.rmdir("tree", dir_fd=namespace_fd)
+        else:
+            shutil.rmtree(claimed.path)
 
 
 class _BoundedPipeDrain:
@@ -1603,6 +1701,28 @@ def _supervisor_launch_context(
 
 
 @dataclass(slots=True)
+class _PrivateDirectoryClaim:
+    """Parent-held claim intent and acknowledgements surviving worker retries."""
+
+    guard: _PrivateDirectory
+    path: Path
+    namespace: _PrivateDirectory | None = None
+    confirmed: bool = False
+    started: bool = False
+
+    def complete(self) -> bool:
+        if self.namespace is None:
+            return not self.started and not self.guard._assert_identity_or_absence()
+        if self.namespace._assert_identity_or_absence():
+            return False
+        if not self.confirmed:
+            raise ProcessOwnershipError(
+                f"Unconfirmed private cleanup namespace disappeared: {self.path}"
+            )
+        return True
+
+
+@dataclass(slots=True)
 class _ActivePrivateDirectoryCleanup:
     """A start-gated cleanup child retained until process reaping is proven."""
 
@@ -1615,7 +1735,7 @@ class _ActivePrivateDirectoryCleanup:
 
 
 _PRIVATE_DIRECTORY_CLEANUP_LOCK = threading.Lock()
-_PENDING_PRIVATE_DIRECTORIES: dict[tuple[str, int, int], _PrivateDirectory] = {}
+_PENDING_PRIVATE_DIRECTORIES: dict[tuple[str, int, int], _PrivateDirectoryClaim] = {}
 _ACTIVE_PRIVATE_DIRECTORY_CLEANUPS: dict[
     tuple[str, int, int], _ActivePrivateDirectoryCleanup
 ] = {}
@@ -1636,9 +1756,19 @@ def _private_directory_operation_lock(guard: _PrivateDirectory) -> threading.Loc
         return operation_lock
 
 
-def _register_pending_private_directory(guard: _PrivateDirectory) -> None:
+def _register_pending_private_directory(
+    guard: _PrivateDirectory,
+) -> _PrivateDirectoryClaim:
     with _PRIVATE_DIRECTORY_CLEANUP_LOCK:
-        _PENDING_PRIVATE_DIRECTORIES[_private_directory_key(guard)] = guard
+        key = _private_directory_key(guard)
+        existing = _PENDING_PRIVATE_DIRECTORIES.get(key)
+        if existing is None:
+            existing = _PrivateDirectoryClaim(
+                guard,
+                guard.path.parent / f".hbrowser-cleanup-{secrets.token_hex(16)}",
+            )
+            _PENDING_PRIVATE_DIRECTORIES[key] = existing
+        return existing
 
 
 def _release_pending_private_directory(guard: _PrivateDirectory) -> None:
@@ -1725,6 +1855,8 @@ def _release_reaped_private_directory_cleanup(
         active.windows_job = None
     if process is not None:
         _capture_private_directory_cleanup_diagnostic(active)
+        if process.stdout is not None:
+            process.stdout.close()
     _release_active_private_directory_cleanup(active)
     if active.observation is not None:
         active.observation.complete(deadline=deadline)
@@ -1778,6 +1910,7 @@ def _force_reap_private_directory_cleanup(
 def _spawn_private_directory_cleanup(
     guard: _PrivateDirectory,
     *,
+    claim: _PrivateDirectoryClaim,
     work_deadline: float,
     ownership_deadline: float,
 ) -> _ActivePrivateDirectoryCleanup:
@@ -1800,9 +1933,13 @@ def _spawn_private_directory_cleanup(
                 str(guard.inode),
                 guard.platform_name,
                 repr(work_deadline),
+                str(claim.path),
+                str(claim.namespace.device) if claim.namespace is not None else "-1",
+                str(claim.namespace.inode) if claim.namespace is not None else "-1",
+                "1" if claim.confirmed else "0",
             ],
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
             env=environment,
@@ -1858,6 +1995,76 @@ def _start_private_directory_cleanup(
         ) from error
 
 
+def _acknowledge_private_directory_claim(
+    active: _ActivePrivateDirectoryCleanup,
+    claim: _PrivateDirectoryClaim,
+    *,
+    deadline: float,
+) -> None:
+    """Two bounded frames publish authority before any destructive traversal."""
+
+    process = active.process
+    if process is None or process.stdout is None or process.stdin is None:
+        raise ProcessOwnershipError("Private cleanup handshake pipes are unavailable")
+    descriptor = process.stdout.fileno()
+    os.set_blocking(descriptor, False)
+    payload = bytearray()
+    phase = 0
+    while phase < 2:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        try:
+            chunk = os.read(descriptor, 128)
+        except BlockingIOError:
+            time.sleep(min(_STATUS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            continue
+        if not chunk:
+            raise ProcessOwnershipError("Private cleanup handshake ended before proof")
+        payload.extend(chunk)
+        if len(payload) > 128:
+            raise ProcessOwnershipError("Private cleanup handshake exceeded its bound")
+        if b"\n" not in payload:
+            continue
+        line, remainder = payload.split(b"\n", 1)
+        if remainder:
+            raise ProcessOwnershipError("Private cleanup sent an unacknowledged frame")
+        payload.clear()
+        if phase == 0:
+            fields = line.split(b" ")
+            if (
+                len(fields) != 3
+                or fields[0] != b"ready"
+                or any(not value.isdigit() for value in fields[1:])
+            ):
+                raise ProcessOwnershipError("Malformed private cleanup namespace proof")
+            namespace = _PrivateDirectory(
+                claim.path, int(fields[1]), int(fields[2]), claim.guard.platform_name
+            )
+            if claim.namespace is not None and namespace != claim.namespace:
+                raise ProcessOwnershipError("Private cleanup namespace proof changed")
+            if not namespace._assert_identity_or_absence():
+                raise ProcessOwnershipError("Private cleanup namespace proof is absent")
+            claim.namespace = namespace
+            command = b"claim\n"
+        else:
+            if line != b"claimed" or claim.namespace is None:
+                raise ProcessOwnershipError("Malformed private cleanup root proof")
+            present = claim.guard._claimed_directory(
+                claim.namespace
+            )._assert_identity_or_absence()
+            if not present and not claim.confirmed:
+                raise ProcessOwnershipError(
+                    "Unconfirmed private cleanup root is absent"
+                )
+            claim.confirmed = True
+            command = b"remove\n"
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        process.stdin.write(command)
+        process.stdin.flush()
+        phase += 1
+
+
 def _remove_private_directory_owned(
     guard: _PrivateDirectory,
     *,
@@ -1872,7 +2079,7 @@ def _remove_private_directory_owned(
         raise ValueError("Private cleanup deadline must be finite")
 
     absolute_deadline = _process_observation.cleanup_deadline(absolute_deadline)
-    _register_pending_private_directory(guard)
+    claim = _register_pending_private_directory(guard)
     operation_lock = _private_directory_operation_lock(guard)
     remaining = max(0.0, absolute_deadline - time.monotonic())
     if not operation_lock.acquire(timeout=remaining):
@@ -1890,7 +2097,7 @@ def _remove_private_directory_owned(
                 prior_active,
                 deadline=absolute_deadline,
             )
-        if not guard._assert_identity_or_absence():
+        if claim.complete():
             _release_pending_private_directory(guard)
             return
 
@@ -1904,8 +2111,10 @@ def _remove_private_directory_owned(
             remaining / 2.0,
         )
         work_deadline = absolute_deadline - kill_reserve
+        claim.started = True
         active = _spawn_private_directory_cleanup(
             guard,
+            claim=claim,
             work_deadline=work_deadline,
             ownership_deadline=absolute_deadline,
         )
@@ -1925,6 +2134,7 @@ def _remove_private_directory_owned(
                 )
             _start_private_directory_cleanup(active)
             worker_started = True
+            _acknowledge_private_directory_claim(active, claim, deadline=work_deadline)
             process.wait(timeout=max(0.0, work_deadline - time.monotonic()))
         except subprocess.TimeoutExpired as error:
             worker_timeout = error
@@ -1933,11 +2143,16 @@ def _remove_private_directory_owned(
                 deadline=absolute_deadline,
             )
             returncode = process.returncode
-        except BaseException:
+        except BaseException as worker_failure:
             _force_reap_private_directory_cleanup(
                 active,
                 deadline=absolute_deadline,
             )
+            worker_failure.add_note(f"Retained private cleanup namespace: {claim.path}")
+            if active.worker_diagnostic is not None:
+                worker_failure.add_note(
+                    f"Cleanup worker diagnostic: {active.worker_diagnostic}"
+                )
             raise
         else:
             returncode = process.returncode
@@ -1946,14 +2161,14 @@ def _remove_private_directory_owned(
                 deadline=absolute_deadline,
             )
 
-        removed = not guard._assert_identity_or_absence()
+        removed = claim.complete()
         if removed:
             _release_pending_private_directory(guard)
         if time.monotonic() >= absolute_deadline:
             raise ProcessOwnershipError(
                 "Private directory cleanup completed after its ownership deadline"
             )
-        if not removed:
+        if not removed or worker_timeout is not None or returncode != 0:
             if worker_timeout is not None:
                 phase = (
                     "during filesystem cleanup"
@@ -1988,7 +2203,7 @@ def _remove_private_directory_owned(
 def _cleanup_pending_private_directories_at_exit() -> None:
     deadline = time.monotonic() + _PROCESS_WAIT_TIMEOUT_SECONDS
     with _PRIVATE_DIRECTORY_CLEANUP_LOCK:
-        pending = tuple(_PENDING_PRIVATE_DIRECTORIES.values())
+        pending = tuple(state.guard for state in _PENDING_PRIVATE_DIRECTORIES.values())
     for guard in pending:
         if time.monotonic() >= deadline:
             break
