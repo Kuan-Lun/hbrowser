@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from h2h_galleryinfo_parser import GalleryURLParser
 from websockets.exceptions import ConnectionClosedError
+from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
 import hbrowser
@@ -66,11 +67,29 @@ ARCHIVE_URL = "https://exhentai.org/archiver.php?gid=7654321&token=deadbeef00"
 
 def _archive_control(**kwargs: object) -> SimpleNamespace:
     return SimpleNamespace(
+        node_id=cdp.dom.NodeId(41),
         apply=AsyncMock(
-            return_value={
-                "href": "#",
-                "onclick": f"return popUp('{ARCHIVE_URL}',480,320)",
-            }
+            side_effect=AssertionError("Archive identity must use DOM.getAttributes")
+        ),
+        **kwargs,
+    )
+
+
+def _dom_attributes(**attributes: str | None) -> list[str]:
+    return [
+        part
+        for name, value in attributes.items()
+        if value is not None
+        for part in (name, value)
+    ]
+
+
+def _archive_gallery_page(**kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        send=AsyncMock(
+            return_value=_dom_attributes(
+                href="#", onclick=f"return popUp('{ARCHIVE_URL}',480,320)"
+            )
         ),
         **kwargs,
     )
@@ -1572,16 +1591,8 @@ class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.archive_url = (
             "https://exhentai.org/archiver.php?gid=7654321&token=deadbeef00"
         )
-        link = SimpleNamespace(
-            click=AsyncMock(),
-            apply=AsyncMock(
-                return_value={
-                    "href": "#",
-                    "onclick": f"return popUp('{self.archive_url}',480,320)",
-                }
-            ),
-        )
-        gallery = SimpleNamespace(
+        link = _archive_control(click=AsyncMock())
+        gallery = _archive_gallery_page(
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [link]]),
             activate=AsyncMock(),
@@ -1618,6 +1629,42 @@ class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
             close=AsyncMock(),
         )
+
+    async def test_archive_identity_reads_only_the_current_gallery_dom(self) -> None:
+        driver, gallery, popup, link = self.make_download()
+
+        self.assertTrue(await driver.download(self.gallery))
+
+        link.apply.assert_not_awaited()
+        gallery.send.assert_awaited_once()
+        command = gallery.send.await_args.args[0]
+        try:
+            self.assertEqual(
+                next(command),
+                {"method": "DOM.getAttributes", "params": {"nodeId": 41}},
+            )
+        finally:
+            command.close()
+        link.click.assert_awaited_once()
+        popup.close.assert_awaited_once()
+
+    async def test_malformed_dom_attributes_are_rejected_before_click(self) -> None:
+        for attributes in (
+            None,
+            {"href": ARCHIVE_URL},
+            ["href"],
+            ["href", 41],
+            ["href", ARCHIVE_URL, "href", ARCHIVE_URL],
+            ["", "value", "href", ARCHIVE_URL],
+        ):
+            with self.subTest(attributes=attributes):
+                driver, gallery, popup, link = self.make_download()
+                gallery.send.return_value = attributes
+                with self.assertRaisesRegex(ValueError, "malformed"):
+                    await driver.download(self.gallery)
+                link.click.assert_not_awaited()
+                popup.activate.assert_not_awaited()
+                popup.close.assert_not_awaited()
 
     async def test_pre_click_foreign_tab_is_never_adopted(self) -> None:
         driver, gallery, popup, link = self.make_download()
@@ -1722,7 +1769,7 @@ class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_control_forms_preserve_the_one_click_flow(self) -> None:
         for form in ("href", "relative-href", "onclick", "matching-both"):
             with self.subTest(form=form):
-                driver, _gallery, popup, link = self.make_download()
+                driver, gallery, popup, link = self.make_download()
                 href = self.archive_url
                 onclick = None
                 if form == "relative-href":
@@ -1732,7 +1779,7 @@ class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     onclick = f'window.open("{self.archive_url}")'
                 elif form == "matching-both":
                     onclick = f"return popUp('{self.archive_url}',480,320)"
-                link.apply.return_value = {"href": href, "onclick": onclick}
+                gallery.send.return_value = _dom_attributes(href=href, onclick=onclick)
                 self.assertTrue(await driver.download(self.gallery))
                 link.click.assert_awaited_once()
                 popup.close.assert_awaited_once()
@@ -1753,8 +1800,8 @@ class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
             {"href": ARCHIVE_URL, "onclick": f"popUp('{ARCHIVE_URL}&other=1')"},
         ):
             with self.subTest(attributes=attributes):
-                driver, _gallery, popup, link = self.make_download()
-                link.apply.return_value = attributes
+                driver, gallery, popup, link = self.make_download()
+                gallery.send.return_value = _dom_attributes(**attributes)
                 with self.assertRaises(ValueError):
                     await driver.download(self.gallery)
                 link.click.assert_not_awaited()
@@ -1887,7 +1934,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(original.click.await_count, 1)
             return "Downloads should start processing within a couple of minutes."
 
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
             close=AsyncMock(),
@@ -1939,7 +1986,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             gallery_closed = True
 
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2012,7 +2059,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
 
         first_link = _archive_control(click=AsyncMock())
         second_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2134,7 +2181,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver = EHDriver(headless=True)
         driver.logger = Mock()
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2198,7 +2245,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 driver = EHDriver(headless=True)
                 driver.logger = Mock()
                 archive_link = _archive_control(click=AsyncMock())
-                gallery_page = SimpleNamespace(
+                gallery_page = _archive_gallery_page(
                     mapper={},
                     target=SimpleNamespace(target_id="gallery"),
                     xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2269,7 +2316,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver = EHDriver(headless=True)
         driver.logger = Mock()
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2343,7 +2390,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver.logger = Mock()
         timeout = ZendriverOperationTimeout(timeout_seconds=5)
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2401,7 +2448,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver.logger = Mock()
         activation_error = RuntimeError("activation dispatch failed")
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2457,7 +2504,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         click_error = RuntimeError("Original click dispatch failed")
         archive_link = _archive_control(click=AsyncMock())
         original_link = SimpleNamespace(click=AsyncMock(side_effect=click_error))
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2522,7 +2569,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         archive_link = _archive_control(
             click=AsyncMock(side_effect=ZendriverOperationTimeout(timeout_seconds=5.0))
         )
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2565,7 +2612,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         archive_link = _archive_control(
             click=AsyncMock(side_effect=click_error),
         )
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),
@@ -2603,7 +2650,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             return gallery.url
 
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2653,7 +2700,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             return gallery.url
 
         archive_link = _archive_control(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),

@@ -19,7 +19,7 @@ from urllib.parse import (
 
 from bs4 import BeautifulSoup
 from h2h_galleryinfo_parser import GalleryURLParser
-from zendriver import cdp
+from zendriver import Tab, cdp
 from zendriver.core.connection import ProtocolException
 
 from ..exceptions import (
@@ -98,20 +98,27 @@ def _archive_url_identity(url: str) -> tuple[str, str, str, dict[str, list[str]]
     )
 
 
-async def _archive_destination(link: Any, gallery_url: str, deadline: Deadline) -> str:
+async def _archive_destination(
+    gallery_tab: Tab, link: Any, gallery_url: str, deadline: Deadline
+) -> str:
     """Read the control's destination without executing its onclick handler."""
     _require_active_deadline(deadline, "Archive control identity")
-    attributes = await wait_for_zendriver(
-        link.apply(
-            "(el) => ({href: el.getAttribute('href'), "
-            "onclick: el.getAttribute('onclick')})"
-        ),
+    raw_attributes = await wait_for_zendriver(
+        gallery_tab.send(cdp.dom.get_attributes(link.node_id)),
         timeout=min(_PAGE_READ_TIMEOUT_SECONDS, deadline.remaining()),
-        owner=link,
+        owner=gallery_tab,
     )
     _require_active_deadline(deadline, "Archive control identity")
-    if not isinstance(attributes, dict):
-        raise ValueError("Archive control has no explicit destination")
+    if (
+        not isinstance(raw_attributes, list)
+        or len(raw_attributes) % 2
+        or not all(isinstance(value, str) for value in raw_attributes)
+    ):
+        raise ValueError("Archive control has malformed DOM attributes")
+    names = raw_attributes[::2]
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise ValueError("Archive control has malformed DOM attributes")
+    attributes = dict(zip(names, raw_attributes[1::2], strict=True))
     href, onclick = attributes.get("href"), attributes.get("onclick")
     urls = []
     if isinstance(href, str) and href and not href.startswith(("#", "javascript:")):
@@ -1587,7 +1594,9 @@ class EHDriver(Driver):
                 "Archive Download control appeared after its shared deadline"
             )
 
-        destination = await _archive_destination(archive_link, gallery.url, deadline)
+        destination = await _archive_destination(
+            gallery_tab, archive_link, gallery.url, deadline
+        )
         opener_id = getattr(getattr(gallery_tab, "target", None), "target_id", None)
         if not isinstance(opener_id, str) or not opener_id:
             raise ValueError("Archive gallery target has no identity")
