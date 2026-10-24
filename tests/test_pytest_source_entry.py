@@ -20,10 +20,16 @@ runpy.run_path(str(package / "source_loader.py"))["load_package"](
     package, "_shared.h2h_dev_tools"
 )
 """
-_TEST = """from _shared.h2h_dev_tools import version_policy
+_TEST = """from pathlib import Path
+from _shared.h2h_dev_tools import version_policy
+import hbrowser
 
 def test_candidate():
     assert getattr(version_policy.__loader__, "_h2h_source_registration", None)
+    assert hbrowser.CANDIDATE == 'candidate runtime source'
+    assert Path(hbrowser.__file__).resolve() == (
+        Path(__file__).resolve().parents[1] / 'hbrowser/__init__.py'
+    )
 """
 
 
@@ -64,6 +70,10 @@ def _checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     (root / "pyproject.toml").write_text(
         "[tool.h2h-dev-tools]\ncomponents = " + json.dumps(components) + "\n"
     )
+    runtime = root / "hbrowser/__init__.py"
+    runtime.write_text(
+        runtime.read_text() + "\nCANDIDATE = 'candidate runtime source'\n"
+    )
     tests = root / "tests"
     tests.mkdir()
     (tests / "test_candidate.py").write_text("def test_warmup(): pass\n")
@@ -89,27 +99,30 @@ def _checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     os.utime(conftest, ns=(timestamp, timestamp))
     (tests / "test_candidate.py").write_text(_TEST)
 
-    module = scripts / "_shared/h2h_dev_tools/version_policy.py"
-    stale = tmp_path / "stale-version.py"
-    prefix = b"raise RuntimeError('STALE SHARED BYTECODE EXECUTED')\n"
-    stale.write_bytes(prefix + b" " * (module.stat().st_size - len(prefix)))
-    stamp = module.stat().st_mtime_ns
-    os.utime(stale, ns=(stamp, stamp))
-    # The negative-control child has no private cache prefix, regardless of
-    # the parent canonical runner's prefix. Seed that child's default cache.
-    cache = (
-        module.parent
-        / "__pycache__"
-        / f"{module.stem}.{sys.implementation.cache_tag}.pyc"
-    )
-    cache.parent.mkdir(exist_ok=True)
-    py_compile.compile(
-        str(stale),
-        cfile=str(cache),
-        dfile=str(module),
-        doraise=True,
-        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
-    )
+    for module, label in (
+        (scripts / "_shared/h2h_dev_tools/version_policy.py", "SHARED"),
+        (runtime, "RUNTIME"),
+    ):
+        stale = tmp_path / f"stale-{label.lower()}.py"
+        prefix = f"raise RuntimeError('STALE {label} BYTECODE EXECUTED')\n".encode()
+        stale.write_bytes(prefix.ljust(module.stat().st_size, b" "))
+        stamp = module.stat().st_mtime_ns
+        os.utime(stale, ns=(stamp, stamp))
+        # The negative-control child has no private cache prefix, regardless of
+        # the parent canonical runner's prefix. Seed that child's default cache.
+        cache = (
+            module.parent
+            / "__pycache__"
+            / f"{module.stem}.{sys.implementation.cache_tag}.pyc"
+        )
+        cache.parent.mkdir(exist_ok=True)
+        py_compile.compile(
+            str(stale),
+            cfile=str(cache),
+            dfile=str(module),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+        )
     ordinary = _run(
         root, environment, "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q"
     )
@@ -144,6 +157,7 @@ def test_pytest_source_entry_ignores_cached_bootstrap_and_preserves_cli_status(
 
     assert result.returncode == expected, result.stdout + result.stderr
     assert "STALE SHARED BYTECODE EXECUTED" not in result.stdout + result.stderr
+    assert "STALE RUNTIME BYTECODE EXECUTED" not in result.stdout + result.stderr
     if selection == "success":
         assert "1 passed" in result.stdout
     elif selection == "failure":

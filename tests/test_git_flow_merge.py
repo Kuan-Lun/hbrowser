@@ -159,6 +159,28 @@ def _run_merge_script(
     )
 
 
+def _cleanup_owned_test_worktree(
+    repository: Path,
+    task_worktree: Path,
+    gate_log: Path,
+    refused: subprocess.CompletedProcess[str],
+) -> None:
+    """Release only this fixture's Python symlink after proving preservation."""
+    assert refused.returncode != 0
+    assert "Task worktree contains untracked or ignored material" in refused.stderr
+    assert task_worktree.is_dir()
+    python = task_worktree / ".venv/bin/python"
+    assert python.is_symlink()
+    assert python.readlink() == Path(sys.executable)
+    assert set(python.parent.iterdir()) == {python}
+    assert set(python.parent.parent.iterdir()) == {python.parent}
+    python.unlink()
+    python.parent.rmdir()
+    python.parent.parent.rmdir()
+    cleaned = _run_merge_script(repository, gate_log, "--cleanup-only", _TASK_BRANCH)
+    assert cleaned.returncode == 0, cleaned.stderr
+
+
 def _assert_branch_missing(repository: Path, branch: str) -> None:
     result = _git(
         repository,
@@ -214,7 +236,7 @@ def test_ancestor_noop_removes_linked_task_worktree(tmp_path: Path) -> None:
 
     result = _run_merge_script(task_worktree, gate_log)
 
-    assert result.returncode == 0, result.stderr
+    _cleanup_owned_test_worktree(repository, task_worktree, gate_log, result)
     assert not task_worktree.exists()
     assert _git_stdout(repository, "rev-parse", "main") == primary_oid
     _assert_branch_missing(repository, _TASK_BRANCH)
@@ -245,7 +267,7 @@ def test_git_subprocesses_discard_hook_local_environment(
 
     result = _run_merge_script(task_worktree, gate_log)
 
-    assert result.returncode == 0, result.stderr
+    _cleanup_owned_test_worktree(repository, task_worktree, gate_log, result)
     assert not task_worktree.exists()
     assert _git_stdout(repository, "rev-parse", "main") == initial_oid
     _assert_branch_missing(repository, _TASK_BRANCH)
@@ -367,8 +389,9 @@ def test_noop_revalidates_task_oid_after_switch(tmp_path: Path) -> None:
     )
 
     assert result.returncode != 0
-    assert "Git ref changed during cleanup" in result.stderr
-    assert _git_stdout(repository, "branch", "--show-current") == _TASK_BRANCH
+    assert "Primary checkout left unexpected state; admission retained" in result.stderr
+    assert (repository / ".git/h2h-merge-workflow.lock").is_dir()
+    assert _git_stdout(repository, "branch", "--show-current") == "main"
     assert _git_stdout(repository, "rev-parse", _TASK_BRANCH) == moved_oid
     assert _git_stdout(repository, "rev-parse", "main") == initial_oid
     assert not gate_log.exists()
@@ -394,8 +417,8 @@ def test_unique_commit_preserves_full_merge_and_cleanup_path(tmp_path: Path) -> 
 
     result = _run_merge_script(task_worktree, gate_log)
 
-    assert result.returncode == 0, result.stderr
-    assert "Merged task/example into main" in result.stdout
+    _cleanup_owned_test_worktree(repository, task_worktree, gate_log, result)
+    assert "merge succeeded, but task worktree remains" in result.stderr
     assert not task_worktree.exists()
     merge_line = _git_stdout(
         repository,

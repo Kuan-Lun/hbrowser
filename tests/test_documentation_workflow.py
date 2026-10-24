@@ -34,6 +34,41 @@ from _shared.h2h_dev_tools.code_review import main
 trace = Path(os.environ["DOCUMENTATION_WORKFLOW_TRACE"])
 with trace.open("a", encoding="utf-8") as stream:
     stream.write(sys.argv[1] + "\n")
+
+# Preserve the real evidence verifier; inject only after its successful read.
+mutation = os.environ.get("DOCUMENTATION_MUTATE_FINAL_VERIFY")
+if mutation and "full" in trace.read_text(encoding="utf-8").splitlines():
+    import subprocess
+    from _shared.h2h_dev_tools.code_review import Reviewer
+
+    original_verify = Reviewer._verify
+
+    def verify_then_mutate(self, target):
+        receipt = original_verify(self, target)
+        root = Path(__file__).resolve().parents[1]
+        def git(*arguments):
+            return subprocess.check_output(
+                ("git", *arguments), cwd=root, text=True).strip()
+        if mutation in {"tree", "unstaged"}:
+            (root / "tests/example.py").write_text("value = 2\n", encoding="utf-8")
+            if mutation == "tree":
+                git("add", "tests/example.py")
+        elif mutation == "head":
+            git("update-ref", "HEAD", git("rev-parse", "MERGE_HEAD"))
+        elif mutation == "merge_head":
+            merge_head = Path(git("rev-parse", "--path-format=absolute",
+                                  "--git-path", "MERGE_HEAD"))
+            merge_head.write_text(git("rev-parse", "HEAD") + "\n", encoding="ascii")
+        elif mutation == "untracked":
+            (root / "untracked.txt").write_text("not reviewed\n", encoding="utf-8")
+        else:
+            raise AssertionError(f"unknown fixture mutation: {mutation}")
+        with trace.open("a", encoding="utf-8") as stream:
+            stream.write(f"mutated:{mutation}\n")
+        return receipt
+
+    Reviewer._verify = verify_then_mutate
+
 main(Path(__file__).resolve().parents[1])
 """
 
@@ -398,6 +433,7 @@ def test_full_merge_gate_rechecks_review_after_program_checks(
     _write(repository, "tests/example.py", "value = 1\n")
     _commit(repository, "test: add example")
     primary = _git(repository, "rev-parse", "main")
+    task = _git(repository, "rev-parse", "HEAD")
     (repository.parent / "checks.log").write_text("", encoding="utf-8")
     monkeypatch.setenv(
         "DOCUMENTATION_INVALIDATE_REVIEW"
@@ -412,9 +448,49 @@ def test_full_merge_gate_rechecks_review_after_program_checks(
     assert "h2h code review:" in result.stderr
     assert _checks(repository) == ["run", "verify", "full", "verify"]
     assert _git(repository, "rev-parse", "main") == primary
-    assert _git(repository, "branch", "--show-current") == "docs/task"
-    assert not (repository / ".git/MERGE_HEAD").exists()
-    assert _git(repository, "status", "--porcelain") == ""
+    assert _git(repository, "rev-parse", "docs/task") == task
+    merge_head = repository / ".git/MERGE_HEAD"
+    admission = repository / ".git/h2h-merge-workflow.lock"
+    if invalidation == "receipt":
+        assert _git(repository, "branch", "--show-current") == "docs/task"
+        assert not merge_head.exists()
+        assert not admission.exists()
+        assert _git(repository, "status", "--porcelain") == ""
+        return
+
+    # A gate's staged change is external to the captured candidate. Preserve
+    # those bytes and the original workflow's admission instead of aborting it.
+    assert "Candidate changed outside this workflow" in result.stderr
+    assert _git(repository, "branch", "--show-current") == "main"
+    assert merge_head.read_text(encoding="ascii") == task + "\n"
+    staged = _run(repository, "git", "show", ":tests/gate-change.py")
+    assert staged.returncode == 0
+    assert staged.stdout == "changed = True\n"
+    assert (repository / "tests/gate-change.py").read_bytes() == b"changed = True\n"
+    index = _git(repository, "write-tree")
+    owner_bytes = (admission / "owner.json").read_bytes()
+    owner = json.loads(owner_bytes)
+    assert owner["repository"] == str(repository)
+    assert isinstance(owner["owner_pid"], int) and owner["owner_pid"] > 0
+    assert len(owner["token"]) == 64 and set(owner["token"]) <= set("0123456789abcdef")
+    identity = admission.stat()
+
+    blocked = _run(repository, "scripts/git-flow-merge.sh", "--cleanup-only")
+
+    assert blocked.returncode != 0
+    assert "admission is already held" in blocked.stderr
+    assert (admission.stat().st_dev, admission.stat().st_ino) == (
+        identity.st_dev,
+        identity.st_ino,
+    )
+    assert (admission / "owner.json").read_bytes() == owner_bytes
+    assert merge_head.read_text(encoding="ascii") == task + "\n"
+    assert _git(repository, "write-tree") == index
+    assert (repository / "tests/gate-change.py").read_bytes() == b"changed = True\n"
+    assert _git(repository, "branch", "--show-current") == "main"
+    assert _git(repository, "rev-parse", "main") == primary
+    assert _git(repository, "rev-parse", "docs/task") == task
+    assert _checks(repository) == ["run", "verify", "full", "verify"]
 
 
 def test_merge_version_gate_uses_repository_python_without_system_shebang(
@@ -472,3 +548,38 @@ def test_repository_policy_rejects_combined_runtime_and_version_commit(
 
     assert result.returncode != 0
     assert "version transition requires its dedicated release commit" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation", ("stable", "tree", "head", "merge_head", "unstaged", "untracked")
+)
+def test_full_merge_gate_rejects_drift_during_final_offline_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "tests/example.py", "value = 1\n")
+    _commit(repository, "test: add reviewed example")
+    _git(repository, "switch", "main")
+    _git(repository, "merge", "--no-ff", "--no-commit", "docs/task")
+    (repository.parent / "checks.log").write_text("", encoding="utf-8")
+    reviewed = _run(
+        repository, ".venv/bin/python", "scripts/review-code.py", "run", "--index"
+    )
+    assert reviewed.returncode == 0, reviewed.stdout + reviewed.stderr
+    if mutation != "stable":
+        monkeypatch.setenv("DOCUMENTATION_MUTATE_FINAL_VERIFY", mutation)
+
+    result = _run(repository, ".githooks/pre-merge-commit")
+
+    expected_checks = ["run", "verify", "full", "verify"]
+    if mutation == "stable":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("Verified exact-candidate code review:") == 2
+    else:
+        expected_checks.append(f"mutated:{mutation}")
+        assert _checks(repository) == expected_checks
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "h2h code review:" in result.stderr
+        # Only the first verification may announce success.
+        assert result.stdout.count("Verified exact-candidate code review:") == 1
+    assert _checks(repository) == expected_checks

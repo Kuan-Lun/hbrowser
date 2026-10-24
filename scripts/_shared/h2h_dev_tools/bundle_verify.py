@@ -18,11 +18,18 @@ BASE_FILES = frozenset({"__init__.py", "bundle_verify.py", "source_loader.py"})
 _MERGE_REVIEW_FILES = frozenset(
     {
         "code_review.py",
+        "git_index.py",
+        "review_plan.py",
+        "review_coverage.py",
+        "review_execution.py",
+        "review_worker.py",
         "process.py",
         "_process_scope.py",
+        "_process_diagnostic.py",
         "change_scope.py",
         "review-merge-candidate.sh",
         "merge_command.py",
+        "merge_admission.py",
         "git-flow-merge.sh",
         "primary-branch.sh",
     }
@@ -31,19 +38,24 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
     "code-review": _MERGE_REVIEW_FILES,
+    "test-support": frozenset({"executable_fixture.py"}),
+    "review-test-support": frozenset(
+        {"review_test_response.py", "review_test_support.py"}
+    ),
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),
     "version-policy": frozenset({"dependency_manifest.py", "version_policy.py"}),
     "publish-version": frozenset({"publish_version.py"}),
-    "process": frozenset({"process.py", "_process_scope.py"}),
-    "pytest": frozenset({"pytest_source.py"}),
+    "process": frozenset({"process.py", "_process_scope.py", "_process_diagnostic.py"}),
+    "pytest": frozenset({"pytest_source.py", "pytest_runtime.py"}),
     "distribution-check": frozenset({"distribution_check.py"}),
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),
     "primary-branch": frozenset({"primary-branch.sh"}),
     "git-flow": _MERGE_REVIEW_FILES,
     "git-environment": frozenset({"git_environment.py"}),
+    "git-index": frozenset({"git_index.py"}),
     "hooks": frozenset(
         {"primary-branch.sh", "install-git-hooks.sh", "commit-message.sh"}
     ),

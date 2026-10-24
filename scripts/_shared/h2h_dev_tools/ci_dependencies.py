@@ -11,10 +11,21 @@ from pathlib import Path
 
 
 def _package_name(requirement: str) -> str:
-    match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
+    """Extract only the leading distribution-name token for bootstrap selection.
+
+    CI uses this before packaging itself is installed. Keep the full requirement
+    unchanged for pip's PEP 508 parser; do not parse versions, extras or markers.
+    The token follows PyPA's ASCII name grammar with space/tab framing and a
+    complete boundary, so neither a malformed name nor its prefix is selected.
+    """
+    match = re.match(
+        r"[ \t]*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+        r"(?=[ \t]*(?:\Z|[\[(@<>=!~;]))",
+        requirement,
+    )
     if match is None:
         raise ValueError(f"Invalid dependency name: {requirement!r}")
-    return re.sub(r"[-_.]+", "-", match[0]).lower()
+    return re.sub(r"[-_.]+", "-", match[1]).lower()
 
 
 def requirements_for(

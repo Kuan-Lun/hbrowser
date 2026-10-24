@@ -32,6 +32,14 @@
 
 ## 任務收斂與可審查交付
 
+- 開發以可獨立驗證、保留既有功能的批次交付；完整批次即驗證與整合，
+  不等整個跨專案任務結束。
+- 每累計 50,000 tokens 進入整合檢查點：停止新增範圍，優先完成既有批次的
+  必要測試、審查、版本與 dependency audit 及本機合併。此時只修復阻擋整合的
+  問題，其餘需求另開後續 task；不得因門檻略過 gate 或刪除未完成依賴所需的功能。
+- 計數採可取得的實際 usage，包含子代理與 CLI 審查；無完整計數時明說限制，
+  仍在每個可合併批次完成時檢查。未通過必要檢查時保留 task，回報阻擋、
+  已驗證範圍及續作入口，不得宣稱已合併。
 - 品質優先適用於已授權的交付範圍，不代表持續擴張目標。開始實作或範圍
   明顯改變時，在對話或既有任務紀錄列出交付物、必要驗收、相依性與完成條件；
   歷史結果與目前阻擋事項分開記錄，不為此另建文件或驗證框架。
@@ -248,6 +256,9 @@
   selectors、Git environment boundary 與 process ownership。手動需要相同來源
   保證時使用 `.venv/bin/python scripts/pytest-source.py <pytest arguments>`；
   普通 `pytest` 僅為手動便利入口，不承諾排除既有 bytecode。
+  Canonical entry 明確宣告本 checkout 的 `hbrowser` runtime source；qualified
+  shared package 的 parent initializer 也須由 source loader 驗證，不得以已
+  import 的同名 module 代替。直接 runtime worker 的來源由下述 local adapter 管理。
 - Canonical pytest 入口另以 repository-local adapter，於 runtime 新 session
   啟動前登記測試清理責任。私有 lifecycle observer 僅回報真實 runtime owner
   與 private-cleanup worker 的生命週期；shipped runtime 不依賴 toolkit。
@@ -273,14 +284,34 @@
 - 首次 review 必須審查完整 candidate project，建立成功的 full baseline；
   之後才可 incremental review。增量審查必須證明 primary first-parent history
   上存在有效 full baseline，且其後每個非文件變更都有有效 review evidence。
-  缺少 baseline 或任何 coverage、舊 v1 receipt、政策或 reviewer dependency
+  缺少 baseline 或任何 coverage、舊 V1／V2 receipt、政策或 reviewer dependency
   closure 變更，均重新執行 full review，不得只審查目前 task diff。
-- v2 receipt 必須綁定 full／incremental scope 與可驗證的 baseline／history
-  coverage；不能以同名檔案、未驗證舊紀錄或單純 ancestor 關係代替完整覆蓋。
+- V3 receipt 必須綁定 full／incremental scope、可驗證的 baseline／history
+  coverage、完整分段計畫、各段與整合結果及 process cleanup；V1／V2 不轉換、
+  不沿用。不能以同名檔案、未驗證舊紀錄或單純 ancestor 關係代替完整覆蓋。
   Passing full candidate 可立即 offline verify；只有其 exact tree 與 ordered
   parents 真正成為 primary first-parent commit，才可作後續 baseline。
   Aborted candidate、側分支與舊版差異 receipt 都不構成基準；新 clone 缺少
   本機 evidence 時重新 full review，offline verify 不會連線補做。
+- 共用 coordinator 以 exact candidate 的 path、mode、blob 與完整 byte ranges
+  建立審查單元，由獨立上下文分段審查；多段結果還須經跨模組整合審查。
+  每段都可讀取完整 candidate 與相關未修改程式；整合須回查原始來源及跨段契約。
+  單元配置、審查回報與 integration obligations 必須完整對應；遺漏、重複、
+  finding 或 incomplete 一律阻止通過。Coverage attestation 不是模型確實閱讀
+  或理解內容的證明。最多四段並行，所有子程序須先登記 nested ownership；
+  規劃、版本探測、各段、整合與清理共用一次 review deadline，不逐段重新計時。
+  多段審查在同一預算內保留 20%（至多 600 秒）供整合；managed reviewer 另在
+  總預算最後保留 5%（至多 30 秒）供外層重驗及發布，不延長 deadline。
+  逾時發布必須撤回；任一失敗須先停止 admission 並清空所有已啟動子程序，
+  再依既有規則恢復 candidate。Partial run 不續接，失敗結果不得作為續跑基準。
+- 二進位檔案須在 candidate 的 `tool.h2h-dev-tools.review.artifacts` 明列
+  exact path、格式、用途、相關 generator／decoder／consumer 與解壓／member 上限。
+  Archive 只可安全列舉及讀取，不得解壓至檔案系統、追蹤連結、執行或
+  unpickle；內含程式、設定與文件仍完整審查。只有明列的歷史數值 evidence
+  members 可採完整 identity、結構與有界值檢視，不能宣稱重算所有數值。
+  未宣告、未知或超限的二進位內容必須拒絕，不得靜默省略；增量刪除依 primary
+  parent 的歷史宣告處理。封存的代理政策與 skill 是待審資料，不會取代本檔
+  或授權執行。
 - Online review 可使用已登入的 Codex 服務，需要 repository-local `.venv`
   與 PATH 中的 `codex`。使用 read-only sandbox；不得修改檔案、執行
   merge/gate、啟動服務或自動修正，不要求 GitHub PR、Actions 或 Stop hook。
@@ -306,10 +337,12 @@
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
 - Merge review stage 先以獨立 owned process group 完成分類，確認清空後，
   只有 full profile 才要求 local review 入口、取得 candidate lock 並啟動 reviewer；
-  純文件不要求 local review 入口或 Codex。CLI version preflight、reviewer 與
-  Codex 由外部 owner 管理同一 process group，owner 使用真正 staged candidate
-  匯出的完整 review closure，並持有 candidate lock 至清理及 evidence publication
-  完成。Managed reviewer 只寫 pending evidence；owner 證明 owned tree 已清空、
+  純文件不要求 local review 入口或 Codex。Reviewer 驗證 parent PID、group leader
+  與 owner execution closure 後才繼承外層 ownership；CLI version、各段 Codex
+  與整合皆由預先登記 nested cleanup obligation 的 canonical owners 管理。
+  Owner 使用真正 staged candidate 匯出的完整 review closure，並持有 candidate
+  lock 至清理及 evidence publication 完成。Managed reviewer 只寫 pending
+  evidence；owner 證明整棵 owned tree 與 nested obligations 已清空、
   重新驗證 exact candidate 與 coverage 後才原子發布，缺少 pending evidence
   亦須阻止合併，不能以 reviewer exit 0 取代證據。
 - `review-code.py verify` 僅離線驗證，絕不呼叫模型。紀錄位於 Git common

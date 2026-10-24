@@ -20,6 +20,8 @@ from pathlib import Path
 from types import CodeType, ModuleType
 from typing import Any
 
+type _ParentSources = dict[str, tuple[str, str | None]]
+
 
 class SourceLoadError(ImportError):
     """The requested source package is not the currently verified implementation."""
@@ -69,14 +71,84 @@ def _sources(
     }
 
 
+def _parents(directory: Path, namespace: str) -> _ParentSources:
+    parts = namespace.split(".")
+    if not all(part.isidentifier() for part in parts):
+        raise SourceLoadError(f"Invalid source namespace: {namespace}")
+    parents = {}
+    for length in range(1, len(parts)):
+        parent = directory.parents[len(parts) - length - 1]
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise SourceLoadError(f"Parent package must be a real directory: {parent}")
+        try:
+            digest = hashlib.sha256(_bytes(parent / "__init__.py")).hexdigest()
+        except FileNotFoundError:
+            digest = None
+        parents[".".join(parts[:length])] = (str(parent), digest)
+    return parents
+
+
+def _parent_registration(name: str, source: tuple[str, str | None]) -> object:
+    return (source[0], name, source[1])
+
+
+def _check_loaded_parents(parents: _ParentSources) -> None:
+    for name, source in parents.items():
+        if name not in sys.modules:
+            continue
+        module = sys.modules[name]
+        loader = getattr(module, "__loader__", None)
+        if getattr(loader, "_h2h_source_registration", None) != _parent_registration(
+            name, source
+        ):
+            raise SourceLoadError(
+                f"Package was imported before source bootstrap: {name}"
+            )
+        if list(getattr(module, "__path__", ())) != [source[0]]:
+            raise SourceLoadError(
+                f"Parent package path changed after bootstrap: {name}"
+            )
+        expected_file = (
+            None if source[1] is None else str(Path(source[0]) / "__init__.py")
+        )
+        if getattr(module, "__file__", None) != expected_file:
+            raise SourceLoadError(f"Parent package source path changed: {name}")
+
+
+class _ParentNamespaceLoader(importlib.abc.Loader):
+    def __init__(self, name: str, directory: Path) -> None:
+        self.directory = directory
+        self._h2h_source_registration = _parent_registration(
+            name, (str(directory), None)
+        )
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        if not stat.S_ISDIR(self.directory.lstat().st_mode):
+            raise SourceLoadError(f"Parent package directory changed: {self.directory}")
+        try:
+            (self.directory / "__init__.py").lstat()
+        except FileNotFoundError:
+            return
+        raise SourceLoadError(f"Parent package initializer appeared: {self.directory}")
+
+
 class _SourceLoader(importlib.abc.SourceLoader):
     def __init__(
-        self, name: str, path: Path, registration: object, digest: str
+        self,
+        name: str,
+        path: Path,
+        registration: object,
+        digest: str,
+        parents: _ParentSources | None = None,
     ) -> None:
         self.name = name
         self.path = path
         self._h2h_source_registration = registration
         self.digest = digest
+        self._h2h_parent_sources = {} if parents is None else parents.copy()
 
     def get_filename(self, fullname: str) -> str:
         return str(self.path)
@@ -100,12 +172,19 @@ class _SourceLoader(importlib.abc.SourceLoader):
 
 
 class _SourceFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, directory: Path, namespace: str, hashes: dict[str, str]) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        namespace: str,
+        hashes: dict[str, str],
+        parents: _ParentSources,
+    ) -> None:
         self.directory = directory
         self.namespace = namespace
         # Plain data permits run_path bootstrap re-entry without depending on the
         # identity of classes created by a preceding run_path invocation.
         self._h2h_source_registration = (str(directory), namespace, hashes)
+        self._h2h_parent_sources = parents.copy()
 
     def find_spec(
         self,
@@ -113,6 +192,28 @@ class _SourceFinder(importlib.abc.MetaPathFinder):
         path: Any = None,
         target: ModuleType | None = None,
     ) -> importlib.machinery.ModuleSpec | None:
+        if fullname in self._h2h_parent_sources:
+            source = self._h2h_parent_sources[fullname]
+            directory, digest = Path(source[0]), source[1]
+            if digest is None:
+                spec = importlib.machinery.ModuleSpec(
+                    fullname,
+                    _ParentNamespaceLoader(fullname, directory),
+                    is_package=True,
+                )
+                spec.submodule_search_locations = [str(directory)]
+                return spec
+            return importlib.util.spec_from_file_location(
+                fullname,
+                directory / "__init__.py",
+                loader=_SourceLoader(
+                    fullname,
+                    directory / "__init__.py",
+                    _parent_registration(fullname, source),
+                    digest,
+                ),
+                submodule_search_locations=[str(directory)],
+            )
         if fullname == self.namespace:
             filename = "__init__.py"
             package = True
@@ -132,6 +233,7 @@ class _SourceFinder(importlib.abc.MetaPathFinder):
             self.directory / filename,
             self._h2h_source_registration,
             hashes[filename],
+            self._h2h_parent_sources,
         )
         return importlib.util.spec_from_file_location(
             fullname,
@@ -146,11 +248,16 @@ def load_package(
     namespace: str,
     *,
     expected_hashes: dict[str, str] | None = None,
+    expected_parents: _ParentSources | None = None,
 ) -> ModuleType:
     """Verify source and register its flat package; preserve identical loaded types.
 
     Repeated calls reverify the payload. A changed package or an earlier normal
     import is rejected rather than silently retaining stale module objects.
+    Parent initializers are repository-owned source, outside the child snapshot
+    manifest. Their explicit path/hash authority is independently revalidated and
+    may be pinned by a controller. Other imports made by those initializers are
+    outside this flat-package source guarantee.
     """
     directory = directory.absolute()
     if not stat.S_ISDIR(directory.lstat().st_mode):
@@ -160,24 +267,37 @@ def load_package(
         raise SourceLoadError("Source package differs from the controller registration")
     if "__init__.py" not in hashes:
         raise SourceLoadError("Source package is missing __init__.py")
+    parents = _parents(directory, namespace)
+    if expected_parents is not None and parents != expected_parents:
+        raise SourceLoadError("Parent packages differ from the controller registration")
     registration = (str(directory), namespace, hashes)
     matching = []
     for finder in sys.meta_path:
         previous = getattr(finder, "_h2h_source_registration", None)
         if previous is not None and previous[1] == namespace:
-            if previous != registration:
+            if (
+                previous != registration
+                or getattr(finder, "_h2h_parent_sources", None) != parents
+            ):
                 raise SourceLoadError(
                     f"Source package changed after bootstrap: {namespace}"
                 )
             matching.append(finder)
+    _check_loaded_parents(parents)
     for name, module in tuple(sys.modules.items()):
         if name == namespace or name.startswith(namespace + "."):
             loader = getattr(module, "__loader__", None)
             previous = getattr(loader, "_h2h_source_registration", None)
-            if not matching or previous != registration:
+            if (
+                not matching
+                or previous != registration
+                or getattr(loader, "_h2h_parent_sources", None) != parents
+            ):
                 raise SourceLoadError(
                     f"Package was imported before source bootstrap: {name}"
                 )
     if not matching:
-        sys.meta_path.insert(0, _SourceFinder(directory, namespace, hashes))
-    return importlib.import_module(namespace)
+        sys.meta_path.insert(0, _SourceFinder(directory, namespace, hashes, parents))
+    module = importlib.import_module(namespace)
+    _check_loaded_parents(parents)
+    return module

@@ -18,6 +18,192 @@ _BOOTSTRAP = (
 )
 
 
+@pytest.mark.parametrize("entry", ["run", "plugin"])
+@pytest.mark.parametrize(
+    "phase, signal_number, uncertain",
+    [
+        ("scope", signal.SIGINT, False),
+        ("scope", signal.SIGTERM, False),
+        ("handler-before", 0, False),
+        ("handler-after", 0, False),
+        ("handoff", signal.SIGTERM, False),
+        ("projection", signal.SIGTERM, False),
+        ("scope", signal.SIGTERM, True),
+        ("projection", signal.SIGTERM, True),
+        ("scope-cleanup", signal.SIGINT, False),
+        ("projection-cleanup", signal.SIGTERM, False),
+        ("projection-cleanup", signal.SIGTERM, True),
+        ("install-error-cleanup", signal.SIGTERM, False),
+        ("normal-cleanup", signal.SIGTERM, False),
+        ("normal-cleanup", signal.SIGTERM, True),
+    ],
+)
+def test_registry_entry_owns_setup_until_cleanup_is_proven(
+    tmp_path: Path, entry: str, phase: str, signal_number: int, uncertain: bool
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Real POSIX scope and signal setup boundary")
+    evidence = tmp_path / "before-rescue.json"
+    _ok(f"""
+        import json, os, signal, time
+        from pathlib import Path
+        from unittest.mock import patch
+        from _shared.h2h_dev_tools import process as outer_process
+        phase, number, uncertain = {phase!r}, {int(signal_number)!r}, {uncertain!r}
+        original_create = a.PosixScope.create
+        original_close = a.PosixScope.close
+        original_signal = signal.signal
+        original_registry_close = a._Registry.close
+        original_current = a._current
+        original_projection = a._WorkerSources
+        scopes, projections, closes = [], [], []
+        cleanup_handoff_deadlines = []
+        deadline = time.monotonic() + a._CLEANUP_SECONDS
+        parent = original_create(deadline=deadline)
+        inherited = os.environ.get(a.ENVIRONMENT_KEY)
+        os.environ[a.ENVIRONMENT_KEY] = parent.capability.encode()
+        failure = RuntimeError('handler entry rejected')
+        cleanup_failure = OSError('scope closure is uncertain')
+        def create(*, deadline):
+            scope = original_create(deadline=deadline)
+            scopes.append((scope, deadline))
+            if phase.startswith('scope'):
+                os.kill(os.getpid(), number)
+            return scope
+        def handler(signum, callback):
+            is_setup = getattr(callback, '__self__', None).__class__ is a._Registry
+            if phase == 'handler-before' and is_setup and signum == signal.SIGINT:
+                raise failure
+            result = original_signal(signum, callback)
+            if phase == 'handler-after' and is_setup and signum == signal.SIGINT:
+                raise failure
+            return result
+        def current():
+            registry = original_current()
+            if phase == 'handoff':
+                os.kill(os.getpid(), number)
+            return registry
+        def projection():
+            if phase == 'install-error-cleanup':
+                raise failure
+            value = original_projection()
+            projections.append(value)
+            if phase.startswith('projection'):
+                os.kill(os.getpid(), number)
+            return value
+        def registry_close(registry):
+            if phase.endswith('-cleanup'):
+                cleanup_handoff_deadlines.append(registry.deadline)
+                os.kill(os.getpid(), signal.SIGTERM)
+            original_registry_close(registry)
+        def close(scope, *, deadline):
+            if any(scope is item for item, _ in scopes):
+                closes.append(deadline)
+                if uncertain and len(closes) == 1:
+                    raise cleanup_failure
+            original_close(scope, deadline=deadline)
+        with outer_process.controlled_termination_signals():
+            handlers = {{
+                n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)
+            }}
+            caught = None
+            later_errors = []
+            try:
+                with patch.object(a.PosixScope, 'create', create), \
+                     patch.object(a.PosixScope, 'close', close), \
+                     patch.object(signal, 'signal', handler), \
+                     patch.object(a, '_current', current), \
+                     patch.object(a, '_WorkerSources', projection), \
+                     patch.object(a._Registry, 'close', registry_close):
+                    try:
+                        if {entry!r} == 'run':
+                            a.run(lambda: None)
+                        else:
+                            a.pytest_addhooks()
+                    except BaseException as error:
+                        caught = error
+                    if {entry!r} == 'plugin':
+                        # Pytest may unconfigure after a plugin entry failure.
+                        # Unknown cleanup must not be retried automatically.
+                        for _ in range(2 if uncertain else 1):
+                            try:
+                                a.pytest_unconfigure()
+                            except BaseException as error:
+                                if caught is None:
+                                    caught = error
+                                else:
+                                    later_errors.append(type(error).__name__)
+                state = {{
+                    'phase': phase, 'entry': {entry!r}, 'uncertain': uncertain,
+                    'later_errors': later_errors,
+                    'scope_directories': [
+                        str(s.capability.directory) for s, _ in scopes],
+                    'scope_exists': [
+                        s.capability.directory.exists() for s, _ in scopes],
+                    'creation_deadlines': [d for _, d in scopes],
+                    'close_deadlines': closes,
+                    'cleanup_handoff_deadlines': cleanup_handoff_deadlines,
+                    'cancelled': getattr(a._registry, 'cancelled', None),
+                    'parent_pending': parent.has_pending(deadline=deadline),
+                    'environment_restored': (os.environ.get(a.ENVIRONMENT_KEY)
+                        == parent.capability.encode()),
+                    'handlers_restored': all(
+                        signal.getsignal(n) == h for n, h in handlers.items()),
+                    'projection_exists': [p.directory.exists() for p in projections],
+                    'exception': type(caught).__name__ if caught is not None else None,
+                }}
+                Path({str(evidence)!r}).write_text(json.dumps(state))
+                assert caught is not None, state
+                assert state['environment_restored'], state
+                assert state['handlers_restored'], state
+                assert not later_errors, state
+                if phase in ('scope-cleanup', 'projection-cleanup'):
+                    assert cleanup_handoff_deadlines == closes, state
+                    assert state['cancelled'] == number, state
+                if uncertain:
+                    assert caught is cleanup_failure, (caught, state)
+                    assert len(closes) == 1, state
+                    assert state['parent_pending'] and all(state['scope_exists']), state
+                    assert all(state['projection_exists']), state
+                else:
+                    assert not state['parent_pending'], state
+                    assert not any(state['scope_exists']), state
+                    assert not any(state['projection_exists']), state
+                    if phase.startswith('handler'):
+                        assert caught is failure, (caught, state)
+                    elif {entry!r} == 'run':
+                        assert isinstance(caught, SystemExit), (caught, state)
+                        assert caught.code == 128 + number, (caught, state)
+                    elif phase == 'install-error-cleanup':
+                        assert caught is failure, (caught, state)
+                    else:
+                        assert isinstance(caught, KeyboardInterrupt), (caught, state)
+                    if phase.startswith('scope'):
+                        assert closes == [scopes[0][1]], state
+            finally:
+                # Before-rescue state above is authoritative. These controls
+                # launched no runtime children, so only their exact empty scopes
+                # and projection may be rescued, within the original bound.
+                for n, previous in handlers.items():
+                    original_signal(n, previous)
+                for scope, bound in scopes:
+                    if scope.capability.directory.exists():
+                        assert not scope.has_pending(deadline=min(deadline, bound))
+                        scope.proven_empty = True
+                        original_close(scope, deadline=min(deadline, bound))
+                for value in projections:
+                    if value.directory.exists():
+                        value.close()
+                if inherited is None:
+                    os.environ.pop(a.ENVIRONMENT_KEY, None)
+                else:
+                    os.environ[a.ENVIRONMENT_KEY] = inherited
+                assert not parent.has_pending(deadline=deadline)
+                parent.proven_empty = True
+                original_close(parent, deadline=deadline)
+    """)
+
+
 def _environment() -> dict[str, str]:
     environment = dict(os.environ)
     # Every automatic subprocess retains the parent capability. Its adapter
@@ -42,6 +228,137 @@ def _run(source: str, *, timeout: float = 20) -> subprocess.CompletedProcess[str
 def _ok(source: str) -> None:
     result = _run(source)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["verification", "second-binding"])
+def test_worker_projection_install_failure_cleans_partial_export(failure: str) -> None:
+    _ok(f"""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        original_patch = patch.object
+        def bind(target, name, value):
+            if name == '_PRIVATE_CLEANUP_WORKER_PATH':
+                raise RuntimeError('copy failed')
+            return original_patch(target, name, value)
+        fault = (
+            patch.object(a._WorkerSources, 'verify',
+                         side_effect=RuntimeError('copy failed'))
+            if {failure!r} == 'verification'
+            else patch.object(a.patch, 'object', side_effect=bind))
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / 'projection'
+            destination.mkdir()
+            with patch.object(a.tempfile, 'mkdtemp', return_value=str(destination)):
+                with fault:
+                    try:
+                        registry.install()
+                    except RuntimeError as error:
+                        assert str(error) == 'copy failed'
+                    else:
+                        raise AssertionError('invalid projection accepted')
+            assert not destination.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+        assert not registry.installed and registry.worker_sources is None
+        registry.close()
+    """)
+
+
+def test_worker_projection_retained_when_nested_scope_cannot_be_proven_empty() -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX nested scope ledger contract")
+    _ok("""
+        import time
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        projection = registry.worker_sources
+        nested = a.PosixScope.create(deadline=time.monotonic()+2)
+        has_pending = registry.scope.has_pending
+        def reject_pending(*, deadline):
+            assert has_pending(deadline=deadline)
+            raise RuntimeError('nested owner remains')
+        with patch.object(registry.scope, 'has_pending', side_effect=reject_pending):
+            try:
+                registry.close()
+            except RuntimeError as error:
+                assert str(error) == 'nested owner remains'
+            else:
+                raise AssertionError('nested scope ignored')
+        assert projection.directory.exists()
+        assert process._SUPERVISOR_PATH.parent == projection.directory
+        # This synthetic nested scope never admitted a process. Remove its
+        # actual durable obligation before retrying the outer close.
+        nested.proven_empty = True
+        nested.close(deadline=time.monotonic()+2)
+        registry.close()
+        assert not projection.directory.exists()
+    """)
+
+
+def test_worker_projection_retained_until_cleanup_proof_is_complete() -> None:
+    _ok("""
+        import time
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        registry.install()
+        projection = registry.worker_sources
+        registry.install()
+        assert registry.worker_sources is projection
+        token = registry.admit(recovery=False, deadline=time.monotonic()+2)
+        def fail(deadline):
+            token.complete(deadline=deadline)
+            raise RuntimeError('cleanup proof rejected')
+        token.bind(fail, deadline=time.monotonic()+2)
+        token.finish_start(deadline=time.monotonic()+2)
+        try:
+            registry.close()
+        except RuntimeError as error:
+            assert str(error) == 'Runtime test cleanup failed'
+        else:
+            raise AssertionError('cleanup failure ignored')
+        assert projection.directory.exists()
+        assert process._SUPERVISOR_PATH.parent == projection.directory
+        registry.close()
+        assert not projection.directory.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+    """)
+
+
+@pytest.mark.parametrize("drift", ["bytes", "mode", "extra"])
+def test_worker_projection_rejects_changed_export(drift: str) -> None:
+    if drift == "mode" and os.name == "nt":
+        pytest.skip("Windows chmod does not expose POSIX executable bits")
+    _ok(f"""
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        registry.install()
+        projection = registry.worker_sources
+        path = projection.directory / 'process.py'
+        if {drift!r} == 'bytes':
+            path.write_bytes(path.read_bytes() + b'\\n')
+        elif {drift!r} == 'mode':
+            path.chmod(path.stat().st_mode ^ 0o100)
+        else:
+            (projection.directory / 'extra.py').touch()
+        try:
+            registry.close()
+        except RuntimeError as error:
+            assert str(error) == 'Runtime worker source projection changed'
+        else:
+            raise AssertionError('changed projection accepted')
+        assert not projection.directory.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+    """)
 
 
 def test_closed_invocation_rejects_real_background_admission() -> None:

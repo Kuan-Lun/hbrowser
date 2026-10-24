@@ -361,15 +361,12 @@ def _candidate(arguments: argparse.Namespace) -> tuple[str, str, str]:
     if arguments.index:
         base = _git("rev-parse", "--verify", "HEAD^{commit}")
         merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
-        if merge_head.exists():
-            parents = merge_head.read_text(encoding="ascii").splitlines()
-            if len(parents) != 1:
-                raise ValueError("--index requires a two-parent merge")
-            merge_parent = parents[0]
-        else:
-            # Git's direct pre-merge hook runs before writing MERGE_HEAD. The
-            # launcher must supply its captured commit, never a moving branch.
-            merge_parent = os.environ.get("WORKFLOW_MERGE_TASK_REF", "")
+        if not merge_head.is_file():
+            raise ValueError("--index requires a pending two-parent merge")
+        parents = merge_head.read_text(encoding="ascii").splitlines()
+        if len(parents) != 1:
+            raise ValueError("--index requires a two-parent merge")
+        merge_parent = parents[0]
         if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_parent):
             raise ValueError("--index requires an immutable full task commit OID")
         merge_revision = _git("rev-parse", "--verify", f"{merge_parent}^{{commit}}")

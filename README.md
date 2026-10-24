@@ -253,12 +253,23 @@ editable 安裝；明確以 `--source package=/path/to/checkout` 提供的依賴
 程式變更合併時需要本機 `.venv` 與 PATH 中已登入的 `codex`。合併腳本會先
 審查真正的 candidate，再執行離線 gate；首次審查涵蓋完整專案，通過並合併後
 才可使用增量審查。新 checkout 缺少本機紀錄或審查基準失效時會重新完整審查。
-純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
+共用 coordinator 將完整檔案範圍分配給獨立審查上下文，多段審查另檢查跨模組
+互動；所有階段共用同一期限。V3 證據不轉換或沿用 V2，更新後須重新完成全專案
+審查。純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
 大型專案的首次審查可明確延長至一小時：
 
 ```bash
 H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600 scripts/git-flow-merge.sh
 ```
+
+合併工具要求 Git 2.38 以上，使用 `ort` 策略；primary 的
+`branch.<primary>.mergeOptions` 僅接受空值或初始化設定的 `--no-ff`，其餘
+自訂選項會拒絕執行。Linked task worktree 若留有
+untracked 或 ignored 檔案、空目錄、symlink 或 `.venv`，合併完成後會保留
+merge commit、task branch 與 worktree，並回報清理未完成。檢視並保存或移除
+這些材料後，從具備 local `.venv` 的 primary checkout 執行
+`scripts/git-flow-merge.sh --cleanup-only task-branch`，即可重試清理，不重跑
+已完成的 review 或 gate。
 
 更新時，在獨立工具環境安裝明確選定的 `h2h-dev-tools` wheel 或版本，再執行：
 

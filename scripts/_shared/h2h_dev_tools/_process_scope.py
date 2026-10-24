@@ -1,8 +1,9 @@
 """Private admission ledger for cooperating nested POSIX process owners.
 
-An obligation is registered before a nested session can exist. Closing admission
-and inspecting obligations share one bounded lock; no PID observation substitutes
-for the nested owner's proof that its own group and obligations are empty.
+An obligation is registered before a nested session or same-group leaf can exist.
+Closing admission and inspecting obligations share one bounded lock; no PID
+observation substitutes for the nested owner's proof that its own group and
+obligations are empty.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import secrets
 import tempfile
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,10 @@ _POLL_SECONDS = 0.01
 
 class ScopeError(RuntimeError):
     """Admission or recursive cleanup proof is unavailable."""
+
+
+class ScopeAdmissionClosed(ScopeError):
+    """The verified parent explicitly rejected new work before registration."""
 
 
 @dataclass(frozen=True)
@@ -93,34 +98,59 @@ class PosixScope:
     capability: _Capability
     parent: _Capability | None
     proven_empty: bool = False
-    cleanup_deadline: float = 0.0
 
     @classmethod
     def create(cls, *, deadline: float) -> PosixScope:
         inherited = os.environ.get(ENVIRONMENT_KEY)
         parent = None if inherited is None else _Capability.decode(inherited)
-        directory = Path(tempfile.mkdtemp(prefix="h2h-process-scope-"))
-        capability = _Capability(directory, secrets.token_hex(32))
-        try:
-            (directory / "lock").touch()
-            (directory / "token").write_text(capability.token, encoding="ascii")
-            (directory / "pending").mkdir()
-            if parent is not None:
-                with parent.locked(deadline=deadline):
-                    if (parent.directory / "closed").exists():
-                        raise ScopeError("Outer process owner has closed admission")
-                    with (parent.directory / "pending" / capability.token).open(
-                        "x", encoding="utf-8"
-                    ) as obligation:
-                        obligation.write(capability.encode())
-        except BaseException:
-            # No child was launched. An interrupted partial parent obligation
-            # remains fail-closed; never erase an uncertain registration.
-            for name in ("lock", "token"):
-                (directory / name).unlink(missing_ok=True)
-            (directory / "pending").rmdir()
-            directory.rmdir()
-            raise
+        # Parent teardown must not observe an empty ledger while a child is
+        # allocating or rolling back local metadata. A verified closed parent
+        # rejects admission before even creating an unpublished directory.
+        with parent.locked(deadline=deadline) if parent is not None else nullcontext():
+            if parent is not None and (parent.directory / "closed").exists():
+                raise ScopeAdmissionClosed("Outer process owner has closed admission")
+            token = secrets.token_hex(32)
+            directory = Path(tempfile.mkdtemp(prefix="h2h-process-scope-"))
+            capability = _Capability(directory, token)
+            obligation = (
+                None if parent is None else parent.directory / "pending" / token
+            )
+            registered = False
+            try:
+                if obligation is not None:
+                    with obligation.open("x", encoding="utf-8") as destination:
+                        destination.write(capability.encode())
+                    registered = True
+                (directory / "lock").touch()
+                (directory / "token").write_text(token, encoding="ascii")
+                (directory / "pending").mkdir()
+            except BaseException as initialization_error:
+                # No child was launched. Keep the parent lock until known local
+                # cleanup and exact completed-registration rollback both finish.
+                # A partial registration is uncertain and is never erased here.
+                try:
+                    for name in ("lock", "token"):
+                        (directory / name).unlink(missing_ok=True)
+                    try:
+                        (directory / "pending").rmdir()
+                    except FileNotFoundError:
+                        pass
+                    directory.rmdir()
+                    if registered and obligation is not None:
+                        if (
+                            obligation.read_text(encoding="utf-8")
+                            != capability.encode()
+                        ):
+                            raise ScopeError(
+                                "Nested cleanup obligation identity changed"
+                            )
+                        obligation.unlink()
+                except Exception as rollback_error:
+                    raise ScopeError(
+                        f"Process scope initialization rollback unproven: "
+                        f"{directory}: {rollback_error}"
+                    ) from initialization_error
+                raise
         return cls(capability, parent)
 
     def environment(self, original: Mapping[str, str] | None) -> dict[str, str]:
@@ -145,20 +175,26 @@ class PosixScope:
             if self.capability.pending():
                 raise ScopeError("Nested cleanup obligations remain")
             (self.capability.directory / "closed").touch()
-            if self.parent is not None:
-                with self.parent.locked(deadline=deadline):
-                    obligation = (
-                        self.parent.directory / "pending" / self.capability.token
-                    )
-                    if (
-                        obligation.read_text(encoding="utf-8")
-                        != self.capability.encode()
-                    ):
-                        raise ScopeError("Nested cleanup obligation identity changed")
+            with (
+                self.parent.locked(deadline=deadline)
+                if self.parent is not None
+                else nullcontext()
+            ):
+                obligation = (
+                    None
+                    if self.parent is None
+                    else self.parent.directory / "pending" / self.capability.token
+                )
+                if obligation is not None and (
+                    obligation.read_text(encoding="utf-8") != self.capability.encode()
+                ):
+                    raise ScopeError("Nested cleanup obligation identity changed")
+                # Both locks remain held through local removal. Queued admission
+                # on an old descriptor subsequently fails its token check; parent
+                # teardown cannot force-kill this owner midway through removal.
+                for name in ("closed", "token", "lock"):
+                    (self.capability.directory / name).unlink()
+                (self.capability.directory / "pending").rmdir()
+                self.capability.directory.rmdir()
+                if obligation is not None:
                     obligation.unlink()
-        # The capability is closed before removal; a queued admission cannot
-        # succeed through either the old lock descriptor or the removed path.
-        for name in ("closed", "token", "lock"):
-            (self.capability.directory / name).unlink()
-        (self.capability.directory / "pending").rmdir()
-        self.capability.directory.rmdir()

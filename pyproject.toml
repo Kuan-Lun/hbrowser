@@ -34,6 +34,7 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = [
+    "distlib>=0.4.4",
     "build>=1.3.0",
     "hatchling>=1.32.0",
     "mypy>=2.3.1",
@@ -75,6 +76,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 
 [tool.h2h.version]
+allow-none-impact = true
 dedicated-release-commit = true
 development-paths = [
     ".Codex/**",
@@ -99,4 +101,4 @@ development-paths = [
 release-paths = ["LICENSE", "hbrowser/**"]
 
 [tool.h2h-dev-tools]
-components = ["code-review", "distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-environment", "git-flow", "hooks", "primary-branch", "pytest", "version-policy"]
+components = ["code-review", "review-test-support", "test-support", "distribution-check", "offline-wheel", "change-scope", "dependencies", "dependency-audit", "documentation", "environment", "git-environment", "git-flow", "hooks", "primary-branch", "pytest", "version-policy"]

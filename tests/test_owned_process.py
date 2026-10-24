@@ -62,7 +62,7 @@ def _owned_harness(
         assert owner is not None
         if not command_process.terminate_owned_tree(owner, deadline=deadline):
             raise RuntimeError("Harness process tree remains owned")
-        if not command_process.close_owner(owner):
+        if not command_process.close_owner(owner, deadline=deadline):
             raise RuntimeError("Harness process owner could not close")
         observation.complete(deadline=deadline)
 

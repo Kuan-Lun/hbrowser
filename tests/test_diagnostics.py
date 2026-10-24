@@ -1309,6 +1309,10 @@ def test_first_diagnostic_does_not_start_a_resource_tracker(tmp_path: Path) -> N
     entry = root / "scripts/pytest-source.py"
     source = dedent(
         """
+        import sys
+        assert sys.pycache_prefix is not None, (
+            'diagnostic probe lost source cache isolation')
+        assert sys.dont_write_bytecode, 'diagnostic probe may write bytecode'
         import asyncio
         from multiprocessing import resource_tracker
         from pathlib import Path
@@ -1343,6 +1347,7 @@ def test_first_diagnostic_does_not_start_a_resource_tracker(tmp_path: Path) -> N
         "HOME": str(tmp_path),
         "TMPDIR": str(tmp_path),
         "PYTHONPATH": str(root),
+        "PYTHONPYCACHEPREFIX": str(tmp_path / "bytecode"),
         "PYTHONDONTWRITEBYTECODE": "1",
         "HBROWSER_LOG_DIR": str(tmp_path / "diagnostics"),
     }
