@@ -225,6 +225,44 @@ class _BlockingDestroyHTTP(_HTTP):
         raise AssertionError("unreachable")
 
 
+class _GatedCreateHTTP(_HTTP):
+    """Delay a valid create response while allowing explicit owned cleanup."""
+
+    def __init__(self, *, gate_request: bool = False) -> None:
+        super().__init__()
+        self.create_started = asyncio.Event()
+        self.release_create = asyncio.Event()
+        self.request_started = asyncio.Event()
+        self.release_request = asyncio.Event()
+        if not gate_request:
+            self.release_request.set()
+
+    async def post(
+        self,
+        endpoint: str,
+        *,
+        json: dict[str, Any],
+        timeout: httpx.Timeout | float,
+    ) -> _Response:
+        command = json["cmd"]
+        if command == "sessions.create":
+            self.responses.append(_created("late-session"))
+        elif command == "request.get":
+            self.responses.append(_solution())
+        elif command == "sessions.destroy":
+            self.responses.append(_destroyed())
+        else:
+            raise AssertionError(f"Unexpected command: {command}")
+        response = await super().post(endpoint, json=json, timeout=timeout)
+        if command == "sessions.create":
+            self.create_started.set()
+            await self.release_create.wait()
+        elif command == "request.get":
+            self.request_started.set()
+            await self.release_request.wait()
+        return response
+
+
 class _BlockingRequestHTTP(_HTTP):
     def __init__(
         self,
@@ -1457,3 +1495,218 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
             _commands(http),
             ["sessions.create", "request.get", "sessions.destroy"],
         )
+
+    async def _assert_terminal_settles_pending_creation(self, action: str) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        terminal: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(http.create_started.wait(), 1)
+            terminal = asyncio.create_task(getattr(scope, action)())
+            await asyncio.sleep(0)
+            self.assertFalse(terminal.done(), "pending creation is still owned")
+            self.assertEqual(_commands(http), ["sessions.create"])
+
+            http.release_create.set()
+            await asyncio.wait_for(terminal, 1)
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await solve
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+            self.assertFalse(client._owned_session_ids)
+            self.assertFalse(client._uncertain_create_ids)
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await scope.solve_managed(LOGIN_URL)
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+        finally:
+            http.release_create.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            if terminal is not None:
+                await asyncio.gather(terminal, return_exceptions=True)
+            await scope.close()
+
+    async def test_close_settles_pending_creation_without_late_navigation(self) -> None:
+        await self._assert_terminal_settles_pending_creation("close")
+
+    async def test_retire_settles_pending_creation_without_late_navigation(
+        self,
+    ) -> None:
+        await self._assert_terminal_settles_pending_creation("retire")
+
+    async def test_cancelled_close_retains_pending_creation_for_cleanup(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        close: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(http.create_started.wait(), 1)
+            close = asyncio.create_task(scope.close())
+            await asyncio.sleep(0)
+            close.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close
+            self.assertFalse(solve.done())
+            http.release_create.set()
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await solve
+            await scope.close()
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+            self.assertFalse(client._owned_session_ids)
+        finally:
+            http.release_create.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            if close is not None:
+                await asyncio.gather(close, return_exceptions=True)
+            await scope.close()
+
+    async def test_cancelled_create_caller_settles_identity_before_cleanup(
+        self,
+    ) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        try:
+            await asyncio.wait_for(http.create_started.wait(), 1)
+            solve.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(solve.done())
+            http.release_create.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await solve
+            await scope.close()
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+            self.assertFalse(client._owned_session_ids)
+            self.assertFalse(client._uncertain_create_ids)
+        finally:
+            http.release_create.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            await scope.close()
+
+    async def test_close_timeout_retains_admitted_creation(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        try:
+            await asyncio.wait_for(http.create_started.wait(), 1)
+            with (
+                patch(
+                    "hbrowser.gallery.browser.flaresolverr._SESSION_LIFECYCLE_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                self.assertRaisesRegex(FlareSolverrSessionUnavailable, "still owns"),
+            ):
+                await scope.close()
+            self.assertFalse(solve.done())
+            self.assertTrue(client._owned_session_ids)
+            self.assertTrue(client._uncertain_create_ids)
+            http.release_create.set()
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await solve
+            await scope.close()
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+            self.assertFalse(client._owned_session_ids)
+        finally:
+            http.release_create.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            await scope.close()
+
+    async def test_close_prevents_late_inflight_request_receipt(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP(gate_request=True)
+        http.release_create.set()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        close: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(http.request_started.wait(), 1)
+            close = asyncio.create_task(scope.close())
+            await asyncio.sleep(0)
+            self.assertFalse(close.done())
+            http.release_request.set()
+            await asyncio.wait_for(close, 1)
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await solve
+            self.assertEqual(
+                _commands(http), ["sessions.create", "request.get", "sessions.destroy"]
+            )
+            self.assertFalse(client._owned_session_ids)
+        finally:
+            http.release_request.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            if close is not None:
+                await asyncio.gather(close, return_exceptions=True)
+            await scope.close()
+
+    async def test_concurrent_close_and_retire_destroy_late_session_once(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        solve = asyncio.create_task(scope.solve_managed(LOGIN_URL))
+        terminal: list[asyncio.Task[None]] = []
+        try:
+            await asyncio.wait_for(http.create_started.wait(), 1)
+            terminal = [
+                asyncio.create_task(scope.close()),
+                asyncio.create_task(scope.retire()),
+            ]
+            await asyncio.sleep(0)
+            self.assertTrue(all(not task.done() for task in terminal))
+            http.release_create.set()
+            await asyncio.wait_for(asyncio.gather(*terminal), 1)
+            with self.assertRaises(FlareSolverrSessionUnavailable):
+                await solve
+            self.assertEqual(_commands(http), ["sessions.create", "sessions.destroy"])
+            self.assertFalse(client._owned_session_ids)
+        finally:
+            http.release_create.set()
+            await asyncio.gather(solve, *terminal, return_exceptions=True)
+            await scope.close()
+
+    async def test_cancelled_creation_task_cannot_report_scope_cleanup(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _HTTP(
+            _created("uncertain-session"),
+            _listed_latest(present=True),
+            _destroyed(),
+        )
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        scope = FlareSolverrSessionScope(client, max_attempts=2)
+        post = http.post
+
+        async def cancelled_create(
+            endpoint: str,
+            *,
+            json: dict[str, Any],
+            timeout: httpx.Timeout | float,
+        ) -> _Response:
+            response = await post(endpoint, json=json, timeout=timeout)
+            if json["cmd"] == "sessions.create":
+                raise asyncio.CancelledError("creation task itself was cancelled")
+            return response
+
+        with patch.object(http, "post", new=cancelled_create):
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await scope.solve_managed(LOGIN_URL)
+                self.assertTrue(client._owned_session_ids)
+                self.assertTrue(client._uncertain_create_ids)
+                with self.assertRaisesRegex(FlareSolverrSessionUnavailable, "owned"):
+                    await scope.close()
+                self.assertEqual(_commands(http), ["sessions.create"])
+                self.assertTrue(client._owned_session_ids)
+            finally:
+                # Only the client's positive inventory/destruction receipts can
+                # release this unknown creation; the scope never claims success.
+                await client.__aexit__(None, None, None)
+        self.assertFalse(client._owned_session_ids)
+        self.assertTrue(http.closed)
