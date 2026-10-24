@@ -420,6 +420,7 @@ async def _post_create_setup(
         timeout=command_timeout,
         owner=page,
         operation="Browser geolocation reset",
+        completion_deadline_expires_at=deadline.expires_at,
     )
 
     if use_tor or proxy_extension is not None:

@@ -1082,6 +1082,83 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["post-setup"])
         register_atexit.assert_called_once_with(browser)
 
+    async def test_direct_startup_checks_geolocation_completion_deadline(self) -> None:
+        for offset in (-0.001, 0.0, 0.001):
+            with self.subTest(completion_offset=offset):
+                page = _tab()
+                browser = _Browser(page, tabs=[page])
+                page.browser = cast(zd.Browser, browser)
+                clock = [time.monotonic()]
+                start = AsyncMock(return_value=browser)
+
+                async def acknowledge(
+                    *_: object,
+                    startup: AsyncMock = start,
+                    current_clock: list[float] = clock,
+                    completion_offset: float = offset,
+                ) -> None:
+                    assert startup.await_args is not None
+                    deadline = startup.await_args.kwargs["deadline"]
+                    # Deliver a successful CDP acknowledgement in the same loop
+                    # turn that advances the clock to the completion boundary.
+                    current_clock[0] = deadline.expires_at + completion_offset
+
+                with (
+                    tempfile.TemporaryDirectory() as profile,
+                    patch.object(factory, "should_use_tor", return_value=False),
+                    patch.object(factory, "configure_proxy", return_value=None),
+                    patch.object(
+                        factory, "_configured_chrome_executable", return_value="/chrome"
+                    ),
+                    patch.object(
+                        factory,
+                        "tempfile",
+                        SimpleNamespace(mkdtemp=Mock(return_value=profile)),
+                    ),
+                    patch.object(factory, "_build_config", return_value=object()),
+                    patch.object(
+                        factory,
+                        "_construct_owned_browser_async",
+                        new=AsyncMock(return_value=browser),
+                    ),
+                    patch.object(factory, "_register_browser_atexit"),
+                    patch.object(factory, "_await_browser_start", new=start),
+                    patch.object(page, "send", new=AsyncMock(side_effect=acknowledge)),
+                    patch.object(factory, "stop_browser", new=AsyncMock()) as stop,
+                    patch.object(factory, "logger") as logger,
+                    patch(
+                        "hbrowser.gallery.utils.deadline.time.monotonic",
+                        side_effect=lambda current_clock=clock: current_clock[0],
+                    ),
+                ):
+                    if offset < 0:
+                        self.assertEqual(
+                            await factory.create_browser(),
+                            (browser, page),
+                        )
+                        stop.assert_not_awaited()
+                        logger.info.assert_any_call(
+                            "Browser ready (%s, %s)", "headless", "direct"
+                        )
+                    else:
+                        with self.assertRaises(BrowserMutationOutcomeUnknownError):
+                            await factory.create_browser()
+                        stop.assert_awaited_once_with(browser, unittest.mock.ANY)
+                        assert stop.await_args is not None
+                        assert start.await_args is not None
+                        self.assertGreater(
+                            stop.await_args.args[1].expires_at,
+                            start.await_args.kwargs["deadline"].expires_at,
+                        )
+                        self.assertNotIn(
+                            call("Browser ready (%s, %s)", "headless", "direct"),
+                            logger.info.call_args_list,
+                        )
+                        with self.assertRaises(ZendriverOwnerRetiredError):
+                            await wait_for_zendriver(
+                                asyncio.sleep(0), timeout=1, owner=page
+                            )
+
     async def test_only_the_selected_proxy_route_can_start_tor(self) -> None:
         from hbrowser.gallery.browser import proxy as proxy_module
 
