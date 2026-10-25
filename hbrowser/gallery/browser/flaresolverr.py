@@ -122,6 +122,10 @@ class FlareSolverrSessionOwnershipError(FlareSolverrError):
         super().__init__("FlareSolverr session ownership remains unresolved")
 
 
+class _FlareSolverrSessionAdmissionError(FlareSolverrSessionOwnershipError):
+    """Existing client work blocks creation without allocating a caller's ID."""
+
+
 class FlareSolverrTransportOwnershipError(FlareSolverrError):
     """The HTTP transport did not provide a completed cleanup receipt."""
 
@@ -524,6 +528,13 @@ class FlareSolverrSessionScope:
                 self._unavailable = True
                 self._creation_unresolved = True
                 raise
+            except _FlareSolverrSessionAdmissionError as error:
+                # The blocking identity belongs to existing client work, not
+                # this scope. Rejection transfers no cleanup responsibility.
+                self._unavailable = True
+                raise FlareSolverrSessionUnavailable(
+                    "FlareSolverr session creation is blocked by unresolved client work"
+                ) from error
             except FlareSolverrSessionOwnershipError as error:
                 logger.warning(
                     "FlareSolverr session creation outcome is unknown; "
@@ -531,8 +542,9 @@ class FlareSolverrSessionScope:
                     self._attempts_used,
                     self._max_attempts,
                 )
-                # Retain the deterministic identity so scope/client cleanup can
-                # poll for positive creation evidence before destroying it.
+                # This invocation allocated the retained nonce before create
+                # I/O. Scope/client cleanup can poll for positive creation
+                # evidence before destroying that identity.
                 self._session = FlareSolverrSession(self._client, error.session_id)
                 self._unavailable = True
                 raise FlareSolverrSessionUnavailable(
@@ -745,8 +757,8 @@ class FlareSolverrClient:
         )
         if unresolved_ids:
             # A prior lifecycle mutation remains unresolved.  No new identity
-            # may overlap that browser generation.
-            raise FlareSolverrSessionOwnershipError(min(unresolved_ids))
+            # may overlap that browser generation or adopt its cleanup duty.
+            raise _FlareSolverrSessionAdmissionError(min(unresolved_ids))
         session_id = secrets.token_hex(16)
         self._owned_session_ids.add(session_id)
         self._uncertain_create_ids.add(session_id)

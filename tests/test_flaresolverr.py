@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -228,14 +228,20 @@ class _BlockingDestroyHTTP(_HTTP):
 class _GatedCreateHTTP(_HTTP):
     """Delay a valid create response while allowing explicit owned cleanup."""
 
-    def __init__(self, *, gate_request: bool = False) -> None:
+    def __init__(
+        self, *, gate_request: bool = False, gate_destroy: bool = False
+    ) -> None:
         super().__init__()
         self.create_started = asyncio.Event()
         self.release_create = asyncio.Event()
         self.request_started = asyncio.Event()
         self.release_request = asyncio.Event()
+        self.destroy_started = asyncio.Event()
+        self.release_destroy = asyncio.Event()
         if not gate_request:
             self.release_request.set()
+        if not gate_destroy:
+            self.release_destroy.set()
 
     async def post(
         self,
@@ -260,6 +266,9 @@ class _GatedCreateHTTP(_HTTP):
         elif command == "request.get":
             self.request_started.set()
             await self.release_request.wait()
+        elif command == "sessions.destroy":
+            self.destroy_started.set()
+            await self.release_destroy.wait()
         return response
 
 
@@ -1495,6 +1504,99 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
             _commands(http),
             ["sessions.create", "request.get", "sessions.destroy"],
         )
+
+    async def _assert_admission_blocker_keeps_original_scope(
+        self, phase: Literal["create", "request", "destroy"]
+    ) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _GatedCreateHTTP(
+            gate_request=phase == "request", gate_destroy=phase == "destroy"
+        )
+        if phase != "create":
+            http.release_create.set()
+        client._http = http  # type: ignore[assignment]  # Offline HTTP transport.
+        owner = FlareSolverrSessionScope(client, max_attempts=1)
+        solve = asyncio.create_task(owner.solve_managed(LOGIN_URL))
+        close: asyncio.Task[None] | None = None
+        try:
+            if phase == "destroy":
+                await asyncio.wait_for(solve, 1)
+                close = asyncio.create_task(owner.close())
+            started = {
+                "create": http.create_started,
+                "request": http.request_started,
+                "destroy": http.destroy_started,
+            }[phase]
+            await asyncio.wait_for(started.wait(), 1)
+            session_id = http.create_session_ids[0]
+            self.assertEqual(client._owned_session_ids, {session_id})
+            pending = {
+                "create": client._uncertain_create_ids,
+                "request": client._uncertain_request_ids,
+                "destroy": client._uncertain_destroy_ids,
+            }[phase]
+            self.assertEqual(pending, {session_id})
+            commands_before_rejection = list(_commands(http))
+
+            with self.assertRaises(FlareSolverrSessionUnavailable) as raised:
+                async with client.session(max_attempts=3) as blocked:
+                    await asyncio.wait_for(blocked.solve_managed(LOGIN_URL), 1)
+
+            # Check the rejected scope's completed context cleanup before any
+            # release/rescue can hide a foreign destroy or inventory request.
+            self.assertIsInstance(
+                raised.exception.__cause__, FlareSolverrSessionOwnershipError
+            )
+            self.assertEqual(_commands(http), commands_before_rejection)
+            self.assertIsNone(blocked._session)
+            self.assertEqual(client._owned_session_ids, {session_id})
+            self.assertEqual(pending, {session_id})
+            self.assertFalse((close if close is not None else solve).done())
+            with self.assertRaises(FlareSolverrSessionOwnershipError) as direct:
+                await client.create_session()
+            self.assertEqual(direct.exception.session_id, session_id)
+            self.assertEqual(_commands(http), commands_before_rejection)
+            self.assertEqual(http.create_session_ids, [session_id])
+
+            http.release_create.set()
+            http.release_request.set()
+            http.release_destroy.set()
+            receipt = await asyncio.wait_for(solve, 1)
+            self.assertEqual(receipt.result.user_agent, "test-agent")
+            if close is not None:
+                await asyncio.wait_for(close, 1)
+            else:
+                self.assertEqual(_destroy_sessions(http), [])
+                self.assertEqual(client._owned_session_ids, {session_id})
+                await owner.close()
+            self.assertEqual(
+                _commands(http), ["sessions.create", "request.get", "sessions.destroy"]
+            )
+            self.assertEqual(http.posts[-1]["json"]["session"], session_id)
+            self.assertFalse(client._owned_session_ids)
+            self.assertFalse(client._uncertain_create_ids)
+            self.assertFalse(client._uncertain_request_ids)
+            self.assertFalse(client._uncertain_destroy_ids)
+            await client.__aexit__(None, None, None)
+            self.assertTrue(http.closed)
+        finally:
+            http.release_create.set()
+            http.release_request.set()
+            http.release_destroy.set()
+            await asyncio.gather(solve, return_exceptions=True)
+            if close is not None:
+                await asyncio.gather(close, return_exceptions=True)
+            await owner.close()
+            await client.__aexit__(None, None, None)
+
+    async def test_blocked_scope_does_not_adopt_pending_create(self) -> None:
+        await self._assert_admission_blocker_keeps_original_scope("create")
+
+    async def test_blocked_scope_does_not_adopt_inflight_request(self) -> None:
+        await self._assert_admission_blocker_keeps_original_scope("request")
+
+    async def test_blocked_scope_does_not_adopt_pending_destroy(self) -> None:
+        await self._assert_admission_blocker_keeps_original_scope("destroy")
 
     async def _assert_terminal_settles_pending_creation(self, action: str) -> None:
         client = FlareSolverrClient("http://127.0.0.1:8191/v1")
