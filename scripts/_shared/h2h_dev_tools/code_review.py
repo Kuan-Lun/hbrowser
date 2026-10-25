@@ -14,6 +14,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -79,6 +80,13 @@ RESULT_SCHEMA: dict[str, Any] = {
 }
 RESULT_SCHEMA["properties"].update(review_coverage.ATTESTATION_PROPERTIES)
 RESULT_SCHEMA["required"].extend(review_coverage.ATTESTATION_PROPERTIES)
+
+
+def _result_schema(plan_digest: str, shard_id: str) -> dict[str, Any]:
+    schema = deepcopy(RESULT_SCHEMA)
+    schema["properties"]["plan_digest"]["enum"] = [plan_digest]
+    schema["properties"]["shard_id"]["enum"] = [shard_id]
+    return schema
 
 
 class ReviewError(RuntimeError):
@@ -1013,8 +1021,6 @@ class Reviewer:
         plan_path = run_directory / "plan.json"
         plan_path.write_bytes(review_plan.canonical(plan.document()))
         plan_path.chmod(0o400)
-        schema_path = run_directory / "schema.json"
-        schema_path.write_text(json.dumps(RESULT_SCHEMA), encoding="utf-8")
         policy = self._git("show", f"{target.tree}:AGENTS.md")
         prompt_prefix = (
             _prompt(target, coverage)
@@ -1087,6 +1093,12 @@ class Reviewer:
                 identifier: str, assignment: dict[str, Any]
             ) -> review_execution.Invocation:
                 directory = run_directory / identifier
+                schema_path = run_directory / f"{identifier}.schema.json"
+                schema_path.write_text(
+                    json.dumps(_result_schema(plan.fingerprint, identifier)),
+                    encoding="utf-8",
+                )
+                schema_path.chmod(0o400)
                 command = [
                     "codex",
                     "exec",
