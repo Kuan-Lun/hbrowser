@@ -7,7 +7,7 @@ import inspect
 import math
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Never
 
 from websockets.exceptions import ConnectionClosed
 
@@ -42,6 +42,16 @@ class _ZendriverQuiescenceChanged(RuntimeError):
 
 
 @dataclass(slots=True)
+class _PendingOpaqueOperation:
+    awaitable: Awaitable[Any]
+    connection: Any | None
+    owner: Any
+    operation: asyncio.Future[Any] | None = None
+    started: bool = False
+    transferred: bool = False
+
+
+@dataclass(slots=True)
 class _ZendriverLifecycle:
     """Protocol operations owned by one browser generation.
 
@@ -53,6 +63,9 @@ class _ZendriverLifecycle:
     retired: bool = False
     operations: dict[asyncio.Future[Any], Any | None] = field(default_factory=dict)
     operation_owners: dict[asyncio.Future[Any], Any] = field(default_factory=dict)
+    pending_awaitables: dict[asyncio.Future[Any], _PendingOpaqueOperation] = field(
+        default_factory=dict
+    )
     shutdown_task: asyncio.Task[None] | None = None
     shutdown_deadline_expires_at: float | None = None
     browser_stop_task: asyncio.Future[Any] | None = None
@@ -143,12 +156,56 @@ class _ZendriverLifecycle:
         connection = self._refresh_owner_connection(owner, connection)
         self.capture_connections((connection,))
         safe_to_cancel = self._connection_is_safe_to_cancel(connection, owner)
+        self._record_rejected_awaitable(awaitable, connection, owner)
+        return not safe_to_cancel
+
+    def _record_rejected_awaitable(
+        self,
+        awaitable: Awaitable[Any],
+        connection: Any | None,
+        owner: Any,
+    ) -> None:
         if not any(candidate is awaitable for candidate in self.rejected_awaitables):
             self.rejected_awaitables.append(awaitable)
             self.rejected_awaitable_connections[id(awaitable)] = connection
             self.rejected_awaitable_owners[id(awaitable)] = owner
         self.protocol_retirement_complete = False
-        return not safe_to_cancel
+
+    def transfer_pending_awaitable(self, operation: asyncio.Future[Any]) -> None:
+        pending = self.pending_awaitables.get(operation)
+        if pending is None:
+            return
+        self.retain_rejected_awaitable(
+            pending.awaitable, pending.connection, pending.owner
+        )
+        pending.transferred = True
+        self.pending_awaitables.pop(operation)
+
+    def _transfer_pending_retirement_inputs(self) -> None:
+        pending_inputs = tuple(self.pending_awaitables.items())
+        for _, pending in pending_inputs:
+            pending.connection = self._refresh_owner_connection(
+                pending.owner, pending.connection
+            )
+            self.capture_connections((pending.connection,))
+            if not self._connection_is_safe_to_cancel(
+                pending.connection, pending.owner
+            ):
+                raise _ZendriverQuiescenceChanged(
+                    "Pending awaitable gained an unquiesced owning connection"
+                )
+        if not self.safe_to_cancel_operations:
+            raise _ZendriverQuiescenceChanged(
+                "Pending awaitable invalidated operation cancellation safety"
+            )
+        # After validation, only ledger writes occur before wrapper cancellation.
+        # Refreshing an owner here could revoke the just-checked quiescence.
+        for operation, pending in pending_inputs:
+            self._record_rejected_awaitable(
+                pending.awaitable, pending.connection, pending.owner
+            )
+            pending.transferred = True
+            self.pending_awaitables.pop(operation)
 
     async def dispose_retained_awaitable(self, awaitable: Awaitable[Any]) -> None:
         """Share one bounded disposal attempt between all cleanup callers."""
@@ -202,6 +259,7 @@ class _ZendriverLifecycle:
             self.safe_to_cancel_operations
             and not self.rejected_awaitables
             and not self.operations
+            and not self.pending_awaitables
         ):
             self.protocol_retirement_complete = True
 
@@ -227,14 +285,15 @@ class _ZendriverLifecycle:
         return False
 
     def _observe_completion(self, operation: asyncio.Future[Any]) -> None:
-        if self.retired:
-            try:
+        try:
+            self.transfer_pending_awaitable(operation)
+            if self.retired:
                 self.refresh_operation_connection(operation)
-            except BaseException:
-                # Completion callbacks must never interfere with Zendriver's
-                # listener. Shutdown's synchronous snapshots retry resolution.
-                _observe_future(operation)
-                return
+        except BaseException:
+            # Completion callbacks must never interfere with Zendriver's
+            # listener. Shutdown's synchronous snapshots retry resolution.
+            _observe_future(operation)
+            return
         self.operations.pop(operation, None)
         self.operation_owners.pop(operation, None)
         _observe_future(operation)
@@ -317,6 +376,14 @@ class _ZendriverLifecycle:
                 continue
             seen.add(id(connection))
             result.append(connection)
+        for pending in tuple(self.pending_awaitables.values()):
+            pending.connection = self._refresh_owner_connection(
+                pending.owner, pending.connection
+            )
+            if pending.connection is None or id(pending.connection) in seen:
+                continue
+            seen.add(id(pending.connection))
+            result.append(pending.connection)
         return tuple(result)
 
     def prepare_operation_retirement(
@@ -352,6 +419,12 @@ class _ZendriverLifecycle:
                 self.rejected_awaitable_owners[id(awaitable)]
             )
         )
+        unresolved_owners.extend(
+            pending.owner
+            for pending in self.pending_awaitables.values()
+            if pending.connection is None
+            and self._owner_connection_can_appear(pending.owner)
+        )
         if unresolved_owners:
             raise _ZendriverQuiescenceChanged(
                 "Zendriver operations still have an unresolved owning connection"
@@ -367,7 +440,8 @@ class _ZendriverLifecycle:
                 "Zendriver operations cannot be retired before their listeners stop"
             )
         errors: list[BaseException] = []
-        operations = tuple(self.operations)
+        operations = tuple(dict.fromkeys((*self.operations, *self.pending_awaitables)))
+        self._transfer_pending_retirement_inputs()
         rejected_awaitables = tuple(self.rejected_awaitables)
 
         # Nothing may suspend between the quiescence check and selecting the
@@ -472,8 +546,10 @@ class _ZendriverRetirement:
     def mark_protocol_retired(self) -> None:
         if not self.lifecycle.safe_to_cancel_operations:
             raise RuntimeError("Zendriver retirement cannot complete before draining")
-        if self.lifecycle.rejected_awaitables or any(
-            not operation.done() for operation in self.lifecycle.operations
+        if (
+            self.lifecycle.rejected_awaitables
+            or self.lifecycle.pending_awaitables
+            or any(not operation.done() for operation in self.lifecycle.operations)
         ):
             raise _ZendriverQuiescenceChanged(
                 "Zendriver retirement still has pending operation ownership"
@@ -729,22 +805,29 @@ async def _reject_awaitable(
     lifecycle: _ZendriverLifecycle,
     connection: Any | None,
     owner: Any,
-) -> None:
+) -> Never:
     """Reject new work without cancelling a live mapped transaction."""
 
-    if inspect.iscoroutine(awaitable):
-        # A native coroutine has not started until it is scheduled, so closing
-        # it cannot affect Zendriver's mapper or a remote operation.
-        awaitable.close()
-        return
-    if isinstance(awaitable, asyncio.Future):
-        if lifecycle.retain_rejected_future(awaitable, connection, owner):
-            return
-        await _dispose_rejected_awaitable(awaitable)
-        return
-    if lifecycle.retain_rejected_awaitable(awaitable, connection, owner):
-        return
-    await lifecycle.dispose_retained_awaitable(awaitable)
+    retired_error = ZendriverOwnerRetiredError(
+        "Zendriver browser generation has already been retired"
+    )
+    try:
+        if inspect.iscoroutine(awaitable):
+            # A native coroutine has not started until it is scheduled, so
+            # closing it cannot affect Zendriver's mapper or a remote operation.
+            awaitable.close()
+        elif isinstance(awaitable, asyncio.Future):
+            if not lifecycle.retain_rejected_future(awaitable, connection, owner):
+                await _dispose_rejected_awaitable(awaitable)
+        elif not lifecycle.retain_rejected_awaitable(awaitable, connection, owner):
+            await lifecycle.dispose_retained_awaitable(awaitable)
+    except Exception as disposal_error:
+        retired_error.add_note(
+            "Rejected awaitable cleanup failed: "
+            f"{type(disposal_error).__name__}: {disposal_error}"
+        )
+        raise retired_error from disposal_error
+    raise retired_error
 
 
 def _validate_zendriver_operation(
@@ -822,26 +905,47 @@ async def wait_for_zendriver[T](
         owner=owner,
     )
     if lifecycle.retired:
-        retired_error = ZendriverOwnerRetiredError(
-            "Zendriver browser generation has already been retired"
+        await _reject_awaitable(
+            awaitable,
+            lifecycle=lifecycle,
+            connection=connection,
+            owner=owner,
         )
-        try:
-            await _reject_awaitable(
-                awaitable,
-                lifecycle=lifecycle,
-                connection=connection,
-                owner=owner,
-            )
-        except Exception as disposal_error:
-            retired_error.add_note(
-                "Rejected awaitable cleanup failed: "
-                f"{type(disposal_error).__name__}: {disposal_error}"
-            )
-            raise retired_error from disposal_error
-        raise retired_error
 
-    operation = asyncio.ensure_future(awaitable)
-    lifecycle.register(operation, connection, owner)
+    operation: asyncio.Future[T]
+    if asyncio.isfuture(awaitable) or asyncio.iscoroutine(awaitable):
+        operation = asyncio.ensure_future(awaitable)
+    else:
+        pending = _PendingOpaqueOperation(awaitable, connection, owner)
+
+        async def run_opaque() -> T:
+            if pending.transferred:
+                raise ZendriverOwnerRetiredError(
+                    "Pending Zendriver awaitable was transferred to retirement"
+                )
+            pending.started = True
+            if pending.operation is not None:
+                lifecycle.pending_awaitables.pop(pending.operation, None)
+            return await awaitable
+
+        operation = asyncio.ensure_future(run_opaque())
+        pending.operation = operation
+        if not pending.started:
+            lifecycle.pending_awaitables[operation] = pending
+            lifecycle.protocol_retirement_complete = False
+    try:
+        lifecycle.register(operation, connection, owner)
+    except ZendriverOwnerRetiredError:
+        # An eager task may retire its browser while ensure_future starts it.
+        # The resulting Future owns already-started work; retain it until its
+        # listener is quiescent instead of closing the original coroutine.
+        lifecycle.transfer_pending_awaitable(operation)
+        await _reject_awaitable(
+            operation,
+            lifecycle=lifecycle,
+            connection=connection,
+            owner=owner,
+        )
     try:
         done, _ = await asyncio.wait((operation,), timeout=timeout_seconds)
     except asyncio.CancelledError:
