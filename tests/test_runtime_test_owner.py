@@ -612,27 +612,31 @@ def test_pre_spawn_registration_failure_releases_only_new_no_child_token() -> No
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         registry = a._current()
-        registry.install()
-        with tempfile.TemporaryDirectory() as directory:
-            guard = process._PrivateDirectory.capture(Path(directory))
-            prior = process._ActivePrivateDirectoryCleanup(guard=guard)
-            process._register_active_private_directory_cleanup(prior)
-            try:
-                with patch.object(process.subprocess, 'Popen') as popen:
-                    try:
-                        process._spawn_private_directory_cleanup(
-                            guard, work_deadline=time.monotonic()+1,
-                            ownership_deadline=time.monotonic()+2)
-                    except process.ProcessOwnershipError:
-                        pass
-                    else:
-                        raise AssertionError('duplicate worker was admitted')
-                    popen.assert_not_called()
-                assert not registry.observations
-                assert process._active_private_directory_cleanup(guard) is prior
-            finally:
-                process._release_active_private_directory_cleanup(prior)
-        registry.close()
+        try:
+            registry.install()
+            with tempfile.TemporaryDirectory() as directory:
+                guard = process._PrivateDirectory.capture(Path(directory))
+                claim = process._PrivateDirectoryClaim(
+                    guard, guard.path.with_name(".hbrowser-cleanup-test"))
+                prior = process._ActivePrivateDirectoryCleanup(guard=guard)
+                process._register_active_private_directory_cleanup(prior)
+                try:
+                    with patch.object(process.subprocess, 'Popen') as popen:
+                        try:
+                            process._spawn_private_directory_cleanup(
+                                guard, claim=claim, work_deadline=time.monotonic()+1,
+                                ownership_deadline=time.monotonic()+2)
+                        except process.ProcessOwnershipError:
+                            pass
+                        else:
+                            raise AssertionError('duplicate worker was admitted')
+                        popen.assert_not_called()
+                    assert not registry.observations
+                    assert process._active_private_directory_cleanup(guard) is prior
+                finally:
+                    process._release_active_private_directory_cleanup(prior)
+        finally:
+            registry.close()
     """)
 
 
