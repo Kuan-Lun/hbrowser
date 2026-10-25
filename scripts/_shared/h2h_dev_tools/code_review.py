@@ -266,12 +266,27 @@ For text, archive-text and gzip-text units, inline content is the exact raw
 source for the declared origin/member/range. Read it directly. Other artifact
 views retain their declared examination limits.
 Do not re-fetch identical bytes solely to prove they were read. Fetch missing
-related sources with bounded output, batching independent lookups and reading
-all necessary ranges. Re-read when semantic review requires it.
+related sources in small, labeled path/range reads, covering every necessary
+range. Re-read when semantic review requires it. Track which required ranges
+are still unread so a clipped response does not silently become coverage.
+Bound the WHOLE returned tool response, not just each command inside it. With
+functions.exec, set an explicit outer max_output_tokens budget and keep the sum
+of inner command limits below it, leaving room for labels and result wrappers.
+Batch independent reads only when their combined output fits that outer budget;
+otherwise split the batch or request smaller source ranges. Increasing an inner
+exec_command limit does not increase the outer functions.exec response limit.
+A command exiting zero, or a complete command log, does not prove its raw source
+was visible in the returned response. Inspect every response for truncation or
+omitted ranges. If clipped, identify the missing path/ranges and fetch them in
+smaller bounded reads before continuing the affected analysis. Do not repeat the
+same oversized batch, count an omitted range as read, or substitute hashes,
+summaries or command status for the missing raw source.
 An assignment with shard_id 'integration' contains maps and handoffs, not raw
 sources. For that assignment, fetch and read raw sources for every reported
 contract, shard boundary and integration obligation; summaries do not replace
-those reads.
+those reads. A source read can support several handoffs: reconcile their distinct
+claims against that source without repeatedly fetching identical bytes. This
+does not permit omitting a necessary caller, related contract or obligation.
 Read the whole assigned content. A fragment also requires its surrounding file
 """
         "contracts. For deleted/renamed units use their origin tree and the exact "
@@ -310,8 +325,15 @@ cap, summary, contracts and each integration analysis up to its cap with every
 known source cited once per obligation. Optional extra references and findings
 share the same wire budget. Do not repeat paths within one source list.
 Report incomplete rather than truncate required coverage or semantic obligations.
-Use incomplete whenever context, tools or time prevent complete assigned review;
-retain all established findings. Do not silently omit units or integration duties.
+Continue the assigned review while bounded reads and analysis can make progress
+within the original deadline. A clipped tool response is a recoverable read gap,
+not by itself evidence that the model context is exhausted. Do not infer context
+exhaustion from cumulative token usage, assignment length or number of tool calls.
+Use incomplete whenever context, tools or time actually prevent completion;
+identify the unread sources/ranges or unresolved obligations, the concrete
+barrier and why bounded continuation cannot resolve it. Do not invent capacity
+or deadline evidence. Retain all established findings and do not silently omit
+units or integration duties. Never report pass with unresolved required coverage.
 Return the required JSON only, with Traditional Chinese summary/findings.
 Pass requires the entire assignment examined and no actionable finding.
 """
