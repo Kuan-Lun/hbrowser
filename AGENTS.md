@@ -318,9 +318,17 @@
   規劃、版本探測、各段、整合與清理共用一次 review deadline，不逐段重新計時。
   多段審查在同一預算內保留 20%（至多 600 秒）供整合；managed reviewer 另在
   總預算最後保留 5%（至多 30 秒）供外層重驗及發布，不延長 deadline。
-  逾時發布必須撤回；執行或驗證失敗須立即停止 admission 並清空所有已啟動
+  執行或驗證失敗須立即停止 admission 並清空所有已啟動
   子程序，再依既有規則恢復 candidate；有效完整 finding 先完成整輪彙整。
   Partial run 不續接，失敗結果不得作為續跑基準。
+- Review evidence 發布以最後一次 atomic rename 為唯一 terminal commit。
+  完整 review、exact candidate／coverage 重驗、全部 review owned process group 與
+  nested obligations 清理及 passing evidence 準備均須先完成；最後再檢查原
+  absolute deadline 與 pending signals，通過後才嘗試 rename，不增加預算。
+  Commit 前失敗不得產生 canonical receipt；rename 成功後保留已生效的有效
+  receipt，後續錯誤仍阻止本次 merge，不以刪除 receipt 回復未提交狀態。
+  最後 filesystem 操作不保證在原期限內回傳；clock 檢查與 rename 並非原子
+  操作，因此也不宣稱 rename 實際開始時刻有嚴格期限保證。
 - 二進位檔案須在 candidate 的 `tool.h2h-dev-tools.review.artifacts` 明列
   exact path、格式、用途、相關 generator／decoder／consumer 與解壓／member 上限。
   Archive 只可安全列舉及讀取，不得解壓至檔案系統、追蹤連結、執行或
