@@ -34,9 +34,14 @@
 
 - 開發以可獨立驗證、保留既有功能的批次交付；完整批次即驗證與整合，
   不等整個跨專案任務結束。
-- 每累計 50,000 tokens 進入整合檢查點：停止新增範圍，優先完成既有批次的
-  必要測試、審查、版本與 dependency audit 及本機合併。此時只修復阻擋整合的
-  問題，其餘需求另開後續 task；不得因門檻略過 gate 或刪除未完成依賴所需的功能。
+- 每個開發批次首次累計達 50,000 tokens 時，只切入一次整合檢查點：停止新增
+  範圍，優先完成該批次的必要測試、審查、版本與 dependency audit 及本機合併。
+  整合期間只修復阻擋整合的問題，其餘需求另開後續 task；不得因門檻略過 gate
+  或刪除未完成依賴所需的功能。
+- 進入整合後，不因 token 繼續累積至門檻的倍數而重新觸發整合、重審、重跑
+  gate 或使仍有效的 evidence 失效；候選與證據仍依既有 exact-candidate 規則驗證。
+- 只有本批次成功完成整合且開始下一批開發時才重新計數；中斷、審查失敗或
+  gate 失敗都不重設批次或計數。
 - 計數採可取得的實際 usage，包含子代理與 CLI 審查；無完整計數時明說限制，
   仍在每個可合併批次完成時檢查。未通過必要檢查時保留 task，回報阻擋、
   已驗證範圍及續作入口，不得宣稱已合併。
@@ -277,6 +282,17 @@
 
 ## Code Review Rules
 
+- 每輪審查須完成該輪既定的完整 scope，彙整各片與 integration 的完整問題清單。
+  有效且完整的 finding 結果屬審查結論，不是執行或驗證失敗；不得因此取消其餘
+  分片，仍須依既有原始來源與跨片契約要求完成 integration。當輪有任何 finding
+  即不通過，不發布 passing receipt；完整清單整批修正並固定最終 candidate 後，
+  才重新審查。無 finding 且必要 gate 通過才合併；無 finding 時毋須為修改而修改。
+  首輪 full baseline、後續完整 incremental scope、exact tree／ordered parents、
+  既有 ownership、coverage 與 deadline 均維持不變。
+- CLI 非零退出、無效 schema／身分／coverage、`incomplete`、逾時或 cleanup
+  無法證明仍屬執行或驗證失敗，必須立即停止排程、關閉 admission 並依既有規則
+  清理與恢復；不得把未完成的輪次冒充完整審查或沿用為 passing evidence。
+
 - 每次 task 合併先由 `scripts/git-flow-merge.sh` 準備真正的 two-parent
   `--no-ff --no-commit` candidate，再依 primary parent 到 staged candidate
   的完整差異分類。Full profile 在 Git hooks 之外呼叫
@@ -302,8 +318,9 @@
   規劃、版本探測、各段、整合與清理共用一次 review deadline，不逐段重新計時。
   多段審查在同一預算內保留 20%（至多 600 秒）供整合；managed reviewer 另在
   總預算最後保留 5%（至多 30 秒）供外層重驗及發布，不延長 deadline。
-  逾時發布必須撤回；任一失敗須先停止 admission 並清空所有已啟動子程序，
-  再依既有規則恢復 candidate。Partial run 不續接，失敗結果不得作為續跑基準。
+  逾時發布必須撤回；執行或驗證失敗須立即停止 admission 並清空所有已啟動
+  子程序，再依既有規則恢復 candidate；有效完整 finding 先完成整輪彙整。
+  Partial run 不續接，失敗結果不得作為續跑基準。
 - 二進位檔案須在 candidate 的 `tool.h2h-dev-tools.review.artifacts` 明列
   exact path、格式、用途、相關 generator／decoder／consumer 與解壓／member 上限。
   Archive 只可安全列舉及讀取，不得解壓至檔案系統、追蹤連結、執行或
@@ -326,10 +343,10 @@
   incremental 審查完整差異與相關未修改程式碼的互動，依本 repository 的架構、ownership、side-effect 與測試契約評估。
   只回報具體觸發條件及影響的 P0、P1、P2，附檔案、行號與理由；格式交由 lint。
   已授權的破壞性變更本身不是缺陷，但版本誤判或遺漏必要轉換仍須回報。
-- 任何 finding、`incomplete`、逾時、非零退出或無效輸出都阻止 merge。
-  上下文或工具不足須回報 `incomplete`，不得聲稱通過。失敗須先確認 owned
-  process cleanup 再 abort；無法證明 cleanup 時依前述例外保留 candidate。
-  修正後重新執行 merge 流程，不得忽略 finding 或手寫 passing receipt。
+- 任何 finding、`incomplete`、逾時、非零退出或無效輸出都阻止 merge；有效完整
+  finding 先完成當輪彙整，執行或驗證失敗則立即停止。上下文或工具不足須回報
+  `incomplete`，不得聲稱通過。證明 owned process cleanup 後才 abort；無法證明時
+  依前述例外保留 candidate。不得忽略 finding 或手寫 passing receipt。
 - Online review 目前只支援 POSIX，以獨立 process group 清理逾時或中斷的
   Codex 及一般 descendants；刻意脫離 group 者不在保證內。Windows 仍可
   offline verify；online review 必須先實作並驗證 Job Object 生命週期。
