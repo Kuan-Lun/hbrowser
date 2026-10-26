@@ -391,17 +391,181 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         command_task = asyncio.create_task(owner.main_tab.execute(stuck_command))
         await command_entered.wait()
         try:
-            with (
-                patch.object(owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01),
-                self.assertRaisesRegex(TimeoutError, "did not drain"),
-            ):
-                await asyncio.wait_for(owner.close(), timeout=1)
+            with patch.object(owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaisesRegex(TimeoutError, "did not drain"):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                first_deadline = owner._close_deadline
+                self.assertFalse(command_task.done())
+                with self.assertRaisesRegex(TimeoutError, "did not drain"):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertIsNot(owner._close_deadline, first_deadline)
 
+            self.assertFalse(command_task.done())
+            self.assertTrue(owner.main_tab._command_lock.locked())
+            self.assertIsNone(owner._browser)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(_return)
             browser_closer.assert_awaited_once_with(browser, ANY)
+            release_command.set()
+            await command_task
+            await owner.close()
             self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+            browser_closer.assert_awaited_once_with(browser, ANY)
         finally:
             release_command.set()
             await command_task
+
+    async def test_cancelled_drain_retains_release_and_shared_caller_ownership(
+        self,
+    ) -> None:
+        for cancel_attempt in (False, True):
+            with self.subTest(cancel_attempt=cancel_attempt):
+                await self._assert_cancelled_drain(cancel_attempt=cancel_attempt)
+
+    async def _assert_cancelled_drain(self, *, cancel_attempt: bool) -> None:
+        owner, browser, closer, _ = self._owner()
+        await owner.start()
+        command_entered = asyncio.Event()
+        release_command = asyncio.Event()
+        drain_entered = asyncio.Event()
+        original_drain = owner_module.TabTransport._drain
+
+        async def command(_: _FakeTab) -> None:
+            command_entered.set()
+            await release_command.wait()
+
+        async def observe_drain(
+            transport: owner_module.TabTransport[_FakeTab],
+        ) -> None:
+            drain_entered.set()
+            await original_drain(transport)
+
+        command_task = asyncio.create_task(owner.main_tab.execute(command))
+        await command_entered.wait()
+        callers: list[asyncio.Task[None]] = []
+        try:
+            with patch.object(owner_module.TabTransport, "_drain", observe_drain):
+                callers.append(asyncio.create_task(owner.close()))
+                await asyncio.wait_for(drain_entered.wait(), timeout=1)
+                shared_task = owner._close_task
+                assert shared_task is not None
+                shared_deadline = owner._close_deadline
+                if not cancel_attempt:
+                    callers.append(asyncio.create_task(owner.close()))
+                cancelled = shared_task if cancel_attempt else callers[0]
+                cancelled.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(callers[0], timeout=1)
+                self.assertFalse(command_task.done())
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                self.assertIsNone(owner._browser)
+                closer.assert_awaited_once_with(browser, ANY)
+                if not cancel_attempt:
+                    self.assertIs(owner._close_task, shared_task)
+                    self.assertIs(owner._close_deadline, shared_deadline)
+                    self.assertFalse(shared_task.done())
+                    self.assertFalse(callers[1].done())
+                release_command.set()
+                await command_task
+                if not cancel_attempt:
+                    await asyncio.wait_for(callers[1], timeout=1)
+                await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                closer.assert_awaited_once_with(browser, ANY)
+        finally:
+            release_command.set()
+            await command_task
+            await asyncio.wait_for(
+                asyncio.gather(*callers, return_exceptions=True), timeout=1
+            )
+
+    async def test_late_positive_closer_retains_only_undrained_commands(self) -> None:
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked):
+                await self._assert_late_closer(blocked=blocked)
+
+    async def _assert_late_closer(self, *, blocked: bool) -> None:
+        owner, browser, closer, _ = self._owner()
+        await owner.start()
+        command_entered = asyncio.Event()
+        release_command = asyncio.Event()
+        now = 0.0
+
+        async def command(_: _FakeTab) -> None:
+            command_entered.set()
+            await release_command.wait()
+
+        async def late_close(
+            observed_browser: _FakeBrowser, deadline: Deadline
+        ) -> None:
+            nonlocal now
+            self.assertIs(observed_browser, browser)
+            now = deadline.expires_at
+
+        closer.side_effect = late_close
+        command_task = asyncio.create_task(owner.main_tab.execute(command))
+        await command_entered.wait()
+        try:
+            if not blocked:
+                release_command.set()
+                await command_task
+            with patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ):
+                with self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError, "completed after"
+                ):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertIsNone(owner._browser)
+                expected = (
+                    BrowserOwnerState.CLOSING if blocked else BrowserOwnerState.CLOSED
+                )
+                self.assertEqual(owner.state, expected)
+                if blocked:
+                    self.assertFalse(command_task.done())
+                    with (
+                        patch.object(
+                            owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01
+                        ),
+                        self.assertRaisesRegex(TimeoutError, "did not drain"),
+                    ):
+                        await asyncio.wait_for(owner.close(), timeout=1)
+                    closer.assert_awaited_once_with(browser, ANY)
+                release_command.set()
+                await command_task
+                await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                closer.assert_awaited_once_with(browser, ANY)
+        finally:
+            release_command.set()
+            await command_task
+
+    async def test_startup_late_positive_closer_is_not_repeated(self) -> None:
+        owner, browser, closer, _ = self._owner(main_tab=_FakeTab(""))
+        now = 0.0
+
+        async def late_close(
+            observed_browser: _FakeBrowser, deadline: Deadline
+        ) -> None:
+            nonlocal now
+            self.assertIs(observed_browser, browser)
+            now = deadline.expires_at
+
+        closer.side_effect = late_close
+        with patch.object(
+            deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+        ):
+            with self.assertRaises(TabBindingError) as raised:
+                await asyncio.wait_for(owner.start(), timeout=1)
+            self.assertIn(
+                "_BrowserCloserCompletedAfterDeadline",
+                " ".join(raised.exception.__notes__),
+            )
+            self.assertIsNone(owner._browser)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+            await asyncio.wait_for(owner.close(), timeout=1)
+            closer.assert_awaited_once_with(browser, ANY)
 
     async def test_hung_injected_closer_uses_one_non_resetting_deadline(
         self,

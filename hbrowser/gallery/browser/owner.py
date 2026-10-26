@@ -192,8 +192,9 @@ class BrowserOwner[BrowserT, TabT]:
 
     The default adapters launch Zendriver through the existing browser factory.
     Tests and higher layers may inject fakes without importing or starting a real
-    browser.  A close operation is represented by one shared task, so concurrent
-    or repeated callers can never invoke the browser closer more than once.
+    browser. Concurrent callers share each close attempt. Once the closer proves
+    browser release, retries only drain remaining commands; the owner is closed
+    only after both responsibilities are complete.
     """
 
     def __init__(
@@ -349,6 +350,8 @@ class BrowserOwner[BrowserT, TabT]:
                             "browser cleanup after startup failure also failed: "
                             f"{type(cleanup_error).__name__}"
                         )
+                        if self._browser is None:
+                            self._state = BrowserOwnerState.CLOSED
                     else:
                         self._browser = None
                         self._state = BrowserOwnerState.CLOSED
@@ -435,6 +438,7 @@ class BrowserOwner[BrowserT, TabT]:
             except BaseException:
                 task = None
             else:
+                self._browser = None
                 if deadline.expired:
                     raise _BrowserCloserCompletedAfterDeadline(
                         "Browser closer completed after its shared ownership deadline"
@@ -475,6 +479,9 @@ class BrowserOwner[BrowserT, TabT]:
             raise BrowserOwnershipError(
                 "Browser closer was cancelled before ownership was released"
             ) from error
+        # Record positive release before reporting lateness or awaiting a drain.
+        # Neither a timed-out nor a cancelled drain may cause a second close.
+        self._browser = None
         if deadline.expired:
             raise _BrowserCloserCompletedAfterDeadline(
                 "Browser closer completed after its shared ownership deadline"
@@ -482,7 +489,6 @@ class BrowserOwner[BrowserT, TabT]:
 
     async def _finish_close(self, close_deadline: Deadline) -> None:
         errors: list[BaseException] = []
-        browser_closed = self._browser is None
         browser = self._browser
         if browser is not None:
             try:
@@ -490,24 +496,21 @@ class BrowserOwner[BrowserT, TabT]:
                 # locks. Closing the transports is what wakes a stuck CDP
                 # command; draining first can deadlock forever.
                 await self._run_browser_closer(browser, close_deadline)
-            except _BrowserCloserCompletedAfterDeadline as error:
-                browser_closed = True
-                errors.append(error)
             except BaseException as error:
                 errors.append(error)
-            else:
-                browser_closed = True
 
+        commands_drained = not self._tabs_by_role
         if self._tabs_by_role:
             drain_timeout = min(
                 _COMMAND_DRAIN_TIMEOUT_SECONDS,
                 close_deadline.remaining(),
             )
             if drain_timeout <= 0:
-                if any(
+                commands_drained = not any(
                     transport._command_lock.locked()
                     for transport in self._tabs_by_role.values()
-                ):
+                )
+                if not commands_drained:
                     errors.append(
                         TimeoutError(
                             "Browser-owner close deadline expired before tab drain"
@@ -531,9 +534,10 @@ class BrowserOwner[BrowserT, TabT]:
                             f"{_OWNER_CLOSE_DEADLINE_SECONDS:g}-second close deadline"
                         )
                     )
+                else:
+                    commands_drained = True
 
-        if browser_closed:
-            self._browser = None
+        if self._browser is None and commands_drained:
             self._state = BrowserOwnerState.CLOSED
         else:
             self._state = BrowserOwnerState.CLOSING
