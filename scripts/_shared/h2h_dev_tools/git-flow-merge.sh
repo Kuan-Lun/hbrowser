@@ -302,18 +302,19 @@ select_local_python() {
 }
 
 run_tracked() {
-    local status=0 working_directory=$2 bounded_command=$recovering
+    local status=0 working_directory=$2 bounded_command=$recovering output_descriptor=2
     [[ "${state_action:-0}" -eq 0 ]] || bounded_command=1
     active_owner=$1
     shift 2
     command_number=$((command_number + 1))
     active_cleanup_receipt="$execution_directory/cleanup-$command_number"
-    if [[ "$active_owner" == diagnostic ]]; then
+    if [[ "$active_owner" == diagnostic || "$active_owner" == completion ]]; then
+        [[ "$active_owner" != completion ]] || output_descriptor=1
         # This fixed stdlib entry must not run site code before ownership begins.
         # Only its canonical bounded writer can spawn children; the receipt is
         # published after that writer is reaped and its obligation is discharged.
         set -- "$merge_python" -I -S -B "$merge_launcher" \
-            --workflow-diagnostic "$active_cleanup_receipt" "$1"
+            --workflow-"$active_owner" "$active_cleanup_receipt" "$1"
     else
         set -- "$working_directory" -- "$@"
         if [[ "$active_owner" == review ]]; then
@@ -332,9 +333,10 @@ run_tracked() {
     # Do not leave a forked supervisor unregistered if a signal arrives between
     # the background launch and assignment of its PID.
     starting_child=1
-    if [[ "$active_owner" == diagnostic ]]; then
-        # Startup errors remain silent; never fall back to a blocking printf.
-        (CDPATH= cd "$working_directory" && exec "$@") 3>&2 >/dev/null 2>&1 &
+    if [[ "$active_owner" == diagnostic || "$active_owner" == completion ]]; then
+        # Preserve stdout for success and stderr for failure diagnostics. Startup
+        # errors stay silent; only the bounded writer may use the destination.
+        (CDPATH= cd "$working_directory" && exec "$@") 3>&"$output_descriptor" >/dev/null 2>&1 &
     elif [[ "$bounded_command" -eq 1 ]]; then
         # Preserve destinations for the nonblocking diagnostic writer only.
         # Startup errors (missing cwd/interpreter/launcher) must not block before
@@ -524,8 +526,8 @@ if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
     delete_task_branch "$cleanup_worktree" "$primary_oid" \
         || fail "no-op task branch cleanup failed; inspect refs: $task_branch"
 
-    printf 'Cleaned up no-op task %s already contained in %s at %s\n' \
-        "$task_branch" "$primary" "$task_oid"
+    run_tracked completion "$cleanup_worktree" \
+        "Cleaned up no-op task $task_branch already contained in $primary at $task_oid"
     exit 0
 fi
 
@@ -602,5 +604,5 @@ fi
 delete_task_branch "$merge_worktree" "$merge_commit" \
     || fail "merge succeeded, but task branch cleanup failed; inspect refs: $task_branch"
 
-printf 'Merged %s into %s at %s\n' \
-    "$task_branch" "$primary" "$merge_commit"
+run_tracked completion "$merge_worktree" \
+    "Merged $task_branch into $primary at $merge_commit"

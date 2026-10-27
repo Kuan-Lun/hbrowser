@@ -24,13 +24,27 @@ _AUDIT_PATH = ".release/dependency-audit.json"
 
 
 def _git(*arguments: str, input_text: str | None = None) -> str:
+    # Git's log output encoding is configurable. Request and decode the same
+    # protocol for this invocation without changing the user's configuration.
     return subprocess.run(
-        ("git", *arguments),
+        ("git", "-c", "i18n.logOutputEncoding=UTF-8", *arguments),
         check=True,
         input=input_text,
         stdout=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
     ).stdout.rstrip("\n")
+
+
+def _git_path(*arguments: str) -> Path:
+    output = subprocess.run(
+        ("git", *arguments), check=True, stdout=subprocess.PIPE
+    ).stdout
+    if not output.endswith(b"\n"):
+        raise ValueError("Git did not terminate its requested path record")
+    # Only Git's final LF is framing. CR/LF and non-UTF-8 bytes may be part of
+    # the metadata path, so neither text mode nor strip() can decode it safely.
+    return Path(os.fsdecode(output[:-1]))
 
 
 def _tree_file(tree: str, path: str) -> bytes:
@@ -360,7 +374,7 @@ def _validate_audit(tree: str, document: dict[str, Any], version: str) -> None:
 def _candidate(arguments: argparse.Namespace) -> tuple[str, str, str]:
     if arguments.index:
         base = _git("rev-parse", "--verify", "HEAD^{commit}")
-        merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
+        merge_head = _git_path("rev-parse", "--git-path", "MERGE_HEAD")
         if not merge_head.is_file():
             raise ValueError("--index requires a pending two-parent merge")
         parents = merge_head.read_text(encoding="ascii").splitlines()

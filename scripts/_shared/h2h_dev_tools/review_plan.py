@@ -359,7 +359,7 @@ class Plan:
 def check_deadline(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise PlanError("Aggregate review deadline expired")
+        raise review_execution.ExecutionError("Aggregate review deadline expired")
     return remaining
 
 
@@ -372,7 +372,7 @@ def _git(repository: Path, *args: str, deadline: float) -> bytes:
             deadline=deadline,
             max_output_bytes=MAX_GIT_METADATA_BYTES,
         )
-    except (OSError, review_execution.ExecutionError) as error:
+    except (OSError, review_execution.GitCommandError) as error:
         raise PlanError(f"Cannot read immutable Git input: {args}: {error}") from error
     check_deadline(deadline)
     return data
@@ -415,7 +415,7 @@ def _blobs(
                 ),
                 max_output_bytes=bound,
             )
-        except (OSError, review_execution.ExecutionError) as error:
+        except (OSError, review_execution.GitCommandError) as error:
             raise PlanError(f"Cannot read immutable Git blob batch: {error}") from error
         check_deadline(deadline)
         offset = 0

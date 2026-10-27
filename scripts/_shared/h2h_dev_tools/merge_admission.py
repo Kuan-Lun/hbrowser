@@ -9,6 +9,7 @@ import os
 import secrets
 import stat
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import NoReturn, TypedDict
@@ -74,15 +75,36 @@ class Workflow:
             raise AdmissionError("Workflow admission token no longer matches")
 
 
+def _capture_git(
+    repository: Path, *arguments: str
+) -> subprocess.CompletedProcess[bytes]:
+    # These calls stay inside the existing canonical Git process owner. Recovery
+    # retains its ten-second deadline; normal phases retain their outer lifetime.
+    # Regular files let this leader return after Git exits even when a callback's
+    # descendants retain stdout/stderr, so the owner can detect and clean them.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        result = subprocess.run(
+            ("git", "-C", str(repository), *arguments),
+            stdout=output,
+            stderr=errors,
+            check=False,
+        )
+        # Snapshot both extents before reading either stream. A surviving
+        # callback may keep appending; reads must not chase that moving EOF.
+        output_size = os.fstat(output.fileno()).st_size
+        error_size = os.fstat(errors.fileno()).st_size
+        output.seek(0)
+        errors.seek(0)
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            output.read(output_size),
+            errors.read(error_size),
+        )
+
+
 def _git(repository: Path, *arguments: str, missing_ref: bool = False) -> bytes:
-    # This helper runs only inside the existing canonical Git process owner.
-    # Recovery reads, comparison, abort, and descendants share that owner's
-    # original ten-second deadline; never create a detached session or new grace.
-    result = subprocess.run(
-        ("git", "-C", str(repository), *arguments),
-        capture_output=True,
-        check=False,
-    )
+    result = _capture_git(repository, *arguments)
     if missing_ref and result.returncode == 1 and not result.stdout:
         return b""
     if result.returncode:
@@ -485,20 +507,14 @@ def _preview_merge_tree(state: Workflow) -> str:
             "Canonical merge requires ort without custom branch mergeOptions; "
             "configured options were not changed"
         )
-    result = subprocess.run(
-        (
-            "git",
-            "-C",
-            str(root),
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
-            "-z",
-            state.primary_oid,
-            state.task_oid,
-        ),
-        capture_output=True,
-        check=False,
+    result = _capture_git(
+        root,
+        "merge-tree",
+        "--write-tree",
+        "--no-messages",
+        "-z",
+        state.primary_oid,
+        state.task_oid,
     )
     if result.returncode == 1:
         raise AdmissionError("Merge preview reports conflicts; no merge was started")

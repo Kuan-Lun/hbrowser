@@ -233,7 +233,9 @@ def _review(
                         standard_output=True,
                         deadline=deadline,
                     )
-                    reviewer._publish_managed_receipt(target, pending)
+                    reviewer._publish_managed_receipt(
+                        target, pending, destination=publication.staging
+                    )
                 # The caller writes its owned-tree proof while this transaction
                 # still owns rollback; failed proof I/O cannot leave a passing review.
                 yield status
@@ -338,7 +340,9 @@ def _write_cleanup_receipt(receipt: Path) -> None:
     temporary.replace(receipt)
 
 
-def _workflow_diagnostic(message: str, receipt: Path) -> int:
+def _workflow_diagnostic(
+    message: str, receipt: Path, *, completion: bool = False
+) -> int:
     from . import process
 
     # Invoked with -I -S -B: no site code can launch arbitrary descendants before
@@ -349,7 +353,9 @@ def _workflow_diagnostic(message: str, receipt: Path) -> int:
             os.fdopen(3, "w", encoding="utf-8", closefd=False) as diagnostic,
             redirect_stderr(diagnostic),
         ):
-            process.report_diagnostic(f"git-flow-merge: {message}")
+            process.report_diagnostic(
+                message if completion else f"git-flow-merge: {message}"
+            )
     except process.ProcessOwnershipError:
         return process.TERMINATION_FAILED_EXIT_CODE
     _write_cleanup_receipt(receipt)
@@ -410,10 +416,9 @@ def main() -> int:
         except process.ProcessOwnershipError:
             return process.TERMINATION_FAILED_EXIT_CODE
         except OSError:
-            if not arguments.recovery:
-                raise
-            # A failed receipt write is still a failure and publishes no proof;
-            # reporting it must not block recovery on the caller's pipe.
+            # Receipt/publication I/O can fail after the owned command and its
+            # deadline have ended. Never emit an unbounded traceback to the
+            # caller's pipe or admit a new reporter after this cleanup boundary.
             return 1
 
 
@@ -432,7 +437,16 @@ if __name__ == "__main__":
         from .merge_admission import main as workflow_state_main
 
         raise SystemExit(workflow_state_main(sys.argv[2:]))
-    if len(sys.argv) == 4 and sys.argv[1] == "--workflow-diagnostic":
-        # FD 3 is the human destination; interpreter/bootstrap errors are null.
-        raise SystemExit(_workflow_diagnostic(sys.argv[3], Path(sys.argv[2])))
+    if len(sys.argv) == 4 and sys.argv[1] in {
+        "--workflow-diagnostic",
+        "--workflow-completion",
+    }:
+        # FD 3 is the original output destination; startup errors remain null.
+        raise SystemExit(
+            _workflow_diagnostic(
+                sys.argv[3],
+                Path(sys.argv[2]),
+                completion=sys.argv[1] == "--workflow-completion",
+            )
+        )
     raise SystemExit(main())

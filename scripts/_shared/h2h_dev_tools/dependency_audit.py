@@ -163,7 +163,7 @@ def main() -> int:
 
     with Path("pyproject.toml").open("rb") as stream:
         document = tomllib.load(stream)
-    package = json.loads(Path("package.json").read_text())
+    package = json.loads(Path("package.json").read_bytes())
     python_audit = [
         _audit_python(group, requirement)
         for group, requirement in _python_requirements(document)
@@ -188,7 +188,8 @@ def main() -> int:
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return 0
 
