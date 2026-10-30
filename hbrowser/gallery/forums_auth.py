@@ -1,10 +1,13 @@
 """Fail-closed authentication-state detection for the E-Hentai Forums."""
 
+import json
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
 
-from .utils import wait_for_zendriver
+from ..exceptions import LoginFailedException
+from .utils import Deadline, wait_for_selector, wait_for_zendriver
+from .utils.mutation import wait_for_zendriver_mutation
 
 FORUMS_HOST = "forums.e-hentai.org"
 _AUTH_STATE_READ_TIMEOUT_SECONDS = 5.0
@@ -34,8 +37,18 @@ async def detect_forums_auth_state(page: Any) -> ForumsAuthState:
     if not isinstance(current_url, str):
         return ForumsAuthState.UNKNOWN
 
-    parsed_url = urlsplit(current_url)
-    if parsed_url.scheme != "https" or parsed_url.hostname != FORUMS_HOST:
+    try:
+        parsed_url = urlsplit(current_url)
+        trusted = (
+            parsed_url.scheme == "https"
+            and parsed_url.hostname == FORUMS_HOST
+            and parsed_url.port in (None, 443)
+            and parsed_url.username is None
+            and parsed_url.password is None
+        )
+    except ValueError:
+        return ForumsAuthState.UNKNOWN
+    if not trusted:
         return ForumsAuthState.UNKNOWN
 
     has_guest_marker = snapshot.get("guest") is True
@@ -46,3 +59,49 @@ async def detect_forums_auth_state(page: Any) -> ForumsAuthState:
     if has_guest_marker and not has_member_marker:
         return ForumsAuthState.GUEST
     return ForumsAuthState.UNKNOWN
+
+
+async def fill_forums_login_form(
+    page: Any, username: str | None, password: str | None, *, deadline: Deadline
+) -> None:
+    """Check origin and fill both fields in one synchronous main-document action.
+
+    Selector waits only establish readiness. They confer no authority to send
+    secrets: navigation may replace their document before the mutation executes.
+    The mutation reselects fields and checks the executing document's origin.
+    """
+    if username is None or password is None:
+        raise LoginFailedException("Forums credentials are unavailable")
+    for selector in ("[name='UserName']", "[name='PassWord']"):
+        await wait_for_selector(page, selector, deadline=deadline)
+    timeout = min(5.0, deadline.remaining())
+    if timeout <= 0:
+        raise TimeoutError("Login-form deadline expired before credential input")
+    arguments = json.dumps([username, password], ensure_ascii=True)
+    script = (
+        """((username, password) => {
+        if (window !== window.top ||
+            window.location.origin !== 'https://forums.e-hentai.org') return false;
+        const user = document.querySelector('[name="UserName"]');
+        const pass = document.querySelector('[name="PassWord"]');
+        if (!(user instanceof HTMLInputElement) ||
+            !(pass instanceof HTMLInputElement)) return false;
+        const setValue = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, 'value').set;
+        setValue.call(user, username);
+        setValue.call(pass, password);
+        user.dispatchEvent(new Event('input', {bubbles: true}));
+        pass.dispatchEvent(new Event('input', {bubbles: true}));
+        return true;
+    })(..."""
+        + arguments
+        + ")"
+    )
+    accepted = await wait_for_zendriver_mutation(
+        page.evaluate(script),
+        timeout=timeout,
+        owner=page,
+        operation="Forums credential input",
+    )
+    if accepted is not True:
+        raise LoginFailedException("Login document is not a trusted Forums form")

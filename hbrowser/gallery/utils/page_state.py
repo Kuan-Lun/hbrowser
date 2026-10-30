@@ -44,6 +44,10 @@ class PageStateTimeout(TimeoutError):
     """A healthy transport did not expose the requested semantic page state."""
 
 
+class PageElementNotFound(PageStateTimeout):
+    """A timely negative DOM query was followed by an empty observation window."""
+
+
 @contextmanager
 def _navigation_completion(browser: Any) -> Iterator[None]:
     """Require semantic completion after ACK for the captured generation."""
@@ -694,7 +698,9 @@ async def _wait_for_dom_change(
     while True:
         remaining = deadline.remaining()
         if remaining <= 0:
-            raise PageStateTimeout(f"{description} did not appear before its deadline")
+            raise PageElementNotFound(
+                f"{description} did not appear before its deadline"
+            )
         wait_seconds = min(_DOM_RECONCILIATION_SECONDS, remaining)
         wait_reaches_deadline = remaining <= _DOM_RECONCILIATION_SECONDS
         change_task = asyncio.create_task(changed.wait())
@@ -752,7 +758,7 @@ async def _wait_for_dom_query(
 
             remaining = deadline.remaining()
             if remaining <= 0:
-                raise PageStateTimeout(
+                raise PageElementNotFound(
                     f"{description} did not appear before its deadline"
                 )
             if supports_events and not observing:
@@ -829,6 +835,7 @@ __all__ = [
     "DEFAULT_NAVIGATION_DEADLINE_SECONDS",
     "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
     "NavigationReceipt",
+    "PageElementNotFound",
     "PageStateTimeout",
     "mutate_and_wait_for_navigation",
     "navigate_and_wait",

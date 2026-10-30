@@ -297,7 +297,7 @@ def _prepare_owned_browser_launch(
 async def _construct_owned_browser_async(
     config: zd.Config,
     *,
-    cleanup_paths: tuple[str, ...],
+    cleanup_paths: tuple[_PrivateDirectory, ...],
     startup_deadline: Deadline,
 ) -> _OwnedZendriverBrowser:
     """Launch in a bounded owner phase, then await local readiness asynchronously."""
@@ -631,22 +631,14 @@ async def _cleanup_browser_after_startup_failure(
 
 
 async def _cleanup_unowned_private_paths(
-    paths: tuple[str, ...],
+    guards: tuple[_PrivateDirectory, ...],
     *,
     deadline: Deadline,
 ) -> list[BaseException]:
     """Remove pre-process private material through settled owned workers."""
 
     cleanup_deadline = deadline.bounded(_PROFILE_CLEANUP_TIMEOUT_SECONDS)
-    guards: list[_PrivateDirectory] = []
     errors: list[BaseException] = []
-    for path in paths:
-        try:
-            guards.append(_PrivateDirectory.capture(Path(path)))
-        except FileNotFoundError:
-            pass
-        except BaseException as error:
-            errors.append(error)
 
     tasks = tuple(
         asyncio.create_task(
@@ -717,9 +709,11 @@ async def _install_chrome_in_owned_worker(
     """Run shared-cache installation in a killable, fully reaped process tree."""
 
     receipt_directory = Path(tempfile.mkdtemp(prefix="hbrowser-chrome-install-"))
+    receipt_guard = _PrivateDirectory.capture(receipt_directory)
     receipt_path = receipt_directory / "receipt.json"
     nonce = secrets.token_hex(16)
     staging_directory: Path | None = None
+    staging_guard: _PrivateDirectory | None = None
     owner: OwnedProcess | None = None
     result: ChromePaths | None = None
     primary_error: BaseException | None = None
@@ -730,6 +724,7 @@ async def _install_chrome_in_owned_worker(
         if remaining <= 0:
             raise TimeoutError("Chrome install deadline expired before worker startup")
         staging_directory = create_chrome_install_staging_root()
+        staging_guard = _PrivateDirectory.capture(staging_directory)
         if work_deadline.expired:
             raise TimeoutError(
                 "Chrome install deadline expired while creating staging ownership"
@@ -751,7 +746,7 @@ async def _install_chrome_in_owned_worker(
                     _CHROME_INSTALL_WORKER_READY_SECONDS,
                     remaining,
                 ),
-                cleanup_paths=(staging_directory,),
+                cleanup_paths=(staging_guard,),
                 deadline=cleanup_deadline.expires_at,
             )
         )
@@ -849,16 +844,16 @@ async def _install_chrome_in_owned_worker(
         except BaseException as error:
             cleanup_error = error
 
-    unowned_private_paths = [str(receipt_directory)]
+    unowned_private_paths = [receipt_guard]
     if (
-        staging_directory is not None
+        staging_guard is not None
         and cleanup_error is None
         and not isinstance(primary_error, ProcessOwnershipError)
     ):
         # A successful wait/shutdown or an ordinary startup failure proves no
         # process can still mutate staging. In the unresolved-ownership case,
         # OwnedProcess retains its identity guard for durable atexit cleanup.
-        unowned_private_paths.append(str(staging_directory))
+        unowned_private_paths.append(staging_guard)
     try:
         private_errors = await _cleanup_unowned_private_paths(
             tuple(unowned_private_paths),
@@ -887,7 +882,7 @@ async def _install_chrome_in_owned_worker(
 
 async def _cleanup_failed_construction(
     tor_process: OwnedProcess | None,
-    private_paths: tuple[str, ...],
+    private_paths: tuple[_PrivateDirectory, ...],
     *,
     deadline: Deadline,
 ) -> tuple[list[BaseException], BaseException | None]:
@@ -1024,11 +1019,14 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
     proxy_extension: str | None = None
     profile_directory: str | None = None
     private_paths_are_owned = False
+    private_guards: list[_PrivateDirectory] = []
     try:
         # Select the effective route before admitting any external process.
         # The residential extension already has priority in _build_config;
         # its validation and actual materialization are this decision's input.
         proxy_extension = configure_proxy()
+        if proxy_extension is not None:
+            private_guards.append(_PrivateDirectory.capture(Path(proxy_extension)))
         use_tor = proxy_extension is None and should_use_tor()
         if use_tor:
             socks_port = find_available_port(TOR_SOCKS_PORT)
@@ -1058,6 +1056,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
             )
             chrome_executable = chrome_paths.chrome
         profile_directory = tempfile.mkdtemp(prefix="hbrowser-profile-")
+        private_guards.insert(0, _PrivateDirectory.capture(Path(profile_directory)))
         config = _build_config(
             headless,
             proxy_extension,
@@ -1071,11 +1070,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         try:
             browser = await _construct_owned_browser_async(
                 config,
-                cleanup_paths=tuple(
-                    path
-                    for path in (profile_directory, proxy_extension)
-                    if path is not None
-                ),
+                cleanup_paths=tuple(private_guards),
                 startup_deadline=browser_startup_work_deadline,
             )
         except ProcessOwnershipError:
@@ -1087,15 +1082,7 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         private_paths_are_owned = True
         _require_browser_process_owner(browser)
     except BaseException as construction_error:
-        private_paths = (
-            ()
-            if private_paths_are_owned
-            else tuple(
-                path
-                for path in (profile_directory, proxy_extension)
-                if path is not None
-            )
-        )
+        private_paths = () if private_paths_are_owned else tuple(private_guards)
         cleanup_task = asyncio.create_task(
             _cleanup_failed_construction(
                 tor_process,

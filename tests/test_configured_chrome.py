@@ -7,7 +7,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser.gallery.browser import factory
 from hbrowser.gallery.browser.chrome_manager import ChromePaths
-from hbrowser.gallery.browser.process import OwnedProcess
+from hbrowser.gallery.browser.process import OwnedProcess, _PrivateDirectory
 from hbrowser.gallery.driver_base import Driver
 
 _ENVIRONMENT_VARIABLE = "HBROWSER_CHROME_EXECUTABLE"
@@ -227,7 +227,10 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         cleanup_paths = (
             (str(self.profile), str(self.extension)) if proxy else (str(self.profile),)
         )
-        self.assertEqual(self.launch.call_args.kwargs["cleanup_paths"], cleanup_paths)
+        guards = self.launch.call_args.kwargs["cleanup_paths"]
+        self.assertEqual(tuple(str(guard.path) for guard in guards), cleanup_paths)
+        for guard in guards:
+            self.assertEqual(guard, _PrivateDirectory.capture(guard.path))
         self.assertNotIn(str(self.executable), cleanup_paths)
         if proxy:
             self.assertIn(f"--load-extension={self.extension}", parameters)

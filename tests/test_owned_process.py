@@ -5262,3 +5262,30 @@ assert not pathlib.Path(sys.argv[2]).exists()
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CapturedPrivatePathLaunchTests(unittest.TestCase):
+    def test_replaced_captured_directory_is_rejected_before_target_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            private.rename(root / "original")
+            private.mkdir()
+            marker = private / "foreign"
+            marker.write_text("preserve", encoding="utf-8")
+            target_marker = root / "launched"
+            with self.assertRaises(process_module.ProcessOwnershipError):
+                process_module.start_owned_process(
+                    sys.executable,
+                    [
+                        "-c",
+                        "from pathlib import Path; import sys; "
+                        "Path(sys.argv[1]).touch()",
+                        str(target_marker),
+                    ],
+                    cleanup_paths=(guard,),
+                )
+            self.assertEqual(marker.read_text(), "preserve")
+            self.assertFalse(target_marker.exists())

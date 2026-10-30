@@ -35,7 +35,11 @@ from .browser.process import ProcessOwnershipError
 from .captcha import CaptchaDetector, LoginChallengeHandler, PageChallengeHandler
 from .captcha.constants import MAX_MANUAL_CHALLENGE_TIMEOUT_SECONDS
 from .challenge_policy import validate_turnstile_tabs
-from .forums_auth import ForumsAuthState, detect_forums_auth_state
+from .forums_auth import (
+    ForumsAuthState,
+    detect_forums_auth_state,
+    fill_forums_login_form,
+)
 from .utils import (
     Deadline,
     ZendriverOperationTimeout,
@@ -677,40 +681,11 @@ class Driver(ABC):
             deadline=login_page_deadline,
         )
 
-        username_input = await wait_for_selector(
+        await fill_forums_login_form(
             self.page,
-            "[name='UserName']",
+            self.username,
+            self.password,
             deadline=login_page_deadline,
-        )
-        username_timeout = min(
-            _PAGE_MUTATION_TIMEOUT_SECONDS,
-            login_page_deadline.remaining(),
-        )
-        if username_timeout <= 0:
-            raise TimeoutError("Login-form deadline expired before username input")
-        await wait_for_zendriver_mutation(
-            username_input.send_keys(self.username),
-            timeout=username_timeout,
-            owner=username_input,
-            operation="Forums username input",
-        )
-
-        password_input = await wait_for_selector(
-            self.page,
-            "[name='PassWord']",
-            deadline=login_page_deadline,
-        )
-        password_timeout = min(
-            _PAGE_MUTATION_TIMEOUT_SECONDS,
-            login_page_deadline.remaining(),
-        )
-        if password_timeout <= 0:
-            raise TimeoutError("Login-form deadline expired before password input")
-        await wait_for_zendriver_mutation(
-            password_input.send_keys(self.password),
-            timeout=password_timeout,
-            owner=password_input,
-            operation="Forums password input",
         )
 
         await self._handle_login_challenge(flaresolverr_session)

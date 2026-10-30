@@ -2283,7 +2283,7 @@ def start_owned_process(
     stdout: int | None = subprocess.PIPE,
     stderr: int | None = subprocess.PIPE,
     drain_output: bool = False,
-    cleanup_paths: Sequence[str | Path] = (),
+    cleanup_paths: Sequence[str | Path | _PrivateDirectory] = (),
     environment: Mapping[str, str] | None = None,
     forward_logging: bool = False,
     startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
@@ -2367,7 +2367,16 @@ def start_owned_process(
         platform_name = _ownership_platform()
         status_guard = _PrivateDirectory.capture(status_directory)
         for path in cleanup_paths:
-            cleanup_guard_list.append(_PrivateDirectory.capture(Path(path)))
+            guard = (
+                path
+                if isinstance(path, _PrivateDirectory)
+                else _PrivateDirectory.capture(Path(path))
+            )
+            if not guard._assert_identity_or_absence():
+                raise ProcessOwnershipError(
+                    "Private generation directory disappeared before launch"
+                )
+            cleanup_guard_list.append(guard)
         cleanup_guards = tuple(cleanup_guard_list)
         supervisor_executable, supervisor_environment = _supervisor_launch_context(
             platform_name,
@@ -2584,7 +2593,7 @@ def start_owned_browser_process(
     executable: str | Path,
     parameters: Sequence[str],
     *,
-    cleanup_paths: Sequence[str | Path] = (),
+    cleanup_paths: Sequence[str | Path | _PrivateDirectory] = (),
     startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
     deadline: float | None = None,
 ) -> OwnedProcess:

@@ -11,11 +11,13 @@ from zendriver.core.connection import ProtocolException
 from hbrowser.gallery.captcha import CaptchaDetector, LoginChallengeHandler
 from hbrowser.gallery.captcha.page_challenge import PageChallengeHandler
 from hbrowser.gallery.utils import (
+    PageElementNotFound,
     PageStateTimeout,
     ZendriverOperationTimeout,
     wait_for_zendriver,
 )
 from hbrowser.gallery.utils import deadline as deadline_module
+from hbrowser.gallery.utils import page_state as page_state_module
 
 
 @dataclass
@@ -58,9 +60,6 @@ class _AbsentDynamicWidgetPage(_Page):
 
     async def query_selector(self, _selector: str) -> None:
         self.query_count += 1
-        # Expire the semantic deadline only after a healthy query has started.
-        # Host scheduling must not decide whether this query is issued.
-        self.now += 3.0
         return None
 
 
@@ -153,10 +152,19 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
     async def test_absent_dynamic_widget_is_not_a_generation_failure(self) -> None:
         page = _AbsentDynamicWidgetPage()
 
-        with patch.object(
-            deadline_module,
-            "time",
-            SimpleNamespace(monotonic=lambda: page.now),
+        original_wait = page_state_module._wait_for_dom_change
+
+        async def expired_observation(*args: Any, **kwargs: Any) -> bool:
+            page.now = 3.0
+            return await original_wait(*args, **kwargs)
+
+        with (
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: page.now)
+            ),
+            patch.object(
+                page_state_module, "_wait_for_dom_change", expired_observation
+            ),
         ):
             detection = await CaptchaDetector().detect(page, timeout=2)
 
@@ -176,6 +184,7 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
             LookupError("DOM document could not be resolved"),
             RuntimeError("DOM query failed"),
             TimeoutError("non-semantic transport timeout"),
+            PageStateTimeout("query returned after semantic deadline"),
         ):
             with self.subTest(error=type(error).__name__):
                 page = _FailedDynamicQueryPage(error)
@@ -185,10 +194,27 @@ class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(page.query_count, 1)
 
     async def test_explicit_missing_widget_timeout_is_absent(self) -> None:
-        page = _FailedDynamicQueryPage(PageStateTimeout("widget was absent"))
+        page = _FailedDynamicQueryPage(PageElementNotFound("widget was absent"))
         detection = await CaptchaDetector().detect(page)
         self.assertEqual(detection.kind, "none")
         self.assertEqual(page.query_count, 1)
+
+    async def test_late_widget_reply_never_means_absent(self) -> None:
+        page = _AbsentDynamicWidgetPage()
+
+        async def late_query(_selector: str) -> _Element:
+            page.now = 4.0
+            return _Element({"class": "cf-turnstile", "data-sitekey": "synthetic"})
+
+        with (
+            patch.object(page, "query_selector", late_query),
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: page.now)
+            ),
+            self.assertRaises(PageStateTimeout) as raised,
+        ):
+            await CaptchaDetector().detect(page, timeout=3)
+        self.assertNotIsInstance(raised.exception, PageElementNotFound)
 
     async def test_dynamic_query_cancellation_propagates(self) -> None:
         page = _FailedDynamicQueryPage(asyncio.CancelledError())

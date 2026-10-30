@@ -21,6 +21,7 @@ from .log import (
 )
 from .page_state import (
     NavigationReceipt,
+    PageElementNotFound,
     PageStateTimeout,
     mutate_and_wait_for_navigation,
     navigate_and_wait,
@@ -47,6 +48,7 @@ __all__ = [
     "LogPersistenceError",
     "LoggingHealth",
     "NavigationReceipt",
+    "PageElementNotFound",
     "PageStateTimeout",
     "ZendriverOperationTimeout",
     "close_forwarded_logging",
