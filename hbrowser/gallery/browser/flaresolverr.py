@@ -902,6 +902,8 @@ class FlareSolverrClient:
         """Destroy one identity and release it only after an ownership receipt."""
         if self._http is None:
             raise RuntimeError("FlareSolverrClient must be used as an async context")
+        if session._client is not self:
+            raise FlareSolverrSessionOwnershipError(session._session_id)
         parent_deadline = (
             Deadline.after(_SESSION_LIFECYCLE_TIMEOUT_SECONDS)
             if deadline is None
@@ -919,7 +921,8 @@ class FlareSolverrClient:
         *,
         deadline: Deadline,
     ) -> None:
-        self._owned_session_ids.add(session_id)
+        if session_id not in self._owned_session_ids:
+            raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_destroy_ids:
             # FlareSolverr pops the registry entry before driver.quit().  A
             # timed-out destroy may therefore be stuck after pop; neither list
@@ -990,6 +993,8 @@ class FlareSolverrClient:
     ) -> FlareSolverrResult:
         if self._closing:
             raise RuntimeError("FlareSolverrClient is closing or closed")
+        if session_id in self._uncertain_create_ids:
+            raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_destroy_ids:
             raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_request_ids:

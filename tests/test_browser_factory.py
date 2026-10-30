@@ -1448,6 +1448,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         failure = RuntimeError("main tab unavailable")
 
         with (
+            patch.object(factory, "_configured_chrome_executable", return_value=None),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hmac
 import io
 import json
 import logging
 import os
+import secrets
 import socket
 import stat
 import struct
@@ -119,6 +121,57 @@ def _raw_forwarding_frame(value: dict[str, object]) -> bytes:
         separators=(",", ":"),
     ).encode("utf-8")
     return struct.pack(">I", len(payload)) + payload
+
+
+def _receive_forwarding_frame(connection: socket.socket) -> dict[str, Any]:
+    def receive(size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            chunk = connection.recv(size - len(result))
+            if not chunk:
+                raise AssertionError("peer closed before the expected frame")
+            result.extend(chunk)
+        return bytes(result)
+
+    size = struct.unpack(">I", receive(4))[0]
+    if not 0 < size <= 32 * 1024:
+        raise AssertionError("peer returned an unbounded frame")
+    decoded = json.loads(receive(size))
+    if not isinstance(decoded, dict):
+        raise AssertionError("peer returned a non-object frame")
+    return decoded
+
+
+def _authenticate_forwarding(connection: socket.socket, token: str) -> None:
+    client_nonce = secrets.token_hex(32)
+    connection.sendall(
+        _raw_forwarding_frame({"nonce": client_nonce, "type": "hello", "version": 2})
+    )
+    challenge = _receive_forwarding_frame(connection)
+    server_nonce = challenge["nonce"]
+
+    def proof(role: bytes) -> str:
+        return hmac.digest(
+            bytes.fromhex(token),
+            b"hbrowser-log-forwarding-v2\0"
+            + role
+            + b"\0"
+            + bytes.fromhex(client_nonce)
+            + bytes.fromhex(server_nonce),
+            "sha256",
+        ).hex()
+
+    if challenge != {
+        "type": "challenge",
+        "nonce": server_nonce,
+        "proof": proof(b"receiver"),
+    }:
+        raise AssertionError("receiver did not prove possession of the capability")
+    connection.sendall(
+        _raw_forwarding_frame({"type": "authenticate", "proof": proof(b"sender")})
+    )
+    if _receive_forwarding_frame(connection) != {"type": "ready"}:
+        raise AssertionError("receiver did not acknowledge authentication")
 
 
 class SemanticLogContextTests(unittest.TestCase):
@@ -684,19 +737,12 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
     def test_child_send_and_close_failures_never_escape_handler_boundary(
         self,
     ) -> None:
-        ready_payload = b'{"type":"ready"}'
-
         @contextmanager
         def connected_handler() -> Iterator[tuple[ForwardingHandler, Mock, Mock]]:
             connection = Mock()
-            connection.recv.side_effect = [
-                struct.pack(">I", len(ready_payload)),
-                ready_payload,
-            ]
             connection_started = Event()
             connection_allowed = Event()
             handshake_complete = Event()
-            receive_ready = ForwardingHandler._receive_ready
             failure_callback = Mock()
 
             def connect(*_args: object, **_kwargs: object) -> Mock:
@@ -705,8 +751,8 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     raise TimeoutError("test did not release the pending connection")
                 return connection
 
-            def complete_handshake(peer: socket.socket) -> None:
-                receive_ready(peer)
+            def complete_handshake(peer: socket.socket, _token: str) -> None:
+                self.assertIs(peer, connection)
                 handshake_complete.set()
 
             with (
@@ -715,7 +761,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     side_effect=connect,
                 ),
                 patch.object(
-                    ForwardingHandler, "_receive_ready", side_effect=complete_handshake
+                    ForwardingHandler, "_authenticate", side_effect=complete_handshake
                 ),
             ):
                 handler = ForwardingHandler(
@@ -728,7 +774,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     connection.sendall.assert_not_called()
                     connection_allowed.set()
                     self.assertTrue(handshake_complete.wait(timeout=2))
-                    connection.sendall.assert_called_once()
+                    connection.sendall.assert_not_called()
                     failure_callback.assert_not_called()
                     yield handler, connection, failure_callback
                 finally:
@@ -814,6 +860,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
         child = """
 import logging
 import os
+import secrets
 from hbrowser import close_forwarded_logging, configure_forwarded_logging
 from hbrowser.gallery.utils import log_context
 
@@ -957,10 +1004,17 @@ close_forwarded_logging()
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode("utf-8")
-                _send_raw_forwarding_frame(
-                    capability["HBROWSER_LOG_FORWARD_ENDPOINT"],
-                    malformed,
+                host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(
+                    ":", 1
                 )
+                with socket.create_connection(
+                    (host, int(raw_port)), timeout=2
+                ) as connection:
+                    _authenticate_forwarding(
+                        connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
+                    )
+                    connection.sendall(struct.pack(">I", len(malformed)) + malformed)
+                    self.assertEqual(connection.recv(1), b"")
                 self.assertTrue(
                     _wait_until(lambda: logging_health().forwarding_degraded)
                 )
@@ -976,9 +1030,9 @@ close_forwarded_logging()
                 "invalid-utf8",
                 "invalid-json",
                 "nonobject",
-                "missing-token",
-                "wrong-token",
-                "nonascii-token",
+                "missing-type",
+                "unknown-type",
+                "legacy-token",
                 "deep-json",
                 "oversized-integer",
             ):
@@ -1002,9 +1056,11 @@ close_forwarded_logging()
                 "invalid-utf8": b"\xff",
                 "invalid-json": b"{",
                 "nonobject": b"[]",
-                "missing-token": b'{"type":"close"}',
-                "wrong-token": json.dumps({"token": wrong_token}).encode(),
-                "nonascii-token": json.dumps({"token": "非ASCII"}).encode(),
+                "missing-type": b"{}",
+                "unknown-type": b'{"type":"unknown"}',
+                "legacy-token": json.dumps(
+                    {"token": wrong_token, "type": "close"}
+                ).encode(),
                 "deep-json": b"[" * 2000 + b"0" + b"]" * 2000,
                 "oversized-integer": b"1" * 5000,
             }
@@ -1025,13 +1081,7 @@ close_forwarded_logging()
                 self.assertTrue(_wait_until(client_started))
                 with connection.makefile("rb") as stream:
                     if authenticated:
-                        connection.sendall(
-                            _raw_forwarding_frame({"token": token, "type": "hello"})
-                        )
-                        header = stream.read(4)
-                        self.assertEqual(len(header), 4)
-                        size = struct.unpack(">I", header)[0]
-                        self.assertEqual(stream.read(size), b'{"type":"ready"}')
+                        _authenticate_forwarding(connection, token)
                     payload = payloads[malformed]
                     connection.sendall(struct.pack(">I", len(payload)) + payload)
                     # EOF is emitted by the real receiver after rejecting this
@@ -1087,26 +1137,18 @@ close_forwarded_logging()
                 with socket.create_connection(
                     (host, int(raw_port)), timeout=2
                 ) as connection:
-                    connection.sendall(
-                        _raw_forwarding_frame(
-                            {
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
-                                "type": "hello",
-                            }
-                        )
+                    _authenticate_forwarding(
+                        connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
                     )
-                    ForwardingHandler._receive_ready(connection)
                     connection.sendall(
                         _raw_forwarding_frame(
                             {
                                 "record": record,
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "record",
                             }
                         )
                         + _raw_forwarding_frame(
                             {
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "close",
                             }
                         )
@@ -1394,18 +1436,9 @@ print(json.dumps({'registered_before': registered_before,
         host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(":", 1)
         connection = socket.create_connection((host, int(raw_port)), timeout=2)
         try:
-            connection.sendall(
-                _raw_forwarding_frame(
-                    {
-                        "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
-                        "type": "hello",
-                    }
-                )
+            _authenticate_forwarding(
+                connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
             )
-            header = connection.recv(4)
-            self.assertEqual(len(header), 4)
-            ready_size = struct.unpack(">I", header)[0]
-            self.assertEqual(connection.recv(ready_size), b'{"type":"ready"}')
             connection.sendall(
                 _raw_forwarding_frame(
                     {
@@ -1424,7 +1457,6 @@ print(json.dumps({'registered_before': registered_before,
                             "tab_role": None,
                             "thread_id": 456,
                         },
-                        "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                         "type": "record",
                     }
                 )

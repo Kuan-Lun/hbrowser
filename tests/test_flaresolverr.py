@@ -1215,6 +1215,8 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
         commands_after_failure = list(_commands(http))
         with self.assertRaises(FlareSolverrSessionOwnershipError):
             await client.create_session()
+        with self.assertRaises(FlareSolverrSessionOwnershipError):
+            await client.get(LOGIN_URL, session_id="pending-session")
         self.assertEqual(_commands(http), commands_after_failure)
 
         with self.assertRaises(FlareSolverrSessionOwnershipError):
@@ -1226,6 +1228,30 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(http.create_session_ids, ["pending-session"])
         self.assertNotIn("sessions.destroy", _commands(http))
+
+    async def test_destroy_rejects_foreign_and_released_session_handles(self) -> None:
+        owner = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        other = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        owner_http, other_http = _HTTP(), _HTTP()
+        owner._http = owner_http  # type: ignore[assignment]
+        other._http = other_http  # type: ignore[assignment]
+        _own_session(owner, "owned-session")
+        session = FlareSolverrSession(owner, "owned-session")
+        for same_id_is_owned in (False, True):
+            with self.subTest(same_id_is_owned=same_id_is_owned):
+                if same_id_is_owned:
+                    _own_session(other, "owned-session")
+                before = set(other._owned_session_ids)
+                with self.assertRaises(FlareSolverrSessionOwnershipError):
+                    await other.destroy_session(session)
+                self.assertEqual(other._owned_session_ids, before)
+                self.assertFalse(other._uncertain_destroy_ids)
+                self.assertEqual(_commands(other_http), [])
+        with self.assertRaises(FlareSolverrSessionOwnershipError):
+            await owner.destroy_session(FlareSolverrSession(owner, "released"))
+        self.assertEqual(owner._owned_session_ids, {"owned-session"})
+        self.assertFalse(owner._uncertain_destroy_ids)
+        self.assertEqual(_commands(owner_http), [])
 
     async def test_mismatched_create_identity_is_not_claimed_as_owned(
         self,
