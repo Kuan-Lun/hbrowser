@@ -979,6 +979,7 @@ class Reviewer:
         destination: Path,
         force_repository: bool = False,
         started: float | None = None,
+        minimum_shard_seconds: int = 0,
     ) -> None:
         started = time.monotonic() if started is None else started
         with review_execution.within_deadline(
@@ -993,6 +994,7 @@ class Reviewer:
                 destination=destination,
                 force_repository=force_repository,
                 started=started,
+                minimum_shard_seconds=minimum_shard_seconds,
             )
 
     def _run_bounded(
@@ -1006,6 +1008,7 @@ class Reviewer:
         destination: Path,
         force_repository: bool,
         started: float,
+        minimum_shard_seconds: int,
     ) -> None:
         self._assert_workspace(target)
         locked_ancestors: set[str] = set()
@@ -1024,6 +1027,7 @@ class Reviewer:
                 model=model,
                 destination=destination,
                 started=started,
+                minimum_shard_seconds=minimum_shard_seconds,
             )
 
     def _run_review(
@@ -1038,6 +1042,7 @@ class Reviewer:
         model: str | None,
         destination: Path,
         started: float,
+        minimum_shard_seconds: int,
     ) -> None:
         runs = self._directory() / "runs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -1072,6 +1077,48 @@ class Reviewer:
         )
         plan.validate_prompt_capacity(prompt_prefix)
         results: dict[str, dict[str, Any]] = {}
+
+        def preflight_schedule() -> float:
+            cutoff = review_execution.shard_deadline(
+                started, deadline, len(plan.shards)
+            )
+            # Match the scheduler's execution cutoff and inherited phase bound;
+            # do not subtract the same standalone cleanup reserve twice.
+            execution_cutoff = min(
+                cutoff - review_execution.CLEANUP_RESERVE, diagnostic_deadline
+            )
+            schedule = review_execution.review_schedule(
+                len(plan.shards),
+                execution_deadline=execution_cutoff,
+                now=time.monotonic(),
+                minimum_shard_seconds=minimum_shard_seconds,
+            )
+            document = {
+                **asdict(schedule),
+                "required_seconds": schedule.required_seconds,
+                "units": len(plan.units),
+                "assigned_bytes": sum(unit.end - unit.start for unit in plan.units),
+                "aggregate_timeout_seconds": timeout,
+                "shard_cutoff_seconds": cutoff - started,
+                "plan_digest": plan.fingerprint,
+            }
+            (run_directory / "time-budget.json").write_bytes(
+                review_plan.canonical(document)
+            )
+            process_control.report_diagnostic(
+                f"Review schedule: {len(plan.units)} units, {schedule.shards} "
+                f"shards, {schedule.waves} waves of up to {schedule.concurrency}; "
+                f"{schedule.available_seconds:.1f}s available, "
+                f"{schedule.required_seconds}s required by the declared "
+                f"{minimum_shard_seconds}s per-shard estimate.",
+                standard_output=True,
+                deadline=diagnostic_deadline,
+            )
+            schedule.require_capacity()
+            return cutoff
+
+        # Reject an infeasible declared estimate before even probing Codex.
+        preflight_schedule()
 
         def execute(
             invocations: list[review_execution.Invocation], phase_deadline: float
@@ -1204,9 +1251,8 @@ class Reviewer:
                 standard_output=True,
                 deadline=diagnostic_deadline,
             )
-            shards_deadline = review_execution.shard_deadline(
-                started, deadline, len(shards)
-            )
+            # Version probing and prompt preparation consume the same budget.
+            shards_deadline = preflight_schedule()
             process_control.report_diagnostic(
                 f"Shard cutoff: {shards_deadline - started:.1f}s; "
                 f"reserved integration: {deadline - shards_deadline:.1f}s "
@@ -1297,6 +1343,15 @@ def main(repository: Path) -> None:
         scope.add_argument("--revision", default="HEAD")
         if command == "run":
             sub.add_argument("--timeout-seconds", type=int, default=900)
+            sub.add_argument(
+                "--min-shard-seconds",
+                type=int,
+                default=0,
+                help=(
+                    "per-shard planning estimate; "
+                    "0 reports capacity without an estimate"
+                ),
+            )
             sub.add_argument("--model")
             sub.add_argument(
                 "--scope",
@@ -1321,7 +1376,10 @@ def main(repository: Path) -> None:
     started = time.monotonic()
     deadline: float | None = None
     publication_reserve: float | None = None
-    if args.command == "run" and 1 <= args.timeout_seconds <= 3600:
+    if (
+        args.command == "run"
+        and 1 <= args.timeout_seconds <= review_execution.MAX_REVIEW_SECONDS
+    ):
         deadline = started + args.timeout_seconds
         if _external_process_owner():
             try:
@@ -1397,7 +1455,17 @@ def main(repository: Path) -> None:
                     publication = admission.enter_context(_publication(destination))
                     if deadline is None:
                         raise ReviewError(
-                            "--timeout-seconds must be between 1 and 3600"
+                            "--timeout-seconds must be between 1 and "
+                            f"{review_execution.MAX_REVIEW_SECONDS}"
+                        )
+                    if not (
+                        0
+                        <= args.min_shard_seconds
+                        <= review_execution.MAX_REVIEW_SECONDS
+                    ):
+                        raise ReviewError(
+                            "--min-shard-seconds must be between 0 and "
+                            f"{review_execution.MAX_REVIEW_SECONDS}"
                         )
                     reviewer._run(
                         target,
@@ -1408,6 +1476,7 @@ def main(repository: Path) -> None:
                         destination=publication.staging,
                         force_repository=args.scope == "repository",
                         started=started,
+                        minimum_shard_seconds=args.min_shard_seconds,
                     )
                 publication.complete(deadline)
     except process_control.ProcessOwnershipError as error:

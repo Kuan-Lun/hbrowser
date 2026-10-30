@@ -273,10 +273,15 @@ editable 安裝；明確以 `--source package=/path/to/checkout` 提供的依賴
 共用 coordinator 將完整檔案範圍分配給獨立審查上下文，多段審查另檢查跨模組
 互動；所有階段共用同一期限。V3 證據不轉換或沿用 V2，更新後須重新完成全專案
 審查。純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
-大型專案的首次審查可明確延長至一小時：
+Review 預設 900 秒，可明確指定 1..14400 秒。啟動 reviewer 前會將完整單元、
+bytes、分片、並行波次及扣除準備耗時與既有保留後的容量寫入該次執行的
+`time-budget.json`。可提供每片規劃估計，預設 0 表示未指定；全部
+`ceil(shards/4)` 波次必須可容納，CLI 探測與 prompt 準備後會再次核對。
+此估計不是逐片 timeout、不延長 deadline，也不保證完成時間。例如：
 
 ```bash
-H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600 scripts/git-flow-merge.sh
+H2H_CODE_REVIEW_TIMEOUT_SECONDS=14400 \
+H2H_CODE_REVIEW_MIN_SHARD_SECONDS=900 scripts/git-flow-merge.sh
 ```
 
 合併工具要求 Git 2.38 以上，使用 `ort` 策略；primary 的

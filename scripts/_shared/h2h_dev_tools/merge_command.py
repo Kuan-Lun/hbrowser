@@ -191,8 +191,17 @@ def _review(
 
     try:
         timeout = int(environment.get("H2H_CODE_REVIEW_TIMEOUT_SECONDS", "900"))
-        if not 1 <= timeout <= 3600:
-            raise ValueError("Review timeout must be between 1 and 3600 seconds")
+        if not 1 <= timeout <= review_execution.MAX_REVIEW_SECONDS:
+            raise ValueError(
+                "Review timeout must be between 1 and "
+                f"{review_execution.MAX_REVIEW_SECONDS} seconds"
+            )
+        minimum = int(environment.get("H2H_CODE_REVIEW_MIN_SHARD_SECONDS", "0"))
+        if not 0 <= minimum <= review_execution.MAX_REVIEW_SECONDS:
+            raise ValueError(
+                "Review minimum shard estimate must be between 0 and "
+                f"{review_execution.MAX_REVIEW_SECONDS} seconds"
+            )
     except ValueError as error:
         process.report_diagnostic(f"merge-command: {error}")
         yield 1

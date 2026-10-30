@@ -21,6 +21,7 @@ from . import process
 
 CONCURRENCY = 4
 CLEANUP_RESERVE = 6.0
+MAX_REVIEW_SECONDS = 4 * 60 * 60
 _ACTIVE_DEADLINE: ContextVar[float | None] = ContextVar("review_deadline", default=None)
 
 
@@ -202,6 +203,59 @@ def shard_deadline(started: float, deadline: float, count: int) -> float:
             "Aggregate budget cannot admit shards and integration cleanup"
         )
     return deadline - reserve
+
+
+@dataclass(frozen=True)
+class ReviewSchedule:
+    """Capacity against a caller's estimate, never a completion guarantee."""
+
+    shards: int
+    concurrency: int
+    waves: int
+    available_seconds: float
+    minimum_shard_seconds: int
+
+    @property
+    def required_seconds(self) -> int:
+        return self.waves * self.minimum_shard_seconds
+
+    def require_capacity(self) -> None:
+        if self.available_seconds <= 0 or (
+            self.available_seconds < self.required_seconds
+        ):
+            raise ExecutionError(
+                f"Review schedule cannot fit {self.shards} shards in {self.waves} "
+                f"waves of up to {self.concurrency}: "
+                f"{self.available_seconds:.1f}s available, "
+                f"{self.required_seconds}s required by "
+                f"--min-shard-seconds={self.minimum_shard_seconds}. "
+                "Choose an explicit feasible aggregate budget or revise the "
+                "planning estimate before starting review."
+            )
+
+
+def review_schedule(
+    shards: int,
+    *,
+    execution_deadline: float,
+    now: float,
+    minimum_shard_seconds: int,
+) -> ReviewSchedule:
+    """Account for all queued waves within the already reserved phase cutoff."""
+    if (
+        shards < 1
+        or not 0 <= minimum_shard_seconds <= MAX_REVIEW_SECONDS
+        or not math.isfinite(execution_deadline)
+        or not math.isfinite(now)
+    ):
+        raise ExecutionError("Invalid review scheduling input")
+    return ReviewSchedule(
+        shards=shards,
+        concurrency=min(CONCURRENCY, shards),
+        waves=(shards + CONCURRENCY - 1) // CONCURRENCY,
+        available_seconds=max(0.0, execution_deadline - now),
+        minimum_shard_seconds=minimum_shard_seconds,
+    )
 
 
 @dataclass(frozen=True)
