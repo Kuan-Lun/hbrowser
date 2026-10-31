@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import py_compile
@@ -81,7 +82,7 @@ def _checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     # Warm the real pytest assertion-rewrite cache using a previous conftest
     # without a bootstrap, then restore equal-size source with the same mtime.
     previous = "# prior conftest without snapshot bootstrap\n"
-    conftest.write_text(previous + " " * (len(_BOOTSTRAP) - len(previous)))
+    conftest.write_text(previous + " " * (len(_BOOTSTRAP) - len(previous)), newline="")
     timestamp = conftest.stat().st_mtime_ns
     environment = {
         name: value
@@ -94,9 +95,23 @@ def _checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     )
     warmup = _run(root, environment, "-m", "pytest", "-p", "no:cacheprovider", "-q")
     assert warmup.returncode == 0, warmup.stdout + warmup.stderr
-    assert list((tests / "__pycache__").glob("conftest.*-pytest-*.pyc"))
-    conftest.write_text(_BOOTSTRAP)
+    caches = list((tests / "__pycache__").glob("conftest.*-pytest-*.pyc"))
+    assert len(caches) == 1
+    conftest.write_text(_BOOTSTRAP, newline="")
     os.utime(conftest, ns=(timestamp, timestamp))
+    # Match the candidate header while retaining the previous bootstrap code.
+    # Pytest 9.2 checks source hashes, so matching mtime/size alone no longer
+    # establishes a negative control that actually executes untrusted bytecode.
+    cache = caches[0]
+    poisoned = cache.read_bytes()
+    flags = int.from_bytes(poisoned[4:8], "little")
+    assert flags in {0, 1, 3}, f"Unknown Python cache flags: {flags}"
+    if flags & 1:
+        cache.write_bytes(
+            poisoned[:8]
+            + importlib.util.source_hash(conftest.read_bytes())
+            + poisoned[16:]
+        )
     (tests / "test_candidate.py").write_text(_TEST)
 
     for module, label in (
