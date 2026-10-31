@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-10-24T09:53:36+00:00",
-  "manifest_sha256": "d5b72cd224035a280424c303a7f838c910cd24e1a7f654b7f57d87c7054df6bc",
+  "checked_at": "2026-10-31T06:46:06+00:00",
+  "manifest_sha256": "ef1052d46d1419e1de44de3092c8ea576d22f07e63c51d58d371e9ecba9e3500",
   "node": [
     {
       "declared": ">=0.18.1",
@@ -10,12 +10,12 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.45.2",
+  "project_version": "0.46.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -68,9 +68,9 @@
       "url": "https://pypi.org/project/httpx/"
     },
     {
-      "declared": "websockets>=17.0.1",
+      "declared": "websockets>=17.4",
       "group": "runtime",
-      "latest": "17.3",
+      "latest": "17.4",
       "latest_satisfies": true,
       "name": "websockets",
       "python_3_14": true,
@@ -114,7 +114,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -125,7 +125,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.4.0",
+      "latest": "2.4.1",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -147,7 +147,7 @@
     {
       "declared": "pytest>=9.1.1",
       "group": "optional:dev",
-      "latest": "9.1.1",
+      "latest": "9.2.0",
       "latest_satisfies": true,
       "name": "pytest",
       "python_3_14": true,
@@ -158,7 +158,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.2",
+      "latest": "0.17.3",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -168,7 +168,7 @@
     }
   ],
   "review": {
-    "note": "2026-10-24 dependency review preparation for hbrowser 0.45.2 with dev-only distlib>=0.4.4: fresh official build/dev metadata confirms build 1.6.1, distlib 0.4.4, hatchling 1.32.4, mypy 2.4.0, packaging 26.3, pytest 9.1.1 and ruff 0.17.2 remain within all declarations. Distlib 0.4.4 release-note research covers launcher/shebang and archive-filtering corrections; its 3.14 classifier and universal wheel support the development-tool requirement, with Windows behavior still requiring platform validation. Fresh official PyPI metadata confirms unchanged stable versions asyncio-atexit 1.0.1, beautifulsoup4 4.15.0, h2h-galleryinfo-parser 0.5.3, httpx 0.28.1, websockets 17.3 and zendriver 0.17.1. All satisfy current runtime declarations, admit Python 3.14 through Requires-Python and provide compatible wheels. No newer stable release lies outside current bounds; retain the documented exact Zendriver lifecycle cohort. Reused the hash-verified 2026-10-22 official release-note/README/sdist research because both versions and constraints are unchanged. Metadata/wheel compatibility is not behavioral acceptance; canonical hbrowser lifecycle/navigation/challenge/timeout/process-tree and parser tests remain separate evidence. Public release notes remain unavailable for h2h-galleryinfo-parser; asyncio-atexit has upstream README but no changelog in the previously inspected official sdist. Fresh npm metadata confirms markdownlint-cli2 0.24.0 satisfies >=0.18.1 and Node >=22; current Node 24.22.1 qualifies. Preserve current bounds and exact zendriver==0.17.1; no new runtime incompatibility was identified. Unchanged versions reuse the explicitly attributed hash-verified prior note research, not newly claimed note reads; no tests or installs were performed for this preparation.",
+    "note": "2026-10-31 direct-dependency review for hbrowser 0.46.0 and the approved mutually authenticated forwarding protocol. Raised websockets minimum to 17.4: the official stable changelog identifies the newly enforced 4096-fragment recv limit as a memory-exhaustion security fix across implementations; 17.4 also makes ConnectionClosed exception chaining consistent. No insecure old forwarding protocol fallback is retained. Fresh single-checkout scripts/rebuild-env.sh resolution installed websockets 17.4 and Python 3.14.8. Official new-release notes reviewed: hatchling 1.33.0 adds Python 3.15 support; pytest 9.2.0 adjusts config validation, plugin import error classification and keyword-only parametrize options; mypy 2.4.1 fixes two-phase overload handling and nested-function mypyc frame setup; Ruff 0.17.2/0.17.3 fix starred type variables, comment-preserving fixes, f-string rewriting and formatting/performance; markdownlint-cli2 0.24.0 updates dependencies, including markdownlint 0.42.0, and requires Node >=22 (local Node 24.22.1). URLs: https://websockets.readthedocs.io/en/stable/project/changelog.html ; https://hatch.pypa.io/latest/history/hatchling/ ; https://docs.pytest.org/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://github.com/astral-sh/ruff/releases/tag/0.17.2 ; https://github.com/astral-sh/ruff/releases/tag/0.17.3 ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md . Unchanged direct versions and their compatibility bounds reuse the explicit 2026-10-24 audit's attributed official release-note/README/sdist research: asyncio-atexit 1.0.1, beautifulsoup4 4.15.0, h2h-galleryinfo-parser 0.5.3, httpx 0.28.1, zendriver 0.17.1, build 1.6.1, distlib 0.4.4 and packaging 26.3. Retain exact zendriver==0.17.1 as the documented lifecycle cohort; existing asyncio-atexit <2 and parser <0.6 compatibility bounds remain. Parser public release notes remain unavailable; asyncio-atexit's previously inspected official sdist has README but no changelog. Current-environment normal fast hook passed (144 formatted files, strict mypy 131 files, 3 Markdown files); prior source-equivalent author tests passed 1056 tests/458 subtests with 2 platform skips using the older dependency cohort. Current-dependency full lifecycle/navigation/challenge/timeout/process-tree validation and installed-wheel smoke are required separately before merge; metadata compatibility is not behavioral or Windows-platform proof.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
