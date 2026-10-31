@@ -16,7 +16,8 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
     "httpx>=0.28.1",
-    "websockets>=17.0.1",
+    # 17.4 bounds fragmented-message accumulation during recv().
+    "websockets>=17.4",
     # Flat CDP sessions, event dispatch and shutdown are verified against this
     # exact Zendriver cohort; upgrades require the ownership/lifecycle suite.
     "zendriver==0.17.1",
