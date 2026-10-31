@@ -24,7 +24,7 @@
     "bundle_verify.py": "e581dae3dac012f7f610b6459948a873d296fcf33dade7f6dd7a0889ca9a964c",
     "change_scope.py": "b793c857669032c4ae81fa10ea52890ef893c9e1f200e947cf2116dbb348288d",
     "ci_dependencies.py": "1ef0e519b00051e700755f76f25131deda63b1d4b52e854e5a5240359740b5a4",
-    "code_review.py": "02e6158c063511f2f0d7e142e5cd321a68e7cecaf9eeb720e0ad3c8ee5cbf7af",
+    "code_review.py": "672c43a7393384ec515abbffbaa39411987eb48ff0459a797acd7218d9cc8108",
     "commit-message.sh": "e113029a1c0a106f05a263baeef0e13e7e9088c903dccce873abc182194bf84e",
     "dependency_audit.py": "141771bdc040455ca9371a542f38a016dee6d3f650536b2181447eb78f6033b9",
     "dependency_manifest.py": "b3a2d2d9b71741cd710a477f1ca41ed2787885908016e6ec078c5b46df5dbb62",
@@ -46,7 +46,7 @@
     "rebuild-env.sh": "5a459ca1ece54f5d80e93ad7e5072fbc5e7a822fbe5b3c3c356b4e706d884057",
     "resolve-sources.sh": "a39cba95cd92786ccbc0ea06988fe79d41e3497cdebaa5e2018e118e6f6accaf",
     "review-merge-candidate.sh": "f2b15a8495a86eb3ff4f492b456ec646cd29d85b19bca9e19fafd98400848eb6",
-    "review_coverage.py": "d568202f4a1f980c605cf48c921695b9e9b78a109c50dc5567c10c8bf5140048",
+    "review_coverage.py": "76433aabf99f43d30c8942d819e0557b8c7563621486e048503a7061175747a6",
     "review_execution.py": "3fe13f7a1fa4cf6c3772a0450a3c503035f5f83455be8a79e5642cddf388aa4b",
     "review_plan.py": "3cf3c61ed4a5a55d744c694f5be1bb3d0ce5b23168d1bdc1f71a90ef52e070ad",
     "review_test_response.py": "76fb6d9397c176c331e3ab02701dd99286c8959140e26d5a077d375058743829",
@@ -55,8 +55,8 @@
     "source_loader.py": "bde325e1ec256962aeb22062244e6999153a6e4302f27e7acd3c1094e3630f3c",
     "version_policy.py": "41357dd56942058d3330124f18e8a772da15c5f29eafd4d676d88809a6a49914"
   },
-  "payload_sha256": "f9663bf45894bd29ec24250d31d2c32be8e8a59e02efaae6e0724c35c2298c8f",
+  "payload_sha256": "db39feed636ba6322a758693a5f96ec69d6074f6556b2b2b98a18bfdba7f5a2f",
   "schema_version": 2,
   "toolkit_name": "h2h-dev-tools",
-  "toolkit_version": "0.10.3"
+  "toolkit_version": "0.10.4"
 }

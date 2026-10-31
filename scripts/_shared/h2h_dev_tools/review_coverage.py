@@ -98,13 +98,16 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
             or set(review) != {"unit_id", "method", "related_paths"}
             or not _text(review["method"], limits["unit_method_utf8_bytes"])
             or not isinstance(review["related_paths"], list)
-            or any(
-                not isinstance(path, str) or path not in paths
-                for path in review["related_paths"]
-            )
+            or any(not isinstance(path, str) for path in review["related_paths"])
             or len(review["related_paths"]) != len(set(review["related_paths"]))
         ):
             raise PlanError("Malformed unit review method or related source")
+        for path in review["related_paths"]:
+            if path not in paths:
+                raise PlanError(
+                    f"Unknown unit related source {path[:256]!r}; "
+                    "expected an exact candidate or declared historical Git path"
+                )
         ids.append(review["unit_id"])
     if (
         any(not isinstance(key, str) for key in ids)
@@ -130,13 +133,16 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
             or not _text(review["analysis"], limits["integration_analysis_utf8_bytes"])
             or not isinstance(review["source_paths"], list)
             or not review["source_paths"]
-            or any(
-                not isinstance(path, str) or path not in paths
-                for path in review["source_paths"]
-            )
+            or any(not isinstance(path, str) for path in review["source_paths"])
             or len(review["source_paths"]) != len(set(review["source_paths"]))
         ):
             raise PlanError("Malformed cross-module review evidence")
+        for path in review["source_paths"]:
+            if path not in paths:
+                raise PlanError(
+                    f"Unknown integration source {path[:256]!r}; "
+                    "expected an exact candidate or declared historical Git path"
+                )
         obligations.append(review["obligation"])
     expected = (
         set(INTEGRATION_OBLIGATIONS)

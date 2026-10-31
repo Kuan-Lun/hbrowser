@@ -339,6 +339,16 @@ from that unit's manifest, including shared README, generator, decoder and consu
 sources. Repeat shared paths in every applicable unit entry; listing a path only
 under another unit, contracts or summary does not satisfy this output contract.
 Read those sources before attesting; use incomplete if that cannot be completed.
+All related_paths and integration source_paths are exact repository-relative Git
+paths, not prose citations. Each must exist in the candidate tree, the declared
+historical_related inventory or a unit's origin path. Verify additional references
+against that immutable authority before returning JSON; do not infer filenames
+from imports, schema references or another reviewer's text. Do not list absolute
+checkout paths, .venv/site-packages dependencies, directories, glob patterns,
+line-number suffixes or archive member names as source paths. External dependency
+observations may be explained in method/analysis text, but cannot attest candidate
+source coverage. Preserve every mandatory related path, including historical
+ones; do not drop required evidence to make an invalid response appear complete.
 Honor assignment.response_limits: text caps count decoded UTF-8 bytes; wire_bytes
 caps the entire raw JSON including escaping and whitespace. Prefer compact UTF-8
 JSON (ensure_ascii=False). Contracts have both per-text and array wire caps.
