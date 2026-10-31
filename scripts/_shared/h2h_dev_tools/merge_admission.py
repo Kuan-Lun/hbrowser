@@ -388,7 +388,9 @@ def _tracked_path(root: Path, relative: Path, tracked: set[bytes]) -> bool:
             identity = (actual / component).lstat()
             matches = []
             for entry in entries:
-                info = entry.stat(follow_symlinks=False)
+                # Windows DirEntry.stat() reports zero device/inode values.
+                # Read the entry itself without following links on every host.
+                info = Path(entry.path).lstat()
                 if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
                     matches.append(entry)
             if len(matches) != 1:

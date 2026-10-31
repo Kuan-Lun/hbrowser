@@ -15,17 +15,17 @@ def _windows_launcher(source: str, interpreter: Path) -> bytes:
 
     with tempfile.TemporaryDirectory(prefix="h2h-python-fixture-") as temporary:
         directory = Path(temporary)
-        inputs = directory / "input"
         outputs = directory / "output"
-        inputs.mkdir()
         outputs.mkdir()
-        (inputs / "fixture.py").write_text(
-            "#!/usr/bin/env python\n" + source, encoding="utf-8", newline=""
-        )
-        maker = ScriptMaker(str(inputs), str(outputs))
+        maker = ScriptMaker(None, str(outputs))
         maker.executable = enquote_executable(str(interpreter))
-        maker.force = True
-        generated = maker.make("fixture.py")
+        maker.variants = {""}
+        # Generate directly from the in-memory template. Distlib's file-copy
+        # path retains an open input in its traceback when writing fails,
+        # preventing Windows from cleaning the temporary directory. The export
+        # selects the output name; our literal template replaces its stub.
+        maker.script_template = ("#!/usr/bin/env python\n" + source).replace("%", "%%")
+        generated = maker.make("fixture = builtins:exec")
         executable = outputs / "fixture.exe"
         if generated != [str(executable)] or not executable.is_file():
             raise RuntimeError("Distlib did not generate the expected native launcher")
