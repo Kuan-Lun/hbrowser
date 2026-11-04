@@ -23,6 +23,7 @@ from ..utils import (
     get_platform,
 )
 from ..utils._child_environment import environment_without_logging_capabilities
+from .process import _PrivateDirectory
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +429,7 @@ def ensure_chrome_installed(
 
     Args:
         force_download: 強制重新下載
+        staging_root: 呼叫端擁有的暫存目錄；呼叫端負責依建立時身分清理。
 
     Returns:
         ChromePaths 包含 chrome 的執行檔路徑和版本
@@ -505,6 +507,12 @@ def ensure_chrome_installed(
                 if supplied_staging_root is None
                 else supplied_staging_root
             )
+            staging_guard = (
+                _PrivateDirectory.capture(active_staging_root)
+                if supplied_staging_root is None
+                else None
+            )
+            installation_error: BaseException | None = None
             staging_version = active_staging_root / version
             staging_chrome_path = staging_version / chrome_folder / chrome_exe_name
             try:
@@ -560,9 +568,22 @@ def ensure_chrome_installed(
                         install_deadline,
                         "old cache cleanup",
                     )
+            except BaseException as error:
+                installation_error = error
+                raise
             finally:
-                if active_staging_root.exists():
-                    shutil.rmtree(active_staging_root)
+                # Supplied staging belongs to the parent process owner, whose
+                # original directory identity survives the worker's lifetime.
+                if staging_guard is not None:
+                    try:
+                        staging_guard.remove(deadline=install_deadline.expires_at)
+                    except BaseException as cleanup_error:
+                        if installation_error is None:
+                            raise
+                        installation_error.add_note(
+                            "Chrome staging cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
 
             logger.info("Chrome is ready")
 

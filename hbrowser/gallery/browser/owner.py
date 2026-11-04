@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from ..utils import (
     Deadline,
+    is_browser_generation_error,
     navigate_and_wait,
     open_tab_and_wait,
 )
@@ -114,9 +115,11 @@ class TabTransport[TabT]:
 
     __slots__ = (
         "_command_lock",
+        "_generation_retired",
         "_handle",
         "_is_owner_open",
         "_navigate_tab",
+        "_retire_owner",
         "_tab",
     )
 
@@ -133,6 +136,8 @@ class TabTransport[TabT]:
         self._navigate_tab = navigate_tab
         self._is_owner_open = is_owner_open
         self._command_lock = asyncio.Lock()
+        self._generation_retired = False
+        self._retire_owner: Callable[[], None] | None = None
 
     @property
     def handle(self) -> TabHandle:
@@ -150,13 +155,13 @@ class TabTransport[TabT]:
     def is_available(self) -> bool:
         """Whether the owner still accepts new commands."""
 
-        return self._is_owner_open()
+        return not self._generation_retired and self._is_owner_open()
 
     def _require_available(self) -> None:
-        if not self._is_owner_open():
+        if not self.is_available:
             raise TabTransportUnavailableError(
                 f"tab role {self.role!r} is unavailable because its browser "
-                "owner is not open"
+                "generation no longer accepts commands"
             )
 
     async def execute[ResultT](
@@ -170,7 +175,16 @@ class TabTransport[TabT]:
             # Closing may have started while this command waited for an earlier
             # operation on the same tab.
             self._require_available()
-            return await command(self._tab)
+            try:
+                return await command(self._tab)
+            except BaseException as error:
+                if is_browser_generation_error(error):
+                    # Seal admission before releasing this command's lock, so
+                    # queued commands and every sibling transport fail closed.
+                    self._generation_retired = True
+                    if self._retire_owner is not None:
+                        self._retire_owner()
+                raise
 
     async def navigate(self, url: str) -> None:
         """Navigate the fixed tab through its injected navigation adapter."""
@@ -310,9 +324,13 @@ class BrowserOwner[BrowserT, TabT]:
             navigate_tab=self._navigate_owned_tab,
             is_owner_open=lambda: self._state is BrowserOwnerState.OPEN,
         )
+        transport._retire_owner = self._retire_generation
         self._tabs_by_role[role] = transport
         self._tabs_by_target[target_id] = transport
         return transport
+
+    def _retire_generation(self) -> None:
+        self._state = BrowserOwnerState.CLOSING
 
     async def _navigate_owned_tab(self, tab: TabT, url: str) -> None:
         try:
@@ -320,7 +338,7 @@ class BrowserOwner[BrowserT, TabT]:
         except BaseException:
             # Keep every transport and the browser for controlled shutdown,
             # but reject commands against this uncertain generation.
-            self._state = BrowserOwnerState.CLOSING
+            self._retire_generation()
             raise
 
     async def start(self) -> Self:
@@ -589,12 +607,14 @@ class BrowserOwner[BrowserT, TabT]:
                     None if completed_task.cancelled() else completed_task.exception()
                 )
                 self._close_task = None
-                if self._state is not BrowserOwnerState.CLOSED and (
-                    completed_task.cancelled() or completed_error is not None
+                if (
+                    self._state is not BrowserOwnerState.CLOSED
+                    and (completed_task.cancelled() or completed_error is not None)
+                    and self._browser_closer_task is None
                 ):
-                    # A completed failed cleanup is a finished attempt. An
-                    # explicit later close may use a new caller-owned deadline;
-                    # calls that overlap the same live task never reset it.
+                    # A finished outer attempt cannot extend an unresolved
+                    # inner closer. Reconcile that task against its original
+                    # deadline, even if it completed since the outer timeout.
                     self._close_deadline = None
             if self._close_task is not None:
                 close_task = self._close_task

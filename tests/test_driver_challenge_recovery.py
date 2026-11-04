@@ -61,16 +61,15 @@ class _UnavailableScope:
 class _TokenPage:
     def __init__(self, events: list[str]) -> None:
         self._events = events
-        self._results = deque(["", True])
+        self._results = deque(["", True, True])
+        self._operations = deque(["read_token", "bind_document", "inject_token"])
         self.expressions: list[str] = []
 
     async def evaluate(self, expression: str) -> object:
         self.expressions.append(expression)
-        self._events.append(
-            "read_token" if len(self.expressions) == 1 else "inject_token"
-        )
         if not self._results:
             raise AssertionError("Unexpected page evaluation")
+        self._events.append(self._operations.popleft())
         return self._results.popleft()
 
 
@@ -346,6 +345,7 @@ class DriverPageChallengeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             events,
             [
                 "read_token",
+                "bind_document",
                 "solve_turnstile",
                 "apply_identity",
                 "mark_identity_applied",

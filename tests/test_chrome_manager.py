@@ -127,7 +127,42 @@ class ChromeCachePublicationTests(unittest.TestCase):
                     version="123.0.0",
                 )
             )
-            self.assertFalse(staging_root.exists())
+            # Supplied staging is still owned by its caller; the installer must
+            # not independently remove a path whose parent owns its identity.
+            self.assertTrue(staging_root.is_dir())
+            self.assertEqual(list(staging_root.iterdir()), [])
+
+    def test_failed_worker_preserves_replacement_supplied_staging(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-chrome-identity-"
+        ) as directory:
+            cache_dir = Path(directory)
+            patches = self._patch_platform(cache_dir)
+            staging = cache_dir / ".hbrowser-chrome-staging-owned"
+            staging.mkdir()
+
+            def replace_staging(*args: object, **kwargs: object) -> None:
+                staging.rename(cache_dir / "original-staging")
+                staging.mkdir()
+                (staging / "foreign-data").write_text("preserve", encoding="utf-8")
+                raise RuntimeError("download interrupted")
+
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(
+                    chrome_manager, "_download_and_extract", side_effect=replace_staging
+                ),
+                self.assertRaisesRegex(RuntimeError, "download interrupted"),
+            ):
+                chrome_manager.ensure_chrome_installed(
+                    deadline=Deadline.after(1), staging_root=staging
+                )
+            self.assertEqual((staging / "foreign-data").read_text(), "preserve")
+            self.assertTrue((cache_dir / "original-staging").is_dir())
 
     def test_failed_staging_does_not_replace_previous_complete_generation(
         self,

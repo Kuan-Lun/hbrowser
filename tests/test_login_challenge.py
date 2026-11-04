@@ -1,4 +1,7 @@
+import json
 import logging
+import shutil
+import subprocess
 import unittest
 from collections import deque
 from unittest.mock import AsyncMock, patch
@@ -120,13 +123,13 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_auto_turnstile_token_is_injected(self) -> None:
-        page = _Page("", True)
+        page = _Page("", True, True)
         solver = _Solver(token="generated-token")
 
         await _handler("turnstile_widget", solver=solver).resolve(page)
 
         self.assertEqual(solver.calls, [(LOGIN_URL, 15, 30_000)])
-        injection_script = page.expressions[1]
+        injection_script = page.expressions[2]
         self.assertIn("cf-turnstile-response", injection_script)
         self.assertIn('"generated-token"', injection_script)
         self.assertIn("new Event('input'", injection_script)
@@ -134,7 +137,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("setAttribute", injection_script)
 
     async def test_solver_failure_falls_back_to_manual_in_gui(self) -> None:
-        page = _Page("", "", "manual-token")
+        page = _Page("", True, "", "manual-token")
         solver = _Solver(error=FlareSolverrSessionUnavailable("solver unavailable"))
 
         with patch(
@@ -149,7 +152,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unexpected_solver_bug_propagates_without_manual_fallback(
         self,
     ) -> None:
-        page = _Page("")
+        page = _Page("", True)
         solver = _Solver(error=RuntimeError("programming bug"))
 
         with (
@@ -164,7 +167,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         sleep.assert_not_awaited()
 
     async def test_identity_apply_failure_never_falls_back_to_manual(self) -> None:
-        page = _Page("")
+        page = _Page("", True)
         solver = _Solver(
             error=BrowserIdentityApplyException(
                 "Could not apply the FlareSolverr Cloudflare cookies"
@@ -183,7 +186,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         sleep.assert_not_awaited()
 
     async def test_missing_solver_token_falls_back_to_manual_in_gui(self) -> None:
-        page = _Page("", "manual-token")
+        page = _Page("", True, "manual-token")
         solver = _Solver(token=None)
 
         await _handler("turnstile_widget", solver=solver).resolve(page)
@@ -191,7 +194,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(solver.calls), 1)
 
     async def test_headless_unresolved_turnstile_fails_immediately(self) -> None:
-        page = _Page("")
+        page = _Page("", True)
         solver = _Solver(token=None)
 
         with (
@@ -215,6 +218,7 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         page = _Page(
             "",
+            True,
             RuntimeError("protocol params included generated-token"),
             "manual-token-must-not-be-read",
         )
@@ -232,8 +236,88 @@ class LoginChallengeHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("generated-token", str(raised.exception))
         self.assertIsNone(raised.exception.__cause__)
         self.assertIsNone(raised.exception.__context__)
-        self.assertEqual(len(page.expressions), 2)
+        self.assertEqual(len(page.expressions), 3)
         sleep.assert_not_awaited()
+
+    async def test_untrusted_capture_does_not_call_solver(self) -> None:
+        page = _Page("", False)
+        solver = _Solver(token="must-not-be-used")
+        with self.assertRaisesRegex(LoginFailedException, "trusted Forums document"):
+            await _handler("turnstile_widget", solver=solver).resolve(page)
+        self.assertEqual(solver.calls, [])
+        self.assertEqual(len(page.expressions), 2)
+
+    async def test_replaced_document_never_falls_back_to_manual(self) -> None:
+        page = _Page("", True, "document-changed", "must-not-read-replacement")
+        solver = _Solver(token="synthetic-token")
+        with self.assertRaisesRegex(LoginFailedException, "changed during solving"):
+            await _handler("turnstile_widget", solver=solver).resolve(page)
+        self.assertEqual(len(page.expressions), 3)
+
+    async def test_actual_scripts_bind_origin_document_and_response_field(self) -> None:
+        page = _Page("", True, True)
+        await _handler(
+            "turnstile_widget", solver=_Solver(token="synthetic-token")
+        ).resolve(page)
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Repository-local Markdown tooling requires Node")
+        assert node is not None
+        program = """
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const reports = [];
+for (const scenario of ['same', 'reload', 'redirect', 'iframe', 'field', 'url',
+                        'untrusted', 'subframe', 'missing-field', 'new-attempt']) {
+  const writes = [];
+  const makeElement = () => ({
+    _value: '', get value() { return this._value; },
+    set value(value) { writes.push(value); this._value = value; },
+    dispatchEvent(event) {}
+  });
+  let element = makeElement();
+  let document = {querySelector: () => element};
+  const window = {location: {origin: 'https://forums.e-hentai.org', href: input.url}};
+  window.top = window;
+  if (scenario === 'untrusted') window.location.origin = 'https://example.test';
+  if (scenario === 'subframe') window.top = {};
+  if (scenario === 'missing-field') element = null;
+  const captured = eval(input.capture);
+  if (scenario === 'reload') document = {querySelector: () => element};
+  if (scenario === 'redirect') window.location.origin = 'https://example.test';
+  if (scenario === 'iframe') window.top = {};
+  if (scenario === 'field') element = makeElement();
+  if (scenario === 'url') window.location.href += '&replaced=1';
+  if (scenario === 'new-attempt') {
+    Object.defineProperty(document, Symbol.for('hbrowser.login.challenge'), {
+      value: {nonce: 'new-attempt', element, url: input.url}
+    });
+  }
+  const result = captured ? eval(input.inject) : false;
+  reports.push({scenario, captured, result, writes});
+}
+process.stdout.write(JSON.stringify(reports));
+"""
+        result = subprocess.run(
+            [node, "-e", program],
+            input=json.dumps(
+                {
+                    "url": LOGIN_URL,
+                    "capture": page.expressions[1],
+                    "inject": page.expressions[2],
+                }
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        for report in json.loads(result.stdout):
+            with self.subTest(scenario=report["scenario"]):
+                if report["scenario"] == "same":
+                    self.assertIs(report["result"], True)
+                    self.assertEqual(report["writes"], ["synthetic-token"])
+                else:
+                    self.assertIsNot(report["result"], True)
+                    self.assertEqual(report["writes"], [])
 
     async def test_existing_recaptcha_token_needs_no_solver(self) -> None:
         page = _Page("existing-recaptcha-token")

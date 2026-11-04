@@ -101,7 +101,24 @@ class LoginChallengeHangProtectionTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(ZendriverOperationTimeout),
         ):
-            await LoginChallengeHandler._write_response_token(page, "#token", "abc")
+            await LoginChallengeHandler._write_response_token(
+                page, "#token", "abc", document_nonce="synthetic-attempt"
+            )
+        evaluate.assert_awaited_once()
+
+    async def test_document_binding_timeout_is_terminal(self) -> None:
+        evaluate = AsyncMock(side_effect=_hang)
+        page = SimpleNamespace(evaluate=evaluate)
+        with (
+            patch.object(login_challenge, "_TOKEN_MUTATION_TIMEOUT_SECONDS", 0.05),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await LoginChallengeHandler._capture_response_field(
+                page,
+                "#token",
+                "https://forums.e-hentai.org/",
+                "synthetic-attempt",
+            )
         evaluate.assert_awaited_once()
 
 
