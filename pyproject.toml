@@ -63,6 +63,11 @@ select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "SIM", "UP"]
 # original exception identity and traceback is a tested lifecycle contract.
 ignore = ["B904", "RUF001", "RUF002", "RUF003", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Immutable snapshots are verified byte-for-byte and follow the source toolkit's
+# accepted Ruff formatter/E501 contract. Handwritten sources retain E501.
+"scripts/_shared/h2h_dev_tools/*.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.14"
 files = ["hbrowser", "tests", "scripts/_shared"]

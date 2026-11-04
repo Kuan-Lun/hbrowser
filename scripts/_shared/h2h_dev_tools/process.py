@@ -61,6 +61,7 @@ class ProcessOwnershipError(RuntimeError):
     """A command violated ownership; cleanup may still finish before propagation."""
 
     cleanup_proven: bool = False
+    owner: OwnedProcess | None = None
 
 
 @dataclass
@@ -336,8 +337,10 @@ class OwnedProcess:
 
 
 def _start_posix_process(phase: ProcessCommand) -> subprocess.Popen[bytes]:
+    from ._process_posix import PinnedProcess
+
     command = phase.argv
-    return subprocess.Popen(
+    return PinnedProcess(
         command,
         cwd=phase.cwd,
         env=phase.environment,
@@ -512,6 +515,7 @@ def start_owned_process(
             deadline=deadline,
             signal_controller=signal_controller,
         )
+    from ._process_posix import AcquisitionError, IdentityError
     from ._process_scope import PosixScope, ScopeError
 
     scope: PosixScope | None = None
@@ -521,6 +525,26 @@ def start_owned_process(
             replace(phase, environment=scope.environment(phase.environment))
         )
         return OwnedProcess(child, posix_scope=scope)
+    except AcquisitionError as error:
+        assert scope is not None
+        owner = OwnedProcess(error.process, posix_scope=scope)
+        failure = ProcessOwnershipError(f"{phase.label}: {error}")
+        failure.owner = owner
+        failure.add_note(
+            f"Unproven process scope retained: {scope.capability.directory}"
+        )
+        try:
+            # Acquisition failed after exec: nested work may already exist.
+            # Reuse admission closure and nested cleanup under the original
+            # deadline. The pinned leader remains waitable, but without a pidfd
+            # this path cannot prove Linux group absence or release its scope.
+            terminate_owned_tree(owner, deadline=deadline, diagnostic=failure.add_note)
+        except BaseException as cleanup_error:
+            failure.add_note(f"Startup cleanup failed: {cleanup_error!r}")
+        raise failure from error
+    except IdentityError as error:
+        # Unknown identity failures do not establish a pre-spawn rollback proof.
+        raise ProcessOwnershipError(f"{phase.label}: {error}") from error
     except (OSError, ScopeError, IndexError, TypeError, ValueError) as error:
         if scope is not None:
             # These Popen argument errors precede child creation; a failed exec
@@ -556,27 +580,27 @@ def _wait_for_process_until(
 def _wait_for_posix_process_group_exit(
     process: subprocess.Popen[bytes],
     *,
-    kill_process_group: Callable[[int, int], None],
     deadline: float,
     scope: PosixScope | None = None,
     poll_deadline: float | None = None,
 ) -> bool:
+    from ._process_posix import PinnedProcess
+
+    if not isinstance(process, PinnedProcess):
+        raise ProcessOwnershipError("POSIX group identity was not retained at launch")
     observation_deadline = (
         deadline if poll_deadline is None else min(deadline, poll_deadline)
     )
     while True:
-        # poll() reaps an exited leader; group membership, rather than leader
-        # state, remains the authority for whether descendants survived.
-        process.poll()
-        try:
-            kill_process_group(process.pid, 0)
-        except ProcessLookupError:
-            if scope is not None and seconds_remaining(deadline) <= 0:
+        # Exit observation preserves native group identity. Linux may reap the
+        # leader while a pidfd still owns the original group of descendants.
+        if process.poll() is not None and (
+            scope is None or not scope.has_pending(deadline=deadline)
+        ):
+            if seconds_remaining(deadline) <= 0:
                 return False
-            if scope is None or not scope.has_pending(deadline=deadline):
-                return _wait_for_process_until(process, deadline=observation_deadline)
-        except PermissionError:
-            pass
+            if process.retire_clean_group(deadline=deadline):
+                return True
         remaining_seconds = seconds_remaining(observation_deadline)
         if remaining_seconds <= 0:
             return False
@@ -589,6 +613,8 @@ def _terminate_posix_process_group(
     deadline: float,
     scope: PosixScope | None = None,
 ) -> bool:
+    from ._process_posix import PinnedProcess
+
     kill_process_group = cast(
         Callable[[int, int], None] | None,
         getattr(os, "killpg", None),
@@ -598,16 +624,16 @@ def _terminate_posix_process_group(
 
     if scope is not None:
         scope.close_admission(deadline=deadline)
+    if not isinstance(process, PinnedProcess):
+        raise ProcessOwnershipError("POSIX group identity was not retained at launch")
 
     try:
-        kill_process_group(process.pid, signal.SIGTERM)
+        process.signal_group(signal.SIGTERM, send=kill_process_group)
     except ProcessLookupError, PermissionError:
-        # XNU can report EPERM for an exited, unreaped group. Signaling failure
-        # is still unknown: require reaping, ESRCH and empty nested obligations
-        # within the original absolute deadline, never treat EPERM as absence.
+        # An exited, pinned leader may make XNU report EPERM. Neither signal
+        # error proves absence: require the same complete retained-identity proof.
         return _wait_for_posix_process_group_exit(
             process,
-            kill_process_group=kill_process_group,
             deadline=deadline,
             scope=scope,
         )
@@ -620,7 +646,6 @@ def _terminate_posix_process_group(
     )
     if _wait_for_posix_process_group_exit(
         process,
-        kill_process_group=kill_process_group,
         deadline=deadline,
         scope=scope,
         poll_deadline=graceful_deadline,
@@ -637,21 +662,11 @@ def _terminate_posix_process_group(
         if not scope.has_pending(deadline=deadline):
             break
         time.sleep(min(TERMINATION_POLL_SECONDS, remaining))
-    if scope is not None and _wait_for_posix_process_group_exit(
-        process,
-        kill_process_group=kill_process_group,
-        deadline=time.monotonic(),
-    ):
-        # Reap an inner owner that exited after releasing its last obligation.
-        # Admission is closed and pending was just proven empty, so this final
-        # group-only observation cannot admit another nested session.
-        return True
     try:
-        kill_process_group(process.pid, signal.SIGKILL)
+        process.signal_group(signal.SIGKILL, send=kill_process_group)
     except ProcessLookupError, PermissionError:
         return _wait_for_posix_process_group_exit(
             process,
-            kill_process_group=kill_process_group,
             deadline=deadline,
             scope=scope,
         )
@@ -659,7 +674,6 @@ def _terminate_posix_process_group(
         return False
     return _wait_for_posix_process_group_exit(
         process,
-        kill_process_group=kill_process_group,
         deadline=deadline,
         scope=scope,
     )
@@ -689,12 +703,7 @@ def wait_for_owned_tree_exit(
             )
         except OSError:
             return False
-    kill_process_group = cast(
-        Callable[[int, int], None] | None,
-        getattr(os, "killpg", None),
-    )
-    if kill_process_group is None:
-        return False
+    from ._process_posix import IdentityError
     from ._process_scope import ScopeError
 
     try:
@@ -702,12 +711,11 @@ def wait_for_owned_tree_exit(
             owner.posix_scope.close_admission(deadline=deadline)
         empty = _wait_for_posix_process_group_exit(
             owner.process,
-            kill_process_group=kill_process_group,
             deadline=deadline,
             scope=owner.posix_scope,
             poll_deadline=observation_deadline,
         )
-    except ScopeError as error:
+    except (ScopeError, IdentityError) as error:
         raise ProcessOwnershipError(
             f"Process scope cleanup could not be proven: {error}"
         ) from error
@@ -888,13 +896,14 @@ def terminate_owned_tree(
 
     if owner.windows_job is not None:
         return _terminate_windows_tree(owner, deadline=deadline, diagnostic=diagnostic)
+    from ._process_posix import IdentityError
     from ._process_scope import ScopeError
 
     try:
         empty = _terminate_posix_process_group(
             owner.process, deadline=deadline, scope=owner.posix_scope
         )
-    except ScopeError as error:
+    except (ScopeError, IdentityError) as error:
         raise ProcessOwnershipError(
             f"Process scope cleanup could not be proven: {error}"
         ) from error
@@ -921,12 +930,16 @@ def close_owner(
 
     job = owner.windows_job
     if job is None:
-        if owner.posix_scope is not None:
-            try:
+        from ._process_posix import PinnedProcess
+
+        try:
+            if isinstance(owner.process, PinnedProcess):
+                owner.process.close_identity()
+            if owner.posix_scope is not None:
                 owner.posix_scope.close(deadline=deadline)
-            except Exception as error:
-                report(str(error))
-                return False
+        except Exception as error:
+            report(str(error))
+            return False
         return True
     try:
         job.close()

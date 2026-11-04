@@ -26,6 +26,7 @@ _MERGE_REVIEW_FILES = frozenset(
         "process.py",
         "_process_scope.py",
         "_process_diagnostic.py",
+        "_process_posix.py",
         "change_scope.py",
         "review-merge-candidate.sh",
         "merge_command.py",
@@ -47,7 +48,14 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),
     "version-policy": frozenset({"dependency_manifest.py", "version_policy.py"}),
     "publish-version": frozenset({"publish_version.py"}),
-    "process": frozenset({"process.py", "_process_scope.py", "_process_diagnostic.py"}),
+    "process": frozenset(
+        {
+            "process.py",
+            "_process_scope.py",
+            "_process_diagnostic.py",
+            "_process_posix.py",
+        }
+    ),
     "pytest": frozenset({"pytest_source.py", "pytest_runtime.py"}),
     "distribution-check": frozenset({"distribution_check.py"}),
     "offline-wheel": frozenset({"offline_wheel.py"}),
