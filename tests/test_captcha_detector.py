@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from bs4 import BeautifulSoup
 from zendriver.core.connection import ProtocolException
 
 from hbrowser.gallery.captcha import CaptchaDetector, LoginChallengeHandler
+from hbrowser.gallery.captcha import detector as detector_module
 from hbrowser.gallery.captcha.page_challenge import PageChallengeHandler
 from hbrowser.gallery.utils import (
     PageElementNotFound,
@@ -75,6 +77,104 @@ class _FailedDynamicQueryPage(_Page):
 
 
 class CaptchaDetectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_returned_at_deadline_cannot_report_challenge(self) -> None:
+        page = _Page("<html></html>", title="Just a moment...")
+        clock = SimpleNamespace(now=0.0)
+
+        async def late_snapshot(_expression: str) -> dict[str, str]:
+            clock.now = 2.0
+            return {"url": page.url, "title": page.title, "html": page.html}
+
+        with (
+            patch.object(page, "evaluate", late_snapshot),
+            patch.object(
+                deadline_module,
+                "time",
+                SimpleNamespace(monotonic=lambda clock=clock: clock.now),
+            ),
+            self.assertRaisesRegex(TimeoutError, "semantic deadline"),
+        ):
+            await CaptchaDetector().detect(page, timeout=2)
+
+    async def test_static_html_parsing_must_finish_inside_original_deadline(
+        self,
+    ) -> None:
+        parse = BeautifulSoup
+        for html, kind in (
+            ('<input name="cf-turnstile-response">', "turnstile_widget"),
+            (
+                '<div class="g-recaptcha" data-sitekey="synthetic"></div>',
+                "recaptcha_v2",
+            ),
+        ):
+            for completion in (1.99, 2.0):
+                with self.subTest(kind=kind, completion=completion):
+                    clock = SimpleNamespace(now=0.0)
+
+                    def timed_parse(
+                        *args: Any,
+                        _clock: SimpleNamespace = clock,
+                        _completion: float = completion,
+                        **kwargs: Any,
+                    ) -> Any:
+                        document = parse(*args, **kwargs)
+                        _clock.now = _completion
+                        return document
+
+                    with (
+                        patch.object(detector_module, "BeautifulSoup", timed_parse),
+                        patch.object(
+                            deadline_module,
+                            "time",
+                            SimpleNamespace(monotonic=lambda clock=clock: clock.now),
+                        ),
+                    ):
+                        if completion == 2.0:
+                            with self.assertRaisesRegex(
+                                TimeoutError, "semantic deadline"
+                            ):
+                                await CaptchaDetector().detect(_Page(html), timeout=2)
+                        else:
+                            result = await CaptchaDetector().detect(
+                                _Page(html), timeout=2
+                            )
+                            self.assertEqual(result.kind, kind)
+
+    async def test_challenge_metadata_cannot_finish_after_deadline(self) -> None:
+        for method, page in (
+            ("_extract_ray_id", _Page("<html></html>", title="Just a moment...")),
+            ("_turnstile_data", _Page('<input name="cf-turnstile-response">')),
+            ("_turnstile_data", _Page("<html></html>")),
+        ):
+            with self.subTest(method=method, html=page.html):
+                page.selections["div.cf-turnstile[data-sitekey]"] = _Element(
+                    {"class": "cf-turnstile", "data-sitekey": "synthetic"}
+                )
+                detector = CaptchaDetector()
+                original = getattr(detector, method)
+                clock = SimpleNamespace(now=0.0)
+
+                def late_metadata(
+                    *args: Any,
+                    _clock: SimpleNamespace = clock,
+                    _original: Any = original,
+                    **kwargs: Any,
+                ) -> Any:
+                    result = _original(*args, **kwargs)
+                    _clock.now = 2.0
+                    return result
+
+                with (
+                    patch.object(detector, method, late_metadata),
+                    patch.object(
+                        deadline_module,
+                        "time",
+                        SimpleNamespace(monotonic=lambda clock=clock: clock.now),
+                    ),
+                    self.assertRaisesRegex(TimeoutError, "semantic deadline"),
+                ):
+                    await detector.detect(page, timeout=2)
+
     async def test_detection_timeout_is_capped_at_five_seconds(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot exceed 5 seconds"):
             await CaptchaDetector().detect(_Page("<html></html>"), timeout=5.01)

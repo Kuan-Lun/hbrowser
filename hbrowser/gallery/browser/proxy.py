@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import secrets
-import shutil
 import socket
 import tempfile
 from pathlib import Path
@@ -22,11 +21,12 @@ from ..utils import (
     wait_for_selector,
     wait_for_zendriver,
 )
-from .process import ProcessOwnershipError
+from .process import ProcessOwnershipError, _PrivateDirectory
 
 logger = logging.getLogger(__name__)
 _PROXY_PAGE_DEADLINE_SECONDS = 10.0
 _DIRECT_IP_REQUEST_TIMEOUT_SECONDS = 5.0
+_PROXY_EXTENSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 class ProxyVerificationError(RuntimeError):
@@ -96,7 +96,12 @@ async def _read_direct_public_ip(*, deadline: Deadline) -> str:
 
 
 def _create_proxy_extension(
-    proxy_host: str, proxy_port: int, proxy_user: str, proxy_pass: str
+    proxy_host: str,
+    proxy_port: int,
+    proxy_user: str,
+    proxy_pass: str,
+    *,
+    cleanup_deadline: Deadline | None = None,
 ) -> str:
     """
     創建一個 Chrome 擴充功能來處理代理認證
@@ -186,6 +191,7 @@ globalThis.hbrowserProxyReady = async token => {{
 
     # 創建臨時目錄
     plugin_dir = Path(tempfile.mkdtemp())
+    private_directory = _PrivateDirectory.capture(plugin_dir)
 
     try:
         manifest_path = plugin_dir / "manifest.json"
@@ -199,7 +205,12 @@ globalThis.hbrowserProxyReady = async token => {{
         return str(plugin_dir)
     except BaseException as creation_error:
         try:
-            shutil.rmtree(plugin_dir)
+            deadline = (
+                Deadline.after(_PROXY_EXTENSION_CLEANUP_TIMEOUT_SECONDS)
+                if cleanup_deadline is None
+                else cleanup_deadline.bounded(_PROXY_EXTENSION_CLEANUP_TIMEOUT_SECONDS)
+            )
+            private_directory.remove(deadline=deadline.expires_at)
         except BaseException as cleanup_error:
             private_error = ProcessOwnershipError(
                 "Proxy extension creation failed and private material "
@@ -212,7 +223,7 @@ globalThis.hbrowserProxyReady = async token => {{
         raise
 
 
-def configure_proxy() -> str | None:
+def configure_proxy(*, cleanup_deadline: Deadline | None = None) -> str | None:
     """建立住宅代理擴充功能（如果有設定）。
 
     Returns:
@@ -243,6 +254,7 @@ def configure_proxy() -> str | None:
         proxy_port=parsed_proxy_port,
         proxy_user=rp_username,
         proxy_pass=rp_password,
+        cleanup_deadline=cleanup_deadline,
     )
     logger.debug("Proxy extension created for the current browser generation")
     return proxy_extension

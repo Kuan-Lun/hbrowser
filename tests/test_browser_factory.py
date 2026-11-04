@@ -1540,7 +1540,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             cleanup_deadline.expires_at - work_deadline.expires_at,
             factory._BROWSER_STARTUP_CLEANUP_RESERVE_SECONDS,
         )
-        configure_proxy.assert_called_once_with()
+        configure_proxy.assert_called_once_with(cleanup_deadline=cleanup_deadline)
 
     async def test_constructor_cancellation_reaps_process_before_returning(
         self,

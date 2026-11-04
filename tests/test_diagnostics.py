@@ -320,6 +320,47 @@ class PageDiagnosticTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Invalid page diagnostic kind"):
                 write_page_diagnostic(directory, "../outside", "content")
 
+    def test_captcha_response_values_are_redacted_before_worker_handoff(self) -> None:
+        # HTMLInputElement.value on a hidden input reflects into its value
+        # attribute, which documentElement.outerHTML includes in the snapshot.
+        for element in (
+            '<input type="hidden" name="cf-turnstile-response" '
+            'value="SYNTHETIC-TOKEN">',
+            '<INPUT VALUE="SYNTHETIC-TOKEN" NAME="cf&#45;turnstile-response">',
+            '<input id="cf-chl-widget-fixture_response" value="SYNTHETIC-TOKEN">',
+            '<textarea id="g-recaptcha-response-1">SYNTHETIC-TOKEN</textarea>',
+            '<textarea name="h-captcha-response">SYNTHETIC-TOKEN</textarea>',
+        ):
+            with self.subTest(element=element):
+                prepared = diagnostic_module._bounded_page_diagnostic_content(
+                    '<html><body><div id="context">Visible context</div>'
+                    + element
+                    + '<input name="ordinary" value="VISIBLE"></body></html>'
+                )
+                self.assertNotIn(b"SYNTHETIC-TOKEN", prepared)
+                self.assertIn(b"REDACTED", prepared)
+                self.assertIn(b"Visible context", prepared)
+                self.assertIn(b' value="VISIBLE"', prepared)
+
+    def test_captcha_redaction_handles_truncation_before_field_identity(self) -> None:
+        prefix = '<p>Context</p><input value="SYNTHETIC-TOKEN" '
+        with patch.object(
+            diagnostic_module, "_PAGE_DIAGNOSTIC_MAX_INPUT_CHARACTERS", len(prefix)
+        ):
+            prepared = diagnostic_module._bounded_page_diagnostic_content(
+                prefix + 'name="cf-turnstile-response">'
+            )
+        self.assertNotIn(b"SYNTHETIC-TOKEN", prepared)
+        self.assertIn(b"Context", prepared)
+        self.assertIn(b"diagnostic truncated", prepared)
+
+    def test_captcha_redaction_handles_incomplete_textarea(self) -> None:
+        prepared = diagnostic_module._bounded_page_diagnostic_content(
+            '<textarea name="g-recaptcha-response">SYNTHETIC-TOKEN'
+        )
+        self.assertNotIn(b"SYNTHETIC-TOKEN", prepared)
+        self.assertIn(b"REDACTED", prepared)
+
     def test_diagnostic_deadline_must_be_finite(self) -> None:
         with TemporaryDirectory() as directory_name:
             for invalid in (True, float("inf"), float("nan")):

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import py_compile
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,55 @@ def test_candidate():
         Path(__file__).resolve().parents[1] / 'hbrowser/__init__.py'
     )
 """
+
+
+@pytest.mark.skipif(os.name != "posix", reason="check-full.sh is a POSIX entry point")
+@pytest.mark.parametrize("inherited_options", ["--collect-only", "-k test_candidate"])
+def test_full_gate_executes_all_tests_despite_inherited_pytest_options(
+    tmp_path: Path, inherited_options: str
+) -> None:
+    root, environment = _checkout(tmp_path)
+    scripts = root / "scripts"
+    shutil.copy2(_ROOT / "scripts/check-full.sh", scripts / "check-full.sh")
+    fast = scripts / "check-fast.sh"
+    fast.write_text("#!/bin/sh\nexit 0\n")
+    fast.chmod(0o755)
+    executable = root / ".venv/bin/python"
+    executable.parent.mkdir(parents=True)
+    # Keep the actual Git environment and canonical pytest adapters. The wheel
+    # stage is a sentinel: the deliberate test failure must prevent reaching it.
+    executable.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  */offline_wheel.py) touch wheel-stage-reached; exit 0;;\n"
+        "esac\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    executable.chmod(0o755)
+    (root / "tests/test_required_failure.py").write_text(
+        "from pathlib import Path\n"
+        "def test_required_failure():\n"
+        "    Path('required-test-executed').touch()\n"
+        "    assert False, 'full gate must execute this test'\n"
+    )
+    environment["PYTEST_ADDOPTS"] = inherited_options
+    manual = _run(root, environment, "scripts/pytest-source.py")
+    assert manual.returncode == 0, manual.stdout + manual.stderr
+    assert not (root / "required-test-executed").exists()
+
+    gate = subprocess.run(
+        ("bash", "scripts/check-full.sh"),
+        cwd=root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "full gate must execute this test" in gate.stdout + gate.stderr
+    assert (root / "required-test-executed").is_file()
+    assert not (root / "wheel-stage-reached").exists()
 
 
 def _run(

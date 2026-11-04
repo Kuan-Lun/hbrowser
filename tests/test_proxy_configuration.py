@@ -52,6 +52,7 @@ class ResidentialProxyConfigurationTests(unittest.TestCase):
                         proxy_port=8443,
                         proxy_user="synthetic-user",
                         proxy_pass="synthetic-password",
+                        cleanup_deadline=None,
                     )
 
     def test_solver_selection_rejects_partial_proxy_identity(self) -> None:

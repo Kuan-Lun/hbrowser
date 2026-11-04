@@ -7,7 +7,7 @@ repository_root="$PWD"
 CDPATH= cd "$repository_root"
 
 scripts/check-fast.sh
-.venv/bin/python scripts/_shared/h2h_dev_tools/git_environment.py \
+PYTEST_ADDOPTS= .venv/bin/python scripts/_shared/h2h_dev_tools/git_environment.py \
     --repository "$repository_root" -- .venv/bin/python scripts/pytest-source.py
 
 .venv/bin/python scripts/_shared/h2h_dev_tools/offline_wheel.py \
