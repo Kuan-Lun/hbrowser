@@ -102,12 +102,12 @@ def _create_proxy_extension(
     proxy_pass: str,
     *,
     cleanup_deadline: Deadline | None = None,
-) -> str:
+) -> _PrivateDirectory:
     """
     創建一個 Chrome 擴充功能來處理代理認證
 
     Returns:
-        只屬於本次瀏覽器 generation 的擴充功能目錄
+        只屬於本次瀏覽器 generation 的擴充功能目錄及其原始身分
     """
     manifest_json = json.dumps(
         {
@@ -202,7 +202,9 @@ globalThis.hbrowserProxyReady = async token => {{
         (plugin_dir / "verification-token").write_text(
             verification_token, encoding="ascii"
         )
-        return str(plugin_dir)
+        if not private_directory._assert_identity_or_absence():
+            raise ProcessOwnershipError("Proxy extension disappeared during creation")
+        return private_directory
     except BaseException as creation_error:
         try:
             deadline = (
@@ -223,11 +225,13 @@ globalThis.hbrowserProxyReady = async token => {{
         raise
 
 
-def configure_proxy(*, cleanup_deadline: Deadline | None = None) -> str | None:
+def configure_proxy(
+    *, cleanup_deadline: Deadline | None = None
+) -> _PrivateDirectory | None:
     """建立住宅代理擴充功能（如果有設定）。
 
     Returns:
-        proxy extension 路徑，或 None
+        持有原始目錄身分的 proxy extension，或 None
     """
     credentials = _residential_proxy_credentials()
     if credentials is None:

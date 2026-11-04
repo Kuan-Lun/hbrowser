@@ -581,6 +581,43 @@ class WaitForMainTabTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_handoff_never_recaptures_a_replaced_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            extension = parent / "extension"
+            extension.mkdir()
+            (extension / "credentials").write_text("synthetic", encoding="utf-8")
+            guard = process_module._PrivateDirectory.capture(extension)
+            original = parent / "original"
+            replacement = parent / "replacement"
+            replacement.mkdir()
+            (replacement / "keep").write_text("unrelated", encoding="utf-8")
+            extension.rename(original)
+            replacement.rename(extension)
+            try:
+                with (
+                    patch.object(
+                        factory, "_configured_chrome_executable", return_value="/chrome"
+                    ),
+                    patch.object(factory, "configure_proxy", return_value=guard),
+                    patch.object(
+                        factory, "_construct_owned_browser_async", new=AsyncMock()
+                    ) as construct,
+                    self.assertRaises(ProcessOwnershipError),
+                ):
+                    await factory._create_browser(True)
+                construct.assert_not_awaited()
+                self.assertEqual((extension / "keep").read_text(), "unrelated")
+                self.assertEqual((original / "credentials").read_text(), "synthetic")
+                self.assertEqual(
+                    (guard.device, guard.inode),
+                    (original.stat().st_dev, original.stat().st_ino),
+                )
+            finally:
+                extension.rename(replacement)
+                original.rename(extension)
+                guard.remove(deadline=Deadline.after(5).expires_at)
+
     async def test_cancelled_failed_launch_preserves_owned_private_paths(self) -> None:
         for settlement in (1, 2):
             with self.subTest(settlement=settlement):
@@ -633,7 +670,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                     factory, "_configured_chrome_executable", return_value="/chrome"
                 ),
                 patch.object(factory, "should_use_tor", return_value=False),
-                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(
+                    factory,
+                    "configure_proxy",
+                    return_value=process_module._PrivateDirectory.capture(
+                        Path(extension)
+                    ),
+                ),
                 patch.object(
                     factory,
                     "tempfile",
@@ -695,12 +738,17 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             profile.mkdir()
             extension.mkdir()
             failure = ProcessOwnershipError("Chrome ownership unresolved")
+            extension_guard = process_module._PrivateDirectory.capture(extension)
             with (
                 patch.object(
                     factory, "_configured_chrome_executable", return_value="/chrome"
                 ),
                 patch.object(factory, "should_use_tor", return_value=False),
-                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(
+                    factory,
+                    "configure_proxy",
+                    return_value=extension_guard,
+                ),
                 patch.object(tempfile, "mkdtemp", return_value=str(profile)),
                 patch.object(factory, "_build_config", return_value=object()),
                 patch.object(
@@ -717,6 +765,9 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await factory._create_browser(True)
             self.assertIs(raised.exception, failure)
+            self.assertIs(
+                construct.call_args.kwargs["cleanup_paths"][-1], extension_guard
+            )
             self.assertEqual(
                 tuple(
                     guard.path for guard in construct.call_args.kwargs["cleanup_paths"]
@@ -836,7 +887,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                     factory, "_configured_chrome_executable", return_value=None
                 ),
                 patch.object(factory, "should_use_tor", return_value=False),
-                patch.object(factory, "configure_proxy", return_value=str(extension)),
+                patch.object(
+                    factory,
+                    "configure_proxy",
+                    return_value=process_module._PrivateDirectory.capture(
+                        Path(extension)
+                    ),
+                ),
                 patch.object(
                     factory,
                     "_install_chrome_in_owned_worker",
@@ -1287,7 +1344,11 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                         factory, "_configured_chrome_executable", return_value="/chrome"
                     ),
                     patch.object(
-                        proxy_module, "_create_proxy_extension", return_value=extension
+                        proxy_module,
+                        "_create_proxy_extension",
+                        return_value=process_module._PrivateDirectory.capture(
+                            Path(extension)
+                        ),
                     ),
                     patch.object(
                         factory,
@@ -1400,7 +1461,13 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     tempfile.TemporaryDirectory() as extension,
                     patch.object(factory, "should_use_tor", return_value=False),
-                    patch.object(factory, "configure_proxy", return_value=extension),
+                    patch.object(
+                        factory,
+                        "configure_proxy",
+                        return_value=process_module._PrivateDirectory.capture(
+                            Path(extension)
+                        ),
+                    ),
                     patch.object(
                         factory,
                         "_install_chrome_in_owned_worker",

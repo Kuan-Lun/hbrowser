@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import itertools
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from hbrowser.gallery.browser import factory, flaresolverr, proxy
+from hbrowser.gallery.browser.process import _PrivateDirectory
 
 _KEYS = ("RP_USERNAME", "RP_PASSWORD", "RP_DNS")
 _VALUES = ("synthetic-user", "synthetic-password", "proxy.example:8443")
@@ -25,7 +26,9 @@ class ResidentialProxyConfigurationTests(unittest.TestCase):
                 self.subTest(states=states),
                 patch.dict("os.environ", environment, clear=True),
                 patch.object(
-                    proxy, "_create_proxy_extension", return_value="owned-extension"
+                    proxy,
+                    "_create_proxy_extension",
+                    return_value=Mock(spec=_PrivateDirectory),
                 ) as create,
             ):
                 if configured in (1, 2):
@@ -45,7 +48,7 @@ class ResidentialProxyConfigurationTests(unittest.TestCase):
                     self.assertFalse(proxy.has_residential_proxy())
                     create.assert_not_called()
                 else:
-                    self.assertEqual(proxy.configure_proxy(), "owned-extension")
+                    self.assertIs(proxy.configure_proxy(), create.return_value)
                     self.assertTrue(proxy.has_residential_proxy())
                     create.assert_called_once_with(
                         proxy_host="proxy.example",

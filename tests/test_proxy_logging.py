@@ -45,7 +45,7 @@ process.stdout.write(JSON.stringify(cases.map(details => {
             {"challenger": {"host": "proxy.example", "port": 8443}},
             {"isProxy": True, "challenger": {"host": "PROXY.EXAMPLE", "port": 8443}},
         ]
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
         self.addCleanup(shutil.rmtree, directory)
         result = subprocess.run(
             ["node", "-e", harness, str(directory / "background.js")],
@@ -109,7 +109,7 @@ async function probe(change) {
     'other-extension', 'no-listener', 'wrong-token'
 ].map(probe)))))();
 """
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
         self.addCleanup(shutil.rmtree, directory)
         manifest = json.loads((directory / "manifest.json").read_text())
         self.assertEqual(manifest["manifest_version"], 3)
@@ -146,12 +146,12 @@ async function probe(change) {
             patch.object(
                 proxy,
                 "_create_proxy_extension",
-                return_value="proxy-extension.zip",
+                return_value=Mock(spec=_PrivateDirectory),
             ),
         ):
             result = proxy.configure_proxy()
 
-        self.assertEqual(result, "proxy-extension.zip")
+        self.assertIsInstance(result, _PrivateDirectory)
         logger.debug.assert_any_call("Using authenticated residential proxy")
         rendered_arguments = repr(logger.method_calls)
         self.assertNotIn("secret-user", rendered_arguments)
@@ -180,7 +180,7 @@ async function probe(change) {
                     proxy_password,
                 )
 
-            background = (Path(result) / "background.js").read_text(encoding="utf-8")
+            background = (result.path / "background.js").read_text(encoding="utf-8")
             self.assertIn(f"host: {json.dumps(proxy_host)}", background)
             self.assertIn(f"username: {json.dumps(proxy_user)}", background)
             self.assertIn(f"password: {json.dumps(proxy_password)}", background)
@@ -220,10 +220,19 @@ async function probe(change) {
     def test_extension_write_failure_removes_only_its_captured_directory(self) -> None:
         for symlink in (False, True):
             with self.subTest(symlink=symlink):
-                self._assert_extension_cleanup_preserves_replacement(symlink)
+                self._assert_extension_cleanup_preserves_replacement(
+                    symlink, final_write_succeeds=False
+                )
+
+    def test_successful_final_write_does_not_transfer_replaced_directory(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_extension_cleanup_preserves_replacement(
+                    symlink, final_write_succeeds=True
+                )
 
     def _assert_extension_cleanup_preserves_replacement(
-        self, replace_with_symlink: bool
+        self, replace_with_symlink: bool, *, final_write_succeeds: bool
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as root:
             parent = Path(root)
@@ -238,14 +247,24 @@ async function probe(change) {
             failure = OSError("synthetic extension write failure")
 
             def replace_during_write(path: Path, content: str, *, encoding: str) -> int:
-                if path.name != "background.js":
+                target = (
+                    "verification-token" if final_write_succeeds else "background.js"
+                )
+                if path.name != target:
                     return original_write(path, content, encoding=encoding)
+                written = (
+                    original_write(path, content, encoding=encoding)
+                    if final_write_succeeds
+                    else 0
+                )
                 plugin.rename(original)
                 if replace_with_symlink:
                     plugin.symlink_to(unrelated, target_is_directory=True)
                 else:
                     unrelated.rename(plugin)
-                raise failure
+                if not final_write_succeeds:
+                    raise failure
+                return written
 
             try:
                 with (
@@ -316,7 +335,7 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_residential_extension_missing_or_failed_never_navigates(
         self,
     ) -> None:
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
         self.addCleanup(shutil.rmtree, directory)
         for state in ("missing", "rejected", "script-error"):
             with self.subTest(state=state):
@@ -347,7 +366,7 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
                 navigate.assert_not_awaited()
 
     async def test_residential_extension_accepts_only_boolean_receipt(self) -> None:
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
+        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
         self.addCleanup(shutil.rmtree, directory)
         target = SimpleNamespace(
             type_="service_worker",

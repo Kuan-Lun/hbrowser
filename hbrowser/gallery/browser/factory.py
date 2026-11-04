@@ -1024,9 +1024,14 @@ async def _create_browser(headless: bool) -> tuple[zd.Browser, zd.Tab]:
         # Select the effective route before admitting any external process.
         # The residential extension already has priority in _build_config;
         # its validation and actual materialization are this decision's input.
-        proxy_extension = configure_proxy(cleanup_deadline=browser_startup_deadline)
-        if proxy_extension is not None:
-            private_guards.append(_PrivateDirectory.capture(Path(proxy_extension)))
+        proxy_directory = configure_proxy(cleanup_deadline=browser_startup_deadline)
+        if proxy_directory is not None:
+            private_guards.append(proxy_directory)
+            if not proxy_directory._assert_identity_or_absence():
+                raise ProcessOwnershipError(
+                    "Proxy extension disappeared before handoff"
+                )
+            proxy_extension = str(proxy_directory.path)
         use_tor = proxy_extension is None and should_use_tor()
         if use_tor:
             socks_port = find_available_port(TOR_SOCKS_PORT)
