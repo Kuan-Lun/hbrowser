@@ -1035,6 +1035,7 @@ close_forwarded_logging()
                 "legacy-token",
                 "deep-json",
                 "oversized-integer",
+                "overflowing-timestamp",
             ):
                 with self.subTest(authenticated=authenticated, malformed=malformed):
                     self._assert_invalid_frame_health(authenticated, malformed)
@@ -1063,6 +1064,26 @@ close_forwarded_logging()
                 ).encode(),
                 "deep-json": b"[" * 2000 + b"0" + b"]" * 2000,
                 "oversized-integer": b"1" * 5000,
+                "overflowing-timestamp": _raw_forwarding_frame(
+                    {
+                        "type": "record",
+                        "record": {
+                            "logger": "hbrowser.tests.overflow",
+                            "level": "INFO",
+                            "message": "invalid timestamp",
+                            "created": 10**400,
+                            "account": None,
+                            "realm": None,
+                            "tab_role": None,
+                            "activity": None,
+                            "scope": None,
+                            "process_id": 1,
+                            "thread_id": 1,
+                            "exception": None,
+                            "stack": None,
+                        },
+                    }
+                )[4:],
             }
             client_thread: Thread | None = None
 

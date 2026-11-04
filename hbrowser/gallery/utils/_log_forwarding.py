@@ -232,8 +232,7 @@ def _decode_record(value: object) -> ForwardedRecord:
     if (
         isinstance(created, bool)
         or not isinstance(created, int | float)
-        or not math.isfinite(float(created))
-        or not 0 <= float(created) <= _MAX_CREATED_TIMESTAMP
+        or not 0 <= created <= _MAX_CREATED_TIMESTAMP
     ):
         raise ForwardingProtocolError("forwarding timestamp is invalid")
 
