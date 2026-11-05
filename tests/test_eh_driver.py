@@ -1262,20 +1262,43 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(driver.get_urls, [EXH_HOME, url])
 
-    async def test_real_ban_notices_override_apparent_search_results(self) -> None:
+    async def test_standalone_ban_responses_reject_search(self) -> None:
         for notice in (
             "<p>Your IP address has been temporarily banned.</p>",
-            '<div role="alert">Your IP address has been temporarily banned '
+            '<div style="text-align:center">'
+            "Your IP address has been temporarily banned "
             "for 1 minute.</div>",
             "<main>Your IP&nbsp;address has been <b>temporarily</b> banned.</main>",
         ):
             with self.subTest(notice=notice):
-                html = _result_page("30 days", SCOPE_GALLERY).replace(
-                    "</body>", notice + "</body>"
-                )
+                html = "<html><body>" + notice + "</body></html>"
                 await self._assert_scope_error(
                     _Document(url=EXH_HOME, html_reads=(html,)), SearchRateLimitError
                 )
+
+    async def test_embedded_ban_text_does_not_override_normal_search_results(
+        self,
+    ) -> None:
+        query = "Your IP address has been temporarily banned for 30 days"
+        for region in (
+            '<div class="c6">{text}</div>',
+            '<div class="unknown-content">{text}</div>',
+            "<p>{text}</p>",
+            '<main><div role="alert">{text}</div></main>',
+        ):
+            with self.subTest(region=region):
+                driver = _HarnessExHDriver()
+                driver.add_route(EXH_HOME, _scope_document())
+                url = _search_url(query)
+                html = _result_page(query, GID_349189_GALLERY).replace(
+                    "</body>", region.format(text=escape(query)) + "</body>"
+                )
+                driver.add_route(url, _Document(url=url, html_reads=(html,)))
+                result = await driver.search(SearchRequest(EXH_HOME, query))
+                self.assertEqual(
+                    [gallery.gid for gallery in result.galleries], [349189]
+                )
+                self.assertEqual(driver.get_urls, [EXH_HOME, url])
 
     async def test_search_data_scripts_and_unrelated_controls_are_not_authority(
         self,

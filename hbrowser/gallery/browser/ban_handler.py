@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from bs4 import BeautifulSoup
+from bs4.element import Comment, Doctype, NavigableString, Tag
 
 from ..utils import (
     Deadline,
@@ -25,6 +26,29 @@ _BAN_NOTICE_PATTERN = re.compile(
 )
 _DURATION_UNIT = r"[0-9]+\s+(?:days?|hours?|minutes?)\b"
 _NOTICE_DURATION = rf"({_DURATION_UNIT}(?:\s*(?:,\s*|and\s+)?{_DURATION_UNIT})*)"
+# A ban replaces the normal page with a standalone text response. These tags
+# only lay out that response; named/interactive/user-content regions are not
+# authority, regardless of their particular CSS class or position on a page.
+_NOTICE_LAYOUT_TAGS = frozenset(
+    {
+        "div",
+        "main",
+        "section",
+        "p",
+        "br",
+        "span",
+        "b",
+        "strong",
+        "i",
+        "em",
+        "small",
+        "center",
+        "pre",
+        "h1",
+        "h2",
+    }
+)
+_NOTICE_LAYOUT_ATTRIBUTES = frozenset({"style", "align", "lang", "dir"})
 _BLANK_PAGE = "<html><head></head><body></body></html>"
 _HOUR_SECONDS = 60 * 60
 _BLANK_PAGE_QUICK_RETRIES = 3
@@ -108,26 +132,43 @@ def check_ban_status(source: str) -> BanStatus:
 
 
 def _ban_notice_document(source: str) -> str | None:
-    """Separate server notices from reflected search/gallery and quoted data."""
+    """Recognize a dedicated ban response, never a notice found inside a page.
+
+    The accepted contract is plain/body text with optional presentational
+    markup. A general div/p/role is not a server-notice identity. In particular,
+    do not remove normal page regions and reinterpret the remainder as a ban.
+    """
 
     document = BeautifulSoup(source, "html.parser")
-    for region in document.select(
-        "head, script, style, template, input, textarea, select, "
-        "#f_search, .itg, .searchtext, #gn, #gj, .glink, "
-        "blockquote, q, pre, code"
-    ):
-        if region.parent is not None:
-            region.decompose()
-    visible_text = " ".join(document.get_text(" ", strip=True).split())
-    notices = document.select("body, main, section, div, p, h1, h2, [role='alert']")
-    if _BAN_NOTICE_PATTERN.match(visible_text) or any(
-        _BAN_NOTICE_PATTERN.match(" ".join(notice.get_text(" ", strip=True).split()))
-        for notice in notices
-    ):
-        # Expiry may be in the paragraph following the notice. Retain the
-        # surrounding server document, but never restore discarded data regions.
-        return visible_text
-    return None
+    if any(len(document.find_all(name)) > 1 for name in ("html", "head", "body")):
+        return None
+    head = document.head
+    if head is not None:
+        if head.parent is not document and head.parent is not document.html:
+            return None
+        head.decompose()
+    root = document.body or document.html or document
+    child: Tag = root
+    for parent in root.parents:
+        if parent is not document and parent.name != "html":
+            return None
+        for sibling in parent.contents:
+            if sibling is child or isinstance(sibling, Comment | Doctype):
+                continue
+            if isinstance(sibling, NavigableString) and not sibling.strip():
+                continue
+            return None
+        child = parent
+    if root.name == "body" and set(root.attrs) - _NOTICE_LAYOUT_ATTRIBUTES:
+        return None
+    for element in root.find_all(True):
+        if (
+            element.name not in _NOTICE_LAYOUT_TAGS
+            or set(element.attrs) - _NOTICE_LAYOUT_ATTRIBUTES
+        ):
+            return None
+    visible_text = " ".join(root.get_text(" ", strip=True).split())
+    return visible_text if _BAN_NOTICE_PATTERN.match(visible_text) else None
 
 
 def _notice_wait_seconds(notice: str) -> int:

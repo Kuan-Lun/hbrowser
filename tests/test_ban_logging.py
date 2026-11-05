@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import unittest
 from html import escape
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+from h2h_galleryinfo_parser import GalleryURLParser
 
 from hbrowser import BrowserMutationOutcomeUnknownError
 from hbrowser.gallery.browser import ban_handler
 from hbrowser.gallery.eh_driver import EHDriver, _RawPageSnapshot
+from hbrowser.gallery.utils import Deadline
 
 _BAN_NOTICE = "Your IP address has been temporarily banned"
 
@@ -18,6 +22,22 @@ def _search_document(query: str, title: str) -> str:
         f'<div class="searchtext">Results for {escape(query)}</div>'
         f'<div class="itg"><a href="/g/1/abcdef/">{escape(title)}</a></div>'
         "</body></html>"
+    )
+
+
+def _gallery_document(
+    text: str,
+    *,
+    comment_markup: str = '<div class="c6">{text}</div>',
+    data_first: bool = False,
+) -> str:
+    title = f'<div id="gd2"><h1 id="gn">{escape(text)}</h1></div>'
+    comments = '<div id="cdiv">' + comment_markup.format(text=escape(text)) + "</div>"
+    contents = comments + title if data_first else title + comments
+    return (
+        "<html><head><title>Gallery</title></head><body>"
+        + contents
+        + '<table id="taglist"><tr><td>Tags</td></tr></table></body></html>'
     )
 
 
@@ -55,18 +75,53 @@ class BanClassificationTests(unittest.TestCase):
             _BAN_NOTICE,
             f"<html>{_BAN_NOTICE}</html>",
             f"<html><body>{_BAN_NOTICE}.</body></html>",
-            f"<nav>Home</nav><main><p>{_BAN_NOTICE}</p></main>",
-            f'<div role="alert">{_BAN_NOTICE}: excessive pageloads.</div>',
+            f"<main><p>{_BAN_NOTICE}</p></main>",
+            f'<div style="text-align:center">{_BAN_NOTICE}: excessive pageloads.</div>',
+            '<html><body><pre style="white-space:pre-wrap">'
+            f"{_BAN_NOTICE}</pre></body></html>",
             "<p>Your IP&nbsp;address has been <b>temporarily</b> banned.</p>",
-            _search_document("30 days", "2 hours").replace(
-                "</body>", f"<p>{_BAN_NOTICE}</p></body>"
-            ),
         )
         for document in notices:
             with self.subTest(document=document):
                 status = ban_handler.check_ban_status(document)
                 self.assertTrue(status.is_banned)
                 self.assertTrue(status.should_wait)
+
+    def test_gallery_data_cannot_become_document_authority_in_any_position(
+        self,
+    ) -> None:
+        for text in (_BAN_NOTICE, _BAN_NOTICE + " for 30 days"):
+            for markup in (
+                '<div class="c6">{text}</div>',
+                '<div class="new-user-region">{text}</div>',
+                '<div role="alert">{text}</div>',
+                "<p>{text}</p>",
+                "<main><section><div>{text}</div></section></main>",
+                "<pre>{text}</pre>",
+            ):
+                for data_first in (False, True):
+                    source = _gallery_document(
+                        text, comment_markup=markup, data_first=data_first
+                    )
+                    with self.subTest(text=text, markup=markup, first=data_first):
+                        self.assertFalse(
+                            ban_handler.check_ban_status(source).should_wait
+                        )
+
+    def test_normal_document_cannot_be_stripped_into_a_standalone_notice(self) -> None:
+        for content in (
+            "<p>" + _BAN_NOTICE + "</p>" + _search_document("30 days", "1 hour"),
+            _search_document("30 days", "1 hour").replace(
+                "</body>", "<p>" + _BAN_NOTICE + "</p></body>"
+            ),
+            '<body><div class="c6">' + _BAN_NOTICE + "</div></body>",
+            '<body><div role="alert">' + _BAN_NOTICE + "</div></body>",
+            "<body><p>" + _BAN_NOTICE + "</p></body><p>Gallery data</p>",
+            '<div class="c6"><body>' + _BAN_NOTICE + "</body></div>",
+            "<body>" + _BAN_NOTICE + "</body><body>Gallery data</body>",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(ban_handler.check_ban_status(content).should_wait)
 
     def test_blank_page_contract_is_unchanged(self) -> None:
         status = ban_handler.check_ban_status("<html><head></head><body></body></html>")
@@ -78,6 +133,120 @@ class BanClassificationTests(unittest.TestCase):
         self.assertEqual(
             ban_handler.parse_ban_time("1 day, 2 hours and 3 minutes"), 93780
         )
+
+
+class GalleryBanNavigationTests(unittest.IsolatedAsyncioTestCase):
+    def _driver(self) -> EHDriver:
+        browser = SimpleNamespace(tabs=[])
+        element = SimpleNamespace(text="synthetic-tag", attrs={"href": "/tag/example"})
+        page = SimpleNamespace(
+            browser=browser,
+            xpath=AsyncMock(return_value=[element]),
+        )
+        driver = EHDriver(headless=True)
+        driver.bind_existing_browser(browser, page, owns_browser=False)
+        return driver
+
+    async def _invoke(self, driver: EHDriver, operation: str) -> None:
+        gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        if operation == "get":
+            await driver.get(gallery.url)
+            driver.page.xpath.assert_not_awaited()
+        elif operation == "tags":
+            tags = await driver.gallery2tag(gallery, "language")
+            self.assertEqual([tag.name for tag in tags], ["synthetic-tag"])
+            driver.page.xpath.assert_awaited_once()
+        else:
+            # The scripted availability response exercises the real bounded
+            # download entry through its normal early return, without a popup.
+            result = await driver._download(gallery, deadline=Deadline.after(10))
+            self.assertFalse(result)
+            driver.page.xpath.assert_awaited_once()
+
+    async def test_gallery_user_content_never_starts_ban_wait_or_reload(self) -> None:
+        for operation in ("get", "tags", "download"):
+            for text in (_BAN_NOTICE, _BAN_NOTICE + " for 30 days"):
+                for markup in (
+                    '<div class="c6">{text}</div>',
+                    '<section role="alert">{text}</section>',
+                    "<p>{text}</p>",
+                ):
+                    source = _gallery_document(
+                        text, comment_markup=markup, data_first=True
+                    )
+                    driver = self._driver()
+                    with (
+                        self.subTest(operation=operation, text=text, markup=markup),
+                        patch.object(
+                            ban_handler, "navigate_and_wait", new=AsyncMock()
+                        ) as navigate,
+                        patch.object(
+                            ban_handler,
+                            "_read_content_before",
+                            new=AsyncMock(return_value=source),
+                        ) as read,
+                        patch.object(
+                            ban_handler,
+                            "_wait_out_ban",
+                            new=AsyncMock(
+                                side_effect=AssertionError(
+                                    "user content cannot authorize waiting"
+                                )
+                            ),
+                        ) as wait,
+                        patch.object(
+                            ban_handler,
+                            "reload_and_wait",
+                            new=AsyncMock(
+                                side_effect=AssertionError(
+                                    "user content cannot authorize reload"
+                                )
+                            ),
+                        ) as reload,
+                    ):
+                        await self._invoke(driver, operation)
+                    navigate.assert_awaited_once()
+                    read.assert_awaited_once()
+                    wait.assert_not_awaited()
+                    reload.assert_not_awaited()
+
+    async def test_gallery_entrypoints_respect_standalone_ban_and_missing_duration(
+        self,
+    ) -> None:
+        for operation in ("get", "tags", "download"):
+            for duration in (" for 1 minute", ""):
+                source = f"<html><body><p>{_BAN_NOTICE}{duration}.</p></body></html>"
+                driver = self._driver()
+                with (
+                    self.subTest(operation=operation, duration=duration),
+                    patch.object(ban_handler, "navigate_and_wait", new=AsyncMock()),
+                    patch.object(
+                        ban_handler,
+                        "_read_content_before",
+                        new=AsyncMock(
+                            side_effect=[source, _gallery_document("Normal title")]
+                        ),
+                    ) as read,
+                    patch.object(ban_handler, "_wait_out_ban", new=AsyncMock()) as wait,
+                    patch.object(
+                        ban_handler, "reload_and_wait", new=AsyncMock()
+                    ) as reload,
+                ):
+                    if duration:
+                        await self._invoke(driver, operation)
+                        wait.assert_awaited_once()
+                        assert wait.await_args is not None
+                        self.assertEqual(wait.await_args.args[0], 60)
+                        reload.assert_awaited_once()
+                        self.assertEqual(read.await_count, 2)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "positive wait duration"
+                        ):
+                            await self._invoke(driver, operation)
+                        driver.page.xpath.assert_not_awaited()
+                        wait.assert_not_awaited()
+                        reload.assert_not_awaited()
 
 
 class BanLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -109,7 +278,7 @@ class BanLoggingTests(unittest.IsolatedAsyncioTestCase):
                 wait.assert_not_awaited()
                 reload.assert_not_awaited()
 
-    async def test_real_notice_duration_ignores_reflected_query_and_gallery_data(
+    async def test_embedded_notice_cannot_authorize_wait_on_a_normal_document(
         self,
     ) -> None:
         reflected = _BAN_NOTICE + " for 30 days"
@@ -131,14 +300,13 @@ class BanLoggingTests(unittest.IsolatedAsyncioTestCase):
             await ban_handler.handle_ban_decorator(object())(
                 "https://example.test/search"
             )
-        wait.assert_awaited_once_with(60, deadline=None)
-        reload.assert_awaited_once()
+        wait.assert_not_awaited()
+        reload.assert_not_awaited()
 
     async def test_missing_notice_duration_cannot_borrow_unrelated_time(self) -> None:
-        source = _search_document(_BAN_NOTICE + " for 30 days", "1 hour").replace(
-            "</body>",
-            f"<p>{_BAN_NOTICE} for excessive pageloads.</p>"
-            "<p>Member for 2 days.</p></body>",
+        source = (
+            f"<html><body><p>{_BAN_NOTICE} for excessive pageloads.</p>"
+            "<p>Member for 2 days.</p></body></html>"
         )
         with (
             patch.object(ban_handler, "_wait_out_ban", new=AsyncMock()) as wait,
@@ -198,9 +366,11 @@ class BanLoggingTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         for banned in (False, True):
-            body = f"<blockquote>{_BAN_NOTICE}</blockquote>"
-            if banned:
-                body += f"<p>{_BAN_NOTICE}.</p>"
+            body = (
+                f"<p>{_BAN_NOTICE}.</p>"
+                if banned
+                else f"<blockquote>{_BAN_NOTICE}</blockquote>"
+            )
             source = f"<html><body><main>{body}</main></body></html>"
             snapshot = _RawPageSnapshot(
                 url="https://e-hentai.org/news.php",
