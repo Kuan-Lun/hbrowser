@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import unittest
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -43,6 +44,7 @@ from hbrowser.gallery.eh_driver import (
     _ArchivePopupIdentity,
     _NextPageState,
     _parse_search_page,
+    _SearchPageSnapshot,
     _wait_for_archive_document,
 )
 from hbrowser.gallery.exh_driver import ExHDriver
@@ -1419,6 +1421,8 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
         query = "artist:test"
         first_url = _search_url(query)
         unsafe_urls = (
+            "https://[",
+            "https://[invalid/",
             "https://e-hentai.org/?f_search=artist%3Atest&f_cats=0&next=2",
             "https://evil.example/?f_search=artist%3Atest&next=2",
             "https://exhentai.org/gallery?f_search=artist%3Atest&next=2",
@@ -1453,11 +1457,12 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
                     driver,
                     "_save_search_diagnostic",
                     new=AsyncMock(return_value=None),
-                ),
+                ) as diagnostic,
                 self.assertRaises(SearchPaginationError),
             ):
                 await driver.search(SearchRequest(EXH_HOME, query))
             self.assertEqual(driver.get_urls, [EXH_HOME, first_url])
+            diagnostic.assert_awaited_once()
 
     async def test_pagination_cycle_fails_before_another_get(self) -> None:
         query = "artist:test"
@@ -1593,6 +1598,128 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.sleep_patch.stop()
 
+    async def test_lookup_rejects_results_that_finish_after_the_shared_deadline(
+        self,
+    ) -> None:
+        for stage, found, expected_gets in (
+            ("validation", True, 2),
+            ("validation", False, 4),
+            ("search-result", True, 2),
+            ("search-result", False, 4),
+            ("search-log", True, 2),
+            ("search-log", False, 4),
+            ("found-result", True, 2),
+            ("first-empty-log", False, 2),
+            ("missing-result", False, 4),
+            ("missing-log", False, 4),
+        ):
+            with self.subTest(stage=stage, found=found):
+                await self._assert_late_lookup_rejected(stage, found, expected_gets)
+
+    async def _assert_late_lookup_rejected(
+        self, stage: str, found: bool, expected_gets: int
+    ) -> None:
+        gid = 349189
+        query = f"gid:{gid}"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        driver.logger = Mock()
+        driver.add_route(EXH_HOME, _scope_document(), _scope_document())
+        html = (
+            _result_page(query, GID_349189_GALLERY)
+            if found
+            else _no_results_page(query)
+        )
+        driver.add_route(
+            search_url,
+            _Document(url=search_url, html_reads=(html,)),
+            _Document(url=search_url, html_reads=(html,)),
+        )
+        now = time.monotonic()
+        expired_at = now + 20
+        reached = False
+        original_validate = driver._validate_search_page
+
+        def expire_at(point: str) -> None:
+            nonlocal now, reached
+            if point == stage and (
+                found
+                or point == "first-empty-log"
+                or driver.get_urls.count(search_url) == 2
+            ):
+                reached = True
+                now = expired_at
+
+        async def validate(
+            snapshot: _SearchPageSnapshot,
+            *,
+            expected_origin: tuple[str, str],
+            expected_query: str | None,
+            expected_context: tuple[tuple[str, str], ...] | None = None,
+            diagnostic_query: str,
+        ) -> None:
+            await original_validate(
+                snapshot,
+                expected_origin=expected_origin,
+                expected_query=expected_query,
+                expected_context=expected_context,
+                diagnostic_query=diagnostic_query,
+            )
+            if expected_query is not None:
+                expire_at("validation")
+
+        def search_result(
+            *,
+            request: SearchRequest,
+            galleries: tuple[GalleryURLParser, ...],
+            pages_visited: int,
+        ) -> GallerySearchResult:
+            result = GallerySearchResult(request, galleries, pages_visited)
+            expire_at("search-result")
+            return result
+
+        def found_result(
+            *, requested_gid: int, gallery: GalleryURLParser
+        ) -> GalleryFound:
+            result = GalleryFound(requested_gid, gallery)
+            expire_at("found-result")
+            return result
+
+        def missing_result(*, gid: int, confirmations: int) -> ConfirmedGalleryMissing:
+            result = ConfirmedGalleryMissing(gid, confirmations)
+            expire_at("missing-result")
+            return result
+
+        def log(message: str, *_arguments: object) -> None:
+            if message.startswith("Gallery search completed"):
+                expire_at("search-log")
+            elif message.startswith("Exact gallery lookup was empty"):
+                expire_at("first-empty-log")
+            elif message.startswith("Gallery absence confirmed"):
+                expire_at("missing-log")
+
+        driver.logger.debug.side_effect = log
+        driver.logger.info.side_effect = log
+        with (
+            patch.object(time, "monotonic", side_effect=lambda: now),
+            patch.object(driver, "_validate_search_page", new=validate),
+            patch("hbrowser.gallery.eh_driver.GallerySearchResult", new=search_result),
+            patch("hbrowser.gallery.eh_driver.GalleryFound", new=found_result),
+            patch(
+                "hbrowser.gallery.eh_driver.ConfirmedGalleryMissing", new=missing_result
+            ),
+            self.assertRaises(SearchNavigationError),
+        ):
+            await driver.lookup_gid(gid)
+        self.assertTrue(reached, "the intended completion boundary was not exercised")
+        self.assertEqual(len(driver.get_urls), expected_gets)
+        expirations = {
+            deadline.expires_at
+            for deadline in driver.get_deadlines
+            if deadline is not None
+        }
+        self.assertEqual(len(expirations), 1)
+
     async def test_two_empty_confirmations_use_two_independent_result_gets(
         self,
     ) -> None:
@@ -1661,6 +1788,43 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Gallery search started", info_text)
         self.assertNotIn("Gallery search completed", info_text)
         driver.logger.warning.assert_not_called()
+
+    async def test_standalone_search_keeps_its_per_document_time_budget(self) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        driver.logger = Mock()
+        driver.add_route(EXH_HOME, _scope_document())
+        driver.add_route(
+            search_url,
+            _Document(
+                url=search_url,
+                html_reads=(_result_page(query, GID_349189_GALLERY),),
+            ),
+        )
+        start = time.monotonic()
+        now = start
+
+        def log(message: str, *_arguments: object) -> None:
+            nonlocal now
+            if message.startswith(
+                ("Gallery search started", "Gallery search completed")
+            ):
+                now += 6
+
+        driver.logger.debug.side_effect = log
+        with patch.object(time, "monotonic", side_effect=lambda: now):
+            result = await driver.search(SearchRequest(EXH_HOME, query))
+
+        self.assertEqual(now - start, 12)
+        self.assertEqual(len(result.galleries), 1)
+        document_deadlines = [
+            deadline for deadline in driver.get_deadlines if deadline is not None
+        ]
+        self.assertEqual(len(document_deadlines), 2)
+        self.assertGreater(
+            document_deadlines[1].expires_at, document_deadlines[0].expires_at
+        )
 
     async def test_empty_then_found_is_not_misclassified_as_missing(self) -> None:
         gid = 349189

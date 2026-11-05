@@ -81,6 +81,16 @@ def _require_active_deadline(deadline: Deadline | None, description: str) -> Non
         raise TimeoutError(f"{description} completed after its deadline")
 
 
+def _require_search_deadline(deadline: Deadline | None, *, url: str) -> None:
+    if deadline is not None and deadline.expired:
+        raise SearchNavigationError(
+            url=url,
+            reason=(
+                "the shared gallery search deadline expired before result acceptance"
+            ),
+        )
+
+
 def _archive_url_identity(url: str) -> tuple[str, str, str, dict[str, list[str]]]:
     parts = urlsplit(url)
     if (
@@ -1252,8 +1262,8 @@ class EHDriver(Driver):
                 snapshot,
             )
 
-        next_url = urljoin(snapshot.url, snapshot.next_href)
         try:
+            next_url = urljoin(snapshot.url, snapshot.next_href)
             next_origin = _trusted_origin(next_url)
             parsed_next = urlsplit(next_url)
         except InvalidSearchRequestError, ValueError:
@@ -1430,6 +1440,7 @@ class EHDriver(Driver):
                 "search() requires a SearchRequest instance"
             )
 
+        _require_search_deadline(deadline, url=request.scope_url)
         origin, query, initial_url = await self._resolve_search_request(
             request,
             deadline=deadline,
@@ -1449,6 +1460,7 @@ class EHDriver(Driver):
         pages_visited = 0
 
         while True:
+            _require_search_deadline(deadline, url=current_url)
             snapshot = await self._navigate_search_url(
                 query,
                 current_url,
@@ -1461,6 +1473,7 @@ class EHDriver(Driver):
                 expected_context=expected_context,
                 diagnostic_query=query,
             )
+            _require_search_deadline(deadline, url=current_url)
             page_identity = self._page_identity(snapshot.url)
             if page_identity != self._page_identity(current_url):
                 await self._raise_search_page_error(
@@ -1510,6 +1523,7 @@ class EHDriver(Driver):
                     len(result.galleries),
                     result.pages_visited,
                 )
+                _require_search_deadline(deadline, url=current_url)
                 return result
 
             if pages_visited == request.max_pages:
@@ -1550,6 +1564,7 @@ class EHDriver(Driver):
         # GETs, including their scope reads, share one semantic deadline.
         lookup_deadline = Deadline.after(SEARCH_PAGE_TIMEOUT_SECONDS)
         for confirmation in range(1, MINIMUM_MISSING_CONFIRMATIONS + 1):
+            _require_search_deadline(lookup_deadline, url=request.scope_url)
             result = await self._search(request, deadline=lookup_deadline)
             if len(result.galleries) > 1:
                 raise GalleryLookupError(
@@ -1557,10 +1572,12 @@ class EHDriver(Driver):
                     f"{len(result.galleries)} logical galleries"
                 )
             if result.galleries:
-                return GalleryFound(
+                found = GalleryFound(
                     requested_gid=gid,
                     gallery=result.galleries[0],
                 )
+                _require_search_deadline(lookup_deadline, url=request.scope_url)
+                return found
             self.logger.debug(
                 "Exact gallery lookup was empty: gid=%d confirmation=%d/%d",
                 gid,
@@ -1568,15 +1585,17 @@ class EHDriver(Driver):
                 MINIMUM_MISSING_CONFIRMATIONS,
             )
 
+        missing = ConfirmedGalleryMissing(
+            gid=gid,
+            confirmations=MINIMUM_MISSING_CONFIRMATIONS,
+        )
         self.logger.info(
             "Gallery absence confirmed: gid=%d confirmations=%d",
             gid,
             MINIMUM_MISSING_CONFIRMATIONS,
         )
-        return ConfirmedGalleryMissing(
-            gid=gid,
-            confirmations=MINIMUM_MISSING_CONFIRMATIONS,
-        )
+        _require_search_deadline(lookup_deadline, url=request.scope_url)
+        return missing
 
     async def download(self, gallery: GalleryURLParser) -> bool:
         self.logger.info(
