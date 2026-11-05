@@ -602,8 +602,8 @@ class BrowserOwner[BrowserT, TabT]:
         """Run one shared close attempt within the first caller's deadline."""
 
         # Capture the caller's absolute boundary before contending on the
-        # lifecycle lock. The first close owns this generation's single
-        # deadline; concurrent and retrying callers cannot reset it.
+        # lifecycle lock. The first close owns the current attempt's deadline;
+        # concurrent callers cannot reset it while its cleanup is unresolved.
         requested_deadline = (
             Deadline.after(_OWNER_CLOSE_DEADLINE_SECONDS)
             if deadline is None
@@ -631,20 +631,7 @@ class BrowserOwner[BrowserT, TabT]:
                     "waiting for lifecycle lock"
                 )
             if self._close_task is not None and self._close_task.done():
-                completed_task = self._close_task
-                completed_error = (
-                    None if completed_task.cancelled() else completed_task.exception()
-                )
                 self._close_task = None
-                if (
-                    self._state is not BrowserOwnerState.CLOSED
-                    and (completed_task.cancelled() or completed_error is not None)
-                    and self._browser_closer_task is None
-                ):
-                    # A finished outer attempt cannot extend an unresolved
-                    # inner closer. Reconcile that task against its original
-                    # deadline, even if it completed since the outer timeout.
-                    self._close_deadline = None
             if self._close_task is not None:
                 close_task = self._close_task
             elif self._state is BrowserOwnerState.CLOSED:
@@ -654,6 +641,17 @@ class BrowserOwner[BrowserT, TabT]:
                     "Browser-owner close caller deadline expired before cleanup"
                 )
             else:
+                closer_task = self._browser_closer_task
+                if closer_task is None or (
+                    closer_task.done()
+                    and (closer_task.cancelled() or closer_task.exception() is not None)
+                ):
+                    # This explicit caller may retry a terminal failed attempt,
+                    # including cleanup started directly by start(). Pending
+                    # work and late positive results retain their original
+                    # deadline until the exact closer has been reconciled.
+                    self._browser_closer_task = None
+                    self._close_deadline = None
                 self._state = BrowserOwnerState.CLOSING
                 close_deadline = self._shared_close_deadline(requested_deadline)
                 self._close_task = asyncio.create_task(
