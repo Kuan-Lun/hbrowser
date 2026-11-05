@@ -6902,6 +6902,191 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class PrivateCleanupSpawnHandoffTests(unittest.TestCase):
+    def test_pre_spawn_registration_failure_completes_original_observation(
+        self,
+    ) -> None:
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                self._assert_registration_failure(registered=registered)
+
+    def _assert_registration_failure(self, *, registered: bool) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        captured: list[process_module._ActivePrivateDirectoryCleanup] = []
+        actual_register = process_module._register_active_private_directory_cleanup
+
+        def fail_registration(
+            active: process_module._ActivePrivateDirectoryCleanup,
+        ) -> None:
+            captured.append(active)
+            observation = active.observation
+            assert isinstance(observation, runtime_test_owner._Observation)
+            self.assertIn(observation, registry.observations)
+            self.assertTrue(observation.starting)
+            self.assertIsNotNone(observation.callback)
+            self.assertFalse(active.spawn_attempted)
+            if registered:
+                actual_register(active)
+            raise OSError("registration interrupted")
+
+        with tempfile.TemporaryDirectory(prefix="hbrowser-cleanup-admission-") as name:
+            private = Path(name) / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            claim = process_module._register_pending_private_directory(guard)
+            deadline = time.monotonic() + 10
+            try:
+                with (
+                    patch.object(
+                        process_module,
+                        "_register_active_private_directory_cleanup",
+                        side_effect=fail_registration,
+                    ),
+                    patch.object(subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(OSError, "registration interrupted"),
+                ):
+                    process_module._spawn_private_directory_cleanup(
+                        guard,
+                        claim=claim,
+                        work_deadline=deadline,
+                        ownership_deadline=deadline,
+                    )
+                popen.assert_not_called()
+                self.assertEqual(len(captured), 1)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                self.assertTrue(private.exists())
+                self.assertEqual(set(registry.observations), observations_before)
+            finally:
+                guard.remove(deadline=deadline)
+
+    def test_unknown_private_spawn_retains_exact_owner_and_foreign_directory(
+        self,
+    ) -> None:
+        for fault in ("popen return", "handle assignment"):
+            with self.subTest(fault=fault):
+                self._assert_unknown_private_spawn(fault)
+
+    def _assert_unknown_private_spawn(self, fault: str) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        actual_popen = subprocess.Popen
+        active_type = process_module._ActivePrivateDirectoryCleanup
+        actual_setattr = active_type.__setattr__
+        children: list[subprocess.Popen[bytes]] = []
+        captured: list[process_module._ActivePrivateDirectoryCleanup] = []
+        actual_register = process_module._register_active_private_directory_cleanup
+        failure = OSError("private worker handle handoff interrupted")
+
+        def record_original_owner(
+            active: process_module._ActivePrivateDirectoryCleanup,
+        ) -> None:
+            captured.append(active)
+            actual_register(active)
+
+        def lose_returned_handle(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            child = actual_popen(*args, **kwargs)
+            children.append(child)
+            raise failure
+
+        def lose_assigned_handle(
+            active: process_module._ActivePrivateDirectoryCleanup,
+            name: str,
+            value: Any,
+        ) -> None:
+            if name == "process" and value is not None:
+                children.append(value)
+                raise failure
+            actual_setattr(active, name, value)
+
+        with tempfile.TemporaryDirectory(prefix="hbrowser-cleanup-handoff-") as name:
+            root = Path(name)
+            private = root / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            claim = process_module._register_pending_private_directory(guard)
+            deadline = time.monotonic() + 10
+            original = root / "original"
+            foreign = root / "foreign"
+            retained = None
+            try:
+                with ExitStack() as patches:
+                    patches.enter_context(
+                        patch.object(
+                            process_module,
+                            "_register_active_private_directory_cleanup",
+                            side_effect=record_original_owner,
+                        )
+                    )
+                    patches.enter_context(
+                        patch.object(
+                            subprocess, "Popen", side_effect=lose_returned_handle
+                        )
+                        if fault == "popen return"
+                        else patch.object(
+                            active_type, "__setattr__", new=lose_assigned_handle
+                        )
+                    )
+                    with self.assertRaises(process_module.ProcessOwnershipError):
+                        process_module._spawn_private_directory_cleanup(
+                            guard,
+                            claim=claim,
+                            work_deadline=deadline,
+                            ownership_deadline=deadline,
+                        )
+                self.assertEqual(len(children), 1)
+                retained = process_module._active_private_directory_cleanup(guard)
+                self.assertIsNotNone(retained)
+                assert retained is not None
+                self.assertTrue(retained.spawn_attempted)
+                self.assertIsNone(retained.process)
+                observation = retained.observation
+                assert isinstance(observation, runtime_test_owner._Observation)
+                self.assertFalse(observation.starting)
+                self.assertFalse(observation.completed)
+                assert observation.callback is not None
+                private.rename(original)
+                private.mkdir()
+                (private / "marker").write_text("preserve", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "spawn outcome is unknown"
+                ):
+                    observation.callback(deadline)
+                self.assertIn(observation, registry.observations)
+                self.assertIsNone(children[0].poll())
+                self.assertEqual((private / "marker").read_text(), "preserve")
+                self.assertFalse(guard._pin.retired)
+                if os.name == "posix":
+                    assert retained.identity_channel is not None
+                    self.assertGreaterEqual(retained.identity_channel.fileno(), 0)
+            finally:
+                # This controlled injector alone retained the actual handle.
+                # Production may not rediscover authority from a PID or path.
+                if children:
+                    # Keep the test safe even when a regression incorrectly
+                    # erased the registry entry before this assertion failed.
+                    retained = captured[0]
+                    retained.process = children[0]
+                    observation = retained.observation
+                    assert isinstance(observation, runtime_test_owner._Observation)
+                    if observation.callback is not None:
+                        observation.callback(deadline)
+                    else:
+                        process_module._force_reap_private_directory_cleanup(
+                            retained, deadline=deadline
+                        )
+                if original.exists():
+                    private.rename(foreign)
+                    original.rename(private)
+                guard.remove(deadline=deadline)
+            self.assertIsNotNone(children[0].poll())
+            self.assertEqual((foreign / "marker").read_text(), "preserve")
+            self.assertFalse(private.exists())
+            self.assertEqual(set(registry.observations), observations_before)
+
+
 class CapturedPrivatePathLaunchTests(unittest.TestCase):
     def test_replaced_captured_directory_is_rejected_before_target_launch(self) -> None:
         registry = runtime_test_owner._current()
@@ -6975,6 +7160,11 @@ class CapturedPrivatePathLaunchTests(unittest.TestCase):
     def test_unknown_spawn_retains_obligation_until_exact_handle_is_recovered(
         self,
     ) -> None:
+        for fault in ("popen return", "handle assignment"):
+            with self.subTest(fault=fault):
+                self._assert_unknown_spawn_retained(fault)
+
+    def _assert_unknown_spawn_retained(self, fault: str) -> None:
         registry = runtime_test_owner._current()
         observations_before = set(registry.observations)
         owners_before = set(process_module._PROVISIONAL_OWNERS)
@@ -6982,6 +7172,8 @@ class CapturedPrivatePathLaunchTests(unittest.TestCase):
         children: list[subprocess.Popen[bytes]] = []
         failure = OSError("launch returned an unknown outcome")
         deadline = time.monotonic() + 10
+        owner_type = process_module._ProvisionalProcessOwner
+        actual_setattr = owner_type.__setattr__
 
         def lose_returned_handle(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
             # The fault injector retains the actual Popen object. Production
@@ -6990,9 +7182,23 @@ class CapturedPrivatePathLaunchTests(unittest.TestCase):
             children.append(child)
             raise failure
 
+        def lose_assigned_handle(
+            owner: process_module._ProvisionalProcessOwner, name: str, value: Any
+        ) -> None:
+            if name == "supervisor" and value is not None:
+                children.append(value)
+                raise failure
+            actual_setattr(owner, name, value)
+
         try:
             with (
-                patch.object(subprocess, "Popen", side_effect=lose_returned_handle),
+                (
+                    patch.object(subprocess, "Popen", side_effect=lose_returned_handle)
+                    if fault == "popen return"
+                    else patch.object(
+                        owner_type, "__setattr__", new=lose_assigned_handle
+                    )
+                ),
                 self.assertRaises(process_module.ProcessOwnershipError),
             ):
                 process_module.start_owned_process(

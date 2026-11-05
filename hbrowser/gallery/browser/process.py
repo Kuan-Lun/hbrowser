@@ -2080,6 +2080,7 @@ class _ActivePrivateDirectoryCleanup:
     worker_diagnostic: str | None = None
     observation: ProcessObservation | None = None
     identity_channel: socket.socket | None = None
+    spawn_attempted: bool = False
 
 
 _PRIVATE_DIRECTORY_CLEANUP_LOCK = threading.Lock()
@@ -2243,6 +2244,13 @@ def _force_reap_private_directory_cleanup(
 ) -> None:
     process = active.process
     if process is None:
+        if active.spawn_attempted:
+            # Popen can create the worker before failing to return its handle.
+            # Preserve the original pins, channel and observation until that
+            # exact worker can be reaped; None is not proof of no process.
+            raise ProcessOwnershipError(
+                "Private directory cleanup worker spawn outcome is unknown"
+            )
         windows_job = active.windows_job
         if windows_job is not None:
             windows_job.close()
@@ -2294,6 +2302,13 @@ def _spawn_private_directory_cleanup(
     observation = _process_observation.admit(recovery=True, deadline=ownership_deadline)
     active = _ActivePrivateDirectoryCleanup(guard=guard, observation=observation)
     try:
+        if observation is not None:
+            observation.bind(
+                lambda deadline: _force_reap_private_directory_cleanup(
+                    active, deadline=deadline
+                ),
+                deadline=ownership_deadline,
+            )
         _register_active_private_directory_cleanup(active)
         platform_name = _ownership_platform()
         executable, environment = _supervisor_launch_context(platform_name)
@@ -2339,27 +2354,27 @@ def _spawn_private_directory_cleanup(
                 startupinfo = startupinfo_type()
                 startupinfo.lpAttributeList = {"handle_list": inherited}
                 creation_options["startupinfo"] = startupinfo
+            command = [
+                executable,
+                "-E",
+                "-S",
+                str(_PRIVATE_CLEANUP_WORKER_PATH),
+                str(guard.cleanup_path),
+                str(guard.device),
+                str(guard.inode),
+                guard.platform_name,
+                repr(work_deadline),
+                str(claim.path),
+                str(claim.namespace.device) if claim.namespace is not None else "-1",
+                str(claim.namespace.inode) if claim.namespace is not None else "-1",
+                "1" if claim.confirmed else "0",
+                str(root_handle),
+                str(namespace_handle),
+                str(channel_handle),
+            ]
+            active.spawn_attempted = True
             process = subprocess.Popen(
-                [
-                    executable,
-                    "-E",
-                    "-S",
-                    str(_PRIVATE_CLEANUP_WORKER_PATH),
-                    str(guard.cleanup_path),
-                    str(guard.device),
-                    str(guard.inode),
-                    guard.platform_name,
-                    repr(work_deadline),
-                    str(claim.path),
-                    str(claim.namespace.device)
-                    if claim.namespace is not None
-                    else "-1",
-                    str(claim.namespace.inode) if claim.namespace is not None else "-1",
-                    "1" if claim.confirmed else "0",
-                    str(root_handle),
-                    str(namespace_handle),
-                    str(channel_handle),
-                ],
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2368,13 +2383,6 @@ def _spawn_private_directory_cleanup(
                 **creation_options,
             )
             active.process = process
-        if observation is not None:
-            observation.bind(
-                lambda deadline: _force_reap_private_directory_cleanup(
-                    active, deadline=deadline
-                ),
-                deadline=ownership_deadline,
-            )
         if active.windows_job is not None:
             active.windows_job.assign(process)
             active.windows_job_assigned = True
