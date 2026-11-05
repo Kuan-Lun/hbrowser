@@ -206,6 +206,7 @@ class FlareSolverrSolveReceipt:
 
     result: FlareSolverrResult = field(repr=False)
     session_generation: int
+    _scope_identity: object = field(default_factory=object, repr=False, compare=False)
 
 
 class FlareSolverrSession:
@@ -318,6 +319,7 @@ class FlareSolverrSessionScope:
         self._attempts_used = 0
         self._session: FlareSolverrSession | None = None
         self._session_generation = 0
+        self._receipt_identity = object()
         self._identity_generation: int | None = None
         self._closed = False
         self._unavailable = False
@@ -370,8 +372,10 @@ class FlareSolverrSessionScope:
         """Anchor only a receipt issued for the current session generation."""
         if self._closed:
             raise ValueError("FlareSolverr session scope is closed")
-        if self._session is None or (
-            receipt.session_generation != self._session_generation
+        if (
+            self._session is None
+            or receipt._scope_identity is not self._receipt_identity
+            or receipt.session_generation != self._session_generation
         ):
             raise ValueError(
                 "FlareSolverr solve receipt is not from the current session generation"
@@ -443,6 +447,7 @@ class FlareSolverrSessionScope:
                 receipt = FlareSolverrSolveReceipt(
                     result=result,
                     session_generation=generation,
+                    _scope_identity=self._receipt_identity,
                 )
                 _require_flaresolverr_deadline(deadline)
                 return receipt

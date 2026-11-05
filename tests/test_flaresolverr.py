@@ -1073,6 +1073,57 @@ class FlareSolverrTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
 
+    async def test_equal_generation_receipts_cannot_cross_scopes(self) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _HTTP(
+            _created("first-scope"),
+            _solution(user_agent="first-agent"),
+            _created("second-scope"),
+            _solution(user_agent="second-agent"),
+            _destroyed(),
+            _destroyed(),
+        )
+        client._http = http  # type: ignore[assignment]
+
+        async with (
+            client.session(max_attempts=1) as first,
+            client.session(max_attempts=1) as second,
+        ):
+            first_receipt = await first.solve_managed(LOGIN_URL)
+            second_receipt = await second.solve_managed(LOGIN_URL)
+            self.assertEqual(first_receipt.session_generation, 1)
+            self.assertEqual(second_receipt.session_generation, 1)
+            for scope, foreign, own in (
+                (first, second_receipt, first_receipt),
+                (second, first_receipt, second_receipt),
+            ):
+                with self.subTest(scope=scope):
+                    with self.assertRaises(ValueError):
+                        scope.mark_identity_applied(foreign)
+                    self.assertIsNone(scope._identity_generation)
+                    scope.mark_identity_applied(own)
+                    self.assertEqual(scope._identity_generation, 1)
+
+        self.assertEqual(_destroy_sessions(http), ["second-scope", "first-scope"])
+
+    async def test_copied_public_receipt_fields_do_not_prove_scope_issuance(
+        self,
+    ) -> None:
+        client = FlareSolverrClient("http://127.0.0.1:8191/v1")
+        http = _HTTP(_created("scope"), _solution(), _destroyed())
+        client._http = http  # type: ignore[assignment]
+
+        async with client.session(max_attempts=1) as scope:
+            original = await scope.solve_managed(LOGIN_URL)
+            unissued = FlareSolverrSolveReceipt(
+                result=original.result,
+                session_generation=original.session_generation,
+            )
+            with self.assertRaises(ValueError):
+                scope.mark_identity_applied(unissued)
+            self.assertIsNone(scope._identity_generation)
+            scope.mark_identity_applied(original)
+
     async def test_session_creation_request_failure_is_retried_within_budget(
         self,
     ) -> None:
