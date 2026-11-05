@@ -18,7 +18,8 @@ import zendriver as zd
 from zendriver import cdp
 
 from hbrowser import BrowserMutationOutcomeUnknownError
-from hbrowser.gallery.browser import factory
+from hbrowser.gallery.browser import BrowserOwner, BrowserOwnerState, factory
+from hbrowser.gallery.browser import owner as owner_module
 from hbrowser.gallery.browser import process as process_module
 from hbrowser.gallery.browser import tor as tor_module
 from hbrowser.gallery.browser.process import (
@@ -395,7 +396,7 @@ class _OwnedBrowser:
     def __init__(self) -> None:
         self.connection = None
         self.targets: list[object] = []
-        self._tor_process = None
+        self._tor_process: OwnedProcess | None = None
         self.stop = AsyncMock()
         self.process_owner = _bind_browser_process_owner(self)
 
@@ -1966,6 +1967,148 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             caller_deadline.expires_at,
         )
 
+    async def test_default_owner_retries_expired_terminal_resource_failure(
+        self,
+    ) -> None:
+        for resource in ("browser", "tor"):
+            with self.subTest(resource=resource):
+                await self._assert_default_owner_resource_retry(resource)
+
+    async def _assert_default_owner_resource_retry(self, resource: str) -> None:
+        browser = _OwnedBrowser()
+        if resource == "tor":
+            browser._tor_process = cast(OwnedProcess, Mock(spec=OwnedProcess))
+        tab = SimpleNamespace(target_id="main")
+        owner: BrowserOwner[_OwnedBrowser, SimpleNamespace] = BrowserOwner(
+            browser_factory=AsyncMock(return_value=(browser, tab)),
+            target_id_getter=lambda item: item.target_id,
+        )
+        now = 0.0
+        resource_deadlines: list[float] = []
+        original_error = RuntimeError("temporary resource cleanup failure")
+
+        def release_resource(*_args: object, **kwargs: Any) -> None:
+            nonlocal now
+            deadline = kwargs["deadline"]
+            expires_at = (
+                deadline.expires_at if isinstance(deadline, Deadline) else deadline
+            )
+            resource_deadlines.append(expires_at)
+            if len(resource_deadlines) == 1:
+                now = expires_at
+                raise original_error
+
+        if resource == "browser":
+            browser.process_owner.shutdown.side_effect = release_resource
+        registered: set[object] = {browser}
+        with (
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+            patch(
+                "hbrowser.gallery.browser.factory.asyncio_atexit.unregister"
+            ) as unregister,
+            patch.object(zd.util, "get_registered_instances", return_value=registered),
+            patch.object(
+                factory,
+                "terminate_tor_process",
+                side_effect=release_resource if resource == "tor" else None,
+            ),
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ),
+        ):
+            factory._register_browser_atexit(cast(zd.Browser, browser))
+            cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+            try:
+                await owner.start()
+                first_deadline = Deadline(5.0)
+                with self.assertRaises(
+                    (ProcessOwnershipError, owner_module.BrowserOwnershipError)
+                ):
+                    await asyncio.wait_for(owner.close(deadline=first_deadline), 1)
+                inner = owner._browser_closer_task
+                if inner is not None:
+                    await asyncio.wait_for(
+                        asyncio.gather(inner, return_exceptions=True), 1
+                    )
+                retirement = _begin_zendriver_retirement(browser)
+                failed_task = retirement.existing_shutdown_task()
+                assert failed_task is not None
+                self.assertTrue(failed_task.done())
+                self.assertIsInstance(failed_task.exception(), ProcessOwnershipError)
+                self.assertFalse(retirement.is_complete())
+                self.assertIs(cleanup.browser, browser)
+                self.assertIn(browser, registered)
+                unregister.assert_not_called()
+                self.assertEqual(retirement.bind_shutdown_deadline(8.0), 5.0)
+                self.assertEqual(resource_deadlines, [5.0])
+
+                await asyncio.wait_for(owner.close(deadline=Deadline(8.0)), 1)
+
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                self.assertTrue(retirement.is_complete())
+                self.assertEqual(resource_deadlines, [5.0, 8.0])
+                self.assertEqual(retirement.bind_shutdown_deadline(9.0), 8.0)
+                self.assertIsNot(retirement.existing_shutdown_task(), failed_task)
+                self.assertIsNone(cleanup.browser)
+                self.assertNotIn(browser, registered)
+                unregister.assert_called_once_with(cleanup, loop=cleanup.loop)
+                browser.stop.assert_awaited_once()
+                await owner.close(deadline=Deadline(9.0))
+                self.assertEqual(resource_deadlines, [5.0, 8.0])
+            finally:
+                # The synthetic durable owner has no OS resources, but finish
+                # its real factory lifecycle even when the regression fails.
+                browser.process_owner.shutdown.side_effect = None
+                await cleanup()
+
+    async def test_expired_retry_does_not_renew_retained_inner_cleanup(self) -> None:
+        for pending_kind in ("browser", "tor", "connection", "listener", "disposal"):
+            with self.subTest(pending_kind=pending_kind):
+                await self._assert_retained_inner_deadline(pending_kind)
+
+    async def _assert_retained_inner_deadline(self, pending_kind: str) -> None:
+        browser = _OwnedBrowser()
+        retirement = _begin_zendriver_retirement(browser)
+        retirement.bind_shutdown_deadline(0.0)
+        release = asyncio.Event()
+
+        async def retained_cleanup() -> None:
+            await release.wait()
+
+        async def failed_attempt() -> None:
+            raise ProcessOwnershipError("retained inner cleanup is unresolved")
+
+        pending = asyncio.create_task(retained_cleanup())
+        failed = asyncio.create_task(failed_attempt())
+        await asyncio.gather(failed, return_exceptions=True)
+        retirement.bind_shutdown_task(failed)
+        if pending_kind == "browser":
+            retirement.bind_browser_stop_task(pending)
+        elif pending_kind == "tor":
+            retirement.bind_tor_stop_task(pending)
+        elif pending_kind == "disposal":
+            retirement.lifecycle.rejected_disposal_tasks[1] = pending
+        else:
+            connection = SimpleNamespace(websocket=None, mapper={})
+            if pending_kind == "connection":
+                setattr(connection, factory._CONNECTION_CLOSE_TASK_ATTRIBUTE, pending)
+            else:
+                connection.listener = SimpleNamespace(task=pending)
+            retirement.capture_connections((connection,))
+        try:
+            with self.assertRaisesRegex(ProcessOwnershipError, "deadline expired"):
+                await factory.stop_browser(browser, Deadline.after(1))
+            self.assertIs(retirement.existing_shutdown_task(), failed)
+            self.assertEqual(retirement.bind_shutdown_deadline(1.0), 0.0)
+            self.assertFalse(pending.done())
+            self.assertFalse(pending.cancelling())
+            self.assertFalse(retirement.is_complete())
+            browser.stop.assert_not_awaited()
+            browser.process_owner.shutdown.assert_not_called()
+        finally:
+            release.set()
+            await asyncio.wait_for(pending, 1)
+
     async def test_ownership_release_failures_remain_retryable(self) -> None:
         unregister_browser = _OwnedBrowser()
         registered_instances: set[object] = {unregister_browser}
@@ -2064,6 +2207,50 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         # Avoid mutating asyncio-atexit's live callback iteration. The package
         # clears every callback only after all registered browsers have run.
         unregister_cleanup.assert_not_called()
+
+    async def test_atexit_keeps_an_unexpired_failed_attempt_deadline(self) -> None:
+        browser = _OwnedBrowser()
+        browser.process_owner.shutdown.side_effect = [
+            RuntimeError("initial process cleanup failed"),
+            RuntimeError("fallback process cleanup failed"),
+            None,
+        ]
+        now = 0.0
+        with (
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.unregister"),
+            patch.object(zd.util, "get_registered_instances", return_value={browser}),
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ),
+        ):
+            factory._register_browser_atexit(cast(zd.Browser, browser))
+            cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+            try:
+                with self.assertRaises(ProcessOwnershipError):
+                    await factory.stop_browser(browser, Deadline(5.0))
+                retirement = _begin_zendriver_retirement(browser)
+                failed = retirement.existing_shutdown_task()
+                assert failed is not None
+                self.assertTrue(failed.done())
+                now = 1.0
+
+                await cleanup()
+
+                self.assertTrue(retirement.is_complete())
+                self.assertEqual(retirement.bind_shutdown_deadline(16.0), 5.0)
+                self.assertEqual(browser.process_owner.shutdown.call_count, 3)
+                self.assertEqual(
+                    [
+                        call.kwargs["deadline"]
+                        for call in browser.process_owner.shutdown.call_args_list
+                    ],
+                    [5.0, 5.0, 5.0],
+                )
+                browser.stop.assert_awaited_once()
+            finally:
+                browser.process_owner.shutdown.side_effect = None
+                await cleanup()
 
     async def test_atexit_recovers_shutdown_that_expired_before_task_creation(
         self,
