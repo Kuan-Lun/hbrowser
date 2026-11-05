@@ -5,8 +5,10 @@ from __future__ import annotations
 import array
 import ctypes
 import os
+import select
 import socket
 import stat
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -304,6 +306,9 @@ class DirectoryPin:
         # Allocate all Python coordination state before accepting a descriptor.
         # A retained constructor traceback must not keep an acquired fd alive.
         self._descriptor: int | None = None
+        self._deletion_watch: select.kqueue | None = None
+        self._deletion_proven = False
+        self._deletion_watch_failed = False
         self._retired = False
         self._delegate: DirectoryPin | None = None
         self._lock = threading.RLock()
@@ -315,6 +320,7 @@ class DirectoryPin:
         cls, descriptor: int, *, windows_api: _WindowsDirectoryApi | None = None
     ) -> DirectoryPin:
         pin = None
+        watch = None
         try:
             pin = cls()
             os.set_inheritable(descriptor, False)
@@ -332,15 +338,68 @@ class DirectoryPin:
                     raise DirectoryIdentityError(
                         "Directory stat does not match its full native identity"
                     )
+            elif sys.platform == "darwin":
+                # APFS may retain a positive link count after rmdir. Register
+                # while this descriptor is being adopted, before path/handshake
+                # validation permits any caller or worker to delete the object.
+                watch = select.kqueue()
+                os.set_inheritable(watch.fileno(), False)
+                watch.control(
+                    [
+                        select.kevent(
+                            descriptor,
+                            filter=select.KQ_FILTER_VNODE,
+                            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                            fflags=select.KQ_NOTE_DELETE
+                            | select.KQ_NOTE_RENAME
+                            | select.KQ_NOTE_REVOKE,
+                        )
+                    ],
+                    0,
+                    0,
+                )
+                pin._deletion_watch = watch
             pin._descriptor = descriptor
             return pin
-        except BaseException:
+        except BaseException as error:
             # This is the sole failure-close owner, including cls.__new__ and
             # lock allocation. Disarm any retained object before closing once.
             if pin is not None:
                 pin._descriptor = None
-            os.close(descriptor)
+                pin._deletion_watch = None
+            try:
+                cls._close_native_handles(descriptor, watch)
+            except BaseException as close_error:
+                error.add_note(
+                    "Native directory acquisition cleanup also failed: "
+                    f"{type(close_error).__name__}"
+                )
             raise
+
+    @staticmethod
+    def _close_native_handles(
+        descriptor: int | None, watch: select.kqueue | None
+    ) -> None:
+        """Attempt each detached native resource once, even if another fails."""
+        failure: BaseException | None = None
+        if watch is not None:
+            try:
+                watch.close()
+            except BaseException as error:
+                failure = error
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                else:
+                    failure.add_note(
+                        "Directory descriptor close also failed: "
+                        f"{type(error).__name__}"
+                    )
+        if failure is not None:
+            raise failure
 
     @classmethod
     def capture(cls, path: Path) -> DirectoryPin:
@@ -421,8 +480,17 @@ class DirectoryPin:
             # Both descriptors still pin this generation, so matching native IDs
             # cannot be a reuse. Keep one pin throughout the redundant close.
             # An ambiguous close leaves the other wrapper failed, not delegated.
+            if authority._deletion_watch is not None:
+                # Preserve an already-consumed NOTE_DELETE before retiring the
+                # redundant queue. Never replace positive evidence with a later
+                # empty event read from another alias.
+                authority_deleted = authority.deleted()
+                redundant_deleted = redundant.deleted()
+                authority._deletion_proven = authority_deleted or redundant_deleted
+            watch = redundant._deletion_watch
             redundant._descriptor = None
-            os.close(descriptor)
+            redundant._deletion_watch = None
+            self._close_native_handles(descriptor, watch)
             redundant._delegate = authority
 
     @property
@@ -441,8 +509,9 @@ class DirectoryPin:
     def deleted(self) -> bool:
         """Return positive native deletion evidence, or a retired authority.
 
-        False is inconclusive: some filesystems retain a directory's link count
-        after rmdir. It must never authorize adopting a replacement generation.
+        Darwin uses a capture-time NOTE_DELETE, because rmdir need not zero its
+        link count. A late event registration or an absent name is not evidence.
+        Other POSIX filesystems with nonzero link counts remain inconclusive.
         """
         authority = self.authority
         if authority is not self:
@@ -453,7 +522,37 @@ class DirectoryPin:
             descriptor = self._require_descriptor()
             if os.name == "nt":
                 return _WindowsDirectoryApi().deleted(_windows_handle(descriptor))
-            return os.fstat(descriptor).st_nlink == 0
+            if sys.platform == "darwin":
+                if self._deletion_proven:
+                    return True
+                if self._deletion_watch_failed:
+                    raise DirectoryIdentityError("Directory deletion watch is unproven")
+                watch = self._deletion_watch
+                if watch is None:
+                    raise DirectoryIdentityError(
+                        "Directory pin lacks its deletion watch"
+                    )
+                try:
+                    events = watch.control(None, 1, 0)
+                except (OSError, ValueError) as error:
+                    self._deletion_watch_failed = True
+                    raise DirectoryIdentityError(
+                        "Directory deletion watch failed"
+                    ) from error
+                for event in events:
+                    if (
+                        event.ident != descriptor
+                        or event.filter != select.KQ_FILTER_VNODE
+                        or event.flags & select.KQ_EV_ERROR
+                        or event.fflags & select.KQ_NOTE_REVOKE
+                    ):
+                        self._deletion_watch_failed = True
+                        raise DirectoryIdentityError("Invalid directory deletion event")
+                    if event.fflags & select.KQ_NOTE_DELETE:
+                        self._deletion_proven = True
+                return self._deletion_proven
+            else:
+                return os.fstat(descriptor).st_nlink == 0
 
     def duplicate_descriptor(self) -> int:
         authority = self.authority
@@ -565,16 +664,20 @@ class DirectoryPin:
             # Never retry close against a potentially reused descriptor after an
             # ambiguous close error. Such a pin remains failed, not completed.
             self._descriptor = None
-            os.close(descriptor)
+            watch = self._deletion_watch
+            self._deletion_watch = None
+            self._close_native_handles(descriptor, watch)
             self._retired = True
 
     def __del__(self) -> None:
         descriptor = getattr(self, "_descriptor", None)
-        if descriptor is not None:
+        watch = getattr(self, "_deletion_watch", None)
+        if descriptor is not None or watch is not None:
             self._descriptor = None
+            self._deletion_watch = None
             try:
-                os.close(descriptor)
-            except OSError:
+                self._close_native_handles(descriptor, watch)
+            except BaseException:
                 pass
 
 

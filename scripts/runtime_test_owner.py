@@ -119,9 +119,13 @@ class _Observation:
     def __init__(self, registry: _Registry) -> None:
         self.registry = registry
         self.thread = threading.get_ident()
-        self.starting = True
+        self._startup_finished = threading.Event()
         self.completed = False
         self.callback: Callable[[float], None] | None = None
+
+    @property
+    def starting(self) -> bool:
+        return not self._startup_finished.is_set()
 
     def bind(self, cleanup: Callable[[float], None], *, deadline: float) -> None:
         with self.registry.locked(deadline):
@@ -129,22 +133,31 @@ class _Observation:
                 raise RuntimeError("Runtime observation cannot change stable ownership")
             self.callback = cleanup
 
-    def finish_start(self, *, deadline: float) -> None:
-        with self.registry.locked(deadline):
-            self.starting = False
-            self.registry.changed.notify_all()
-        self.registry.deliver_cancel()
+    def finish_start(self, *, deadline: float, failed: bool = False) -> None:
+        # The runtime calls this only from its final startup boundary. Publish
+        # that handoff even when startup exhausted its deadline; it authorizes
+        # neither new work nor cleanup success. The original callback still
+        # owns unknown spawn outcomes and every live resource.
+        del deadline
+        self._startup_finished.set()
+        self.registry.handoff_changed.set()
+        # An ownership failure already propagating must not be replaced by
+        # cancellation or an expired observer lock. The enclosing invocation
+        # still performs its fixed-deadline close and reports cancellation.
+        if not failed:
+            self.registry.deliver_cancel()
 
     def complete(self, *, deadline: float) -> None:
         with self.registry.locked(deadline):
             self.completed = True
             self.registry.observations.discard(self)
-            self.registry.changed.notify_all()
+            self.registry.handoff_changed.set()
 
 
 class _Registry:
     def __init__(self) -> None:
         self.changed = threading.Condition(threading.RLock())
+        self.handoff_changed = threading.Event()
         self.observations: set[_Observation] = set()
         self.closing = False
         self.sealed = False
@@ -268,6 +281,10 @@ class _Registry:
             attempted: set[_Observation] = set()
             while True:
                 with self.locked(deadline):
+                    # Clear before inspecting stable tokens. A concurrent
+                    # finish either appears in this snapshot or leaves a wakeup
+                    # for the following wait; no startup lock is required.
+                    self.handoff_changed.clear()
                     if not self.observations:
                         self.sealed = True
                         break
@@ -281,8 +298,14 @@ class _Registry:
                             raise TimeoutError(
                                 "Runtime test cleanup proof is incomplete"
                             )
-                        self.changed.wait(timeout=max(0.0, deadline - time.monotonic()))
-                        continue
+                if not available:
+                    # Any handoff wakes the inventory, even if another startup
+                    # never finishes. Clean every known owner within the same
+                    # deadline while retaining all unresolved observations.
+                    self.handoff_changed.wait(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                    continue
                 for item in available:
                     attempted.add(item)
                     if item.callback is None:

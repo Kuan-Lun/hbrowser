@@ -30,11 +30,12 @@ class TorBootstrapDeadlineTests(unittest.TestCase):
         self.lines: deque[str] = deque(maxlen=256)
         self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.now))
         self.enterContext(patch.object(tor, "_find_tor_binary", return_value="/tor"))
-        self.enterContext(
-            patch.object(tempfile, "mkdtemp", return_value="/unused/mock-tor-data")
-        )
         self.start_process = self.enterContext(
-            patch.object(tor, "start_owned_process", return_value=self.owner)
+            patch.object(
+                tor,
+                "_start_owned_process_with_private_directory",
+                return_value=self.owner,
+            )
         )
         self.register = self.enterContext(patch.object(atexit, "register"))
         self.unregister = self.enterContext(patch.object(atexit, "unregister"))
@@ -248,6 +249,43 @@ class TorBootstrapDeadlineTests(unittest.TestCase):
         tor.terminate_tor_process(self.owner, deadline=Deadline.after(1))
         self.assertIsNone(cleanup._tor_process)
         self.unregister.assert_called_once_with(cleanup)
+
+
+class TorPreallocationFailureTests(unittest.TestCase):
+    def test_initial_logging_failure_does_not_leave_a_tor_directory(self) -> None:
+        self._assert_preallocation_failure(exhaust_deadline=False)
+
+    def test_expired_initial_logging_does_not_leave_a_tor_directory(self) -> None:
+        self._assert_preallocation_failure(exhaust_deadline=True)
+
+    def _assert_preallocation_failure(self, *, exhaust_deadline: bool) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_mkdtemp = tempfile.mkdtemp
+            now = time.monotonic()
+            deadline = Deadline(now + 20)
+
+            def log(_message: str) -> None:
+                nonlocal now
+                if exhaust_deadline:
+                    now = deadline.expires_at
+                else:
+                    raise RuntimeError("initial Tor logging failed")
+
+            def allocate(*args: str, **kwargs: str) -> str:
+                return original_mkdtemp(*args, **(kwargs | {"dir": str(root)}))
+
+            with (
+                patch.object(tor, "_find_tor_binary", return_value="/tor"),
+                patch.object(tor.logger, "info", side_effect=log),
+                patch.object(tempfile, "mkdtemp", side_effect=allocate),
+                patch.object(time, "monotonic", side_effect=lambda: now),
+                patch("subprocess.Popen") as spawn,
+                self.assertRaises(TimeoutError if exhaust_deadline else RuntimeError),
+            ):
+                tor._start_tor_process(9150, deadline=deadline)
+            spawn.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
 
 
 class TorCleanupDeadlineTests(unittest.TestCase):

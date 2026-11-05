@@ -7,7 +7,6 @@ import os
 import platform
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -17,7 +16,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..utils import Deadline
-from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
+from .process import (
+    OwnedProcess,
+    ProcessOwnershipError,
+    _start_owned_process_with_private_directory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,12 +221,10 @@ def _start_tor_process(
     process_startup_timeout = min(10.0, bootstrap_deadline.remaining())
     if process_startup_timeout <= 0:
         raise RuntimeError("Tor startup exceeded the shared browser deadline")
-    data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
-
     logger.info(f"Starting Tor process on SOCKS port {socks_port}...")
-    tor_process = start_owned_process(
+    tor_process = _start_owned_process_with_private_directory(
         tor_binary,
-        [
+        lambda data_dir: [
             "--SocksPort",
             str(socks_port),
             "--DataDirectory",
@@ -231,7 +232,7 @@ def _start_tor_process(
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        cleanup_paths=(data_dir,),
+        directory_prefix="tor_data_",
         startup_timeout=process_startup_timeout,
         deadline=bootstrap_deadline.expires_at,
     )

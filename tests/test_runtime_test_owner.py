@@ -457,6 +457,260 @@ def test_starting_background_owner_handoffs_before_cleanup() -> None:
     """)
 
 
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_expired_startup_handoff_preserves_failure_and_allows_registry_cleanup(
+    cancelled: bool,
+) -> None:
+    _ok(
+        """
+        import signal, sys, time
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        deadline = time.monotonic() + .3
+        failure = RuntimeError('constructor crossed startup deadline')
+        retained = []
+        def fail_late(*args, **kwargs):
+            owner, = process._PROVISIONAL_OWNERS.values()
+            retained.append(owner)
+            assert owner.supervisor is not None and owner.status_guard is not None
+            if CANCELLED:
+                registry.on_signal(signal.SIGTERM, None)
+            time.sleep(max(0, deadline - time.monotonic()) + .01)
+            raise failure
+        try:
+            with patch.object(process, 'OwnedProcess', side_effect=fail_late):
+                try:
+                    process.start_owned_process(sys.executable, ['-c', 'pass'],
+                                                deadline=deadline)
+                except process.ProcessOwnershipError as error:
+                    assert 'original resources remain unresolved' in str(error)
+                    assert isinstance(error.__cause__, process.ProcessOwnershipError)
+                    assert error.__cause__.__context__ is failure
+                else:
+                    raise AssertionError('late startup was accepted')
+            owner, = retained
+            token = owner.observation
+            assert token in registry.observations and not token.starting
+            assert not token.completed and owner.supervisor.poll() is None
+            original_guard = owner.status_guard
+            cleanup_deadline = registry.deadline
+            registry.close()
+            if CANCELLED:
+                assert registry.deadline == cleanup_deadline
+            assert registry.finished and token.completed
+            assert owner.supervisor.poll() is not None
+            assert original_guard._pin.retired and not original_guard.path.exists()
+            assert not process._PROVISIONAL_OWNERS
+            assert not registry.observations
+            if registry.scope is not None:
+                assert not registry.scope.capability.directory.exists()
+        finally:
+            # Only this injector retained the original concrete owner. Rescue
+            # it before assertion unwind; never infer a new owner from a PID.
+            for owner in retained:
+                if id(owner) in process._PROVISIONAL_OWNERS:
+                    process._cleanup_provisional_owner(owner,
+                                                       deadline=time.monotonic()+3)
+            if not registry.finished:
+                registry.close()
+    """.replace("CANCELLED", repr(cancelled))
+    )
+
+
+def test_expired_private_worker_handoff_reaches_original_registry_callback() -> None:
+    _ok("""
+        import tempfile, time
+        from pathlib import Path
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        original_popen = process.subprocess.Popen
+        children = []
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / 'private'
+            path.mkdir()
+            guard = process._PrivateDirectory.capture(path)
+            claim = process._register_pending_private_directory(guard)
+            deadline = time.monotonic()+.3
+            def slow_return(*args, **kwargs):
+                child = original_popen(*args, **kwargs)
+                children.append(child)
+                time.sleep(max(0, deadline-time.monotonic())+.01)
+                return child
+            try:
+                with patch.object(process.subprocess, 'Popen', side_effect=slow_return):
+                    active = process._spawn_private_directory_cleanup(
+                        guard, claim=claim, work_deadline=deadline,
+                        ownership_deadline=deadline)
+                assert active.process is children[0]
+                assert not active.observation.starting
+                assert not active.observation.completed
+                registry.close()
+                assert registry.finished and active.observation.completed
+                assert children[0].poll() is not None
+                assert process._active_private_directory_cleanup(guard) is None
+                assert path.exists() and not guard._pin.retired
+            finally:
+                active = process._active_private_directory_cleanup(guard)
+                if active is not None:
+                    process._force_reap_private_directory_cleanup(
+                        active, deadline=time.monotonic()+3)
+                if not registry.finished:
+                    registry.close()
+                # This fixture never permitted filesystem work. It still owns
+                # the original root, independently of the now-reaped worker.
+                assert all(child.poll() is not None for child in children)
+                process._release_pending_private_directory(guard)
+                guard._retire()
+    """)
+
+
+def test_expired_handoff_never_completes_unknown_ownership() -> None:
+    _ok("""
+        import time
+        registry = a._Registry()
+        token = registry.admit(recovery=False, deadline=time.monotonic()+1)
+        calls = []
+        failure = RuntimeError('spawn outcome remains unknown')
+        def unknown(deadline):
+            calls.append(deadline)
+            raise failure
+        token.bind(unknown, deadline=time.monotonic()+1)
+        token.finish_start(deadline=time.monotonic()-1)
+        assert not token.starting and not token.completed
+        # This unit registry never created a scope or any process. Its fixed
+        # short cleanup budget makes the fail-closed boundary deterministic.
+        registry.deadline = time.monotonic()+.03
+        original_deadline = registry.deadline
+        try:
+            registry.close()
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError('unknown ownership reported empty')
+        assert calls == [original_deadline]
+        assert registry.deadline == original_deadline
+        assert token in registry.observations and not token.completed
+        assert not registry.finished and not registry.sealed
+    """)
+
+
+def test_successful_handoff_delivers_cancel_inside_callers_exception_handler() -> None:
+    _ok("""
+        import signal, time
+        registry = a._current()
+        deadline = time.monotonic()+1
+        try:
+            # Exercise the actual post-setup cancellation boundary. A bare
+            # registry intentionally defers cancellation during construction.
+            assert not registry.deferring_cancel
+            token = registry.admit(recovery=False, deadline=deadline)
+            token.bind(lambda d: token.complete(deadline=d), deadline=deadline)
+            registry.cancelled = signal.SIGTERM
+            registry.deadline = deadline
+            registry.closing = True
+            try:
+                raise ValueError('caller is handling an unrelated failure')
+            except ValueError:
+                try:
+                    token.finish_start(deadline=deadline)
+                except KeyboardInterrupt:
+                    pass
+                else:
+                    raise AssertionError('normal cancellation was suppressed')
+            assert not token.starting and not token.completed
+        finally:
+            # This token launched no process. Its real callback and the normal
+            # registry close still release the actual nested scope on failure.
+            registry.close()
+        assert registry.finished and token.completed
+        assert registry.deadline == deadline
+        if registry.scope is not None:
+            assert not registry.scope.capability.directory.exists()
+    """)
+
+
+@pytest.mark.parametrize("phase", ["inventory", "waiting"])
+def test_one_stalled_startup_does_not_block_another_owners_cleanup(phase: str) -> None:
+    _ok(
+        """
+        import threading, time
+        from unittest.mock import patch
+        registry = a._Registry()
+        bound = time.monotonic()+1
+        registry.admit(recovery=False, deadline=bound)
+        registry.admit(recovery=False, deadline=bound)
+        # Match the old implementation's first selected token: it never finishes.
+        first, second = tuple(registry.observations)
+        calls = []
+        first.bind(lambda d: calls.append(('unready', d)), deadline=bound)
+        def complete_second(deadline):
+            assert time.monotonic() < deadline
+            calls.append(('ready', deadline))
+            second.complete(deadline=deadline)
+        second.bind(complete_second, deadline=bound)
+        waiting = threading.Event()
+        published = threading.Event()
+        errors = []
+        def finish():
+            try:
+                # The actual startup finally, not elapsed time, authorizes
+                # this callback. An expired startup budget is still allowed.
+                second.finish_start(deadline=time.monotonic()-1)
+                published.set()
+            except BaseException as error:
+                errors.append(error)
+        def background_finish():
+            if waiting.wait(2):
+                finish()
+        thread = threading.Thread(target=background_finish)
+        original_clear = registry.handoff_changed.clear
+        original_wait = registry.handoff_changed.wait
+        def clear():
+            clear_count[0] += 1
+            original_clear()
+            if PHASE == 'inventory' and clear_count[0] == 1:
+                # Clear-before-inventory must see this finished token rather
+                # than discard its notification and then sleep to the deadline.
+                finish()
+        clear_count = [0]
+        def wait(timeout=None):
+            if PHASE == 'waiting':
+                waiting.set()
+            return original_wait(timeout)
+        registry.deadline = bound
+        if PHASE == 'waiting':
+            thread.start()
+        try:
+            with (
+                patch.object(registry.handoff_changed, 'clear', side_effect=clear),
+                patch.object(registry.handoff_changed, 'wait', side_effect=wait),
+            ):
+                try:
+                    registry.close()
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError('unfinished startup reported empty')
+        finally:
+            if PHASE == 'waiting':
+                thread.join(2)
+                assert not thread.is_alive()
+        assert not errors, errors
+        assert published.is_set()
+        assert calls == [('ready', bound)], calls
+        assert first.starting and not first.completed
+        assert second.completed and second not in registry.observations
+        assert registry.observations == {first}
+        assert registry.deadline == bound
+        assert not registry.finished and not registry.sealed
+    """.replace("PHASE", repr(phase))
+    )
+
+
 def test_mock_owner_real_private_cleanup_remains_observed() -> None:
     _ok("""
         import tempfile, time

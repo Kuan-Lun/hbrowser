@@ -24,7 +24,6 @@ from hbrowser.gallery.browser import tor as tor_module
 from hbrowser.gallery.browser.process import (
     OwnedProcess,
     ProcessOwnershipError,
-    start_owned_process,
 )
 from hbrowser.gallery.browser.tor import terminate_tor_process
 from hbrowser.gallery.utils import (
@@ -3247,43 +3246,43 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 class TorRealDeadlineTests(unittest.TestCase):
     def test_bootstrap_exhaustion_reaps_process_before_returning(self) -> None:
         owners: list[OwnedProcess] = []
+        data_directories: list[Path] = []
 
         def start_fake_tor(*_args: Any, **kwargs: Any) -> OwnedProcess:
-            owner = start_owned_process(
+            def parameters(data: Path) -> list[str]:
+                data_directories.append(data)
+                return ["-c", "import time; time.sleep(60)"]
+
+            owner = process_module._start_owned_process_with_private_directory(
                 sys.executable,
-                ["-c", "import time; time.sleep(60)"],
+                parameters,
                 **kwargs,
             )
             owners.append(owner)
             return owner
 
-        with tempfile.TemporaryDirectory() as directory:
-            data = Path(directory) / "tor-data"
-            data.mkdir()
-            deadline = Deadline.after(4)
-            try:
-                with (
-                    patch.object(tor_module, "_find_tor_binary", return_value="tor"),
-                    patch.object(
-                        tor_module,
-                        "tempfile",
-                        SimpleNamespace(mkdtemp=lambda **_: str(data)),
-                    ),
-                    patch.object(tor_module, "start_owned_process", new=start_fake_tor),
-                    self.assertRaisesRegex(
-                        RuntimeError, "failed to bootstrap"
-                    ) as raised,
-                ):
-                    tor_module._start_tor_process(9150, deadline=deadline)
-                self.assertNotIsInstance(raised.exception, ProcessOwnershipError)
-                self.assertEqual(len(owners), 1)
-                self.assertIsNotNone(owners[0].poll())
-                self.assertFalse(data.exists())
-                self.assertGreater(deadline.remaining(), 0)
-            finally:
-                for owner in owners:
-                    # Negative controls must not leave a live synthetic Tor process.
-                    terminate_tor_process(owner)
+        deadline = Deadline.after(4)
+        try:
+            with (
+                patch.object(tor_module, "_find_tor_binary", return_value="tor"),
+                patch.object(
+                    tor_module,
+                    "_start_owned_process_with_private_directory",
+                    new=start_fake_tor,
+                ),
+                self.assertRaisesRegex(RuntimeError, "failed to bootstrap") as raised,
+            ):
+                tor_module._start_tor_process(9150, deadline=deadline)
+            self.assertNotIsInstance(raised.exception, ProcessOwnershipError)
+            self.assertEqual(len(owners), 1)
+            self.assertIsNotNone(owners[0].poll())
+            self.assertEqual(len(data_directories), 1)
+            self.assertFalse(data_directories[0].exists())
+            self.assertGreater(deadline.remaining(), 0)
+        finally:
+            for owner in owners:
+                # Negative controls must not leave a live synthetic Tor process.
+                terminate_tor_process(owner)
 
 
 class TorProcessCleanupTests(unittest.TestCase):
@@ -3295,14 +3294,6 @@ class TorProcessCleanupTests(unittest.TestCase):
         )
         tor_binary.start()
         self.addCleanup(tor_binary.stop)
-
-        data_directory = patch.object(
-            tempfile,
-            "mkdtemp",
-            return_value="/private/tmp/hbrowser-tor-unit-data",
-        )
-        data_directory.start()
-        self.addCleanup(data_directory.stop)
 
     @staticmethod
     def _owned_process(*, stdout: object) -> Mock:
@@ -3316,7 +3307,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 return_value=process,
             ) as start_process,
             patch("hbrowser.gallery.browser.tor.atexit.register"),
@@ -3328,7 +3319,15 @@ class TorProcessCleanupTests(unittest.TestCase):
         self.assertEqual(start_process.call_args.args[0], "/tor")
         self.assertEqual(start_process.call_args.kwargs["stdout"], subprocess.PIPE)
         self.assertEqual(start_process.call_args.kwargs["stderr"], subprocess.STDOUT)
-        self.assertEqual(len(start_process.call_args.kwargs["cleanup_paths"]), 1)
+        self.assertEqual(
+            start_process.call_args.kwargs["directory_prefix"], "tor_data_"
+        )
+        parameters = start_process.call_args.args[1]
+        data = Path("owned-tor-data")
+        self.assertEqual(
+            parameters(data),
+            ["--SocksPort", "9150", "--DataDirectory", str(data)],
+        )
         terminate_tor_process(process)
 
         process.shutdown.assert_called_once_with(
@@ -3355,7 +3354,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 return_value=process,
             ),
             patch(
@@ -3383,7 +3382,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 return_value=process,
             ),
             self.assertRaisesRegex(RuntimeError, "capture Tor process output"),
@@ -3404,7 +3403,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 return_value=process,
             ),
             self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 7"),
@@ -3430,7 +3429,11 @@ class TorProcessCleanupTests(unittest.TestCase):
             return process
 
         with (
-            patch.object(tor_module, "start_owned_process", side_effect=start_process),
+            patch.object(
+                tor_module,
+                "_start_owned_process_with_private_directory",
+                side_effect=start_process,
+            ),
             patch.object(time, "monotonic", side_effect=lambda: now[0]),
             self.assertRaisesRegex(RuntimeError, "failed to bootstrap"),
         ):
@@ -3445,7 +3448,9 @@ class TorProcessCleanupTests(unittest.TestCase):
 
     def test_expired_shared_deadline_does_not_start_tor(self) -> None:
         with (
-            patch.object(tor_module, "start_owned_process") as start_process,
+            patch.object(
+                tor_module, "_start_owned_process_with_private_directory"
+            ) as start_process,
             self.assertRaisesRegex(RuntimeError, "shared browser deadline"),
         ):
             tor_module._start_tor_process(9150, deadline=Deadline(0.0))
@@ -3515,7 +3520,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 return_value=process,
             ),
             patch(
@@ -3574,7 +3579,7 @@ class TorProcessCleanupTests(unittest.TestCase):
         with (
             patch.object(
                 tor_module,
-                "start_owned_process",
+                "_start_owned_process_with_private_directory",
                 side_effect=[first_process, second_process],
             ),
             patch(

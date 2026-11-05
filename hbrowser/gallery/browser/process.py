@@ -184,6 +184,9 @@ class _ProvisionalProcessOwner:
     observation: ProcessObservation | None = None
     status_directory: Path | None = None
     status_creation_attempted: bool = False
+    private_directory: Path | None = None
+    private_creation_attempted: bool = False
+    private_guard: _PrivateDirectory | None = None
     spawn_attempted: bool = False
 
 
@@ -283,8 +286,19 @@ class _PrivateDirectory:
             raise ProcessOwnershipError(str(error)) from error
         try:
             metadata = self.cleanup_path.lstat()
-        except FileNotFoundError:
-            return False
+        except FileNotFoundError as error:
+            # A name can disappear because the held directory was renamed.
+            # Recheck the native generation for deletion racing the path read;
+            # absence alone must never retire its cleanup responsibility.
+            try:
+                if self._pin.deleted():
+                    return False
+            except DirectoryIdentityError as identity_error:
+                raise ProcessOwnershipError(str(identity_error)) from identity_error
+            raise ProcessOwnershipError(
+                "Private generation directory name disappeared without native "
+                "deletion proof"
+            ) from error
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or getattr(metadata, "st_file_attributes", 0) & 0x400
@@ -403,8 +417,16 @@ class _PrivateDirectory:
         def claim() -> None:
             if not namespace._assert_identity_or_absence():
                 raise ProcessOwnershipError("Private cleanup namespace disappeared")
-            if claimed._assert_identity_or_absence():
-                return
+            # Before the first rename this destination legitimately has no
+            # name, while the native pin still refers to the original root.
+            # This probe authorizes only the claim transition, never completion.
+            try:
+                claimed.cleanup_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if claimed._assert_identity_or_absence():
+                    return
             if confirmed:
                 # The parent confirmed this exact root before permitting deletion.
                 return
@@ -868,9 +890,14 @@ def _cleanup_provisional_owner(
         raise ProcessOwnershipError(
             "Private status directory creation has no captured native identity"
         )
+    if owner.private_creation_attempted and owner.private_guard is None:
+        raise ProcessOwnershipError(
+            "Private startup directory creation has no captured native identity"
+        )
     guards = _normalize_private_directories(
         (
             *((owner.status_guard,) if owner.status_guard is not None else ()),
+            *((owner.private_guard,) if owner.private_guard is not None else ()),
             *owner.cleanup_guards,
         )
     )
@@ -2073,6 +2100,12 @@ class _PrivateDirectoryClaim:
             raise ProcessOwnershipError(
                 f"Unconfirmed private cleanup namespace disappeared: {self.path}"
             )
+        # Removing the namespace does not prove that a root moved outside it
+        # was deleted. Both held generations must have terminal native proof.
+        if self.guard._assert_identity_or_absence():
+            raise ProcessOwnershipError(
+                "Private cleanup namespace disappeared before root deletion"
+            )
         return True
 
 
@@ -2308,6 +2341,7 @@ def _spawn_private_directory_cleanup(
 ) -> _ActivePrivateDirectoryCleanup:
     observation = _process_observation.admit(recovery=True, deadline=ownership_deadline)
     active = _ActivePrivateDirectoryCleanup(guard=guard, observation=observation)
+    startup_failed = False
     try:
         if observation is not None:
             observation.bind(
@@ -2325,6 +2359,7 @@ def _spawn_private_directory_cleanup(
             root_handle = (
                 -1
                 if guard._pin.retired
+                or (sys.platform == "darwin" and guard._pin.deleted())
                 else transfers.enter_context(guard._pin.exported())
             )
             namespace_handle = (
@@ -2395,6 +2430,7 @@ def _spawn_private_directory_cleanup(
             active.windows_job_assigned = True
         return active
     except BaseException as startup_error:
+        startup_failed = True
         try:
             _force_reap_private_directory_cleanup(
                 active,
@@ -2412,7 +2448,7 @@ def _spawn_private_directory_cleanup(
         raise
     finally:
         if observation is not None:
-            observation.finish_start(deadline=ownership_deadline)
+            observation.finish_start(deadline=ownership_deadline, failed=startup_failed)
 
 
 def _start_private_directory_cleanup(
@@ -2782,6 +2818,58 @@ def start_owned_process(
     supported by snapshot-based ownership proof.
     """
 
+    return _start_owned_process(
+        executable,
+        parameters,
+        stdout=stdout,
+        stderr=stderr,
+        drain_output=drain_output,
+        cleanup_paths=cleanup_paths,
+        environment=environment,
+        forward_logging=forward_logging,
+        startup_timeout=startup_timeout,
+        deadline=deadline,
+    )
+
+
+def _start_owned_process_with_private_directory(
+    executable: str | Path,
+    parameters_factory: Callable[[Path], Sequence[str]],
+    *,
+    directory_prefix: str,
+    stdout: int | None = subprocess.PIPE,
+    stderr: int | None = subprocess.PIPE,
+    startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
+    deadline: float | None = None,
+) -> OwnedProcess:
+    """Allocate launch material only after its original owner is registered."""
+    return _start_owned_process(
+        executable,
+        (),
+        stdout=stdout,
+        stderr=stderr,
+        startup_timeout=startup_timeout,
+        deadline=deadline,
+        private_directory=(directory_prefix, parameters_factory),
+    )
+
+
+def _start_owned_process(
+    executable: str | Path,
+    parameters: Sequence[str],
+    *,
+    stdout: int | None = subprocess.PIPE,
+    stderr: int | None = subprocess.PIPE,
+    drain_output: bool = False,
+    cleanup_paths: Sequence[str | Path | _PrivateDirectory] = (),
+    environment: Mapping[str, str] | None = None,
+    forward_logging: bool = False,
+    startup_timeout: float = _STARTUP_TIMEOUT_SECONDS,
+    deadline: float | None = None,
+    private_directory: tuple[str, Callable[[Path], Sequence[str]]] | None = None,
+) -> OwnedProcess:
+    """Keep admission, private allocation and process launch under one owner."""
+
     if (
         isinstance(startup_timeout, bool)
         or not isinstance(startup_timeout, int | float)
@@ -2832,6 +2920,7 @@ def start_owned_process(
     windows_job: _WindowsJob | None = None
     owner: OwnedProcess | None = None
     cleanup_guard_list: list[_PrivateDirectory] = []
+    startup_failed = False
     try:
         # Bind before creating a private directory or attempting Popen. A failed
         # acquisition retains this exact owner, including an unknown outcome.
@@ -2851,6 +2940,17 @@ def start_owned_process(
         platform_name = _ownership_platform()
         status_guard = _PrivateDirectory.capture(status_directory)
         provisional_owner.status_guard = status_guard
+        if private_directory is not None:
+            prefix, parameters_factory = private_directory
+            startup_phase_timeout()
+            provisional_owner.private_creation_attempted = True
+            private_path = Path(tempfile.mkdtemp(prefix=prefix))
+            provisional_owner.private_directory = private_path
+            private_guard = _PrivateDirectory.capture(private_path)
+            provisional_owner.private_guard = private_guard
+            cleanup_guard_list.append(private_guard)
+            provisional_owner.cleanup_guards = tuple(cleanup_guard_list)
+            parameters = parameters_factory(private_path)
         for path in cleanup_paths:
             guard = (
                 path
@@ -2882,6 +2982,7 @@ def start_owned_process(
             *parameters,
         ]
         creation_options = _supervisor_creation_options()
+        startup_phase_timeout()
         provisional_owner.spawn_attempted = True
         supervisor = subprocess.Popen(
             command,
@@ -2963,6 +3064,7 @@ def start_owned_process(
             raise TimeoutError("process startup receipt arrived after its deadline")
         return owner
     except BaseException as startup_error:
+        startup_failed = True
         if owner is not None:
             try:
                 owner.shutdown(
@@ -3002,7 +3104,7 @@ def start_owned_process(
         raise
     finally:
         if observation is not None:
-            observation.finish_start(deadline=overall_deadline)
+            observation.finish_start(deadline=overall_deadline, failed=startup_failed)
 
 
 def start_owned_browser_process(
