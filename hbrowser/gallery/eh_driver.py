@@ -958,19 +958,54 @@ class EHDriver(Driver):
     @staticmethod
     def _is_challenge_page(snapshot: _SearchPageSnapshot | _RawPageSnapshot) -> bool:
         title = snapshot.title.casefold()
-        html = snapshot.html.casefold()
-        return (
-            "just a moment" in title
-            or "請稍候" in title
-            or "_cf_chl_opt" in html
-            or "cf-chl-widget" in html
-            or "cf-turnstile" in html
-            or "g-recaptcha" in html
-            or 'id="challenge-form"' in html
-            or 'id="cf-challenge-running"' in html
-            or 'id="challenge-running"' in html
-            or 'id="challenge-stage"' in html
-        )
+        if "just a moment" in title or "請稍候" in title:
+            return True
+        document = BeautifulSoup(snapshot.html, "html.parser")
+        if (
+            document.select_one(
+                ".cf-turnstile, .g-recaptcha, [id^='cf-chl-widget'], "
+                "#challenge-form, #cf-challenge-running, #challenge-running, "
+                "#challenge-stage, input[name='cf-turnstile-response'], "
+                "textarea[name='g-recaptcha-response']"
+            )
+            is not None
+        ):
+            return True
+        for element in document.select("script, iframe[src]"):
+            source = element.get("src")
+            if isinstance(source, str):
+                try:
+                    resource = urlsplit(urljoin(snapshot.url, source))
+                except ValueError:
+                    continue
+                if (
+                    resource.path.startswith("/cdn-cgi/challenge-platform/")
+                    or (
+                        resource.hostname == "challenges.cloudflare.com"
+                        and resource.path.startswith("/turnstile/")
+                    )
+                    or (
+                        resource.hostname
+                        in {"www.google.com", "www.recaptcha.net", "www.gstatic.com"}
+                        and resource.path.startswith("/recaptcha/")
+                    )
+                ):
+                    return True
+            elif element.name == "script":
+                script_type = element.get("type", "")
+                if not isinstance(script_type, str) or script_type.casefold() not in {
+                    "",
+                    "module",
+                    "text/javascript",
+                    "application/javascript",
+                }:
+                    continue
+                if re.match(
+                    r"\s*(?:(?:var|let|const)\s+)?(?:window\.)?_cf_chl_opt\s*=\s*\{",
+                    element.get_text(),
+                ):
+                    return True
+        return False
 
     @staticmethod
     def _is_authentication_page(
@@ -980,16 +1015,39 @@ class EHDriver(Driver):
             hostname = urlsplit(snapshot.url).hostname
         except ValueError:
             hostname = None
-        title = snapshot.title.casefold()
-        html = snapshot.html.casefold()
-        return (
-            hostname == "forums.e-hentai.org"
-            or title in {"log in", "login"}
-            or "you are not logged in" in html
-            or "kokomade.jpg" in html
-            or (
-                ('name="username"' in html or "name='username'" in html)
-                and ('name="password"' in html or "name='password'" in html)
+        if hostname == "forums.e-hentai.org" or snapshot.title.casefold() in {
+            "log in",
+            "login",
+        }:
+            return True
+        document = BeautifulSoup(snapshot.html, "html.parser")
+        # Search data can quote any login or challenge vocabulary. Only the
+        # surrounding page's controls and notices establish authentication loss.
+        for region in document.select("#f_search, .itg, .searchtext"):
+            region.decompose()
+        for form in document.select("form"):
+            if (
+                form.select_one("input[name='username' i]") is not None
+                and form.select_one("input[name='password' i]") is not None
+            ):
+                return True
+        for image in document.select("img[src]"):
+            source = image.get("src")
+            if isinstance(source, str):
+                try:
+                    image_path = urlsplit(source).path
+                except ValueError:
+                    continue
+                if image_path.rsplit("/", 1)[-1].casefold() == "kokomade.jpg":
+                    return True
+        return any(
+            re.match(
+                r"you are not logged in(?:[\s.!?:]|$)",
+                notice.get_text(" ", strip=True).casefold(),
+            )
+            is not None
+            for notice in document.select(
+                "body, main, div, section, p, h1, h2, [role='alert']"
             )
         )
 

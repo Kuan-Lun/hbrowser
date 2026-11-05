@@ -1218,6 +1218,133 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error_type=error_type.__name__):
                 await self._assert_scope_error(document, error_type)
 
+    async def test_search_data_cannot_impersonate_challenge_or_login_pages(
+        self,
+    ) -> None:
+        reflected_values = (
+            "g-recaptcha",
+            "cf-turnstile",
+            "cf-chl-widget",
+            "_cf_chl_opt",
+            "you are not logged in",
+            "kokomade.jpg",
+            '<div id="challenge-form">you are not logged in</div>',
+            '<input name="username"><input name="password">',
+        )
+        for query in reflected_values:
+            for empty in (False, True):
+                with self.subTest(query=query, empty=empty):
+                    driver = _HarnessExHDriver()
+                    scope = _result_page("", SCOPE_GALLERY).replace(
+                        ">Gallery<", f">{escape(query)}<"
+                    )
+                    driver.add_route(
+                        EXH_HOME, _Document(url=EXH_HOME, html_reads=(scope,))
+                    )
+                    url = _search_url(query)
+                    html = (
+                        _no_results_page(query)
+                        if empty
+                        else _result_page(query, GID_349189_GALLERY).replace(
+                            ">Gallery<", f">{escape(query)}<"
+                        )
+                    )
+                    driver.add_route(url, _Document(url=url, html_reads=(html,)))
+
+                    result = await driver.search(SearchRequest(EXH_HOME, query))
+
+                    self.assertEqual(result.pages_visited, 1)
+                    self.assertEqual(
+                        [gallery.gid for gallery in result.galleries],
+                        [] if empty else [349189],
+                    )
+                    self.assertEqual(driver.get_urls, [EXH_HOME, url])
+
+    async def test_search_data_scripts_and_unrelated_controls_are_not_authority(
+        self,
+    ) -> None:
+        query = "gid:349189"
+        ordinary_markup = (
+            '<!-- <div id="challenge-form">cf-turnstile</div> -->',
+            '<script type="application/json">'
+            '{"query":"window._cf_chl_opt = {}"}</script>',
+            '<script>const query = "_cf_chl_opt";</script>',
+            '<script>const query = ";window._cf_chl_opt = {";</script>',
+            '<form><input name="username"></form><form><input name="password"></form>',
+            '<img src="/covers/ordinary.jpg" alt="kokomade.jpg">',
+        )
+        for markup in ordinary_markup:
+            with self.subTest(markup=markup):
+                driver = _HarnessExHDriver()
+                driver.add_route(EXH_HOME, _scope_document())
+                url = _search_url(query)
+                html = _result_page(query, GID_349189_GALLERY).replace(
+                    "</body>", markup + "</body>"
+                )
+                driver.add_route(url, _Document(url=url, html_reads=(html,)))
+
+                result = await driver.search(SearchRequest(EXH_HOME, query))
+
+                self.assertEqual(
+                    [gallery.gid for gallery in result.galleries], [349189]
+                )
+
+    async def test_structural_challenges_override_an_apparent_result_page(self) -> None:
+        challenges = (
+            '<div class="g-recaptcha" data-sitekey="synthetic"></div>',
+            '<div class="cf-turnstile" data-sitekey="synthetic"></div>',
+            '<iframe id="cf-chl-widget-example"></iframe>',
+            "<div id='challenge-form'></div>",
+            "<div id='cf-challenge-running'></div>",
+            "<div id='challenge-running'></div>",
+            "<div id='challenge-stage'></div>",
+            '<input type="hidden" name="cf-turnstile-response">',
+            '<textarea name="g-recaptcha-response"></textarea>',
+            '<script>window._cf_chl_opt = {cType: "managed"};</script>',
+            '<script>var _cf_chl_opt = {cType: "managed"};</script>',
+            '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1">'
+            "</script>",
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js">'
+            "</script>",
+            '<script src="https://www.google.com/recaptcha/api.js"></script>',
+            '<iframe src="https://www.recaptcha.net/recaptcha/api2/anchor"></iframe>',
+        )
+        for challenge in challenges:
+            with self.subTest(challenge=challenge):
+                html = _result_page("", SCOPE_GALLERY).replace(
+                    "</body>", challenge + "</body>"
+                )
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)), SearchChallengeError
+                )
+
+    async def test_authentication_controls_and_notices_override_apparent_results(
+        self,
+    ) -> None:
+        authentication = (
+            '<form><input name="UserName"><input name="PassWord"></form>',
+            '<img src="/img/kokomade.jpg?cache=1">',
+            "<p>You are not logged in.</p>",
+            '<div role="alert">You are not logged in: please sign in.</div>',
+            "<nav>News</nav><main>You are not logged in.</main>",
+        )
+        for notice in authentication:
+            with self.subTest(notice=notice):
+                html = _result_page("", SCOPE_GALLERY).replace(
+                    "</body>", notice + "</body>"
+                )
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)),
+                    SearchAuthenticationError,
+                )
+        await self._assert_scope_error(
+            _Document(
+                url=EXH_HOME,
+                html_reads=("<html><body>You are not logged in.</body></html>",),
+            ),
+            SearchAuthenticationError,
+        )
+
     async def test_missing_or_invalid_next_control_fails_closed(self) -> None:
         query = "gid:1"
         url = _search_url(query)
