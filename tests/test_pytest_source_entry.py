@@ -69,9 +69,17 @@ def test_automatic_gates_execute_all_tests_despite_inherited_pytest_options(
         "test_diagnostics.py",
         "test_page_diagnostic_transport.py",
         "test_driver_shutdown_priority.py",
+        "test_process_protocol_frames.py",
     )
     for name in ownership_tests:
         (root / "tests" / name).write_text("def test_required_success(): pass\n")
+    (root / "tests/test_proxy_logging.py").write_text(
+        "import unittest\n"
+        "class ProxyLoggingTests(unittest.TestCase):\n"
+        "    def test_manifest_directory_replacement_never_receives_proxy_secrets"
+        "(self):\n"
+        "        pass\n"
+    )
     (root / "tests" / ownership_tests[0]).write_text(
         "from pathlib import Path\n"
         "def test_required_failure():\n"
