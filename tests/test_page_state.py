@@ -52,6 +52,10 @@ class _EventPage:
         self.reload_payload: dict[str, Any] | None = None
         self.selector_results: list[Any] = []
         self.selector_queries = 0
+        self.document_objects: dict[str, dict[str, str]] = {}
+        self.released_document_objects: list[str] = []
+        self.snapshot_object_ids: list[str] = []
+        self._next_object_id = 0
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     def _schedule(self, coroutine: Coroutine[Any, Any, None]) -> None:
@@ -70,6 +74,7 @@ class _EventPage:
             await handler(event, self)
 
     async def _emit_cross_document(self, loader_id: str) -> None:
+        self.loader_id = loader_id
         await self.emit(
             cdp.page.FrameNavigated,
             SimpleNamespace(
@@ -107,6 +112,20 @@ class _EventPage:
                 assert payload["params"]["worldName"] == "hbrowser.navigation-url"
                 return cdp.runtime.ExecutionContextId(123)
             case "Runtime.evaluate":
+                if payload["params"]["expression"] == "document":
+                    assert payload["params"]["returnByValue"] is False
+                    self._next_object_id += 1
+                    object_id = f"document-{self._next_object_id}"
+                    self.document_objects[object_id] = {
+                        "url": self.url,
+                        "readyState": self.ready_state,
+                    }
+                    return (
+                        SimpleNamespace(
+                            object_id=cdp.runtime.RemoteObjectId(object_id)
+                        ),
+                        None,
+                    )
                 assert payload["params"]["contextId"] == 123
                 assert payload["params"]["returnByValue"] is True
                 expression = payload["params"]["expression"]
@@ -119,6 +138,19 @@ class _EventPage:
                     ),
                     None,
                 )
+            case "Runtime.callFunctionOn":
+                params = payload["params"]
+                object_id = params["objectId"]
+                assert "this.URL" in params["functionDeclaration"]
+                assert "this.readyState" in params["functionDeclaration"]
+                assert "contextId" not in params
+                self.snapshot_object_ids.append(object_id)
+                return SimpleNamespace(value=self.document_objects[object_id]), None
+            case "Runtime.releaseObject":
+                object_id = payload["params"]["objectId"]
+                del self.document_objects[object_id]
+                self.released_document_objects.append(object_id)
+                return None
             case "Page.navigate":
                 requested_url = payload["params"]["url"]
                 self.navigation_requests.append(requested_url)
@@ -523,6 +555,176 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.url, "https://example.test/new")
         self.assertEqual(page.handlers[cdp.page.FrameNavigated], [])
         self.assertEqual(page.handlers[cdp.page.LifecycleEvent], [])
+        self.assertEqual(page.snapshot_object_ids, ["document-1"])
+        self.assertEqual(page.released_document_objects, ["document-1"])
+        self.assertFalse(page.document_objects)
+
+    async def test_navigation_receipt_rejects_intervening_document_generations(
+        self,
+    ) -> None:
+        for operation in ("navigate", "reload", "click"):
+            for transition in ("different loader", "A-B-A", "reused loader"):
+                for phase in ("capture", "snapshot", "after snapshot"):
+                    with self.subTest(
+                        operation=operation, transition=transition, phase=phase
+                    ):
+                        await self._assert_document_transition_rejected(
+                            operation, transition, phase
+                        )
+
+    async def _assert_document_transition_rejected(
+        self, operation: str, transition: str, phase: str
+    ) -> None:
+        page = _EventPage()
+        original_send = page.send
+        original_browser = page.browser
+        injected = False
+        target_url = "https://example.test/new"
+        mutation = AsyncMock()
+
+        async def change_document() -> None:
+            nonlocal injected
+            injected = True
+            original_loader = page.loader_id
+            # The URL is intentionally identical: URL equality does not prove
+            # document identity, including a restored BFCache document A.
+            page.url = target_url
+            if transition != "reused loader":
+                await page._emit_cross_document("intervening-B")
+            if transition != "different loader":
+                await page._emit_cross_document(original_loader)
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            method = payload["method"]
+            is_capture = (
+                method == "Runtime.evaluate"
+                and payload["params"]["expression"] == "document"
+            )
+            if not injected and (
+                (phase == "capture" and is_capture)
+                or (phase == "snapshot" and method == "Runtime.callFunctionOn")
+            ):
+                await change_document()
+            result = await original_send(iter((payload,)))
+            if (
+                not injected
+                and phase == "after snapshot"
+                and method == "Runtime.callFunctionOn"
+            ):
+                # Match Zendriver's queued async event callbacks rather than
+                # requiring immediate inline event delivery.
+                page._schedule(change_document())
+            return result
+
+        async def click() -> str:
+            page.url = target_url
+            await page._emit_cross_document("click-A")
+            return "accepted once"
+
+        mutation.side_effect = click
+        with patch.object(page, "send", new=send):
+            with self.assertRaisesRegex(PageStateTimeout, "document changed"):
+                if operation == "navigate":
+                    await navigate_and_wait(
+                        page, target_url, deadline=Deadline.after(1)
+                    )
+                elif operation == "reload":
+                    await reload_and_wait(page, deadline=Deadline.after(1))
+                else:
+                    await mutate_and_wait_for_navigation(
+                        page,
+                        mutation,
+                        owner=page,
+                        operation="One click",
+                        deadline=Deadline.after(1),
+                    )
+        self.assertTrue(injected)
+        self.assertFalse(page.document_objects)
+        self.assertFalse(any(page.handlers.values()))
+        if operation == "navigate":
+            self.assertEqual(page.navigation_requests, [target_url])
+        if operation == "click":
+            mutation.assert_awaited_once_with()
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(
+                asyncio.sleep(0), timeout=1, owner=original_browser
+            )
+
+    async def test_document_snapshot_uses_and_releases_captured_remote_object(
+        self,
+    ) -> None:
+        page = _EventPage()
+        original_url = page.url
+        original_send = page.send
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            result = await original_send(iter((payload,)))
+            if payload["method"] == "Runtime.evaluate":
+                # The next default execution context may belong to another
+                # document. callFunctionOn must still address the captured one.
+                page.url = "https://example.test/other-document"
+                page.ready_state = "loading"
+            return result
+
+        with patch.object(page, "send", new=send):
+            snapshot = await page_state_module._read_document_snapshot(
+                page, Deadline.after(1)
+            )
+        self.assertEqual(snapshot, (original_url, "complete"))
+        self.assertEqual(page.snapshot_object_ids, ["document-1"])
+        self.assertEqual(page.released_document_objects, ["document-1"])
+        self.assertFalse(page.document_objects)
+
+    async def test_snapshot_protocol_failure_releases_object_and_retires_browser(
+        self,
+    ) -> None:
+        page = _EventPage()
+        original_send = page.send
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            if payload["method"] == "Runtime.callFunctionOn":
+                return SimpleNamespace(value=None), {"message": "Document destroyed"}
+            return await original_send(iter((payload,)))
+
+        with patch.object(page, "send", new=send), self.assertRaises(ProtocolException):
+            await navigate_and_wait(
+                page, "https://example.test/new", deadline=Deadline.after(1)
+            )
+        self.assertFalse(page.document_objects)
+        self.assertEqual(page.released_document_objects, ["document-1"])
+        self.assertFalse(any(page.handlers.values()))
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_same_document_receipt_rejects_subsequent_fragment_change(
+        self,
+    ) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        original_send = page.send
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            if payload["method"] == "Runtime.callFunctionOn":
+                page.url = "https://example.test/old#other"
+                await page.emit(
+                    cdp.page.NavigatedWithinDocument,
+                    SimpleNamespace(frame_id="main-frame", url=page.url),
+                )
+            return await original_send(iter((payload,)))
+
+        with (
+            patch.object(page, "send", new=send),
+            self.assertRaisesRegex(PageStateTimeout, "document changed"),
+        ):
+            await navigate_and_wait(
+                page, "https://example.test/old#requested", deadline=Deadline.after(1)
+            )
+        self.assertFalse(page.document_objects)
+        self.assertFalse(any(page.handlers.values()))
 
     async def test_setup_event_before_trigger_cannot_complete_navigation(self) -> None:
         page = _EventPage()
@@ -583,6 +785,73 @@ class PageStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(time.monotonic() - started, 0.02)
         self.assertIsNone(receipt.loader_id)
         self.assertEqual(receipt.url, "https://example.test/old#new-fragment")
+
+    async def test_same_document_pre_ack_events_cannot_substitute_requested_url(
+        self,
+    ) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        requested_url = "https://example.test/old#requested"
+        other_url = "https://example.test/old#other"
+        original_send = page.send
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            if payload["method"] == "Page.navigate":
+                page.navigation_requests.append(payload["params"]["url"])
+                # Both events precede the command reply and expect_loader().
+                # Finding the requested URL somewhere in history is not proof
+                # that it is still the document's current navigation result.
+                for url in (requested_url, other_url):
+                    page.url = url
+                    await page.emit(
+                        cdp.page.NavigatedWithinDocument,
+                        SimpleNamespace(frame_id="main-frame", url=url),
+                    )
+                return "main-frame", None, None, False
+            return await original_send(iter((payload,)))
+
+        with patch.object(page, "send", new=send), self.assertRaises(PageStateTimeout):
+            await navigate_and_wait(page, requested_url, deadline=Deadline.after(0.05))
+
+        self.assertEqual(page.navigation_requests, [requested_url])
+        self.assertEqual(page.url, other_url)
+        self.assertFalse(page.snapshot_object_ids)
+        self.assertFalse(any(page.handlers.values()))
+        with self.assertRaises(ZendriverOwnerRetiredError):
+            await wait_for_zendriver(asyncio.sleep(0), timeout=1, owner=page)
+
+    async def test_same_document_pre_ack_latest_matching_target_can_complete(
+        self,
+    ) -> None:
+        page = _EventPage()
+        page.navigation_loader = None
+        requested_url = "https://example.test/old#requested"
+        original_send = page.send
+
+        async def send(command: Any) -> Any:
+            payload = next(command)
+            if payload["method"] == "Page.navigate":
+                page.navigation_requests.append(payload["params"]["url"])
+                for url in ("https://example.test/old#intermediate", requested_url):
+                    page.url = url
+                    await page.emit(
+                        cdp.page.NavigatedWithinDocument,
+                        SimpleNamespace(frame_id="main-frame", url=url),
+                    )
+                return "main-frame", None, None, False
+            return await original_send(iter((payload,)))
+
+        with patch.object(page, "send", new=send):
+            receipt = await navigate_and_wait(
+                page, requested_url, deadline=Deadline.after(1)
+            )
+
+        self.assertIsNone(receipt.loader_id)
+        self.assertEqual(receipt.url, requested_url)
+        self.assertEqual(page.navigation_requests, [requested_url])
+        self.assertFalse(page.document_objects)
+        self.assertFalse(any(page.handlers.values()))
 
     async def test_same_document_uses_browser_serialized_url(self) -> None:
         for requested, serialized in (
