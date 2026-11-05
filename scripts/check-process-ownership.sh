@@ -13,7 +13,7 @@ else
     process_python="python"
 fi
 
-"$process_python" scripts/_shared/h2h_dev_tools/git_environment.py \
+PYTEST_ADDOPTS= "$process_python" scripts/_shared/h2h_dev_tools/git_environment.py \
     --repository "$repository_root" -- "$process_python" scripts/pytest-source.py \
     tests/test_owned_process.py \
     tests/test_browser_factory.py \

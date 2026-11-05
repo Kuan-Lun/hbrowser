@@ -35,14 +35,17 @@ def test_candidate():
 """
 
 
-@pytest.mark.skipif(os.name != "posix", reason="check-full.sh is a POSIX entry point")
+@pytest.mark.skipif(
+    os.name != "posix", reason="Repository gates are POSIX entry points"
+)
+@pytest.mark.parametrize("entry", ["check-full.sh", "check-process-ownership.sh"])
 @pytest.mark.parametrize("inherited_options", ["--collect-only", "-k test_candidate"])
-def test_full_gate_executes_all_tests_despite_inherited_pytest_options(
-    tmp_path: Path, inherited_options: str
+def test_automatic_gates_execute_all_tests_despite_inherited_pytest_options(
+    tmp_path: Path, inherited_options: str, entry: str
 ) -> None:
     root, environment = _checkout(tmp_path)
     scripts = root / "scripts"
-    shutil.copy2(_ROOT / "scripts/check-full.sh", scripts / "check-full.sh")
+    shutil.copy2(_ROOT / "scripts" / entry, scripts / entry)
     fast = scripts / "check-fast.sh"
     fast.write_text("#!/bin/sh\nexit 0\n")
     fast.chmod(0o755)
@@ -58,19 +61,31 @@ def test_full_gate_executes_all_tests_despite_inherited_pytest_options(
         f'exec {shlex.quote(sys.executable)} "$@"\n'
     )
     executable.chmod(0o755)
-    (root / "tests/test_required_failure.py").write_text(
+    ownership_tests = (
+        "test_owned_process.py",
+        "test_browser_factory.py",
+        "test_runtime_test_owner.py",
+        "test_tor_cleanup.py",
+        "test_diagnostics.py",
+        "test_page_diagnostic_transport.py",
+        "test_driver_shutdown_priority.py",
+    )
+    for name in ownership_tests:
+        (root / "tests" / name).write_text("def test_required_success(): pass\n")
+    (root / "tests" / ownership_tests[0]).write_text(
         "from pathlib import Path\n"
         "def test_required_failure():\n"
         "    Path('required-test-executed').touch()\n"
-        "    assert False, 'full gate must execute this test'\n"
+        "    assert False, 'automatic gate must execute this test'\n"
     )
     environment["PYTEST_ADDOPTS"] = inherited_options
+    environment["HBROWSER_CHECK_PYTHON"] = str(executable)
     manual = _run(root, environment, "scripts/pytest-source.py")
     assert manual.returncode == 0, manual.stdout + manual.stderr
     assert not (root / "required-test-executed").exists()
 
     gate = subprocess.run(
-        ("bash", "scripts/check-full.sh"),
+        ("bash", f"scripts/{entry}"),
         cwd=root,
         env=environment,
         check=False,
@@ -79,7 +94,7 @@ def test_full_gate_executes_all_tests_despite_inherited_pytest_options(
         timeout=30,
     )
     assert gate.returncode == 1, gate.stdout + gate.stderr
-    assert "full gate must execute this test" in gate.stdout + gate.stderr
+    assert "automatic gate must execute this test" in gate.stdout + gate.stderr
     assert (root / "required-test-executed").is_file()
     assert not (root / "wheel-stage-reached").exists()
 
