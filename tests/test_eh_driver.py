@@ -1218,7 +1218,7 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error_type=error_type.__name__):
                 await self._assert_scope_error(document, error_type)
 
-    async def test_search_data_cannot_impersonate_challenge_or_login_pages(
+    async def test_search_data_cannot_impersonate_blocking_pages(
         self,
     ) -> None:
         reflected_values = (
@@ -1230,6 +1230,8 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             "kokomade.jpg",
             '<div id="challenge-form">you are not logged in</div>',
             '<input name="username"><input name="password">',
+            "Your IP address has been temporarily banned",
+            "Your IP address has been temporarily banned for 30 days",
         )
         for query in reflected_values:
             for empty in (False, True):
@@ -1259,6 +1261,21 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
                         [] if empty else [349189],
                     )
                     self.assertEqual(driver.get_urls, [EXH_HOME, url])
+
+    async def test_real_ban_notices_override_apparent_search_results(self) -> None:
+        for notice in (
+            "<p>Your IP address has been temporarily banned.</p>",
+            '<div role="alert">Your IP address has been temporarily banned '
+            "for 1 minute.</div>",
+            "<main>Your IP&nbsp;address has been <b>temporarily</b> banned.</main>",
+        ):
+            with self.subTest(notice=notice):
+                html = _result_page("30 days", SCOPE_GALLERY).replace(
+                    "</body>", notice + "</body>"
+                )
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)), SearchRateLimitError
+                )
 
     async def test_search_data_scripts_and_unrelated_controls_are_not_authority(
         self,

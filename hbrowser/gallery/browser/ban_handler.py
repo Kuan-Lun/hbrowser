@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from bs4 import BeautifulSoup
+
 from ..utils import (
     Deadline,
     navigate_and_wait,
@@ -18,6 +20,11 @@ from ..utils import (
 logger = logging.getLogger(__name__)
 
 _BAN_MESSAGE = "Your IP address has been temporarily banned"
+_BAN_NOTICE_PATTERN = re.compile(
+    rf"^{re.escape(_BAN_MESSAGE)}(?:[\s.!?:,;()]|$)", re.IGNORECASE
+)
+_DURATION_UNIT = r"[0-9]+\s+(?:days?|hours?|minutes?)\b"
+_NOTICE_DURATION = rf"({_DURATION_UNIT}(?:\s*(?:,\s*|and\s+)?{_DURATION_UNIT})*)"
 _BLANK_PAGE = "<html><head></head><body></body></html>"
 _HOUR_SECONDS = 60 * 60
 _BLANK_PAGE_QUICK_RETRIES = 3
@@ -95,9 +102,43 @@ class BanStatus:
 def check_ban_status(source: str) -> BanStatus:
     """從頁面原始碼判斷目前是否處於 IP ban 或空白頁狀態。"""
     return BanStatus(
-        is_banned=_BAN_MESSAGE in source,
+        is_banned=_ban_notice_document(source) is not None,
         is_blank_page=source == _BLANK_PAGE,
     )
+
+
+def _ban_notice_document(source: str) -> str | None:
+    """Separate server notices from reflected search/gallery and quoted data."""
+
+    document = BeautifulSoup(source, "html.parser")
+    for region in document.select(
+        "head, script, style, template, input, textarea, select, "
+        "#f_search, .itg, .searchtext, #gn, #gj, .glink, "
+        "blockquote, q, pre, code"
+    ):
+        if region.parent is not None:
+            region.decompose()
+    visible_text = " ".join(document.get_text(" ", strip=True).split())
+    notices = document.select("body, main, section, div, p, h1, h2, [role='alert']")
+    if _BAN_NOTICE_PATTERN.match(visible_text) or any(
+        _BAN_NOTICE_PATTERN.match(" ".join(notice.get_text(" ", strip=True).split()))
+        for notice in notices
+    ):
+        # Expiry may be in the paragraph following the notice. Retain the
+        # surrounding server document, but never restore discarded data regions.
+        return visible_text
+    return None
+
+
+def _notice_wait_seconds(notice: str) -> int:
+    # A duration elsewhere on the page is not authority to sleep. Preserve the
+    # standalone "banned for ..." form and the server's explicit expiry clause;
+    # consume only their adjacent duration units, not arbitrary trailing prose.
+    for prefix in (r"\bban expires in\s+", rf"{re.escape(_BAN_MESSAGE)}\s+for\s+"):
+        match = re.search(prefix + _NOTICE_DURATION, notice, re.IGNORECASE)
+        if match is not None:
+            return parse_ban_time(match.group(1).lower())
+    return 0
 
 
 def format_wait_message(wait_seconds: int, wait_until: datetime) -> str:
@@ -147,7 +188,9 @@ async def _retry_until_unbanned(
         if not is_first:
             logger.warning("Banned again")
 
-        wait_seconds = parse_ban_time(source)
+        notice = _ban_notice_document(source)
+        assert notice is not None
+        wait_seconds = _notice_wait_seconds(notice)
         if wait_seconds <= 0:
             raise RuntimeError("IP ban page did not contain a positive wait duration")
         wait_until = datetime.now() + timedelta(seconds=wait_seconds)
