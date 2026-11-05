@@ -28,6 +28,7 @@ from _shared.h2h_dev_tools._process_scope import ENVIRONMENT_KEY, PosixScope
 _CLEANUP_SECONDS = 5.0
 _WORKER_FILES = (
     "process.py",
+    "_directory_identity.py",
     "_process_control.py",
     "_process_observation.py",
     "_process_supervisor.py",

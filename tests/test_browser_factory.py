@@ -7,7 +7,8 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -61,6 +62,30 @@ def _bind_browser_process_owner(
         owner.poll.return_value = returncode
     setattr(browser, factory._BROWSER_PROCESS_OWNER_ATTRIBUTE, owner)
     return owner
+
+
+@contextmanager
+def _release_mock_owner_directories() -> Iterator[None]:
+    """Complete the real directory obligations that mocked owners cannot own."""
+
+    # Enter after TemporaryDirectory and before the operation's mocks: teardown
+    # uses the original guards with real APIs before the enclosing tree is removed.
+    original_capture = process_module._PrivateDirectory.capture
+    with ExitStack() as cleanup:
+
+        def capture(
+            path: Path, *, platform_name: str | None = None
+        ) -> process_module._PrivateDirectory:
+            guard = original_capture(path, platform_name=platform_name)
+            cleanup.callback(
+                lambda: guard.remove(deadline=Deadline.after(5).expires_at)
+            )
+            return guard
+
+        with patch.object(
+            process_module._PrivateDirectory, "capture", side_effect=capture
+        ):
+            yield
 
 
 class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
@@ -143,7 +168,10 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_browser_client_construction_cleans_owner_without_publication(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-late-client-") as directory:
+        with (
+            tempfile.TemporaryDirectory(prefix="hbrowser-late-client-") as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             executable = root / "browser"
             executable.touch()
@@ -245,7 +273,10 @@ class OwnedZendriverContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_prelaunch_discovers_port_and_binds_owner_without_global_hook(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-contract-test-") as directory:
+        with (
+            tempfile.TemporaryDirectory(prefix="hbrowser-contract-test-") as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             executable = root / "browser"
             executable.touch()
@@ -626,7 +657,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 await self._assert_failed_launch_retains_paths(settlement)
 
     async def _assert_failed_launch_retains_paths(self, settlement: int) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             profile, extension = root / "profile", root / "extension"
             profile.mkdir()
@@ -734,7 +768,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_chrome_constructor_retains_transferred_private_paths(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            _release_mock_owner_directories(),
+        ):
             profile = Path(directory) / "profile"
             extension = Path(directory) / "extension"
             profile.mkdir()
@@ -781,7 +818,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(extension.is_dir())
 
     async def test_failed_discovery_preserves_replacement_profile(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             profile = root / "profile"
             profile.mkdir()
@@ -799,37 +839,48 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                     (guard.path / "foreign").write_text("preserve", encoding="utf-8")
 
             owner.shutdown.side_effect = shutdown
-            with (
-                patch.object(
-                    factory, "_configured_chrome_executable", return_value="/chrome"
-                ),
-                patch.object(factory, "configure_proxy", return_value=None),
-                patch.object(factory, "should_use_tor", return_value=False),
-                patch.object(tempfile, "mkdtemp", return_value=str(profile)),
-                patch.object(
-                    factory,
-                    "_build_config",
-                    return_value=SimpleNamespace(user_data_dir=str(profile)),
-                ),
-                patch.object(
-                    factory,
-                    "_prepare_owned_browser_launch",
-                    return_value=(Path("/chrome"), []),
-                ),
-                patch.object(factory, "start_owned_browser_process", side_effect=start),
-                patch.object(
-                    factory,
-                    "_wait_for_devtools_active_port_async",
-                    new=AsyncMock(side_effect=RuntimeError("discovery failed")),
-                ),
-                self.assertRaises(ProcessOwnershipError),
-            ):
-                await factory._create_browser(True)
-            self.assertEqual((profile / "foreign").read_text(), "preserve")
-            self.assertEqual(captured[0].path, profile)
+            try:
+                with (
+                    patch.object(
+                        factory, "_configured_chrome_executable", return_value="/chrome"
+                    ),
+                    patch.object(factory, "configure_proxy", return_value=None),
+                    patch.object(factory, "should_use_tor", return_value=False),
+                    patch.object(tempfile, "mkdtemp", return_value=str(profile)),
+                    patch.object(
+                        factory,
+                        "_build_config",
+                        return_value=SimpleNamespace(user_data_dir=str(profile)),
+                    ),
+                    patch.object(
+                        factory,
+                        "_prepare_owned_browser_launch",
+                        return_value=(Path("/chrome"), []),
+                    ),
+                    patch.object(
+                        factory, "start_owned_browser_process", side_effect=start
+                    ),
+                    patch.object(
+                        factory,
+                        "_wait_for_devtools_active_port_async",
+                        new=AsyncMock(side_effect=RuntimeError("discovery failed")),
+                    ),
+                    self.assertRaises(ProcessOwnershipError),
+                ):
+                    await factory._create_browser(True)
+                self.assertEqual((profile / "foreign").read_text(), "preserve")
+                self.assertEqual(captured[0].path, profile)
+            finally:
+                # Restore only the original generation after the preservation oracle.
+                if (root / "claimed").exists():
+                    profile.rename(root / "replacement")
+                    (root / "claimed").rename(profile)
 
     async def test_installer_wait_preserves_replacement_staging(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             staging = root / "staging"
             staging.mkdir()
@@ -863,18 +914,27 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 )
                 return owner
 
-            with (
-                patch.object(
-                    factory, "create_chrome_install_staging_root", return_value=staging
-                ),
-                patch.object(factory, "start_owned_process", side_effect=start),
-                self.assertRaises(ProcessOwnershipError),
-            ):
-                await factory._install_chrome_in_owned_worker(
-                    work_deadline=Deadline.after(5), cleanup_deadline=Deadline.after(10)
-                )
-            self.assertEqual((staging / "foreign").read_text(), "preserve")
-            owner.shutdown.assert_not_called()
+            try:
+                with (
+                    patch.object(
+                        factory,
+                        "create_chrome_install_staging_root",
+                        return_value=staging,
+                    ),
+                    patch.object(factory, "start_owned_process", side_effect=start),
+                    self.assertRaises(ProcessOwnershipError),
+                ):
+                    await factory._install_chrome_in_owned_worker(
+                        work_deadline=Deadline.after(5),
+                        cleanup_deadline=Deadline.after(10),
+                    )
+                self.assertEqual((staging / "foreign").read_text(), "preserve")
+                owner.shutdown.assert_not_called()
+            finally:
+                # Restore only the original generation after the preservation oracle.
+                if (root / "claimed").exists():
+                    staging.rename(root / "replacement")
+                    (root / "claimed").rename(staging)
 
     async def test_installer_ownership_failure_cleans_untransferred_proxy_directory(
         self,
@@ -928,9 +988,12 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_chrome_install_worker_receipt_is_nonce_bound_and_reaped(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="hbrowser-install-receipt-"
-        ) as directory:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="hbrowser-install-receipt-"
+            ) as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             receipt_directory = root / "receipt"
             receipt_directory.mkdir()
@@ -1012,9 +1075,10 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleanup_receipt.call_args.kwargs["deadline"], cleanup_deadline)
 
     async def test_chrome_install_cancellation_reaps_worker_before_return(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="hbrowser-install-cancel-"
-        ) as directory:
+        with (
+            tempfile.TemporaryDirectory(prefix="hbrowser-install-cancel-") as directory,
+            _release_mock_owner_directories(),
+        ):
             receipt_directory = Path(directory) / "receipt"
             receipt_directory.mkdir()
             staging_directory = Path(directory) / "staging"
@@ -1207,6 +1271,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             events.append("post-setup")
 
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(
@@ -1256,6 +1321,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
                 with (
                     tempfile.TemporaryDirectory() as profile,
+                    _release_mock_owner_directories(),
                     patch.object(factory, "should_use_tor", return_value=False),
                     patch.object(factory, "configure_proxy", return_value=None),
                     patch.object(
@@ -1338,6 +1404,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     tempfile.TemporaryDirectory() as extension,
                     tempfile.TemporaryDirectory() as profile,
+                    _release_mock_owner_directories(),
                     patch.dict(os.environ, environment, clear=True),
                     patch.object(
                         tor_module, "_find_tor_binary", return_value="/tor"
@@ -1462,6 +1529,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                 verify = AsyncMock(side_effect=verification_error)
                 with (
                     tempfile.TemporaryDirectory() as extension,
+                    _release_mock_owner_directories(),
                     patch.object(factory, "should_use_tor", return_value=False),
                     patch.object(
                         factory,
@@ -1517,6 +1585,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         failure = RuntimeError("main tab unavailable")
 
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "_configured_chrome_executable", return_value=None),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
@@ -1623,9 +1692,12 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             allow_launch.wait(timeout=1)
             return owner
 
-        with tempfile.TemporaryDirectory(
-            prefix="hbrowser-construction-test-"
-        ) as directory:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="hbrowser-construction-test-"
+            ) as directory,
+            _release_mock_owner_directories(),
+        ):
             root = Path(directory)
             executable = root / "browser"
             executable.touch()
@@ -1704,6 +1776,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(
@@ -1750,6 +1823,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         browser.start = AsyncMock(side_effect=failed_start)
         browser.stop = AsyncMock()
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(
@@ -1802,6 +1876,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
         browser.stop.side_effect = [cleanup_error, None]
 
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(
@@ -2109,6 +2184,7 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         cleanup_error = RuntimeError("cleanup failed")
         with (
+            _release_mock_owner_directories(),
             patch.object(factory, "should_use_tor", return_value=False),
             patch.object(factory, "configure_proxy", return_value=None),
             patch.object(

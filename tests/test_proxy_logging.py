@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -45,8 +44,9 @@ process.stdout.write(JSON.stringify(cases.map(details => {
             {"challenger": {"host": "proxy.example", "port": 8443}},
             {"isProxy": True, "challenger": {"host": "PROXY.EXAMPLE", "port": 8443}},
         ]
-        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         result = subprocess.run(
             ["node", "-e", harness, str(directory / "background.js")],
             input=json.dumps(details),
@@ -109,8 +109,9 @@ async function probe(change) {
     'other-extension', 'no-listener', 'wrong-token'
 ].map(probe)))))();
 """
-        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         manifest = json.loads((directory / "manifest.json").read_text())
         self.assertEqual(manifest["manifest_version"], 3)
         self.assertIn("webRequestAuthProvider", manifest["permissions"])
@@ -180,42 +181,54 @@ async function probe(change) {
                     proxy_password,
                 )
 
-            background = (result.path / "background.js").read_text(encoding="utf-8")
-            self.assertIn(f"host: {json.dumps(proxy_host)}", background)
-            self.assertIn(f"username: {json.dumps(proxy_user)}", background)
-            self.assertIn(f"password: {json.dumps(proxy_password)}", background)
+            try:
+                background = (result.path / "background.js").read_text(encoding="utf-8")
+                self.assertIn(f"host: {json.dumps(proxy_host)}", background)
+                self.assertIn(f"username: {json.dumps(proxy_user)}", background)
+                self.assertIn(f"password: {json.dumps(proxy_password)}", background)
+            finally:
+                result.remove(deadline=Deadline.after(5).expires_at)
 
     def test_proxy_extension_cleanup_failure_is_an_ownership_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as directory:
             plugin_directory = Path(directory) / "plugin"
             plugin_directory.mkdir()
+            guard = _PrivateDirectory.capture(plugin_directory)
             creation_error = OSError("write failed")
             cleanup_error = OSError("remove failed")
-            with (
-                patch.object(
-                    tempfile,
-                    "mkdtemp",
-                    return_value=str(plugin_directory),
-                ),
-                patch.object(Path, "write_text", side_effect=creation_error),
-                patch.object(
-                    _PrivateDirectory, "remove", side_effect=cleanup_error
-                ) as remove,
-                self.assertRaises(ProcessOwnershipError) as raised,
-            ):
-                deadline = Deadline.after(1)
-                proxy._create_proxy_extension(
-                    "host", 8080, "user", "password", cleanup_deadline=deadline
-                )
+            try:
+                with (
+                    patch.object(
+                        tempfile,
+                        "mkdtemp",
+                        return_value=str(plugin_directory),
+                    ),
+                    patch.object(
+                        _PrivateDirectory, "capture", return_value=guard
+                    ) as capture,
+                    patch.object(Path, "write_text", side_effect=creation_error),
+                    patch.object(
+                        _PrivateDirectory, "remove", side_effect=cleanup_error
+                    ) as remove,
+                    self.assertRaises(ProcessOwnershipError) as raised,
+                ):
+                    deadline = Deadline.after(1)
+                    proxy._create_proxy_extension(
+                        "host", 8080, "user", "password", cleanup_deadline=deadline
+                    )
 
-            self.assertIs(raised.exception.__cause__, cleanup_error)
-            self.assertLessEqual(
-                remove.call_args.kwargs["deadline"], deadline.expires_at
-            )
-            self.assertIn(
-                "Creation failure type: OSError",
-                raised.exception.__notes__,
-            )
+                capture.assert_called_once_with(plugin_directory)
+                self.assertIs(raised.exception.__cause__, cleanup_error)
+                self.assertLessEqual(
+                    remove.call_args.kwargs["deadline"], deadline.expires_at
+                )
+                self.assertIn(
+                    "Creation failure type: OSError",
+                    raised.exception.__notes__,
+                )
+            finally:
+                # The failed remove was a Mock; the fixture still owns this pin.
+                guard.remove(deadline=Deadline.after(5).expires_at)
 
     def test_extension_write_failure_removes_only_its_captured_directory(self) -> None:
         for symlink in (False, True):
@@ -238,6 +251,7 @@ async function probe(change) {
             parent = Path(root)
             plugin = parent / "plugin"
             plugin.mkdir()
+            guard = _PrivateDirectory.capture(plugin)
             original = parent / "original"
             unrelated = parent / "unrelated"
             unrelated.mkdir()
@@ -269,10 +283,14 @@ async function probe(change) {
             try:
                 with (
                     patch.object(tempfile, "mkdtemp", return_value=str(plugin)),
+                    patch.object(
+                        _PrivateDirectory, "capture", return_value=guard
+                    ) as capture,
                     patch.object(Path, "write_text", replace_during_write),
                     self.assertRaises(ProcessOwnershipError) as caught,
                 ):
                     proxy._create_proxy_extension("host", 8080, "user", "password")
+                capture.assert_called_once_with(plugin)
                 self.assertIsInstance(caught.exception.__cause__, ProcessOwnershipError)
                 self.assertEqual((plugin / "keep").read_text(), "unrelated material")
                 self.assertTrue((original / "manifest.json").is_file())
@@ -285,9 +303,7 @@ async function probe(change) {
                     else:
                         plugin.rename(unrelated)
                     original.rename(plugin)
-                    _PrivateDirectory.capture(plugin).remove(
-                        deadline=Deadline.after(5).expires_at
-                    )
+                    guard.remove(deadline=Deadline.after(5).expires_at)
 
     def test_extension_write_failure_reaps_owned_cleanup_and_preserves_error(
         self,
@@ -335,8 +351,9 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_residential_extension_missing_or_failed_never_navigates(
         self,
     ) -> None:
-        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         for state in ("missing", "rejected", "script-error"):
             with self.subTest(state=state):
                 target = SimpleNamespace(
@@ -366,8 +383,9 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
                 navigate.assert_not_awaited()
 
     async def test_residential_extension_accepts_only_boolean_receipt(self) -> None:
-        directory = proxy._create_proxy_extension("proxy.example", 8443, "u", "p").path
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         target = SimpleNamespace(
             type_="service_worker",
             url="chrome-extension://owned/background.js",

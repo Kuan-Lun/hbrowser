@@ -635,6 +635,10 @@ def test_pre_spawn_registration_failure_releases_only_new_no_child_token() -> No
                     assert process._active_private_directory_cleanup(guard) is prior
                 finally:
                     process._release_active_private_directory_cleanup(prior)
+                    # Fixture-only prior owner never had a process or claim.
+                    assert process._active_private_directory_cleanup(guard) is None
+                    assert not registry.observations
+                    guard._retire()
         finally:
             registry.close()
     """)
@@ -642,14 +646,17 @@ def test_pre_spawn_registration_failure_releases_only_new_no_child_token() -> No
 
 def test_sealed_scope_blocks_atexit_retry_after_reaped_cleanup_failure() -> None:
     _ok("""
-        import tempfile, time
+        import shutil, tempfile, time
         from pathlib import Path
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         registry = a._current()
         registry.install()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-sealed-retry-", delete=False
+        ) as directory:
             root = Path(directory)
+            print(f"sealed cleanup fixture: {root}", flush=True)
             private = root / 'private'
             private.mkdir()
             worker = root / 'failed-worker.py'
@@ -674,4 +681,12 @@ def test_sealed_scope_blocks_atexit_retry_after_reaped_cleanup_failure() -> None
                 spawn.assert_not_called()
             assert key in process._PENDING_PRIVATE_DIRECTORIES
             assert private.is_dir()
+            # Only fixture rescue follows the production retention assertions.
+            # This exact synthetic worker has exited and no observation is active;
+            # do not reopen sealed admission or launch another cleanup worker.
+            assert process._active_private_directory_cleanup(guard) is None
+            assert not registry.observations
+            process._release_pending_private_directory(guard)
+            guard._retire()
+            shutil.rmtree(root)
     """)

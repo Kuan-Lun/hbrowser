@@ -15,6 +15,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 _FILES = {
     "process.py",
+    "_directory_identity.py",
     "_process_control.py",
     "_process_observation.py",
     "_process_supervisor.py",
@@ -66,7 +67,13 @@ def _poison_cache(module: Path, tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize("entry", ["pytest", "harness"])
 @pytest.mark.parametrize(
-    "poison", ["_process_control.py", "process.py", "_process_observation.py"]
+    "poison",
+    [
+        "_process_control.py",
+        "process.py",
+        "_process_observation.py",
+        "_directory_identity.py",
+    ],
 )
 def test_worker_source_projection_ignores_valid_stale_sibling_cache(
     tmp_path: Path, entry: str, poison: str

@@ -152,9 +152,20 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
                 return_value=str(self.profile),
             )
         )
+
+        def retain_fixture_guards(*_arguments: object, **keywords: object) -> Mock:
+            guards = keywords.get("cleanup_paths", ())
+            assert isinstance(guards, tuple)
+            for guard in guards:
+                assert isinstance(guard, _PrivateDirectory)
+                self.addCleanup(guard._retire)
+            return self.owner
+
         self.launch = self.enterContext(
             patch.object(
-                factory, "start_owned_browser_process", return_value=self.owner
+                factory,
+                "start_owned_browser_process",
+                side_effect=retain_fixture_guards,
             )
         )
         self.enterContext(
@@ -231,7 +242,8 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         guards = self.launch.call_args.kwargs["cleanup_paths"]
         self.assertEqual(tuple(str(guard.path) for guard in guards), cleanup_paths)
         for guard in guards:
-            self.assertEqual(guard, _PrivateDirectory.capture(guard.path))
+            self.assertTrue(guard._assert_identity_or_absence())
+            # Native pins remain live until the Mock owner's fixture cleanup.
         self.assertNotIn(str(self.executable), cleanup_paths)
         if proxy:
             self.assertIs(guards[-1], extension_guard)
