@@ -698,6 +698,21 @@ def _lifecycle_for(browser: Any, *, create: bool) -> _ZendriverLifecycle | None:
     return lifecycle
 
 
+def _is_zendriver_owner_retired(owner: Any) -> bool:
+    """Read an existing generation's admission state without creating ownership.
+
+    Generic BrowserOwner adapters may use slot-only values which cannot enroll
+    in this protocol lifecycle. They have no protocol retirement to report.
+    A present but corrupt lifecycle still fails closed through _lifecycle_for.
+    """
+    try:
+        browser, _ = _resolve_owner(owner)
+    except TypeError:
+        return False
+    lifecycle = _lifecycle_for(browser, create=False)
+    return lifecycle is not None and lifecycle.retired
+
+
 def _observe_future(operation: asyncio.Future[Any]) -> None:
     if operation.cancelled():
         return

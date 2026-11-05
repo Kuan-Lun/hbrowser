@@ -21,6 +21,7 @@ from ..utils import (
     navigate_and_wait,
     open_tab_and_wait,
 )
+from ..utils.protocol import _is_zendriver_owner_retired
 from .factory import create_browser, stop_browser
 
 _TAB_OPEN_DEADLINE_SECONDS = 10.0
@@ -155,7 +156,22 @@ class TabTransport[TabT]:
     def is_available(self) -> bool:
         """Whether the owner still accepts new commands."""
 
+        self._synchronize_protocol_retirement()
         return not self._generation_retired and self._is_owner_open()
+
+    def _retire_generation(self) -> None:
+        self._generation_retired = True
+        if self._retire_owner is not None:
+            self._retire_owner()
+
+    def _synchronize_protocol_retirement(self) -> None:
+        # Cancellation keeps its original exception type. The concrete
+        # protocol tombstone, rather than CancelledError alone, closes admission.
+        if _is_zendriver_owner_retired(self._tab):
+            self._retire_generation()
+        # The owner also checks its original browser, even if a callback changed
+        # the mutable tab's browser relationship while its operation was active.
+        self._is_owner_open()
 
     def _require_available(self) -> None:
         if not self.is_available:
@@ -181,10 +197,12 @@ class TabTransport[TabT]:
                 if is_browser_generation_error(error):
                     # Seal admission before releasing this command's lock, so
                     # queued commands and every sibling transport fail closed.
-                    self._generation_retired = True
-                    if self._retire_owner is not None:
-                        self._retire_owner()
+                    self._retire_generation()
                 raise
+            finally:
+                # This also catches callbacks which handle protocol cancellation
+                # themselves. Seal admission before the command lock is released.
+                self._synchronize_protocol_retirement()
 
     async def navigate(self, url: str) -> None:
         """Navigate the fixed tab through its injected navigation adapter."""
@@ -272,10 +290,20 @@ class BrowserOwner[BrowserT, TabT]:
 
     @property
     def state(self) -> BrowserOwnerState:
+        self._generation_is_open()
         return self._state
 
     @property
     def is_open(self) -> bool:
+        return self._generation_is_open()
+
+    def _generation_is_open(self) -> bool:
+        if (
+            self._state is BrowserOwnerState.OPEN
+            and self._browser is not None
+            and _is_zendriver_owner_retired(self._browser)
+        ):
+            self._retire_generation()
         return self._state is BrowserOwnerState.OPEN
 
     @property
@@ -322,7 +350,7 @@ class BrowserOwner[BrowserT, TabT]:
             handle=handle,
             tab=tab,
             navigate_tab=self._navigate_owned_tab,
-            is_owner_open=lambda: self._state is BrowserOwnerState.OPEN,
+            is_owner_open=self._generation_is_open,
         )
         transport._retire_owner = self._retire_generation
         self._tabs_by_role[role] = transport
@@ -330,7 +358,8 @@ class BrowserOwner[BrowserT, TabT]:
         return transport
 
     def _retire_generation(self) -> None:
-        self._state = BrowserOwnerState.CLOSING
+        if self._state is BrowserOwnerState.OPEN:
+            self._state = BrowserOwnerState.CLOSING
 
     async def _navigate_owned_tab(self, tab: TabT, url: str) -> None:
         try:
@@ -345,7 +374,7 @@ class BrowserOwner[BrowserT, TabT]:
         """Launch and bind the browser factory's main tab exactly once."""
 
         async with self._lifecycle_lock:
-            if self._state is BrowserOwnerState.OPEN:
+            if self._generation_is_open():
                 return self
             if self._state is not BrowserOwnerState.NEW:
                 raise BrowserOwnerStateError(
@@ -396,7 +425,7 @@ class BrowserOwner[BrowserT, TabT]:
 
         self._validate_role(role)
         async with self._lifecycle_lock:
-            if self._state is not BrowserOwnerState.OPEN:
+            if not self._generation_is_open():
                 raise BrowserOwnerStateError(
                     f"cannot open tab while browser owner is {self._state.value!r}"
                 )

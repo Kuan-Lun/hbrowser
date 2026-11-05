@@ -16,7 +16,11 @@ from hbrowser.gallery.browser import (
     TabTransportUnavailableError,
 )
 from hbrowser.gallery.browser import owner as owner_module
-from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
+from hbrowser.gallery.utils import (
+    Deadline,
+    ZendriverOperationTimeout,
+    wait_for_zendriver,
+)
 from hbrowser.gallery.utils import deadline as deadline_module
 from hbrowser.gallery.utils.page_state import PageStateTimeout
 
@@ -32,6 +36,169 @@ class _FakeBrowser:
 
 
 class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protocol_cancellation_seals_queued_and_sibling_admission(
+        self,
+    ) -> None:
+        for swallow, rebind_tab in ((False, False), (True, False), (True, True)):
+            with self.subTest(swallow=swallow, rebind_tab=rebind_tab):
+                browser = SimpleNamespace()
+                tab = SimpleNamespace(target_id="main", browser=browser)
+                sibling_tab = SimpleNamespace(target_id="sibling", browser=browser)
+                closer = AsyncMock()
+                owner: BrowserOwner[SimpleNamespace, SimpleNamespace] = BrowserOwner(
+                    browser_factory=AsyncMock(return_value=(browser, tab)),
+                    browser_closer=closer,
+                    tab_factory=AsyncMock(return_value=sibling_tab),
+                    target_id_getter=lambda item: item.target_id,
+                )
+                await owner.start()
+                sibling = await owner.open_tab("sibling")
+                operation: asyncio.Future[object] = (
+                    asyncio.get_running_loop().create_future()
+                )
+                entered, cancelled, release = (
+                    asyncio.Event(),
+                    asyncio.Event(),
+                    asyncio.Event(),
+                )
+                queued_command, sibling_command = AsyncMock(), AsyncMock()
+
+                async def command(
+                    current: SimpleNamespace,
+                    operation: asyncio.Future[object] = operation,
+                    entered: asyncio.Event = entered,
+                    cancelled: asyncio.Event = cancelled,
+                    release: asyncio.Event = release,
+                    swallow: bool = swallow,
+                ) -> None:
+                    entered.set()
+                    try:
+                        await wait_for_zendriver(operation, timeout=5, owner=current)
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        if not swallow:
+                            raise
+                        await release.wait()
+
+                active = asyncio.create_task(owner.main_tab.execute(command))
+                await entered.wait()
+                queued = asyncio.create_task(owner.main_tab.execute(queued_command))
+                await asyncio.sleep(0)
+                try:
+                    if rebind_tab:
+                        # The accepted operation still belongs to the original
+                        # browser, even if the mutable tab now points elsewhere.
+                        tab.browser = SimpleNamespace()
+                    active.cancel()
+                    await cancelled.wait()
+                    self.assertFalse(operation.done())
+                    self.assertFalse(operation.cancelled())
+                    # In the swallowed case, the active callback still holds
+                    # its lock. The sibling must already reject new raw work.
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await sibling.execute(sibling_command)
+                    self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                    self.assertFalse(owner.is_open)
+                    with self.assertRaises(BrowserOwnerStateError):
+                        await owner.open_tab("late")
+                    release.set()
+                    if swallow:
+                        await active
+                    else:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await active
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await queued
+                    queued_command.assert_not_awaited()
+                    sibling_command.assert_not_awaited()
+                    closer.assert_not_awaited()
+                finally:
+                    release.set()
+                    if not operation.done():
+                        operation.set_result(None)
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    await owner.close()
+                closer.assert_awaited_once()
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                self.assertFalse(sibling.is_available)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_cancellation_without_protocol_retirement_keeps_owner_open(
+        self,
+    ) -> None:
+        for cancel_queued in (False, True):
+            with self.subTest(cancel_queued=cancel_queued):
+                owner, _, _, _ = self._owner()
+                await owner.start()
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def command(
+                    _: _FakeTab,
+                    entered: asyncio.Event = entered,
+                    release: asyncio.Event = release,
+                ) -> None:
+                    entered.set()
+                    await release.wait()
+
+                active = asyncio.create_task(owner.main_tab.execute(command))
+                await entered.wait()
+                queued_command = AsyncMock()
+                queued = asyncio.create_task(owner.main_tab.execute(queued_command))
+                await asyncio.sleep(0)
+                try:
+                    target = queued if cancel_queued else active
+                    target.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await target
+                    self.assertTrue(owner.is_open)
+                    self.assertTrue(owner.main_tab.is_available)
+                    release.set()
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    if cancel_queued:
+                        queued_command.assert_not_awaited()
+                    self.assertEqual(
+                        await owner.main_tab.execute(AsyncMock(return_value="ready")),
+                        "ready",
+                    )
+                finally:
+                    release.set()
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    await owner.close()
+
+    async def test_standalone_transport_observes_real_protocol_cancellation(
+        self,
+    ) -> None:
+        tab = SimpleNamespace()
+        transport = owner_module.TabTransport(
+            handle=TabHandle("standalone", "main", "target"),
+            tab=tab,
+            navigate_tab=AsyncMock(),
+            is_owner_open=lambda: True,
+        )
+        operation: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        entered = asyncio.Event()
+
+        async def command(current: SimpleNamespace) -> None:
+            entered.set()
+            await wait_for_zendriver(operation, timeout=5, owner=current)
+
+        active = asyncio.create_task(transport.execute(command))
+        await entered.wait()
+        active.cancel()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await active
+            self.assertFalse(transport.is_available)
+            rejected = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await transport.execute(rejected)
+            rejected.assert_not_awaited()
+            self.assertFalse(operation.done())
+        finally:
+            if not operation.done():
+                operation.set_result(None)
+            await asyncio.sleep(0)
+
     async def test_terminal_command_closes_queued_and_sibling_admission(self) -> None:
         for failure in (
             BrowserMutationOutcomeUnknownError("unknown result"),
