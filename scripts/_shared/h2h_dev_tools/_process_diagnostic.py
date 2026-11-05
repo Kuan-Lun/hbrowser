@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 MAX_PAYLOAD_BYTES = 20 * 1024
 DIAGNOSTIC_SECONDS = 0.25
+DEFAULT_CLEANUP_SECONDS = 6.0
 MINIMUM_ADMISSION_SECONDS = 0.025
 _TRUNCATED = "\n[diagnostic truncated]"
 # A fixed isolated interpreter has no site hooks, imports only stdlib and never
@@ -65,12 +66,14 @@ def write_diagnostic(
     payload: bytes,
     *,
     deadline: float,
+    work_deadline: float,
     signal_controller: SignalController,
 ) -> None:
     """Write or discard human output, proving helper cleanup before returning.
 
-    Spawn, write, kill and reap share deadline. The first half is for execution;
-    the rest is retained for cleanup, never a new grace period. Expired or tiny
+    Admission and display use the short work deadline, retaining its existing
+    half-window execution cutoff. Reaping and scope closure use the caller's
+    original cleanup deadline, never a new grace period. Expired or tiny work
     budgets do not admit a helper. An inherited POSIX owner must admit a leaf
     obligation before spawn; a closed parent discards this optional output. No
     process group, session or recursive command runner is created.
@@ -80,9 +83,10 @@ def write_diagnostic(
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise ValueError("Diagnostic payload exceeds its explicit argv bound")
     started = time.monotonic()
-    if deadline - started < MINIMUM_ADMISSION_SECONDS:
+    work_deadline = min(work_deadline, deadline, started + DIAGNOSTIC_SECONDS)
+    if work_deadline - started < MINIMUM_ADMISSION_SECONDS:
         return
-    execution_deadline = started + (deadline - started) / 2
+    execution_deadline = started + (work_deadline - started) / 2
     child: subprocess.Popen[bytes] | None = None
     job: WindowsJob | None = None
     assigned = False
@@ -116,7 +120,7 @@ def write_diagnostic(
                 return
             if os.name == "posix" and ENVIRONMENT_KEY in os.environ:
                 try:
-                    scope = PosixScope.create(deadline=deadline)
+                    scope = PosixScope.create(deadline=work_deadline)
                 except ScopeAdmissionClosed:
                     return
                 except Exception as error:
@@ -126,8 +130,11 @@ def write_diagnostic(
                 # Admission may have consumed the execution slice. Even without
                 # a child, the registered obligation must be closed below.
                 signal_controller.raise_pending()
-                if seconds_remaining(execution_deadline) == 0:
-                    return
+            # Job creation, command preparation or POSIX admission can consume
+            # the display window. Recheck on every platform before any spawn;
+            # already acquired metadata/empty Jobs still close in finally.
+            if seconds_remaining(execution_deadline) == 0:
+                return
             child = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE if job is not None else subprocess.DEVNULL,

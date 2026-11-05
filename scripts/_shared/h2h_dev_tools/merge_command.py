@@ -328,8 +328,9 @@ def _execute(
         from . import merge_admission
 
         # The receipt proves process cleanup only, never successful admission
-        # release. Keep the original phase deadline and require exit zero too.
-        if recovery_deadline is None or time.monotonic() >= recovery_deadline:
+        # release. Normal completion retains the outer lifetime; failure recovery
+        # must still finish within its original phase deadline. Require exit zero.
+        if recovery_deadline is not None and time.monotonic() >= recovery_deadline:
             return 1
         try:
             merge_admission.release(release_workflow)
@@ -398,8 +399,8 @@ def main() -> int:
         parser.error("review cannot run as failure recovery")
     if arguments.recovery_output_fds and not arguments.recovery:
         parser.error("recovery output descriptors require --recovery")
-    if arguments.release_workflow is not None and not arguments.recovery:
-        parser.error("workflow release requires --recovery")
+    if arguments.release_workflow is not None and arguments.review:
+        parser.error("workflow release cannot run as review")
     with ExitStack() as diagnostics:
         if arguments.recovery_output_fds:
             # Startup errors go to /dev/null. Only the common diagnostic writer

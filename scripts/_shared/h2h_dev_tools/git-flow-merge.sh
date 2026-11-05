@@ -210,18 +210,24 @@ HOOK
 }
 
 run_workflow_state() {
-    # Capture/comparison and recovery retain the ten-second owner budget.
-    # Cleanliness checks, merge planning and checkout can run Git callbacks.
-    # They use the existing outer lifetime, not a failure-recovery budget.
+    # Every normal state operation uses the existing outer lifetime. Only the
+    # failure handler sets recovering and supplies the ten-second owner budget.
     # Always use the original copied bootstrap, even after task removal.
-    local state_action=1 owner=process
+    local owner=process
     case "${1-}" in
-        begin | switch-primary | check-clean) state_action=0 ;;
         release) owner=release; shift; set -- validate-release "$@" ;;
     esac
     run_tracked "$owner" "${merge_worktree:-$repository_root}" \
         "$merge_python" -I -B "$workflow_launcher" --workflow-state \
         "$@" --state "$workflow_state"
+}
+
+release_successful_workflow() {
+    # Validation still runs under its normal owner. Once terminal release starts,
+    # any failure or interruption may only finish that owner, never start recovery
+    # against admission that the filesystem-only release may already have removed.
+    terminal_release_started=1
+    run_workflow_state release
 }
 
 restore_after_failure() {
@@ -239,6 +245,8 @@ restore_after_failure() {
     if [[ "$owner_cleanup_failed" -ne 0 ]]; then
         diagnose 'process cleanup unproven; candidate and task retained; workflow admission retained'
         recovery_failed=1
+    elif [[ "$terminal_release_started" -ne 0 ]]; then
+        [[ "$status" -eq 0 ]] || recovery_failed=1
     elif [[ -f "${workflow_state-}" ]]; then
         if (( status != 0 )); then
             if run_workflow_state recover-abort; then
@@ -303,7 +311,6 @@ select_local_python() {
 
 run_tracked() {
     local status=0 working_directory=$2 bounded_command=$recovering output_descriptor=2
-    [[ "${state_action:-0}" -eq 0 ]] || bounded_command=1
     active_owner=$1
     shift 2
     command_number=$((command_number + 1))
@@ -528,6 +535,7 @@ if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
 
     run_tracked completion "$cleanup_worktree" \
         "Cleaned up no-op task $task_branch already contained in $primary at $task_oid"
+    release_successful_workflow
     exit 0
 fi
 
@@ -606,3 +614,4 @@ delete_task_branch "$merge_worktree" "$merge_commit" \
 
 run_tracked completion "$merge_worktree" \
     "Merged $task_branch into $primary at $merge_commit"
+release_successful_workflow

@@ -759,12 +759,14 @@ def report_diagnostic(
     standard_output: bool = False,
     newline: bool = True,
     deadline: float | None = None,
+    work_deadline: float | None = None,
     signal_controller: SignalController | None = None,
 ) -> None:
     """Emit optional bounded human output without changing caller FD flags.
 
-    Owned callers pass their existing absolute deadline and signal controller.
-    A standalone CLI without an outer deadline gets one explicit small budget.
+    Owned callers pass their existing absolute cleanup deadline and controller.
+    An earlier work cutoff limits new display work without shortening cleanup.
+    A caller without a deadline gets one explicit six-second total budget.
     Full pipes may discard diagnostics, but an unproven helper cleanup propagates.
     Automatic signal handling requires the main thread; callers with existing
     signal control pass that controller. Background cleanup workers collect text
@@ -774,12 +776,17 @@ def report_diagnostic(
 
     if deadline is not None and not math.isfinite(deadline):
         raise ValueError("Diagnostic deadline must be finite")
+    if work_deadline is not None and not math.isfinite(work_deadline):
+        raise ValueError("Diagnostic work deadline must be finite")
     now = time.monotonic()
-    deadline = min(
+    if deadline is None:
+        deadline = now + _process_diagnostic.DEFAULT_CLEANUP_SECONDS
+    work_deadline = min(
         now + _process_diagnostic.DIAGNOSTIC_SECONDS,
-        deadline if deadline is not None else math.inf,
+        deadline,
+        work_deadline if work_deadline is not None else math.inf,
     )
-    if deadline <= now:
+    if work_deadline <= now:
         return
     stream = sys.stdout if standard_output else sys.stderr
     try:
@@ -813,6 +820,7 @@ def report_diagnostic(
             descriptor,
             payload,
             deadline=deadline,
+            work_deadline=work_deadline,
             signal_controller=controller,
         )
 
@@ -992,6 +1000,11 @@ def _run_command(
             "Deadline must be finite and cleanup reserve finite and positive"
         )
     started_at = time.monotonic()
+    ownership_deadline = (
+        hard_deadline
+        if hard_deadline is not None
+        else started_at + termination_reserve_seconds
+    )
     execution_deadline = (
         None if hard_deadline is None else hard_deadline - termination_reserve_seconds
     )
@@ -1011,16 +1024,12 @@ def _run_command(
     report_diagnostic(
         f"\n==> {phase.label} ({budget_detail})\n+ " + shlex.join(phase.argv),
         standard_output=True,
-        deadline=execution_deadline,
+        deadline=ownership_deadline,
+        work_deadline=execution_deadline,
         signal_controller=signal_controller,
     )
     if execution_deadline is not None and time.monotonic() >= execution_deadline:
         return TIMEOUT_EXIT_CODE
-    ownership_deadline = (
-        hard_deadline
-        if hard_deadline is not None
-        else started_at + termination_reserve_seconds
-    )
     owner: OwnedProcess | None = None
     tree_empty_proven = False
     ownership_error: ProcessOwnershipError | None = None
