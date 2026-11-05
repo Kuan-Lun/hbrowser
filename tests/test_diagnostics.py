@@ -11,15 +11,19 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import ANY, AsyncMock, Mock, patch
+
+from bs4 import BeautifulSoup, Tag
 
 from hbrowser import EHDriver
 from hbrowser.gallery import utils as gallery_utils
 from hbrowser.gallery.browser import page_diagnostic as page_diagnostic_module
 from hbrowser.gallery.browser.process import OwnedProcess, ProcessOwnershipError
 from hbrowser.gallery.driver_base import Driver
+from hbrowser.gallery.eh_driver import _normalize_random_encounter_url
 from hbrowser.gallery.utils import (
     Deadline,
     ZendriverOperationTimeout,
@@ -309,9 +313,173 @@ class PageDiagnosticTests(unittest.TestCase):
         self.assertNotIn(first_secret, diagnostic)
         self.assertNotIn(second_secret, diagnostic)
         self.assertIn("s=Battle&amp;ss=ba&amp;encounter=REDACTED", diagnostic)
-        self.assertIn("?encounter=REDACTED&ss=ba&s=Battle", diagnostic)
+        self.assertIn("<script>REDACTED</script>", diagnostic)
         self.assertIn('id="eventpane"', diagnostic)
         self.assertIn("?notencounter=VISIBLE", diagnostic)
+
+    def test_encoded_encounter_keys_are_redacted_before_worker_handoff(self) -> None:
+        secret = "ENCODED-QUERY-CAPABILITY="
+        keys = (
+            "%65ncounter",
+            "encoun%74er",
+            "%65%6E%63%6f%75%6e%74%65%72",
+            "en\tcou\r\nnter",
+            "&#101;ncounter",
+            "en&#x63;ounter",
+            "&#x25;65ncounter",
+            "%65n&#99;ounter",
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                prepared = diagnostic_module._bounded_page_diagnostic_content(
+                    "<html><body><p>Visible context</p>"
+                    '<a href="https://hentaiverse.org/?s=Battle&amp;ss=ba&amp;'
+                    f'{key}={secret}">Fight</a></body></html>'
+                )
+
+                self.assertNotIn(secret.encode(), prepared)
+                self.assertIn(b"REDACTED", prepared)
+                self.assertIn(b"Visible context", prepared)
+                self.assertIn(b"s=Battle", prepared)
+                self.assertIn(b"ss=ba", prepared)
+
+    def test_percent_encoded_encounter_keys_are_redacted_in_script_urls(self) -> None:
+        secret = "SCRIPT-QUERY-CAPABILITY="
+        for key in ("%65ncounter", "en%63ounter", "en\tcounter"):
+            with self.subTest(key=key):
+                content = (
+                    '<script>const battle = "https://hentaiverse.org/?'
+                    f'{key}={secret}&ss=ba&s=Battle";</script>'
+                )
+                prepared = diagnostic_module._bounded_page_diagnostic_content(content)
+
+                self.assertNotIn(secret.encode(), prepared)
+                self.assertEqual(prepared, b"<script>REDACTED</script>")
+
+    def test_raw_secret_fragments_do_not_leave_whitespace_or_escaped_quote_suffixes(
+        self,
+    ) -> None:
+        url_prefix = "https://hentaiverse.org/?s=Battle&ss=ba&%65ncounter="
+        accepted = _normalize_random_encounter_url(
+            url_prefix + "PRIVATE-PREFIX PRIVATE-TAIL"
+        )
+        self.assertIsNotNone(accepted)
+        assert accepted is not None
+        self.assertIn("encounter=PRIVATE-PREFIX+PRIVATE-TAIL", accepted)
+        ordinary_script = (
+            '<script id="ordinary">const context = '
+            r'"Visible \"quoted\" context";</script>'
+        )
+        for value in (
+            "PRIVATE-PREFIX PRIVATE-TAIL",
+            "PRIVATE-PREFIX\nPRIVATE-TAIL",
+            r"PRIVATE-PREFIX\"PRIVATE-TAIL",
+            r"PRIVATE-PREFIX\'PRIVATE-TAIL",
+            r"PRIVATE-PREFIX\\\"PRIVATE-TAIL",
+            'PRIVATE-PREFIX" + "PRIVATE-TAIL',
+        ):
+            url = url_prefix + value
+            fragments = {
+                "script": f'<script>const battle = "{url}";</script>',
+                "text": f"<pre>{escape(url)}</pre>",
+                "comment": f"<!-- {url} -->",
+            }
+            for kind, fragment in fragments.items():
+                with self.subTest(value=value, kind=kind):
+                    content = (
+                        "<p>Keep ordinary diagnostic context</p>"
+                        + fragment
+                        + ordinary_script
+                    )
+                    prepared = diagnostic_module._bounded_page_diagnostic_content(
+                        content
+                    )
+
+                    self.assertNotIn(b"PRIVATE-PREFIX", prepared)
+                    self.assertNotIn(b"PRIVATE-TAIL", prepared)
+                    self.assertIn(b"REDACTED", prepared)
+                    self.assertIn(b"Keep ordinary diagnostic context", prepared)
+                    self.assertIn(ordinary_script.encode(), prepared)
+
+    def test_unrelated_raw_fragments_are_preserved_without_decoding_javascript(
+        self,
+    ) -> None:
+        for key in ("notencounter", "%2565ncounter", "en+counter"):
+            with self.subTest(key=key):
+                content = (
+                    '<script>const ordinary = "https://example.org/?'
+                    f"{key}=VISIBLE-PREFIX "
+                    r'VISIBLE-TAIL\"";</script>'
+                    "<!-- Keep ordinary comment -->"
+                    "<pre>Keep ordinary text</pre>"
+                )
+
+                self.assertEqual(
+                    diagnostic_module._bounded_page_diagnostic_content(content),
+                    content.encode(),
+                )
+
+    def test_multivalued_attribute_does_not_split_the_secret_before_redaction(
+        self,
+    ) -> None:
+        prepared = diagnostic_module._bounded_page_diagnostic_content(
+            '<div class="https://hentaiverse.org/?%65ncounter='
+            'PRIVATE-PREFIX PRIVATE-TAIL">Keep ordinary content</div>'
+        )
+
+        self.assertNotIn(b"PRIVATE-PREFIX", prepared)
+        self.assertNotIn(b"PRIVATE-TAIL", prepared)
+        self.assertIn(b"REDACTED", prepared)
+        self.assertIn(b"Keep ordinary content", prepared)
+
+    def test_attribute_redaction_removes_secret_suffix_after_space_or_entity(
+        self,
+    ) -> None:
+        for separator in (" ", "&#32;", "&#9;", "&#10;", "&quot;", "&#39;"):
+            with self.subTest(separator=separator):
+                prepared = diagnostic_module._bounded_page_diagnostic_content(
+                    '<a id="battle" href="https://hentaiverse.org/?'
+                    f"%65ncounter=PRIVATE-PREFIX{separator}PRIVATE-TAIL"
+                    '&amp;ss=ba&amp;s=Battle">Fight</a>'
+                    '<a id="context-link" href="https://example.org/?'
+                    'notencounter=Visible &quot;quoted&quot; context">Context</a>'
+                )
+
+                self.assertNotIn(b"PRIVATE-PREFIX", prepared)
+                self.assertNotIn(b"PRIVATE-TAIL", prepared)
+                document = BeautifulSoup(prepared.decode(), "html.parser")
+                battle = document.find("a", id="battle")
+                context = document.find("a", id="context-link")
+                assert isinstance(battle, Tag)
+                assert isinstance(context, Tag)
+                self.assertEqual(
+                    battle.get("href"),
+                    "https://hentaiverse.org/?%65ncounter=REDACTED&ss=ba&s=Battle",
+                )
+                self.assertEqual(
+                    context.get("href"),
+                    'https://example.org/?notencounter=Visible "quoted" context',
+                )
+
+    def test_query_key_redaction_does_not_decode_twice_or_remove_spaces(self) -> None:
+        for key in (
+            "notencounter",
+            "%65ncountered",
+            "%2565ncounter",
+            "en+counter",
+            "encounter+",
+            "%20encounter",
+            "en%09counter",
+        ):
+            with self.subTest(key=key):
+                content = (
+                    f'<a href="https://example.org/?{key}=VISIBLE">Ordinary context</a>'
+                )
+
+                self.assertEqual(
+                    diagnostic_module._bounded_page_diagnostic_content(content),
+                    content.encode(),
+                )
 
     def test_kind_cannot_escape_the_diagnostic_directory(self) -> None:
         with TemporaryDirectory() as directory_name:
@@ -571,6 +739,53 @@ class PageDiagnosticOwnerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(path.parent, directory)
             self.assertEqual(path.read_text(), "owned content")
+
+    async def test_worker_transport_receives_only_redacted_encoded_capabilities(
+        self,
+    ) -> None:
+        owner = self._owner(self._receipt())
+        secret = "WORKER-HANDOFF-CAPABILITY="
+        content = (
+            '<a href="https://hentaiverse.org/?s=Battle&amp;ss=ba&amp;'
+            f'&#x25;65ncounter={secret}">Fight</a>'
+        )
+        with (
+            TemporaryDirectory() as directory_name,
+            patch.object(
+                page_diagnostic_module,
+                "_page_diagnostic_directory_hint",
+                return_value=Path(directory_name),
+            ),
+            patch(
+                "hbrowser.gallery.browser.page_diagnostic.secrets.token_hex",
+                return_value=self._NONCE,
+            ),
+            patch.object(
+                page_diagnostic_module,
+                "start_owned_process",
+                return_value=owner,
+            ) as start,
+            patch.object(
+                page_diagnostic_module, "_transfer_payload", new=AsyncMock()
+            ) as transfer,
+        ):
+            path = await page_diagnostic_module.write_page_diagnostic_owned(
+                "driver_error", content, deadline=Deadline.after(5)
+            )
+
+            self.assertEqual(path.parent, Path(directory_name))
+
+        transfer.assert_awaited_once()
+        assert transfer.await_args is not None
+        passed_owner, payload = transfer.await_args.args
+        self.assertIs(passed_owner, owner)
+        self.assertIsInstance(payload, bytes)
+        self.assertNotIn(secret.encode(), payload)
+        self.assertIn(b"%65ncounter=REDACTED", payload)
+        self.assertEqual(start.call_args.args[1][-1], str(len(payload)))
+        self.assertNotIn(secret, repr(start.call_args))
+        owner.shutdown.assert_called_once()
+        self.assertTrue(owner.stdout.closed)
 
     async def test_short_deadline_never_starts_or_stages_a_worker(self) -> None:
         with (
