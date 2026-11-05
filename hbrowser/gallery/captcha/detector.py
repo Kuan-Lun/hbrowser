@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 
 from ..utils import (
     Deadline,
-    PageStateTimeout,
+    PageElementNotFound,
     wait_for_selector,
     wait_for_zendriver,
 )
@@ -60,6 +60,7 @@ class CaptchaDetector:
             timeout=_read_timeout(detection_deadline),
             owner=page,
         )
+        _read_timeout(detection_deadline)
         if not isinstance(snapshot, dict):
             raise TypeError("CAPTCHA detection snapshot was not an object")
         url = snapshot.get("url")
@@ -75,15 +76,18 @@ class CaptchaDetector:
         # 檢測 Cloudflare managed challenge
         if self._is_managed_challenge(title, html):
             ray_id = self._extract_ray_id(html)
+            _read_timeout(detection_deadline)
             return ChallengeDetection(
                 url=url, kind="cf_managed_challenge", ray_id=ray_id
             )
 
         # 檢測 Turnstile widget
         document = BeautifulSoup(html, "html.parser")
+        _read_timeout(detection_deadline)
         widget = document.select_one(TURNSTILE_WIDGET_CSS)
         if widget is not None:
             widget_data = self._turnstile_data(dict(widget.attrs))
+            _read_timeout(detection_deadline)
             return ChallengeDetection(
                 url=url,
                 kind="turnstile_widget",
@@ -94,30 +98,34 @@ class CaptchaDetector:
         recaptcha = document.select_one(_RECAPTCHA_WIDGET_CSS)
         if recaptcha is not None:
             sitekey_value = recaptcha.attrs.get("data-sitekey")
+            _read_timeout(detection_deadline)
             return ChallengeDetection(
                 url=url,
                 kind="recaptcha_v2",
                 sitekey=sitekey_value if isinstance(sitekey_value, str) else None,
             )
 
+        _read_timeout(detection_deadline)
         try:
             dynamic_widget = await wait_for_selector(
                 page,
                 _ANY_WIDGET_CSS,
                 deadline=detection_deadline,
             )
-        except PageStateTimeout:
+        except PageElementNotFound:
             return ChallengeDetection(url=url, kind="none")
 
         attrs = dict(dynamic_widget.attrs)
         if self._is_turnstile_attrs(attrs):
             widget_data = self._turnstile_data(attrs)
+            _read_timeout(detection_deadline)
             return ChallengeDetection(
                 url=url,
                 kind="turnstile_widget",
                 sitekey=widget_data["sitekey"],
                 iframe_src=widget_data["src"],
             )
+        _read_timeout(detection_deadline)
         return ChallengeDetection(
             url=url,
             kind="recaptcha_v2",

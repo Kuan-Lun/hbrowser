@@ -184,7 +184,7 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
     async def test_authentication_mutation_failures_are_terminal_and_never_advance(
         self,
     ) -> None:
-        stages = ("login_link", "username", "password", "submit")
+        stages = ("login_link", "credentials", "submit")
         for failed_stage in stages:
             with self.subTest(failed_stage=failed_stage):
                 driver = self._driver()
@@ -202,17 +202,26 @@ class DriverTypedTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
                     "password": SimpleNamespace(send_keys=AsyncMock()),
                     "submit": SimpleNamespace(click=AsyncMock()),
                 }
+                credential_input = AsyncMock(return_value=True)
                 mutation = (
-                    elements[failed_stage].send_keys
-                    if failed_stage in {"username", "password"}
+                    credential_input
+                    if failed_stage == "credentials"
                     else elements[failed_stage].click
                 )
                 mutation.side_effect = RuntimeError(
                     f"sensitive {failed_stage} protocol payload"
                 )
+
+                async def evaluate(
+                    expression: str, mutation: AsyncMock = credential_input
+                ) -> object:
+                    if "setValue.call" in expression:
+                        return await mutation(expression)
+                    return "https://forums.e-hentai.org/"
+
                 driver.page = SimpleNamespace(
                     select=AsyncMock(side_effect=elements.values()),
-                    evaluate=AsyncMock(return_value="https://forums.e-hentai.org/"),
+                    evaluate=evaluate,
                 )
 
                 with (

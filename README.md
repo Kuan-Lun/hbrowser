@@ -104,6 +104,11 @@ if __name__ == "__main__":
 ```
 
 進入 `async with` 時會啟動瀏覽器、登入並前往首頁；離開區塊時會關閉瀏覽器。
+登入表單只會在目前主文件的 origin 為 `https://forums.e-hentai.org` 時寫入帳密；
+來源檢查與欄位寫入在同一次同步操作內完成，外站重新導向會拒絕登入。
+自動 Turnstile 解題結果綁定送出請求時的主文件與回應欄位；等待期間若重新載入、
+導向其他頁面或替換欄位，會拒絕注入 token 並停止該次登入。
+CAPTCHA 查詢結果逾時會回報失敗，不會當成驗證碼不存在。
 第一次使用建議保留 `headless=False`，以便在必要時手動完成驗證。
 
 | 使用網站 | 匯入並建立的 driver | `scope_url` |
@@ -116,6 +121,20 @@ if __name__ == "__main__":
 搜尋會收集去重後的結果，預設上限為 100 頁、5,000 筆。可以在 `SearchRequest`
 設定較小的 `max_pages` 或 `max_results`，但不能超過上述上限。
 如果尚有結果卻已達上限，會拋出 `SearchLimitExceededError`；請縮小搜尋範圍。
+
+瀏覽器私有目錄從建立起保存同一份身分紀錄，跨層錯誤處理不重新認領原路徑。
+清理先移入本次清理專用的私有目錄，核對身分並由父程序確認後
+才刪除內容。原路徑後來出現的替代目錄不會被刪除；若移入的目錄身分不符，
+會保留內容並在錯誤中回報確切位置，不自動移回而覆蓋其他檔案。
+父程序保留已確認的清理身分，子程序中斷後可在原期限及所有權規則下重試。
+若私有目錄建立後尚未完成身分確認就中斷，則保留待人工檢視，不猜測或接納遺留目錄。
+請勿在清理期間修改這些私有目錄：此契約以清理程序為唯一寫入者，不保證防止任意
+同帳號程序刻意進入私有目錄進行競爭修改。Windows 分享鎖仍依原期限有限重試。
+
+使用 `BrowserOwner` 的 tab transport 執行指令時，已判定瀏覽器世代終止的錯誤
+會同步停止所有分頁接收新指令，包括排隊中的指令。請關閉該 owner 後重新建立。
+仍未結算的 browser closer 共用最初期限；重試 `close()` 不會延長該工作期限，
+也不會把逾期完成當成本次成功。
 
 ## 常見操作
 
@@ -158,6 +177,15 @@ else:
 情況可能回傳 `False`。檔案接收與儲存位置由 H@H 處理，HBrowser 不回傳封存檔內容。
 若收到 `ArchiveDownloadOutcomeUnknownError`，請先檢查 H@H 狀態再決定是否重試，
 因為前一次操作可能已生效。
+
+下載控制項必須提供明確目的地：支援 `href` 的相對或絕對 HTTP(S) 網址，或
+`onclick` 的單一函式呼叫：第一參數為未跳脫、以引號包住的完整絕對 HTTP(S)
+網址，其餘參數只能是數字，可加 `return` 與結尾分號。拼接、變數與額外敘述
+不支援，也不執行 JavaScript 來推測目的地。網址必須與圖庫同來源、使用不同
+路徑並含 query；缺少或存在多個不同
+目的地時，會在點擊前拋出 `ValueError`。彈出視窗必須由本次圖庫分頁開啟，且其
+來源、路徑及控制項原有 query 值一致，才會啟用、點擊或關閉；可接受額外 query。
+身分不符或有多個候選視窗時會停止，不重播下載點擊，也不關閉陌生分頁。
 
 ### 每日簽到
 
@@ -233,6 +261,13 @@ if __name__ == "__main__":
 日誌寫入 `events-*.jsonl`；舊檔不會自動刪除，可在程式關閉日誌後自行封存或清理。
 必要的日誌寫入失敗會在設定或結束檢查時拋出 `LogPersistenceError`。
 
+使用 parent／child 日誌轉送時，兩端須使用相同版本並在升級後一起重啟。
+轉送連線會以每次連線的新 challenge 驗證雙方；驗證接收端前不傳送日誌，
+原始 capability token 不會經由 socket 傳送。舊版傳送 token 的握手不再接受，
+也不自動降級；這是本機 loopback 身分驗證，並非加密傳輸。
+已寫入的 `events-*.jsonl` 可保留，不需資料轉換；執行中的連線與尚未送出的
+記憶體佇列無法離線轉換，請先正常關閉舊 parent／child，再啟動升級後的程序。
+
 瀏覽器失敗時也可能儲存 HTML 診斷檔；這些檔案可能含有帳號相關內容，請妥善保管。
 回報問題時請附上套件版本、作業系統、例外名稱，以及是否使用無視窗模式、Tor 或
 FlareSolverr，並移除日誌中的私人資訊。問題可提交到
@@ -253,12 +288,28 @@ editable 安裝；明確以 `--source package=/path/to/checkout` 提供的依賴
 程式變更合併時需要本機 `.venv` 與 PATH 中已登入的 `codex`。合併腳本會先
 審查真正的 candidate，再執行離線 gate；首次審查涵蓋完整專案，通過並合併後
 才可使用增量審查。新 checkout 缺少本機紀錄或審查基準失效時會重新完整審查。
-純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
-大型專案的首次審查可明確延長至一小時：
+共用 coordinator 將完整檔案範圍分配給獨立審查上下文，多段審查另檢查跨模組
+互動；所有階段共用同一期限。V3 證據不轉換或沿用 V2，更新後須重新完成全專案
+審查。純文件合併只執行文件 gate。詳細證據及中斷處理契約見 [AGENTS.md](AGENTS.md)。
+Review 預設 900 秒，可明確指定 1..14400 秒。啟動 reviewer 前會將完整單元、
+bytes、分片、並行波次及扣除準備耗時與既有保留後的容量寫入該次執行的
+`time-budget.json`。可提供每片規劃估計，預設 0 表示未指定；全部
+`ceil(shards/4)` 波次必須可容納，CLI 探測與 prompt 準備後會再次核對。
+此估計不是逐片 timeout、不延長 deadline，也不保證完成時間。例如：
 
 ```bash
-H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600 scripts/git-flow-merge.sh
+H2H_CODE_REVIEW_TIMEOUT_SECONDS=14400 \
+H2H_CODE_REVIEW_MIN_SHARD_SECONDS=900 scripts/git-flow-merge.sh
 ```
+
+合併工具要求 Git 2.38 以上，使用 `ort` 策略；primary 的
+`branch.<primary>.mergeOptions` 僅接受空值或初始化設定的 `--no-ff`，其餘
+自訂選項會拒絕執行。Linked task worktree 若留有
+untracked 或 ignored 檔案、空目錄、symlink 或 `.venv`，合併完成後會保留
+merge commit、task branch 與 worktree，並回報清理未完成。檢視並保存或移除
+這些材料後，從具備 local `.venv` 的 primary checkout 執行
+`scripts/git-flow-merge.sh --cleanup-only task-branch`，即可重試清理，不重跑
+已完成的 review 或 gate。
 
 更新時，在獨立工具環境安裝明確選定的 `h2h-dev-tools` wheel 或版本，再執行：
 

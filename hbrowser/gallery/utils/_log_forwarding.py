@@ -122,14 +122,62 @@ def _encode_frame(value: Mapping[str, object]) -> bytes:
     return struct.pack(">I", len(payload)) + payload
 
 
-def _receive_exact(connection: socket.socket, byte_count: int) -> bytes:
+def _handshake_timeout(connection: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ForwardingReceiveError("forwarding authentication deadline expired")
+    connection.settimeout(remaining)
+
+
+def _receive_exact(
+    connection: socket.socket, byte_count: int, *, deadline: float
+) -> bytes:
     received = bytearray()
     while len(received) < byte_count:
+        _handshake_timeout(connection, deadline)
         chunk = connection.recv(byte_count - len(received))
         if not chunk:
             raise ForwardingReceiveError("forwarding peer closed during handshake")
         received.extend(chunk)
+    _handshake_timeout(connection, deadline)
     return bytes(received)
+
+
+def _decode_json(payload: bytes) -> dict[str, object]:
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+        if not isinstance(decoded, dict) or _canonical_json(decoded) != payload:
+            raise ForwardingProtocolError("forwarding JSON is not a canonical object")
+        return decoded
+    except (ValueError, TypeError, RecursionError, OverflowError) as error:
+        raise ForwardingProtocolError("forwarding JSON is invalid") from error
+
+
+def _handshake_proof(
+    token: str, role: str, client_nonce: str, server_nonce: str
+) -> str:
+    # Separate peer roles and bind both fresh challenges. The root capability
+    # never crosses the socket, including after successful authentication.
+    transcript = (
+        b"hbrowser-log-forwarding-v2\0"
+        + role.encode("ascii")
+        + b"\0"
+        + bytes.fromhex(client_nonce)
+        + bytes.fromhex(server_nonce)
+    )
+    return hmac.digest(bytes.fromhex(token), transcript, "sha256").hex()
+
+
+def _valid_nonce(value: object) -> bool:
+    return isinstance(value, str) and _TOKEN_PATTERN.fullmatch(value) is not None
+
+
+def _valid_proof(value: object, expected: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.isascii()
+        and hmac.compare_digest(value, expected)
+    )
 
 
 def _bounded_text(value: str, limit: int) -> str:
@@ -184,8 +232,7 @@ def _decode_record(value: object) -> ForwardedRecord:
     if (
         isinstance(created, bool)
         or not isinstance(created, int | float)
-        or not math.isfinite(float(created))
-        or not 0 <= float(created) <= _MAX_CREATED_TIMESTAMP
+        or not 0 <= created <= _MAX_CREATED_TIMESTAMP
     ):
         raise ForwardingProtocolError("forwarding timestamp is invalid")
 
@@ -269,8 +316,11 @@ class ForwardingHandler(logging.Handler):
         # Handler.__init__ publishes a weak reference to logging.shutdown.
         # Validate and establish all close state before that publication; a
         # retained constructor traceback must never expose a partial handler.
-        super().__init__(logging.DEBUG)
+        self.lock = None
+        self._name = None
+        self._closed = False
         try:
+            super().__init__(logging.DEBUG)
             self._worker = threading.Thread(
                 target=self._run,
                 name="hbrowser-log-forwarding-send",
@@ -287,27 +337,54 @@ class ForwardingHandler(logging.Handler):
             raise
 
     @staticmethod
-    def _receive_ready(connection: socket.socket) -> None:
-        header = _receive_exact(connection, 4)
+    def _receive_handshake(
+        connection: socket.socket, deadline: float
+    ) -> dict[str, object]:
+        header = _receive_exact(connection, 4, deadline=deadline)
         frame_bytes = struct.unpack(">I", header)[0]
         if not 0 < frame_bytes <= _MAX_FRAME_BYTES:
-            raise ForwardingProtocolError("forwarding ready frame length is invalid")
-        payload = _receive_exact(connection, frame_bytes)
-        try:
-            decoded = json.loads(payload.decode("utf-8"))
-            if decoded != {"type": "ready"} or _canonical_json(decoded) != payload:
-                raise ForwardingProtocolError("forwarding ready frame is invalid")
-        except (
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-            TypeError,
-            ValueError,
-            RecursionError,
-            OverflowError,
-        ) as error:
             raise ForwardingProtocolError(
-                "forwarding ready frame is invalid"
-            ) from error
+                "forwarding handshake frame length is invalid"
+            )
+        return _decode_json(_receive_exact(connection, frame_bytes, deadline=deadline))
+
+    @staticmethod
+    def _authenticate(connection: socket.socket, token: str) -> None:
+        deadline = time.monotonic() + _AUTHENTICATION_TIMEOUT_SECONDS
+        client_nonce = secrets.token_hex(32)
+        _handshake_timeout(connection, deadline)
+        connection.sendall(
+            _encode_frame({"type": "hello", "version": 2, "nonce": client_nonce})
+        )
+        challenge = ForwardingHandler._receive_handshake(connection, deadline)
+        server_nonce = challenge.get("nonce")
+        if (
+            set(challenge) != {"type", "nonce", "proof"}
+            or challenge.get("type") != "challenge"
+            or not isinstance(server_nonce, str)
+            or not _valid_nonce(server_nonce)
+            or not _valid_proof(
+                challenge.get("proof"),
+                _handshake_proof(token, "receiver", client_nonce, server_nonce),
+            )
+        ):
+            raise ForwardingProtocolError("forwarding receiver authentication failed")
+        _handshake_timeout(connection, deadline)
+        connection.sendall(
+            _encode_frame(
+                {
+                    "type": "authenticate",
+                    "proof": _handshake_proof(
+                        token, "sender", client_nonce, server_nonce
+                    ),
+                }
+            )
+        )
+        if ForwardingHandler._receive_handshake(connection, deadline) != {
+            "type": "ready"
+        }:
+            raise ForwardingProtocolError("forwarding ready frame is invalid")
+        connection.settimeout(_CONNECT_TIMEOUT_SECONDS)
 
     @staticmethod
     def _formatted_exception(record: logging.LogRecord) -> str | None:
@@ -417,15 +494,12 @@ class ForwardingHandler(logging.Handler):
             )
             connection.settimeout(_CONNECT_TIMEOUT_SECONDS)
             self._socket = connection
-            connection.sendall(_encode_frame({"token": self._token, "type": "hello"}))
-            self._receive_ready(connection)
+            self._authenticate(connection, self._token)
             failure_stage = "forward-send"
             while True:
                 if self._stop_requested.is_set() and self._queue.empty():
                     failure_stage = "forward-close"
-                    connection.sendall(
-                        _encode_frame({"token": self._token, "type": "close"})
-                    )
+                    connection.sendall(_encode_frame({"type": "close"}))
                     return
                 try:
                     encoded = self._queue.get(timeout=0.05)
@@ -455,7 +529,6 @@ class ForwardingHandler(logging.Handler):
             encoded = _encode_frame(
                 {
                     "record": self._record_payload(record),
-                    "token": self._token,
                     "type": "record",
                 }
             )
@@ -628,11 +701,11 @@ class LogForwardingReceiver:
                     daemon=True,
                 )
                 with self._clients_lock:
-                    if len(self._clients) >= _MAX_CLIENTS:
+                    if self._stopping.is_set() or len(self._clients) >= _MAX_CLIENTS:
                         connection.close()
                         continue
                     self._clients.add(client)
-                client.thread.start()
+                    client.thread.start()
             except Exception as error:
                 self._stopping.set()
                 with self._clients_lock:
@@ -687,101 +760,83 @@ class LogForwardingReceiver:
             received.extend(chunk)
         return bytes(received)
 
-    def _decode_frame(
-        self,
-        payload: bytes,
-        client: _ClientConnection,
-    ) -> tuple[bool, str, ForwardedRecord | None]:
-        try:
-            decoded = json.loads(payload.decode("utf-8"))
-        except ValueError, RecursionError:
-            # UTF-8/JSON syntax, integer limits and nesting limits are all
-            # untrusted-frame failures; connection identity is checked by the
-            # receiver even when this frame cannot establish authentication.
-            return False, "noise", None
-        if not isinstance(decoded, dict):
-            return False, "noise", None
-        supplied_token = decoded.get("token")
-        authenticated = (
-            isinstance(supplied_token, str)
-            and supplied_token.isascii()
-            and hmac.compare_digest(supplied_token, self._token)
+    def _read_frame(self, client: _ClientConnection) -> bytes:
+        header = self._read_exact(client, 4)
+        frame_bytes = struct.unpack(">I", header)[0]
+        if not 0 < frame_bytes <= _MAX_FRAME_BYTES:
+            raise ForwardingProtocolError("forwarding frame length is invalid")
+        return self._read_exact(client, frame_bytes)
+
+    def _authenticate_client(self, client: _ClientConnection) -> None:
+        hello = _decode_json(self._read_frame(client))
+        client_nonce = hello.get("nonce")
+        if (
+            set(hello) != {"type", "version", "nonce"}
+            or hello.get("type") != "hello"
+            or hello.get("version") != 2
+            or not isinstance(client_nonce, str)
+            or not _valid_nonce(client_nonce)
+        ):
+            raise ForwardingProtocolError("forwarding hello schema is invalid")
+        server_nonce = secrets.token_hex(32)
+        client.connection.sendall(
+            _encode_frame(
+                {
+                    "type": "challenge",
+                    "nonce": server_nonce,
+                    "proof": _handshake_proof(
+                        self._token, "receiver", client_nonce, server_nonce
+                    ),
+                }
+            )
         )
-        if not authenticated:
-            return False, "noise", None
-        # Authentication is established before canonical/schema validation so
-        # a peer possessing the capability cannot disguise protocol corruption
-        # as unauthenticated network noise.
-        client.authenticated = True
+        payload = self._read_frame(client)
+        # Verify possession before enforcing the exact authenticated schema so
+        # a peer with the capability cannot hide corruption as connection noise.
         try:
-            if _canonical_json(decoded) != payload:
-                raise ForwardingProtocolError("forwarding JSON is not canonical")
-            frame_type = decoded.get("type")
-            match frame_type:
-                case "hello":
-                    if set(decoded) != {"token", "type"}:
-                        raise ForwardingProtocolError(
-                            "forwarding hello schema is invalid"
-                        )
-                    return True, "hello", None
-                case "close":
-                    if set(decoded) != {"token", "type"}:
-                        raise ForwardingProtocolError(
-                            "forwarding close schema is invalid"
-                        )
-                    return True, "close", None
-                case "record":
-                    if set(decoded) != {"record", "token", "type"}:
-                        raise ForwardingProtocolError(
-                            "forwarding frame schema is invalid"
-                        )
-                    return True, "record", _decode_record(decoded["record"])
-                case _:
-                    raise ForwardingProtocolError("forwarding frame type is invalid")
-        except (TypeError, ValueError, RecursionError, OverflowError) as error:
-            if isinstance(error, ForwardingProtocolError):
-                raise
+            response = json.loads(payload.decode("utf-8"))
+        except (ValueError, RecursionError) as error:
             raise ForwardingProtocolError(
-                "forwarding canonical JSON is invalid"
+                "forwarding authentication is invalid"
             ) from error
+        if not isinstance(response, dict) or not _valid_proof(
+            response.get("proof"),
+            _handshake_proof(self._token, "sender", client_nonce, server_nonce),
+        ):
+            raise ForwardingProtocolError("forwarding sender authentication failed")
+        client.authenticated = True
+        response = _decode_json(payload)
+        if set(response) != {"type", "proof"} or response.get("type") != "authenticate":
+            raise ForwardingProtocolError("forwarding authentication schema is invalid")
+        if time.monotonic() - client.accepted_at >= _AUTHENTICATION_TIMEOUT_SECONDS:
+            raise ForwardingReceiveError("forwarding authentication deadline expired")
+        client.connection.sendall(_encode_frame({"type": "ready"}))
+
+    @staticmethod
+    def _decode_frame(payload: bytes) -> tuple[str, ForwardedRecord | None]:
+        decoded = _decode_json(payload)
+        match decoded.get("type"):
+            case "close":
+                if set(decoded) != {"type"}:
+                    raise ForwardingProtocolError("forwarding close schema is invalid")
+                return "close", None
+            case "record":
+                if set(decoded) != {"record", "type"}:
+                    raise ForwardingProtocolError("forwarding record schema is invalid")
+                return "record", _decode_record(decoded["record"])
+            case _:
+                raise ForwardingProtocolError("forwarding frame type is invalid")
 
     def _serve_client(self, client: _ClientConnection) -> None:
         try:
             while True:
                 try:
-                    header = self._read_exact(client, 4)
-                    frame_bytes = struct.unpack(">I", header)[0]
-                    if not 0 < frame_bytes <= _MAX_FRAME_BYTES:
-                        if client.authenticated:
-                            raise ForwardingProtocolError(
-                                "forwarding frame length is invalid"
-                            )
+                    if not client.authenticated:
+                        self._authenticate_client(client)
+                    frame_type, record = self._decode_frame(self._read_frame(client))
+                    if frame_type == "close":
+                        client.graceful_close = True
                         return
-                    payload = self._read_exact(client, frame_bytes)
-                    authenticated, frame_type, record = self._decode_frame(
-                        payload,
-                        client,
-                    )
-                    if not authenticated:
-                        if client.authenticated:
-                            raise ForwardingProtocolError(
-                                "authenticated forwarding frame is invalid"
-                            )
-                        return
-                    match frame_type:
-                        case "close":
-                            client.graceful_close = True
-                            return
-                        case "hello":
-                            try:
-                                client.connection.sendall(
-                                    _encode_frame({"type": "ready"})
-                                )
-                            except Exception as error:
-                                raise ForwardingReceiveError(
-                                    "forwarding ready receipt could not be sent"
-                                ) from error
-                            continue
                     if record is None:
                         raise ForwardingProtocolError(
                             "forwarding record frame is empty"
@@ -840,20 +895,24 @@ class LogForwardingReceiver:
             or drain_timeout <= 0
         ):
             raise ValueError("forwarding drain timeout must be finite and positive")
-        self._stopping.set()
-        self._drain_deadline = time.monotonic() + float(drain_timeout)
+        deadline = time.monotonic() + float(drain_timeout)
+        with self._clients_lock:
+            self._stopping.set()
+            self._drain_deadline = (
+                deadline
+                if self._drain_deadline is None
+                else min(self._drain_deadline, deadline)
+            )
 
         def remaining_budget() -> float:
-            deadline = self._drain_deadline
-            if deadline is None:
-                return 0.0
+            # Concurrent close callers and retries must not extend this call.
             return max(0.0, deadline - time.monotonic())
 
         try:
             self._listener.close()
         except OSError:
             pass
-        self._accept_thread.join(timeout=min(remaining_budget(), 0.5))
+        self._accept_thread.join(timeout=remaining_budget())
 
         while remaining_budget() > 0:
             with self._clients_lock:
@@ -888,17 +947,18 @@ class LogForwardingReceiver:
                 for client in self._clients
                 if client.thread is not None and client.thread.is_alive()
             )
-        if still_running:
-            drain_error = ForwardingDrainError("forwarding client thread did not stop")
+        if self._accept_thread.is_alive() or still_running:
+            drain_error = ForwardingDrainError(
+                "forwarding receiver thread did not stop"
+            )
             self._report_failure("forward-drain", drain_error)
             self._discarded = True
-            self._stopped = True
             raise drain_error
         self._discarded = True
         self._stopped = True
 
-    def _discard_after_fork(self) -> None:
-        """Close inherited descriptors in a fork child whose threads vanished."""
+    def _abandon_delivery(self) -> None:
+        """Revoke delivery and close descriptors without claiming thread exit."""
         self._discarded = True
         self._delivery_enabled = False
         try:
@@ -910,6 +970,10 @@ class LogForwardingReceiver:
                 client.connection.close()
             except OSError:
                 pass
+
+    def _discard_after_fork(self) -> None:
+        """Close inherited descriptors in a fork child whose threads vanished."""
+        self._abandon_delivery()
         self._stopped = True
 
 

@@ -61,6 +61,7 @@ class ProcessOwnershipError(RuntimeError):
     """A command violated ownership; cleanup may still finish before propagation."""
 
     cleanup_proven: bool = False
+    owner: OwnedProcess | None = None
 
 
 @dataclass
@@ -336,8 +337,10 @@ class OwnedProcess:
 
 
 def _start_posix_process(phase: ProcessCommand) -> subprocess.Popen[bytes]:
+    from ._process_posix import PinnedProcess
+
     command = phase.argv
-    return subprocess.Popen(
+    return PinnedProcess(
         command,
         cwd=phase.cwd,
         env=phase.environment,
@@ -512,6 +515,7 @@ def start_owned_process(
             deadline=deadline,
             signal_controller=signal_controller,
         )
+    from ._process_posix import AcquisitionError, IdentityError
     from ._process_scope import PosixScope, ScopeError
 
     scope: PosixScope | None = None
@@ -521,12 +525,38 @@ def start_owned_process(
             replace(phase, environment=scope.environment(phase.environment))
         )
         return OwnedProcess(child, posix_scope=scope)
-    except (OSError, ScopeError) as error:
+    except AcquisitionError as error:
+        assert scope is not None
+        owner = OwnedProcess(error.process, posix_scope=scope)
+        failure = ProcessOwnershipError(f"{phase.label}: {error}")
+        failure.owner = owner
+        failure.add_note(
+            f"Unproven process scope retained: {scope.capability.directory}"
+        )
+        try:
+            # Acquisition failed after exec: nested work may already exist.
+            # Reuse admission closure and nested cleanup under the original
+            # deadline. The pinned leader remains waitable, but without a pidfd
+            # this path cannot prove Linux group absence or release its scope.
+            terminate_owned_tree(owner, deadline=deadline, diagnostic=failure.add_note)
+        except BaseException as cleanup_error:
+            failure.add_note(f"Startup cleanup failed: {cleanup_error!r}")
+        raise failure from error
+    except IdentityError as error:
+        # Unknown identity failures do not establish a pre-spawn rollback proof.
+        raise ProcessOwnershipError(f"{phase.label}: {error}") from error
+    except (OSError, ScopeError, IndexError, TypeError, ValueError) as error:
         if scope is not None:
-            # Popen reported failure before it returned a child handle. Its
-            # subprocess contract reaps a failed exec before raising OSError.
+            # These Popen argument errors precede child creation; a failed exec
+            # is reaped before OSError is raised. Unknown exceptions or signals
+            # do not establish this proof and must retain their obligation.
             scope.proven_empty = True
-            scope.close(deadline=deadline)
+            try:
+                scope.close(deadline=deadline)
+            except (OSError, ScopeError) as rollback_error:
+                raise ProcessOwnershipError(
+                    f"{phase.label}: startup scope rollback is unproven"
+                ) from rollback_error
         raise ProcessOwnershipError(phase.label) from error
 
 
@@ -550,24 +580,28 @@ def _wait_for_process_until(
 def _wait_for_posix_process_group_exit(
     process: subprocess.Popen[bytes],
     *,
-    kill_process_group: Callable[[int, int], None],
     deadline: float,
     scope: PosixScope | None = None,
+    poll_deadline: float | None = None,
 ) -> bool:
+    from ._process_posix import PinnedProcess
+
+    if not isinstance(process, PinnedProcess):
+        raise ProcessOwnershipError("POSIX group identity was not retained at launch")
+    observation_deadline = (
+        deadline if poll_deadline is None else min(deadline, poll_deadline)
+    )
     while True:
-        # poll() reaps an exited leader; group membership, rather than leader
-        # state, remains the authority for whether descendants survived.
-        process.poll()
-        try:
-            kill_process_group(process.pid, 0)
-        except ProcessLookupError:
-            if scope is not None and seconds_remaining(deadline) <= 0:
+        # Exit observation preserves native group identity. Linux may reap the
+        # leader while a pidfd still owns the original group of descendants.
+        if process.poll() is not None and (
+            scope is None or not scope.has_pending(deadline=deadline)
+        ):
+            if seconds_remaining(deadline) <= 0:
                 return False
-            if scope is None or not scope.has_pending(deadline=deadline):
-                return _wait_for_process_until(process, deadline=deadline)
-        except PermissionError:
-            pass
-        remaining_seconds = seconds_remaining(deadline)
+            if process.retire_clean_group(deadline=deadline):
+                return True
+        remaining_seconds = seconds_remaining(observation_deadline)
         if remaining_seconds <= 0:
             return False
         time.sleep(min(TERMINATION_POLL_SECONDS, remaining_seconds))
@@ -579,6 +613,8 @@ def _terminate_posix_process_group(
     deadline: float,
     scope: PosixScope | None = None,
 ) -> bool:
+    from ._process_posix import PinnedProcess
+
     kill_process_group = cast(
         Callable[[int, int], None] | None,
         getattr(os, "killpg", None),
@@ -588,13 +624,16 @@ def _terminate_posix_process_group(
 
     if scope is not None:
         scope.close_admission(deadline=deadline)
+    if not isinstance(process, PinnedProcess):
+        raise ProcessOwnershipError("POSIX group identity was not retained at launch")
 
     try:
-        kill_process_group(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+        process.signal_group(signal.SIGTERM, send=kill_process_group)
+    except ProcessLookupError, PermissionError:
+        # An exited, pinned leader may make XNU report EPERM. Neither signal
+        # error proves absence: require the same complete retained-identity proof.
         return _wait_for_posix_process_group_exit(
             process,
-            kill_process_group=kill_process_group,
             deadline=deadline,
             scope=scope,
         )
@@ -607,9 +646,9 @@ def _terminate_posix_process_group(
     )
     if _wait_for_posix_process_group_exit(
         process,
-        kill_process_group=kill_process_group,
-        deadline=graceful_deadline,
+        deadline=deadline,
         scope=scope,
+        poll_deadline=graceful_deadline,
     ):
         return True
     # The inner owner must survive long enough to prove its separate session
@@ -623,21 +662,11 @@ def _terminate_posix_process_group(
         if not scope.has_pending(deadline=deadline):
             break
         time.sleep(min(TERMINATION_POLL_SECONDS, remaining))
-    if scope is not None and _wait_for_posix_process_group_exit(
-        process,
-        kill_process_group=kill_process_group,
-        deadline=time.monotonic(),
-    ):
-        # Reap an inner owner that exited after releasing its last obligation.
-        # Admission is closed and pending was just proven empty, so this final
-        # group-only observation cannot admit another nested session.
-        return True
     try:
-        kill_process_group(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+        process.signal_group(signal.SIGKILL, send=kill_process_group)
+    except ProcessLookupError, PermissionError:
         return _wait_for_posix_process_group_exit(
             process,
-            kill_process_group=kill_process_group,
             deadline=deadline,
             scope=scope,
         )
@@ -645,7 +674,6 @@ def _terminate_posix_process_group(
         return False
     return _wait_for_posix_process_group_exit(
         process,
-        kill_process_group=kill_process_group,
         deadline=deadline,
         scope=scope,
     )
@@ -655,46 +683,59 @@ def wait_for_owned_tree_exit(
     owner: OwnedProcess,
     *,
     deadline: float,
+    poll_deadline: float | None = None,
 ) -> bool:
+    """Observe group exit briefly while retaining the original ledger budget.
+
+    A short poll limits waiting for group disappearance, not admission closure
+    or nested-obligation proof. Both remain bounded by the caller's deadline.
+    """
+    observation_deadline = (
+        deadline if poll_deadline is None else min(deadline, poll_deadline)
+    )
     if owner.windows_job is not None:
         try:
             return owner.windows_job.wait_empty(
-                deadline=deadline
+                deadline=observation_deadline
             ) and _wait_for_process_until(
                 owner.process,
-                deadline=deadline,
+                deadline=observation_deadline,
             )
         except OSError:
             return False
-    kill_process_group = cast(
-        Callable[[int, int], None] | None,
-        getattr(os, "killpg", None),
-    )
-    if kill_process_group is None:
-        return False
-    if owner.posix_scope is not None:
-        owner.posix_scope.cleanup_deadline = deadline
-        owner.posix_scope.close_admission(deadline=deadline)
-    empty = _wait_for_posix_process_group_exit(
-        owner.process,
-        kill_process_group=kill_process_group,
-        deadline=deadline,
-        scope=owner.posix_scope,
-    )
+    from ._process_posix import IdentityError
+    from ._process_scope import ScopeError
+
+    try:
+        if owner.posix_scope is not None:
+            owner.posix_scope.close_admission(deadline=deadline)
+        empty = _wait_for_posix_process_group_exit(
+            owner.process,
+            deadline=deadline,
+            scope=owner.posix_scope,
+            poll_deadline=observation_deadline,
+        )
+    except (ScopeError, IdentityError) as error:
+        raise ProcessOwnershipError(
+            f"Process scope cleanup could not be proven: {error}"
+        ) from error
     if owner.posix_scope is not None:
         owner.posix_scope.proven_empty = empty
     return empty
 
 
-def _diagnostic_supports_nonblocking(descriptor: int) -> bool:
-    # Python's Windows get/set_blocking only support pipes. Preserve native
-    # console encoding and regular-file output instead of silently dropping it.
-    return os.name != "nt" or stat.S_ISFIFO(os.fstat(descriptor).st_mode)
+def _diagnostic_requires_writer(descriptor: int) -> bool:
+    # Windows console and regular-file streams retain their native TextIOWrapper
+    # encoding/newline contract. Pipe output requires an independently owned write.
+    mode = os.fstat(descriptor).st_mode
+    return os.name != "nt" or stat.S_ISFIFO(mode)
 
 
-def _print_memory_or_native_diagnostic(message: str, stream: TextIO) -> None:
+def _print_memory_or_native_diagnostic(
+    message: str, stream: TextIO, *, newline: bool = True
+) -> None:
     try:
-        print(message, file=stream, flush=True)
+        print(message, file=stream, end="\n" if newline else "", flush=True)
     except Exception:
         # A failed native TextIOWrapper flush can retain buffered bytes and
         # overwrite the real exit status during finalization. Retire only its
@@ -712,51 +753,95 @@ def _print_memory_or_native_diagnostic(message: str, stream: TextIO) -> None:
             pass
 
 
-def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
-    """Best-effort human output: pipe backpressure cannot delay owned cleanup."""
+def report_diagnostic(
+    message: str,
+    *,
+    standard_output: bool = False,
+    newline: bool = True,
+    deadline: float | None = None,
+    work_deadline: float | None = None,
+    signal_controller: SignalController | None = None,
+) -> None:
+    """Emit optional bounded human output without changing caller FD flags.
 
+    Owned callers pass their existing absolute cleanup deadline and controller.
+    An earlier work cutoff limits new display work without shortening cleanup.
+    A caller without a deadline gets one explicit six-second total budget.
+    Full pipes may discard diagnostics, but an unproven helper cleanup propagates.
+    Automatic signal handling requires the main thread; callers with existing
+    signal control pass that controller. Background cleanup workers collect text
+    in their own sink and let the controlling thread emit after all workers join.
+    """
+    from . import _process_diagnostic
+
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("Diagnostic deadline must be finite")
+    if work_deadline is not None and not math.isfinite(work_deadline):
+        raise ValueError("Diagnostic work deadline must be finite")
+    now = time.monotonic()
+    if deadline is None:
+        deadline = now + _process_diagnostic.DEFAULT_CLEANUP_SECONDS
+    work_deadline = min(
+        now + _process_diagnostic.DIAGNOSTIC_SECONDS,
+        deadline,
+        work_deadline if work_deadline is not None else math.inf,
+    )
+    if work_deadline <= now:
+        return
     stream = sys.stdout if standard_output else sys.stderr
     try:
         descriptor = stream.fileno()
     except Exception:
-        # Support known memory-only capture, never call a custom no-FD writer
-        # whose blocking behavior cannot be controlled by the process owner.
         if isinstance(stream, io.StringIO) or (
             isinstance(stream, io.TextIOWrapper)
             and isinstance(stream.buffer, io.BytesIO)
         ):
-            _print_memory_or_native_diagnostic(message, stream)
+            _print_memory_or_native_diagnostic(message, stream, newline=newline)
         return
     try:
-        if not _diagnostic_supports_nonblocking(descriptor):
-            _print_memory_or_native_diagnostic(message, stream)
+        if not _diagnostic_requires_writer(descriptor):
+            _print_memory_or_native_diagnostic(message, stream, newline=newline)
             return
-        blocking = os.get_blocking(descriptor)
-        try:
-            # dup/inheritance shares these flags with the caller: always restore
-            # the original setting, including after short output or EAGAIN.
-            os.set_blocking(descriptor, False)
-            remaining = memoryview(
-                (message + "\n").encode(
-                    stream.encoding or "utf-8",
-                    errors=stream.errors or "backslashreplace",
-                )
-            )
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written == 0:
-                    break
-                remaining = remaining[written:]
-        finally:
-            os.set_blocking(descriptor, blocking)
+        payload = _process_diagnostic.encode_diagnostic(
+            message,
+            encoding=stream.encoding or "utf-8",
+            errors=stream.errors or "backslashreplace",
+            newline=newline,
+        )
     except Exception:
-        # Closed/full pipes discard diagnostics without creating a buffered
-        # retry at interpreter exit. Never redirect or flush the caller's data.
-        pass
+        return
+    controller_context = (
+        controlled_termination_signals()
+        if signal_controller is None
+        else nullcontext(signal_controller)
+    )
+    with controller_context as controller:
+        _process_diagnostic.write_diagnostic(
+            descriptor,
+            payload,
+            deadline=deadline,
+            work_deadline=work_deadline,
+            signal_controller=controller,
+        )
+
+
+def _report_cleanup_diagnostic(
+    message: str,
+    *,
+    deadline: float,
+    diagnostic: Callable[[str], None] | None,
+) -> None:
+    if diagnostic is None:
+        report_diagnostic(message, deadline=deadline)
+    else:
+        diagnostic(message)
 
 
 def _taskkill_windows_tree(
-    process: subprocess.Popen[bytes], *, deadline: float
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+    diagnostic: Callable[[str], None] | None = None,
 ) -> bool:
     remaining_seconds = seconds_remaining(deadline)
     if remaining_seconds == 0:
@@ -773,9 +858,11 @@ def _taskkill_windows_tree(
         return False
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        report_diagnostic(
+        _report_cleanup_diagnostic(
             f"taskkill failed with exit {completed.returncode}"
-            + (f": {detail}" if detail else "")
+            + (f": {detail}" if detail else ""),
+            deadline=deadline,
+            diagnostic=diagnostic,
         )
         return False
     return True
@@ -785,6 +872,7 @@ def _terminate_windows_tree(
     owner: OwnedProcess,
     *,
     deadline: float,
+    diagnostic: Callable[[str], None] | None = None,
 ) -> bool:
     job = owner.windows_job
     if job is None or seconds_remaining(deadline) == 0:
@@ -792,9 +880,12 @@ def _terminate_windows_tree(
     try:
         job.terminate()
     except OSError as error:
-        report_diagnostic(str(error))
-        if not _taskkill_windows_tree(owner.process, deadline=deadline):
-            return False
+        fallback = _taskkill_windows_tree(
+            owner.process, deadline=deadline, diagnostic=diagnostic
+        )
+        empty = fallback and wait_for_owned_tree_exit(owner, deadline=deadline)
+        _report_cleanup_diagnostic(str(error), deadline=deadline, diagnostic=diagnostic)
+        return empty
     return wait_for_owned_tree_exit(owner, deadline=deadline)
 
 
@@ -802,35 +893,66 @@ def terminate_owned_tree(
     owner: OwnedProcess,
     *,
     deadline: float,
+    diagnostic: Callable[[str], None] | None = None,
 ) -> bool:
-    """Terminate and verify the managed command process tree before deadline."""
+    """Terminate and verify the managed command process tree before deadline.
+
+    Owned callers collect diagnostics until the tree is empty and owner closed.
+    The collector only records text; it must not launch work or handle signals.
+    Standalone callers retain the existing bounded diagnostic output by default.
+    """
 
     if owner.windows_job is not None:
-        return _terminate_windows_tree(owner, deadline=deadline)
-    if owner.posix_scope is not None:
-        owner.posix_scope.cleanup_deadline = deadline
-    empty = _terminate_posix_process_group(
-        owner.process, deadline=deadline, scope=owner.posix_scope
-    )
+        return _terminate_windows_tree(owner, deadline=deadline, diagnostic=diagnostic)
+    from ._process_posix import IdentityError
+    from ._process_scope import ScopeError
+
+    try:
+        empty = _terminate_posix_process_group(
+            owner.process, deadline=deadline, scope=owner.posix_scope
+        )
+    except (ScopeError, IdentityError) as error:
+        raise ProcessOwnershipError(
+            f"Process scope cleanup could not be proven: {error}"
+        ) from error
     if owner.posix_scope is not None:
         owner.posix_scope.proven_empty = empty
     return empty
 
 
-def close_owner(owner: OwnedProcess) -> bool:
+def close_owner(
+    owner: OwnedProcess,
+    *,
+    deadline: float,
+    diagnostic: Callable[[str], None] | None = None,
+) -> bool:
+    """Close using the caller's phase deadline, independent of earlier tree polls.
+
+    Concurrent callers must collect diagnostics into their own sink and emit
+    them from the controlling thread after joining. The sink only records a
+    message; it must not launch cleanup or change ownership.
+    """
+
+    def report(message: str) -> None:
+        _report_cleanup_diagnostic(message, deadline=deadline, diagnostic=diagnostic)
+
     job = owner.windows_job
     if job is None:
-        if owner.posix_scope is not None:
-            try:
-                owner.posix_scope.close(deadline=owner.posix_scope.cleanup_deadline)
-            except Exception as error:
-                report_diagnostic(str(error))
-                return False
+        from ._process_posix import PinnedProcess
+
+        try:
+            if isinstance(owner.process, PinnedProcess):
+                owner.process.close_identity()
+            if owner.posix_scope is not None:
+                owner.posix_scope.close(deadline=deadline)
+        except Exception as error:
+            report(str(error))
+            return False
         return True
     try:
         job.close()
     except OSError as error:
-        report_diagnostic(str(error))
+        report(str(error))
         return False
     return True
 
@@ -878,36 +1000,43 @@ def _run_command(
             "Deadline must be finite and cleanup reserve finite and positive"
         )
     started_at = time.monotonic()
-    budget_detail = (
-        "unbounded"
-        if hard_deadline is None
-        else f"{max(0.0, hard_deadline - started_at):.1f}s total remaining"
+    ownership_deadline = (
+        hard_deadline
+        if hard_deadline is not None
+        else started_at + termination_reserve_seconds
     )
-    report_diagnostic(f"\n==> {phase.label} ({budget_detail})", standard_output=True)
-    report_diagnostic("+ " + shlex.join(phase.argv), standard_output=True)
     execution_deadline = (
         None if hard_deadline is None else hard_deadline - termination_reserve_seconds
     )
     if execution_deadline is not None and execution_deadline <= started_at:
         report_diagnostic(
             f"command budget lacks the {termination_reserve_seconds:.1f}s "
-            f"termination reserve before {phase.label}"
+            f"termination reserve before {phase.label}",
+            deadline=hard_deadline,
+            signal_controller=signal_controller,
         )
         return TIMEOUT_EXIT_CODE
-    ownership_deadline = (
-        hard_deadline
-        if hard_deadline is not None
-        else started_at + termination_reserve_seconds
+    budget_detail = (
+        "unbounded"
+        if hard_deadline is None
+        else f"{max(0.0, hard_deadline - started_at):.1f}s total remaining"
     )
+    report_diagnostic(
+        f"\n==> {phase.label} ({budget_detail})\n+ " + shlex.join(phase.argv),
+        standard_output=True,
+        deadline=ownership_deadline,
+        work_deadline=execution_deadline,
+        signal_controller=signal_controller,
+    )
+    if execution_deadline is not None and time.monotonic() >= execution_deadline:
+        return TIMEOUT_EXIT_CODE
     owner: OwnedProcess | None = None
     tree_empty_proven = False
     ownership_error: ProcessOwnershipError | None = None
     termination_deadline: float | None = None
     return_code = TERMINATION_FAILED_EXIT_CODE
+    messages: list[str] = []
     try:
-        # Do not deliver a controlled platform signal after Popen creates the
-        # child but before this frame owns its process tree. The handler records
-        # a pending signal and delivers it after ownership is established.
         with signal_controller.defer():
             owner = start_owned_process(
                 phase,
@@ -924,7 +1053,7 @@ def _run_command(
         except subprocess.TimeoutExpired:
             termination_deadline = hard_deadline
             return_code = TIMEOUT_EXIT_CODE
-            report_diagnostic(
+            messages.append(
                 f"command budget expired during {phase.label}; "
                 "terminating its process tree"
             )
@@ -941,63 +1070,108 @@ def _run_command(
             )
             with signal_controller.defer():
                 tree_empty_proven = wait_for_owned_tree_exit(
-                    owner, deadline=clean_exit_deadline
+                    owner,
+                    deadline=termination_deadline,
+                    poll_deadline=clean_exit_deadline,
                 )
             if not tree_empty_proven:
-                report_diagnostic(
+                messages.append(
                     "command leader exited with surviving process-tree members "
                     f"during {phase.label}"
                 )
                 ownership_error = ProcessOwnershipError(phase.label)
                 raise ownership_error
+    except ProcessOwnershipError as error:
+        ownership_error = error
+        raise
     except KeyboardInterrupt, RunnerSignalInterrupt:
-        report_diagnostic(
+        messages.append(
             f"command interrupted during {phase.label}; terminating its process tree"
         )
         raise
     finally:
         if owner is not None:
-            # Every exit, including wait or diagnostic failure, passes through
-            # bounded teardown. Defer signals through Job closure as well, and
-            # never let failed termination skip the kill-on-close backstop.
+            # Human output is deferred until the command is empty and closed.
+            # Its optional writer never competes with the primary tree teardown.
             with signal_controller.defer():
+                if termination_deadline is None:
+                    termination_deadline = (
+                        time.monotonic() + termination_reserve_seconds
+                    )
+                    if hard_deadline is not None:
+                        termination_deadline = min(hard_deadline, termination_deadline)
+                cleanup_error: ProcessOwnershipError | None = None
                 try:
                     if not tree_empty_proven:
-                        if termination_deadline is None:
-                            termination_deadline = (
-                                time.monotonic() + termination_reserve_seconds
-                            )
-                            if hard_deadline is not None:
-                                termination_deadline = min(
-                                    hard_deadline, termination_deadline
-                                )
                         try:
                             tree_empty_proven = terminate_owned_tree(
-                                owner, deadline=termination_deadline
+                                owner,
+                                deadline=termination_deadline,
+                                diagnostic=messages.append,
                             )
+                        except ProcessOwnershipError:
+                            raise
                         except Exception as error:
                             raise ProcessOwnershipError(phase.label) from error
                         if not tree_empty_proven:
-                            report_diagnostic(
-                                "could not verify process-tree termination for "
-                                f"{phase.label}"
-                            )
                             raise ProcessOwnershipError(phase.label)
+                except ProcessOwnershipError as error:
+                    cleanup_error = ownership_error or error
+                    if cleanup_error is not error:
+                        cleanup_error.add_note(f"Cleanup error: {error}")
                 finally:
-                    if not close_owner(owner):
-                        raise ProcessOwnershipError(phase.label)
+                    if not close_owner(
+                        owner,
+                        deadline=termination_deadline,
+                        diagnostic=messages.append,
+                    ):
+                        cleanup_error = (
+                            cleanup_error
+                            or ownership_error
+                            or ProcessOwnershipError(phase.label)
+                        )
+                if cleanup_error is not None:
+                    # Unsafe cleanup must not launch an interruptible diagnostic
+                    # writer. Preserve the first ownership error and its cause;
+                    # callers can display these notes after handling ownership.
+                    cleanup_error.cleanup_proven = False
+                    for message in messages:
+                        cleanup_error.add_note(message)
+                    raise cleanup_error
                 if ownership_error is not None:
                     ownership_error.cleanup_proven = tree_empty_proven
+                # A failed diagnostic helper remains ownership failure even when
+                # the main command is empty; never label that helper as proven.
+                if messages:
+                    report_diagnostic(
+                        "\n".join(messages),
+                        deadline=termination_deadline,
+                        signal_controller=signal_controller,
+                    )
                 report_diagnostic(
-                    f"owned_tree_empty={tree_empty_proven}", standard_output=True
+                    f"owned_tree_empty={tree_empty_proven}",
+                    standard_output=True,
+                    deadline=termination_deadline,
+                    signal_controller=signal_controller,
                 )
     finished_at = time.monotonic()
     elapsed = finished_at - started_at
     if hard_deadline is not None and finished_at > hard_deadline and return_code == 0:
         return_code = TIMEOUT_EXIT_CODE
     report_diagnostic(
-        f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})", standard_output=True
+        f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})",
+        standard_output=True,
+        deadline=termination_deadline
+        if termination_deadline is not None
+        else hard_deadline,
+        signal_controller=signal_controller,
     )
+    if (
+        hard_deadline is not None
+        and time.monotonic() > hard_deadline
+        and return_code == 0
+    ):
+        return TIMEOUT_EXIT_CODE
     return return_code
 
 

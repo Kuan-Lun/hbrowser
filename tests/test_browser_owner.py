@@ -16,7 +16,11 @@ from hbrowser.gallery.browser import (
     TabTransportUnavailableError,
 )
 from hbrowser.gallery.browser import owner as owner_module
-from hbrowser.gallery.utils import Deadline, ZendriverOperationTimeout
+from hbrowser.gallery.utils import (
+    Deadline,
+    ZendriverOperationTimeout,
+    wait_for_zendriver,
+)
 from hbrowser.gallery.utils import deadline as deadline_module
 from hbrowser.gallery.utils.page_state import PageStateTimeout
 
@@ -32,6 +36,245 @@ class _FakeBrowser:
 
 
 class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protocol_cancellation_seals_queued_and_sibling_admission(
+        self,
+    ) -> None:
+        for swallow, rebind_tab in ((False, False), (True, False), (True, True)):
+            with self.subTest(swallow=swallow, rebind_tab=rebind_tab):
+                browser = SimpleNamespace()
+                tab = SimpleNamespace(target_id="main", browser=browser)
+                sibling_tab = SimpleNamespace(target_id="sibling", browser=browser)
+                closer = AsyncMock()
+                owner: BrowserOwner[SimpleNamespace, SimpleNamespace] = BrowserOwner(
+                    browser_factory=AsyncMock(return_value=(browser, tab)),
+                    browser_closer=closer,
+                    tab_factory=AsyncMock(return_value=sibling_tab),
+                    target_id_getter=lambda item: item.target_id,
+                )
+                await owner.start()
+                sibling = await owner.open_tab("sibling")
+                operation: asyncio.Future[object] = (
+                    asyncio.get_running_loop().create_future()
+                )
+                entered, cancelled, release = (
+                    asyncio.Event(),
+                    asyncio.Event(),
+                    asyncio.Event(),
+                )
+                queued_command, sibling_command = AsyncMock(), AsyncMock()
+
+                async def command(
+                    current: SimpleNamespace,
+                    operation: asyncio.Future[object] = operation,
+                    entered: asyncio.Event = entered,
+                    cancelled: asyncio.Event = cancelled,
+                    release: asyncio.Event = release,
+                    swallow: bool = swallow,
+                ) -> None:
+                    entered.set()
+                    try:
+                        await wait_for_zendriver(operation, timeout=5, owner=current)
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        if not swallow:
+                            raise
+                        await release.wait()
+
+                active = asyncio.create_task(owner.main_tab.execute(command))
+                await entered.wait()
+                queued = asyncio.create_task(owner.main_tab.execute(queued_command))
+                await asyncio.sleep(0)
+                try:
+                    if rebind_tab:
+                        # The accepted operation still belongs to the original
+                        # browser, even if the mutable tab now points elsewhere.
+                        tab.browser = SimpleNamespace()
+                    active.cancel()
+                    await cancelled.wait()
+                    self.assertFalse(operation.done())
+                    self.assertFalse(operation.cancelled())
+                    # In the swallowed case, the active callback still holds
+                    # its lock. The sibling must already reject new raw work.
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await sibling.execute(sibling_command)
+                    self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                    self.assertFalse(owner.is_open)
+                    with self.assertRaises(BrowserOwnerStateError):
+                        await owner.open_tab("late")
+                    release.set()
+                    if swallow:
+                        await active
+                    else:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await active
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await queued
+                    queued_command.assert_not_awaited()
+                    sibling_command.assert_not_awaited()
+                    closer.assert_not_awaited()
+                finally:
+                    release.set()
+                    if not operation.done():
+                        operation.set_result(None)
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    await owner.close()
+                closer.assert_awaited_once()
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                self.assertFalse(sibling.is_available)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+
+    async def test_cancellation_without_protocol_retirement_keeps_owner_open(
+        self,
+    ) -> None:
+        for cancel_queued in (False, True):
+            with self.subTest(cancel_queued=cancel_queued):
+                owner, _, _, _ = self._owner()
+                await owner.start()
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def command(
+                    _: _FakeTab,
+                    entered: asyncio.Event = entered,
+                    release: asyncio.Event = release,
+                ) -> None:
+                    entered.set()
+                    await release.wait()
+
+                active = asyncio.create_task(owner.main_tab.execute(command))
+                await entered.wait()
+                queued_command = AsyncMock()
+                queued = asyncio.create_task(owner.main_tab.execute(queued_command))
+                await asyncio.sleep(0)
+                try:
+                    target = queued if cancel_queued else active
+                    target.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await target
+                    self.assertTrue(owner.is_open)
+                    self.assertTrue(owner.main_tab.is_available)
+                    release.set()
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    if cancel_queued:
+                        queued_command.assert_not_awaited()
+                    self.assertEqual(
+                        await owner.main_tab.execute(AsyncMock(return_value="ready")),
+                        "ready",
+                    )
+                finally:
+                    release.set()
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    await owner.close()
+
+    async def test_standalone_transport_observes_real_protocol_cancellation(
+        self,
+    ) -> None:
+        tab = SimpleNamespace()
+        transport = owner_module.TabTransport(
+            handle=TabHandle("standalone", "main", "target"),
+            tab=tab,
+            navigate_tab=AsyncMock(),
+            is_owner_open=lambda: True,
+        )
+        operation: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        entered = asyncio.Event()
+
+        async def command(current: SimpleNamespace) -> None:
+            entered.set()
+            await wait_for_zendriver(operation, timeout=5, owner=current)
+
+        active = asyncio.create_task(transport.execute(command))
+        await entered.wait()
+        active.cancel()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await active
+            self.assertFalse(transport.is_available)
+            rejected = AsyncMock()
+            with self.assertRaises(TabTransportUnavailableError):
+                await transport.execute(rejected)
+            rejected.assert_not_awaited()
+            self.assertFalse(operation.done())
+        finally:
+            if not operation.done():
+                operation.set_result(None)
+            await asyncio.sleep(0)
+
+    async def test_terminal_command_closes_queued_and_sibling_admission(self) -> None:
+        for failure in (
+            BrowserMutationOutcomeUnknownError("unknown result"),
+            ZendriverOperationTimeout(timeout_seconds=1),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                owner, browser, closer, _ = self._owner(
+                    extra_tabs=[_FakeTab("second-target")]
+                )
+                await owner.start()
+                second = await owner.open_tab("second")
+                entered, release = asyncio.Event(), asyncio.Event()
+                queued_command, sibling_command = AsyncMock(), AsyncMock()
+
+                async def fail(
+                    _: _FakeTab,
+                    entered: asyncio.Event = entered,
+                    release: asyncio.Event = release,
+                    failure: BaseException = failure,
+                ) -> None:
+                    entered.set()
+                    await release.wait()
+                    raise failure
+
+                active = asyncio.create_task(owner.main_tab.execute(fail))
+                await entered.wait()
+                queued = asyncio.create_task(owner.main_tab.execute(queued_command))
+                await asyncio.sleep(0)
+                try:
+                    release.set()
+                    with self.assertRaises(type(failure)):
+                        await active
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await queued
+                    self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                    self.assertFalse(second.is_available)
+                    with self.assertRaises(TabTransportUnavailableError):
+                        await second.execute(sibling_command)
+                    queued_command.assert_not_awaited()
+                    sibling_command.assert_not_awaited()
+                    closer.assert_not_awaited()
+                finally:
+                    release.set()
+                    await asyncio.gather(active, queued, return_exceptions=True)
+                    await owner.close()
+                closer.assert_awaited_once_with(browser, ANY)
+
+    async def test_ordinary_command_error_keeps_owner_available(self) -> None:
+        owner, _, _, _ = self._owner()
+        async with owner:
+            with self.assertRaisesRegex(ValueError, "invalid request"):
+                await owner.main_tab.execute(
+                    AsyncMock(side_effect=ValueError("invalid request"))
+                )
+            self.assertTrue(owner.is_open)
+            self.assertEqual(
+                await owner.main_tab.execute(AsyncMock(return_value="retry")), "retry"
+            )
+
+    async def test_standalone_transport_rejects_its_retired_generation(self) -> None:
+        transport = owner_module.TabTransport(
+            handle=TabHandle("external-owner", "main", "target"),
+            tab=_FakeTab("target"),
+            navigate_tab=AsyncMock(),
+            is_owner_open=lambda: True,
+        )
+        with self.assertRaises(BrowserMutationOutcomeUnknownError):
+            await transport.execute(
+                AsyncMock(side_effect=BrowserMutationOutcomeUnknownError("unknown"))
+            )
+        self.assertFalse(transport.is_available)
+        retry = AsyncMock()
+        with self.assertRaises(TabTransportUnavailableError):
+            await transport.execute(retry)
+        retry.assert_not_awaited()
+
     async def test_unknown_navigation_of_existing_tab_retires_generation(self) -> None:
         owner, browser, closer, _ = self._owner(
             tab_navigator=AsyncMock(
@@ -391,17 +634,181 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
         command_task = asyncio.create_task(owner.main_tab.execute(stuck_command))
         await command_entered.wait()
         try:
-            with (
-                patch.object(owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01),
-                self.assertRaisesRegex(TimeoutError, "did not drain"),
-            ):
-                await asyncio.wait_for(owner.close(), timeout=1)
+            with patch.object(owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaisesRegex(TimeoutError, "did not drain"):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                first_deadline = owner._close_deadline
+                self.assertFalse(command_task.done())
+                with self.assertRaisesRegex(TimeoutError, "did not drain"):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertIsNot(owner._close_deadline, first_deadline)
 
+            self.assertFalse(command_task.done())
+            self.assertTrue(owner.main_tab._command_lock.locked())
+            self.assertIsNone(owner._browser)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+            with self.assertRaises(TabTransportUnavailableError):
+                await owner.main_tab.execute(_return)
             browser_closer.assert_awaited_once_with(browser, ANY)
+            release_command.set()
+            await command_task
+            await owner.close()
             self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+            browser_closer.assert_awaited_once_with(browser, ANY)
         finally:
             release_command.set()
             await command_task
+
+    async def test_cancelled_drain_retains_release_and_shared_caller_ownership(
+        self,
+    ) -> None:
+        for cancel_attempt in (False, True):
+            with self.subTest(cancel_attempt=cancel_attempt):
+                await self._assert_cancelled_drain(cancel_attempt=cancel_attempt)
+
+    async def _assert_cancelled_drain(self, *, cancel_attempt: bool) -> None:
+        owner, browser, closer, _ = self._owner()
+        await owner.start()
+        command_entered = asyncio.Event()
+        release_command = asyncio.Event()
+        drain_entered = asyncio.Event()
+        original_drain = owner_module.TabTransport._drain
+
+        async def command(_: _FakeTab) -> None:
+            command_entered.set()
+            await release_command.wait()
+
+        async def observe_drain(
+            transport: owner_module.TabTransport[_FakeTab],
+        ) -> None:
+            drain_entered.set()
+            await original_drain(transport)
+
+        command_task = asyncio.create_task(owner.main_tab.execute(command))
+        await command_entered.wait()
+        callers: list[asyncio.Task[None]] = []
+        try:
+            with patch.object(owner_module.TabTransport, "_drain", observe_drain):
+                callers.append(asyncio.create_task(owner.close()))
+                await asyncio.wait_for(drain_entered.wait(), timeout=1)
+                shared_task = owner._close_task
+                assert shared_task is not None
+                shared_deadline = owner._close_deadline
+                if not cancel_attempt:
+                    callers.append(asyncio.create_task(owner.close()))
+                cancelled = shared_task if cancel_attempt else callers[0]
+                cancelled.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(callers[0], timeout=1)
+                self.assertFalse(command_task.done())
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                self.assertIsNone(owner._browser)
+                closer.assert_awaited_once_with(browser, ANY)
+                if not cancel_attempt:
+                    self.assertIs(owner._close_task, shared_task)
+                    self.assertIs(owner._close_deadline, shared_deadline)
+                    self.assertFalse(shared_task.done())
+                    self.assertFalse(callers[1].done())
+                release_command.set()
+                await command_task
+                if not cancel_attempt:
+                    await asyncio.wait_for(callers[1], timeout=1)
+                await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                closer.assert_awaited_once_with(browser, ANY)
+        finally:
+            release_command.set()
+            await command_task
+            await asyncio.wait_for(
+                asyncio.gather(*callers, return_exceptions=True), timeout=1
+            )
+
+    async def test_late_positive_closer_retains_only_undrained_commands(self) -> None:
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked):
+                await self._assert_late_closer(blocked=blocked)
+
+    async def _assert_late_closer(self, *, blocked: bool) -> None:
+        owner, browser, closer, _ = self._owner()
+        await owner.start()
+        command_entered = asyncio.Event()
+        release_command = asyncio.Event()
+        now = 0.0
+
+        async def command(_: _FakeTab) -> None:
+            command_entered.set()
+            await release_command.wait()
+
+        async def late_close(
+            observed_browser: _FakeBrowser, deadline: Deadline
+        ) -> None:
+            nonlocal now
+            self.assertIs(observed_browser, browser)
+            now = deadline.expires_at
+
+        closer.side_effect = late_close
+        command_task = asyncio.create_task(owner.main_tab.execute(command))
+        await command_entered.wait()
+        try:
+            if not blocked:
+                release_command.set()
+                await command_task
+            with patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ):
+                with self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError, "completed after"
+                ):
+                    await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertIsNone(owner._browser)
+                expected = (
+                    BrowserOwnerState.CLOSING if blocked else BrowserOwnerState.CLOSED
+                )
+                self.assertEqual(owner.state, expected)
+                if blocked:
+                    self.assertFalse(command_task.done())
+                    with (
+                        patch.object(
+                            owner_module, "_COMMAND_DRAIN_TIMEOUT_SECONDS", 0.01
+                        ),
+                        self.assertRaisesRegex(TimeoutError, "did not drain"),
+                    ):
+                        await asyncio.wait_for(owner.close(), timeout=1)
+                    closer.assert_awaited_once_with(browser, ANY)
+                release_command.set()
+                await command_task
+                await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                closer.assert_awaited_once_with(browser, ANY)
+        finally:
+            release_command.set()
+            await command_task
+
+    async def test_startup_late_positive_closer_is_not_repeated(self) -> None:
+        owner, browser, closer, _ = self._owner(main_tab=_FakeTab(""))
+        now = 0.0
+
+        async def late_close(
+            observed_browser: _FakeBrowser, deadline: Deadline
+        ) -> None:
+            nonlocal now
+            self.assertIs(observed_browser, browser)
+            now = deadline.expires_at
+
+        closer.side_effect = late_close
+        with patch.object(
+            deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+        ):
+            with self.assertRaises(TabBindingError) as raised:
+                await asyncio.wait_for(owner.start(), timeout=1)
+            self.assertIn(
+                "_BrowserCloserCompletedAfterDeadline",
+                " ".join(raised.exception.__notes__),
+            )
+            self.assertIsNone(owner._browser)
+            self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+            await asyncio.wait_for(owner.close(), timeout=1)
+            closer.assert_awaited_once_with(browser, ANY)
 
     async def test_hung_injected_closer_uses_one_non_resetting_deadline(
         self,
@@ -486,14 +893,19 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
                     owner_module.BrowserOwnershipError, "shared ownership deadline"
                 ):
                     await asyncio.wait_for(owner.close(), timeout=1)
+                self.assertIs(owner._close_deadline, shared_deadline)
                 browser_closer.assert_awaited_once()
 
                 release_closer.set()
                 closer_task = owner._browser_closer_task
                 assert closer_task is not None
                 await asyncio.wait_for(asyncio.shield(closer_task), timeout=1)
-                # A completed failed attempt permits a fresh deadline on retry,
-                # while reconciliation must not invoke the closer again.
+                # Reconcile the late result against the original deadline,
+                # even though the inner task has now completed.
+                with self.assertRaisesRegex(
+                    owner_module.BrowserOwnershipError, "shared ownership deadline"
+                ):
+                    await asyncio.wait_for(owner.close(), timeout=1)
                 await asyncio.wait_for(owner.close(), timeout=1)
                 self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
                 browser_closer.assert_awaited_once()

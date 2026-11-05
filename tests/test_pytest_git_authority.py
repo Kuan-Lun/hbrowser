@@ -83,8 +83,16 @@ def test_pytest_entries_do_not_inherit_candidate_git_authority(
         "test_diagnostics.py",
         "test_page_diagnostic_transport.py",
         "test_driver_shutdown_priority.py",
+        "test_process_protocol_frames.py",
     ):
         (repository / "tests" / name).write_text("def test_process_fixture(): pass\n")
+    (repository / "tests/test_proxy_logging.py").write_text(
+        "import unittest\n"
+        "class ProxyLoggingTests(unittest.TestCase):\n"
+        "    def test_manifest_directory_replacement_never_receives_proxy_secrets"
+        "(self):\n"
+        "        pass\n"
+    )
     state = tmp_path / "children"
     state.mkdir()
     gate_authority = tmp_path / "gate-authority"

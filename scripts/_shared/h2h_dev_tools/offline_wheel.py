@@ -8,6 +8,7 @@ validation and never evidence of clean dependency resolution.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -26,14 +27,14 @@ def _site(python: Path, *, cwd: Path) -> Path:
             str(python),
             "-I",
             "-c",
-            "import sysconfig; print(sysconfig.get_path('purelib'))",
+            "import json, sysconfig; print(json.dumps(sysconfig.get_path('purelib')))",
         ],
         cwd=cwd,
         check=True,
         text=True,
         capture_output=True,
     )
-    return Path(result.stdout.strip())
+    return Path(json.loads(result.stdout))
 
 
 def run_offline_smoke(

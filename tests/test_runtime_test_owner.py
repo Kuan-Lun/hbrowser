@@ -18,6 +18,192 @@ _BOOTSTRAP = (
 )
 
 
+@pytest.mark.parametrize("entry", ["run", "plugin"])
+@pytest.mark.parametrize(
+    "phase, signal_number, uncertain",
+    [
+        ("scope", signal.SIGINT, False),
+        ("scope", signal.SIGTERM, False),
+        ("handler-before", 0, False),
+        ("handler-after", 0, False),
+        ("handoff", signal.SIGTERM, False),
+        ("projection", signal.SIGTERM, False),
+        ("scope", signal.SIGTERM, True),
+        ("projection", signal.SIGTERM, True),
+        ("scope-cleanup", signal.SIGINT, False),
+        ("projection-cleanup", signal.SIGTERM, False),
+        ("projection-cleanup", signal.SIGTERM, True),
+        ("install-error-cleanup", signal.SIGTERM, False),
+        ("normal-cleanup", signal.SIGTERM, False),
+        ("normal-cleanup", signal.SIGTERM, True),
+    ],
+)
+def test_registry_entry_owns_setup_until_cleanup_is_proven(
+    tmp_path: Path, entry: str, phase: str, signal_number: int, uncertain: bool
+) -> None:
+    if os.name != "posix":
+        pytest.skip("Real POSIX scope and signal setup boundary")
+    evidence = tmp_path / "before-rescue.json"
+    _ok(f"""
+        import json, os, signal, time
+        from pathlib import Path
+        from unittest.mock import patch
+        from _shared.h2h_dev_tools import process as outer_process
+        phase, number, uncertain = {phase!r}, {int(signal_number)!r}, {uncertain!r}
+        original_create = a.PosixScope.create
+        original_close = a.PosixScope.close
+        original_signal = signal.signal
+        original_registry_close = a._Registry.close
+        original_current = a._current
+        original_projection = a._WorkerSources
+        scopes, projections, closes = [], [], []
+        cleanup_handoff_deadlines = []
+        deadline = time.monotonic() + a._CLEANUP_SECONDS
+        parent = original_create(deadline=deadline)
+        inherited = os.environ.get(a.ENVIRONMENT_KEY)
+        os.environ[a.ENVIRONMENT_KEY] = parent.capability.encode()
+        failure = RuntimeError('handler entry rejected')
+        cleanup_failure = OSError('scope closure is uncertain')
+        def create(*, deadline):
+            scope = original_create(deadline=deadline)
+            scopes.append((scope, deadline))
+            if phase.startswith('scope'):
+                os.kill(os.getpid(), number)
+            return scope
+        def handler(signum, callback):
+            is_setup = getattr(callback, '__self__', None).__class__ is a._Registry
+            if phase == 'handler-before' and is_setup and signum == signal.SIGINT:
+                raise failure
+            result = original_signal(signum, callback)
+            if phase == 'handler-after' and is_setup and signum == signal.SIGINT:
+                raise failure
+            return result
+        def current():
+            registry = original_current()
+            if phase == 'handoff':
+                os.kill(os.getpid(), number)
+            return registry
+        def projection():
+            if phase == 'install-error-cleanup':
+                raise failure
+            value = original_projection()
+            projections.append(value)
+            if phase.startswith('projection'):
+                os.kill(os.getpid(), number)
+            return value
+        def registry_close(registry):
+            if phase.endswith('-cleanup'):
+                cleanup_handoff_deadlines.append(registry.deadline)
+                os.kill(os.getpid(), signal.SIGTERM)
+            original_registry_close(registry)
+        def close(scope, *, deadline):
+            if any(scope is item for item, _ in scopes):
+                closes.append(deadline)
+                if uncertain and len(closes) == 1:
+                    raise cleanup_failure
+            original_close(scope, deadline=deadline)
+        with outer_process.controlled_termination_signals():
+            handlers = {{
+                n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM)
+            }}
+            caught = None
+            later_errors = []
+            try:
+                with patch.object(a.PosixScope, 'create', create), \
+                     patch.object(a.PosixScope, 'close', close), \
+                     patch.object(signal, 'signal', handler), \
+                     patch.object(a, '_current', current), \
+                     patch.object(a, '_WorkerSources', projection), \
+                     patch.object(a._Registry, 'close', registry_close):
+                    try:
+                        if {entry!r} == 'run':
+                            a.run(lambda: None)
+                        else:
+                            a.pytest_addhooks()
+                    except BaseException as error:
+                        caught = error
+                    if {entry!r} == 'plugin':
+                        # Pytest may unconfigure after a plugin entry failure.
+                        # Unknown cleanup must not be retried automatically.
+                        for _ in range(2 if uncertain else 1):
+                            try:
+                                a.pytest_unconfigure()
+                            except BaseException as error:
+                                if caught is None:
+                                    caught = error
+                                else:
+                                    later_errors.append(type(error).__name__)
+                state = {{
+                    'phase': phase, 'entry': {entry!r}, 'uncertain': uncertain,
+                    'later_errors': later_errors,
+                    'scope_directories': [
+                        str(s.capability.directory) for s, _ in scopes],
+                    'scope_exists': [
+                        s.capability.directory.exists() for s, _ in scopes],
+                    'creation_deadlines': [d for _, d in scopes],
+                    'close_deadlines': closes,
+                    'cleanup_handoff_deadlines': cleanup_handoff_deadlines,
+                    'cancelled': getattr(a._registry, 'cancelled', None),
+                    'parent_pending': parent.has_pending(deadline=deadline),
+                    'environment_restored': (os.environ.get(a.ENVIRONMENT_KEY)
+                        == parent.capability.encode()),
+                    'handlers_restored': all(
+                        signal.getsignal(n) == h for n, h in handlers.items()),
+                    'projection_exists': [p.directory.exists() for p in projections],
+                    'exception': type(caught).__name__ if caught is not None else None,
+                }}
+                Path({str(evidence)!r}).write_text(json.dumps(state))
+                assert caught is not None, state
+                assert state['environment_restored'], state
+                assert state['handlers_restored'], state
+                assert not later_errors, state
+                if phase in ('scope-cleanup', 'projection-cleanup'):
+                    assert cleanup_handoff_deadlines == closes, state
+                    assert state['cancelled'] == number, state
+                if uncertain:
+                    assert caught is cleanup_failure, (caught, state)
+                    assert len(closes) == 1, state
+                    assert state['parent_pending'] and all(state['scope_exists']), state
+                    assert all(state['projection_exists']), state
+                else:
+                    assert not state['parent_pending'], state
+                    assert not any(state['scope_exists']), state
+                    assert not any(state['projection_exists']), state
+                    if phase.startswith('handler'):
+                        assert caught is failure, (caught, state)
+                    elif {entry!r} == 'run':
+                        assert isinstance(caught, SystemExit), (caught, state)
+                        assert caught.code == 128 + number, (caught, state)
+                    elif phase == 'install-error-cleanup':
+                        assert caught is failure, (caught, state)
+                    else:
+                        assert isinstance(caught, KeyboardInterrupt), (caught, state)
+                    if phase.startswith('scope'):
+                        assert closes == [scopes[0][1]], state
+            finally:
+                # Before-rescue state above is authoritative. These controls
+                # launched no runtime children, so only their exact empty scopes
+                # and projection may be rescued, within the original bound.
+                for n, previous in handlers.items():
+                    original_signal(n, previous)
+                for scope, bound in scopes:
+                    if scope.capability.directory.exists():
+                        assert not scope.has_pending(deadline=min(deadline, bound))
+                        scope.proven_empty = True
+                        original_close(scope, deadline=min(deadline, bound))
+                for value in projections:
+                    if value.directory.exists():
+                        value.close()
+                if inherited is None:
+                    os.environ.pop(a.ENVIRONMENT_KEY, None)
+                else:
+                    os.environ[a.ENVIRONMENT_KEY] = inherited
+                assert not parent.has_pending(deadline=deadline)
+                parent.proven_empty = True
+                original_close(parent, deadline=deadline)
+    """)
+
+
 def _environment() -> dict[str, str]:
     environment = dict(os.environ)
     # Every automatic subprocess retains the parent capability. Its adapter
@@ -42,6 +228,137 @@ def _run(source: str, *, timeout: float = 20) -> subprocess.CompletedProcess[str
 def _ok(source: str) -> None:
     result = _run(source)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["verification", "second-binding"])
+def test_worker_projection_install_failure_cleans_partial_export(failure: str) -> None:
+    _ok(f"""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        original_patch = patch.object
+        def bind(target, name, value):
+            if name == '_PRIVATE_CLEANUP_WORKER_PATH':
+                raise RuntimeError('copy failed')
+            return original_patch(target, name, value)
+        fault = (
+            patch.object(a._WorkerSources, 'verify',
+                         side_effect=RuntimeError('copy failed'))
+            if {failure!r} == 'verification'
+            else patch.object(a.patch, 'object', side_effect=bind))
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / 'projection'
+            destination.mkdir()
+            with patch.object(a.tempfile, 'mkdtemp', return_value=str(destination)):
+                with fault:
+                    try:
+                        registry.install()
+                    except RuntimeError as error:
+                        assert str(error) == 'copy failed'
+                    else:
+                        raise AssertionError('invalid projection accepted')
+            assert not destination.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+        assert not registry.installed and registry.worker_sources is None
+        registry.close()
+    """)
+
+
+def test_worker_projection_retained_when_nested_scope_cannot_be_proven_empty() -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX nested scope ledger contract")
+    _ok("""
+        import time
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        projection = registry.worker_sources
+        nested = a.PosixScope.create(deadline=time.monotonic()+2)
+        has_pending = registry.scope.has_pending
+        def reject_pending(*, deadline):
+            assert has_pending(deadline=deadline)
+            raise RuntimeError('nested owner remains')
+        with patch.object(registry.scope, 'has_pending', side_effect=reject_pending):
+            try:
+                registry.close()
+            except RuntimeError as error:
+                assert str(error) == 'nested owner remains'
+            else:
+                raise AssertionError('nested scope ignored')
+        assert projection.directory.exists()
+        assert process._SUPERVISOR_PATH.parent == projection.directory
+        # This synthetic nested scope never admitted a process. Remove its
+        # actual durable obligation before retrying the outer close.
+        nested.proven_empty = True
+        nested.close(deadline=time.monotonic()+2)
+        registry.close()
+        assert not projection.directory.exists()
+    """)
+
+
+def test_worker_projection_retained_until_cleanup_proof_is_complete() -> None:
+    _ok("""
+        import time
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        registry.install()
+        projection = registry.worker_sources
+        registry.install()
+        assert registry.worker_sources is projection
+        token = registry.admit(recovery=False, deadline=time.monotonic()+2)
+        def fail(deadline):
+            token.complete(deadline=deadline)
+            raise RuntimeError('cleanup proof rejected')
+        token.bind(fail, deadline=time.monotonic()+2)
+        token.finish_start(deadline=time.monotonic()+2)
+        try:
+            registry.close()
+        except RuntimeError as error:
+            assert str(error) == 'Runtime test cleanup failed'
+        else:
+            raise AssertionError('cleanup failure ignored')
+        assert projection.directory.exists()
+        assert process._SUPERVISOR_PATH.parent == projection.directory
+        registry.close()
+        assert not projection.directory.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+    """)
+
+
+@pytest.mark.parametrize("drift", ["bytes", "mode", "extra"])
+def test_worker_projection_rejects_changed_export(drift: str) -> None:
+    if drift == "mode" and os.name == "nt":
+        pytest.skip("Windows chmod does not expose POSIX executable bits")
+    _ok(f"""
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        original = (process._SUPERVISOR_PATH, process._PRIVATE_CLEANUP_WORKER_PATH)
+        registry.install()
+        projection = registry.worker_sources
+        path = projection.directory / 'process.py'
+        if {drift!r} == 'bytes':
+            path.write_bytes(path.read_bytes() + b'\\n')
+        elif {drift!r} == 'mode':
+            path.chmod(path.stat().st_mode ^ 0o100)
+        else:
+            (projection.directory / 'extra.py').touch()
+        try:
+            registry.close()
+        except RuntimeError as error:
+            assert str(error) == 'Runtime worker source projection changed'
+        else:
+            raise AssertionError('changed projection accepted')
+        assert not projection.directory.exists()
+        assert (process._SUPERVISOR_PATH,
+                process._PRIVATE_CLEANUP_WORKER_PATH) == original
+    """)
 
 
 def test_closed_invocation_rejects_real_background_admission() -> None:
@@ -138,6 +455,260 @@ def test_starting_background_owner_handoffs_before_cleanup() -> None:
         assert not thread.is_alive()
         assert owners[0]._supervisor.poll() is not None
     """)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_expired_startup_handoff_preserves_failure_and_allows_registry_cleanup(
+    cancelled: bool,
+) -> None:
+    _ok(
+        """
+        import signal, sys, time
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        deadline = time.monotonic() + .3
+        failure = RuntimeError('constructor crossed startup deadline')
+        retained = []
+        def fail_late(*args, **kwargs):
+            owner, = process._PROVISIONAL_OWNERS.values()
+            retained.append(owner)
+            assert owner.supervisor is not None and owner.status_guard is not None
+            if CANCELLED:
+                registry.on_signal(signal.SIGTERM, None)
+            time.sleep(max(0, deadline - time.monotonic()) + .01)
+            raise failure
+        try:
+            with patch.object(process, 'OwnedProcess', side_effect=fail_late):
+                try:
+                    process.start_owned_process(sys.executable, ['-c', 'pass'],
+                                                deadline=deadline)
+                except process.ProcessOwnershipError as error:
+                    assert 'original resources remain unresolved' in str(error)
+                    assert isinstance(error.__cause__, process.ProcessOwnershipError)
+                    assert error.__cause__.__context__ is failure
+                else:
+                    raise AssertionError('late startup was accepted')
+            owner, = retained
+            token = owner.observation
+            assert token in registry.observations and not token.starting
+            assert not token.completed and owner.supervisor.poll() is None
+            original_guard = owner.status_guard
+            cleanup_deadline = registry.deadline
+            registry.close()
+            if CANCELLED:
+                assert registry.deadline == cleanup_deadline
+            assert registry.finished and token.completed
+            assert owner.supervisor.poll() is not None
+            assert original_guard._pin.retired and not original_guard.path.exists()
+            assert not process._PROVISIONAL_OWNERS
+            assert not registry.observations
+            if registry.scope is not None:
+                assert not registry.scope.capability.directory.exists()
+        finally:
+            # Only this injector retained the original concrete owner. Rescue
+            # it before assertion unwind; never infer a new owner from a PID.
+            for owner in retained:
+                if id(owner) in process._PROVISIONAL_OWNERS:
+                    process._cleanup_provisional_owner(owner,
+                                                       deadline=time.monotonic()+3)
+            if not registry.finished:
+                registry.close()
+    """.replace("CANCELLED", repr(cancelled))
+    )
+
+
+def test_expired_private_worker_handoff_reaches_original_registry_callback() -> None:
+    _ok("""
+        import tempfile, time
+        from pathlib import Path
+        from unittest.mock import patch
+        from hbrowser.gallery.browser import process
+        registry = a._current()
+        registry.install()
+        original_popen = process.subprocess.Popen
+        children = []
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / 'private'
+            path.mkdir()
+            guard = process._PrivateDirectory.capture(path)
+            claim = process._register_pending_private_directory(guard)
+            deadline = time.monotonic()+.3
+            def slow_return(*args, **kwargs):
+                child = original_popen(*args, **kwargs)
+                children.append(child)
+                time.sleep(max(0, deadline-time.monotonic())+.01)
+                return child
+            try:
+                with patch.object(process.subprocess, 'Popen', side_effect=slow_return):
+                    active = process._spawn_private_directory_cleanup(
+                        guard, claim=claim, work_deadline=deadline,
+                        ownership_deadline=deadline)
+                assert active.process is children[0]
+                assert not active.observation.starting
+                assert not active.observation.completed
+                registry.close()
+                assert registry.finished and active.observation.completed
+                assert children[0].poll() is not None
+                assert process._active_private_directory_cleanup(guard) is None
+                assert path.exists() and not guard._pin.retired
+            finally:
+                active = process._active_private_directory_cleanup(guard)
+                if active is not None:
+                    process._force_reap_private_directory_cleanup(
+                        active, deadline=time.monotonic()+3)
+                if not registry.finished:
+                    registry.close()
+                # This fixture never permitted filesystem work. It still owns
+                # the original root, independently of the now-reaped worker.
+                assert all(child.poll() is not None for child in children)
+                process._release_pending_private_directory(guard)
+                guard._retire()
+    """)
+
+
+def test_expired_handoff_never_completes_unknown_ownership() -> None:
+    _ok("""
+        import time
+        registry = a._Registry()
+        token = registry.admit(recovery=False, deadline=time.monotonic()+1)
+        calls = []
+        failure = RuntimeError('spawn outcome remains unknown')
+        def unknown(deadline):
+            calls.append(deadline)
+            raise failure
+        token.bind(unknown, deadline=time.monotonic()+1)
+        token.finish_start(deadline=time.monotonic()-1)
+        assert not token.starting and not token.completed
+        # This unit registry never created a scope or any process. Its fixed
+        # short cleanup budget makes the fail-closed boundary deterministic.
+        registry.deadline = time.monotonic()+.03
+        original_deadline = registry.deadline
+        try:
+            registry.close()
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError('unknown ownership reported empty')
+        assert calls == [original_deadline]
+        assert registry.deadline == original_deadline
+        assert token in registry.observations and not token.completed
+        assert not registry.finished and not registry.sealed
+    """)
+
+
+def test_successful_handoff_delivers_cancel_inside_callers_exception_handler() -> None:
+    _ok("""
+        import signal, time
+        registry = a._current()
+        deadline = time.monotonic()+1
+        try:
+            # Exercise the actual post-setup cancellation boundary. A bare
+            # registry intentionally defers cancellation during construction.
+            assert not registry.deferring_cancel
+            token = registry.admit(recovery=False, deadline=deadline)
+            token.bind(lambda d: token.complete(deadline=d), deadline=deadline)
+            registry.cancelled = signal.SIGTERM
+            registry.deadline = deadline
+            registry.closing = True
+            try:
+                raise ValueError('caller is handling an unrelated failure')
+            except ValueError:
+                try:
+                    token.finish_start(deadline=deadline)
+                except KeyboardInterrupt:
+                    pass
+                else:
+                    raise AssertionError('normal cancellation was suppressed')
+            assert not token.starting and not token.completed
+        finally:
+            # This token launched no process. Its real callback and the normal
+            # registry close still release the actual nested scope on failure.
+            registry.close()
+        assert registry.finished and token.completed
+        assert registry.deadline == deadline
+        if registry.scope is not None:
+            assert not registry.scope.capability.directory.exists()
+    """)
+
+
+@pytest.mark.parametrize("phase", ["inventory", "waiting"])
+def test_one_stalled_startup_does_not_block_another_owners_cleanup(phase: str) -> None:
+    _ok(
+        """
+        import threading, time
+        from unittest.mock import patch
+        registry = a._Registry()
+        bound = time.monotonic()+1
+        registry.admit(recovery=False, deadline=bound)
+        registry.admit(recovery=False, deadline=bound)
+        # Match the old implementation's first selected token: it never finishes.
+        first, second = tuple(registry.observations)
+        calls = []
+        first.bind(lambda d: calls.append(('unready', d)), deadline=bound)
+        def complete_second(deadline):
+            assert time.monotonic() < deadline
+            calls.append(('ready', deadline))
+            second.complete(deadline=deadline)
+        second.bind(complete_second, deadline=bound)
+        waiting = threading.Event()
+        published = threading.Event()
+        errors = []
+        def finish():
+            try:
+                # The actual startup finally, not elapsed time, authorizes
+                # this callback. An expired startup budget is still allowed.
+                second.finish_start(deadline=time.monotonic()-1)
+                published.set()
+            except BaseException as error:
+                errors.append(error)
+        def background_finish():
+            if waiting.wait(2):
+                finish()
+        thread = threading.Thread(target=background_finish)
+        original_clear = registry.handoff_changed.clear
+        original_wait = registry.handoff_changed.wait
+        def clear():
+            clear_count[0] += 1
+            original_clear()
+            if PHASE == 'inventory' and clear_count[0] == 1:
+                # Clear-before-inventory must see this finished token rather
+                # than discard its notification and then sleep to the deadline.
+                finish()
+        clear_count = [0]
+        def wait(timeout=None):
+            if PHASE == 'waiting':
+                waiting.set()
+            return original_wait(timeout)
+        registry.deadline = bound
+        if PHASE == 'waiting':
+            thread.start()
+        try:
+            with (
+                patch.object(registry.handoff_changed, 'clear', side_effect=clear),
+                patch.object(registry.handoff_changed, 'wait', side_effect=wait),
+            ):
+                try:
+                    registry.close()
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError('unfinished startup reported empty')
+        finally:
+            if PHASE == 'waiting':
+                thread.join(2)
+                assert not thread.is_alive()
+        assert not errors, errors
+        assert published.is_set()
+        assert calls == [('ready', bound)], calls
+        assert first.starting and not first.completed
+        assert second.completed and second not in registry.observations
+        assert registry.observations == {first}
+        assert registry.deadline == bound
+        assert not registry.finished and not registry.sealed
+    """.replace("PHASE", repr(phase))
+    )
 
 
 def test_mock_owner_real_private_cleanup_remains_observed() -> None:
@@ -295,40 +866,51 @@ def test_pre_spawn_registration_failure_releases_only_new_no_child_token() -> No
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         registry = a._current()
-        registry.install()
-        with tempfile.TemporaryDirectory() as directory:
-            guard = process._PrivateDirectory.capture(Path(directory))
-            prior = process._ActivePrivateDirectoryCleanup(guard=guard)
-            process._register_active_private_directory_cleanup(prior)
-            try:
-                with patch.object(process.subprocess, 'Popen') as popen:
-                    try:
-                        process._spawn_private_directory_cleanup(
-                            guard, work_deadline=time.monotonic()+1,
-                            ownership_deadline=time.monotonic()+2)
-                    except process.ProcessOwnershipError:
-                        pass
-                    else:
-                        raise AssertionError('duplicate worker was admitted')
-                    popen.assert_not_called()
-                assert not registry.observations
-                assert process._active_private_directory_cleanup(guard) is prior
-            finally:
-                process._release_active_private_directory_cleanup(prior)
-        registry.close()
+        try:
+            registry.install()
+            with tempfile.TemporaryDirectory() as directory:
+                guard = process._PrivateDirectory.capture(Path(directory))
+                claim = process._PrivateDirectoryClaim(
+                    guard, guard.path.with_name(".hbrowser-cleanup-test"))
+                prior = process._ActivePrivateDirectoryCleanup(guard=guard)
+                process._register_active_private_directory_cleanup(prior)
+                try:
+                    with patch.object(process.subprocess, 'Popen') as popen:
+                        try:
+                            process._spawn_private_directory_cleanup(
+                                guard, claim=claim, work_deadline=time.monotonic()+1,
+                                ownership_deadline=time.monotonic()+2)
+                        except process.ProcessOwnershipError:
+                            pass
+                        else:
+                            raise AssertionError('duplicate worker was admitted')
+                        popen.assert_not_called()
+                    assert not registry.observations
+                    assert process._active_private_directory_cleanup(guard) is prior
+                finally:
+                    process._release_active_private_directory_cleanup(prior)
+                    # Fixture-only prior owner never had a process or claim.
+                    assert process._active_private_directory_cleanup(guard) is None
+                    assert not registry.observations
+                    guard._retire()
+        finally:
+            registry.close()
     """)
 
 
 def test_sealed_scope_blocks_atexit_retry_after_reaped_cleanup_failure() -> None:
     _ok("""
-        import tempfile, time
+        import shutil, tempfile, time
         from pathlib import Path
         from unittest.mock import patch
         from hbrowser.gallery.browser import process
         registry = a._current()
         registry.install()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(
+            prefix="hbrowser-sealed-retry-", delete=False
+        ) as directory:
             root = Path(directory)
+            print(f"sealed cleanup fixture: {root}", flush=True)
             private = root / 'private'
             private.mkdir()
             worker = root / 'failed-worker.py'
@@ -353,4 +935,12 @@ def test_sealed_scope_blocks_atexit_retry_after_reaped_cleanup_failure() -> None
                 spawn.assert_not_called()
             assert key in process._PENDING_PRIVATE_DIRECTORIES
             assert private.is_dir()
+            # Only fixture rescue follows the production retention assertions.
+            # This exact synthetic worker has exited and no observation is active;
+            # do not reopen sealed admission or launch another cleanup worker.
+            assert process._active_private_directory_cleanup(guard) is None
+            assert not registry.observations
+            process._release_pending_private_directory(guard)
+            guard._retire()
+            shutil.rmtree(root)
     """)

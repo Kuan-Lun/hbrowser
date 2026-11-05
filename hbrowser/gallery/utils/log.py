@@ -613,12 +613,12 @@ class _AppendOnlyJsonlHandler(logging.Handler):
         segment_bytes: int,
         level: int,
     ) -> None:
-        super().__init__(level)
         self.directory = directory
         self.segment_bytes = segment_bytes
         self._stream: BinaryIO | None = None
         self._segment_path: Path | None = None
         self._written_bytes = 0
+        self._next_segment_index = 1
         self._writer_pid = os.getpid()
         self._directory_descriptor: int | None = None
         self._directory_identity: tuple[int, int] | None = None
@@ -642,8 +642,16 @@ class _AppendOnlyJsonlHandler(logging.Handler):
             daemon=True,
         )
         self._worker_started = False
-        _configure_handler_context(self)
+        # Handler.__init__ publishes this instance to logging.shutdown. Allocate
+        # its complete close state first, including the unstarted writer. Keep
+        # the base close state safe even if creation of its lock fails after
+        # registration and the constructor traceback retains the instance.
+        self.lock = None
+        self._name = None
+        self._closed = False
         try:
+            super().__init__(level)
+            _configure_handler_context(self)
             self._pin_directory()
             self._acquire_owner_lock()
             self._next_segment_index = self._discover_next_segment_index()
@@ -1826,7 +1834,7 @@ def close_logging() -> None:
                 except Exception as error:
                     forwarding_ownership_unresolved = True
                     _record_forwarding_failure("forward-drain", error)
-                    receiver._discard_after_fork()
+                    receiver._abandon_delivery()
             _LOGGING_CLOSED = True
             _LOGGING_CONFIGURED = False
             process_handler = _PROCESS_LOG_HANDLER

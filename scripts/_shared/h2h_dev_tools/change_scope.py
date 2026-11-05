@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, Protocol
 
 ChangeScope = Literal["documentation", "full"]
 _DOCUMENT_PATHS = frozenset(
@@ -21,7 +23,24 @@ class ChangeScopeError(RuntimeError):
     """The exact change set could not be established safely."""
 
 
-def git_output(root: Path, *arguments: str) -> bytes:
+class GitReader(Protocol):
+    """A caller may supply its existing owned Git execution boundary."""
+
+    def __call__(
+        self, root: Path, /, *arguments: str, deadline: float | None = None
+    ) -> bytes: ...
+
+
+def _git_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return 60
+    remaining = deadline - time.monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise ChangeScopeError("Change classification deadline expired or is invalid")
+    return min(60, remaining)
+
+
+def git_output(root: Path, *arguments: str, deadline: float | None = None) -> bytes:
     """Read Git output without interpreting filenames as lines or shell code."""
 
     try:
@@ -30,7 +49,7 @@ def git_output(root: Path, *arguments: str) -> bytes:
             cwd=root,
             check=True,
             capture_output=True,
-            timeout=60,
+            timeout=_git_timeout(deadline),
         )
     except (OSError, subprocess.SubprocessError) as error:
         detail = (
@@ -39,14 +58,27 @@ def git_output(root: Path, *arguments: str) -> bytes:
             else str(error)
         )
         raise ChangeScopeError(f"Git operation failed: {detail}") from error
+    _git_timeout(deadline)
     return result.stdout
 
 
-def resolve_tree(root: Path, revision: str) -> str:
+def resolve_tree(
+    root: Path,
+    revision: str,
+    *,
+    deadline: float | None = None,
+    git_reader: GitReader | None = None,
+) -> str:
     """Resolve a commit or tree to one immutable tree object ID."""
 
-    output = git_output(
-        root, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{tree}}"
+    read = git_output if git_reader is None else git_reader
+    output = read(
+        root,
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        f"{revision}^{{tree}}",
+        deadline=deadline,
     )
     try:
         tree = output.decode("ascii").strip()
@@ -57,16 +89,18 @@ def resolve_tree(root: Path, revision: str) -> str:
     return tree
 
 
-def capture_candidate(root: Path, revision: str | None) -> str:
+def capture_candidate(
+    root: Path, revision: str | None, *, deadline: float | None = None
+) -> str:
     """Capture either the index or an explicitly requested revision."""
 
     if revision is not None:
-        return resolve_tree(root, revision)
+        return resolve_tree(root, revision, deadline=deadline)
     try:
-        tree = git_output(root, "write-tree").decode("ascii").strip()
+        tree = git_output(root, "write-tree", deadline=deadline).decode("ascii").strip()
     except UnicodeError as error:
         raise ChangeScopeError("Git returned an invalid index tree") from error
-    return resolve_tree(root, tree)
+    return resolve_tree(root, tree, deadline=deadline)
 
 
 def _is_document(path: str) -> bool:
@@ -78,8 +112,10 @@ def _is_document(path: str) -> bool:
     )
 
 
-def _is_text(root: Path, object_id: str) -> bool:
-    content = git_output(root, "cat-file", "blob", object_id)
+def _is_text(
+    root: Path, object_id: str, *, deadline: float | None, git_reader: GitReader
+) -> bool:
+    content = git_reader(root, "cat-file", "blob", object_id, deadline=deadline)
     if b"\0" in content:
         return False
     try:
@@ -89,12 +125,20 @@ def _is_text(root: Path, object_id: str) -> bool:
     return True
 
 
-def classify_changes(base: str, candidate: str, root: Path) -> ChangeScope:
+def classify_changes(
+    base: str,
+    candidate: str,
+    root: Path,
+    *,
+    deadline: float | None = None,
+    git_reader: GitReader | None = None,
+) -> ChangeScope:
     """Allow only registered, non-executable text documents into the light gate."""
 
-    base_tree = resolve_tree(root, base)
-    candidate_tree = resolve_tree(root, candidate)
-    raw = git_output(
+    read = git_output if git_reader is None else git_reader
+    base_tree = resolve_tree(root, base, deadline=deadline, git_reader=read)
+    candidate_tree = resolve_tree(root, candidate, deadline=deadline, git_reader=read)
+    raw = read(
         root,
         "diff",
         "--raw",
@@ -107,6 +151,7 @@ def classify_changes(base: str, candidate: str, root: Path) -> ChangeScope:
         base_tree,
         candidate_tree,
         "--",
+        deadline=deadline,
     )
     if not raw:
         return "full"
@@ -114,6 +159,7 @@ def classify_changes(base: str, candidate: str, root: Path) -> ChangeScope:
     if fields.pop() != b"" or len(fields) % 2:
         raise ChangeScopeError("Malformed NUL-delimited Git difference")
     for index in range(0, len(fields), 2):
+        _git_timeout(deadline)
         try:
             header = fields[index].decode("ascii").split()
             path = fields[index + 1].decode("utf-8")
@@ -131,8 +177,11 @@ def classify_changes(base: str, candidate: str, root: Path) -> ChangeScope:
         if not _is_document(path) or modes != expected.get(status):
             return "full"
         for mode, object_id in zip(modes, (old_id, new_id), strict=True):
-            if mode != "000000" and not _is_text(root, object_id):
+            if mode != "000000" and not _is_text(
+                root, object_id, deadline=deadline, git_reader=read
+            ):
                 return "full"
+    _git_timeout(deadline)
     return "documentation"
 
 

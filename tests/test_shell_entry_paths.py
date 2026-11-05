@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _shared.h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX shell entry points")
@@ -51,14 +52,13 @@ def test_quality_gate_keeps_git_root_with_line_breaks(
     ):
         executable = repository / relative
         executable.parent.mkdir(parents=True, exist_ok=True)
-        executable.write_text(
-            f"#!{sys.executable}\n"
+        write_python_executable(
+            executable,
             "import json, os, sys\n"
             f"with open({str(log)!r}, 'a') as output:\n"
             "    record = {'cwd': os.getcwd(), 'argv': sys.argv}\n"
-            "    output.write(json.dumps(record) + '\\n')\n"
+            "    output.write(json.dumps(record) + '\\n')\n",
         )
-        executable.chmod(0o755)
     nested = repository / "nested"
     nested.mkdir()
 
@@ -195,11 +195,11 @@ def _two_checkouts(tmp_path: Path) -> tuple[Path, Path]:
         for relative in (".venv/bin/ruff", "node_modules/.bin/markdownlint-cli2"):
             executable = root / relative
             executable.parent.mkdir(parents=True, exist_ok=True)
-            executable.write_text(
-                f"#!{sys.executable}\nfrom pathlib import Path\n"
-                "Path('format-target.txt').write_text('formatted by local tool\\n')\n"
+            write_python_executable(
+                executable,
+                "from pathlib import Path\n"
+                "Path('format-target.txt').write_text('formatted by local tool\\n')\n",
             )
-            executable.chmod(0o755)
     return intended, sibling
 
 
@@ -216,8 +216,9 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
     binary = tmp_path / "controlled-tools"
     binary.mkdir()
     uv = binary / "uv"
-    uv.write_text(
-        f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+    write_python_executable(
+        uv,
+        "import json, sys\nfrom pathlib import Path\n"
         "arguments = sys.argv[1:]\n"
         f"assert Path.cwd() in (Path({str(intended)!r}), Path({str(sibling)!r}))\n"
         "if arguments == ['--version']:\n"
@@ -240,12 +241,11 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
         "else:\n"
         "    assert arguments[:2] == ['pip', 'install']\n",
     )
-    uv.chmod(0o755)
     npm = binary / "npm"
-    npm.write_text(
-        f"#!{sys.executable}\nfrom pathlib import Path\nPath('.npm-ran').touch()\n"
+    write_python_executable(
+        npm,
+        "from pathlib import Path\nPath('.npm-ran').touch()\n",
     )
-    npm.chmod(0o755)
     nested = (sibling if entry == "rebuild-env.sh" else intended) / "nested"
     if directory_search != "unset":
         nested = intended

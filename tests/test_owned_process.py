@@ -1,18 +1,26 @@
+import array
 import atexit
 import ctypes
+import gc
+import io
 import math
 import os
+import select
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest.mock import ANY, Mock, call, patch
 
@@ -21,6 +29,7 @@ import zendriver as zd
 from _shared.h2h_dev_tools import process as command_process
 
 from hbrowser.gallery.browser import _directory_cleanup_worker as cleanup_worker_module
+from hbrowser.gallery.browser import _directory_identity as identity_module
 from hbrowser.gallery.browser import _process_control as control_module
 from hbrowser.gallery.browser import _process_observation
 from hbrowser.gallery.browser import _process_supervisor as supervisor_module
@@ -62,7 +71,7 @@ def _owned_harness(
         assert owner is not None
         if not command_process.terminate_owned_tree(owner, deadline=deadline):
             raise RuntimeError("Harness process tree remains owned")
-        if not command_process.close_owner(owner):
+        if not command_process.close_owner(owner, deadline=deadline):
             raise RuntimeError("Harness process owner could not close")
         observation.complete(deadline=deadline)
 
@@ -101,6 +110,100 @@ def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
     return not _pid_exists(pid)
 
 
+@contextmanager
+def _private_directory_fixture(
+    *, prefix: str = "hbrowser-private-fixture-", delete: bool = True
+) -> Iterator[str]:
+    # Keep the underlying TemporaryDirectory from deleting unproven state even
+    # when a failed assertion unwinds this context or its finalizer later runs.
+    with tempfile.TemporaryDirectory(prefix=prefix, delete=False) as directory:
+        captured: list[process_module._PrivateDirectory] = []
+        original_capture = process_module._PrivateDirectory.capture
+
+        def capture(
+            path: Path, *, platform_name: str | None = None
+        ) -> process_module._PrivateDirectory:
+            guard = original_capture(path, platform_name=platform_name)
+            captured.append(guard)
+            return guard
+
+        try:
+            with patch.object(
+                process_module._PrivateDirectory, "capture", side_effect=capture
+            ):
+                yield directory
+        finally:
+            with process_module._PRIVATE_DIRECTORY_CLEANUP_LOCK:
+                unresolved = any(
+                    process_module._private_directory_key(guard)
+                    in process_module._PENDING_PRIVATE_DIRECTORIES
+                    or process_module._private_directory_key(guard)
+                    in process_module._ACTIVE_PRIVATE_DIRECTORY_CLEANUPS
+                    for guard in captured
+                )
+            if unresolved:
+                raise RuntimeError(
+                    f"Retain private fixture with unresolved ownership: {directory}"
+                )
+            # These are fixture-held handles only. Production completion and
+            # retention assertions have already run before this rescue boundary.
+            for guard in captured:
+                guard._retire()
+            if delete and Path(directory).exists():
+                shutil.rmtree(directory)
+
+
+@contextmanager
+def _claimed_namespace(
+    guard: process_module._PrivateDirectory,
+) -> Iterator[process_module._PrivateDirectory]:
+    namespace_path = guard.path.parent / f".hbrowser-cleanup-test-{id(guard)}"
+    namespace_path.mkdir(mode=0o700)
+    namespace = None
+    try:
+        namespace = process_module._PrivateDirectory.capture(namespace_path)
+        guard._claim_inline(namespace, confirmed=False, deadline=time.monotonic() + 2)
+        yield namespace
+    finally:
+        # Fixture rescue only: runtime never deletes an unverified claim.
+        guard._retire()
+        if namespace is not None:
+            namespace._retire()
+        if namespace_path.exists():
+            shutil.rmtree(namespace_path)
+
+
+def _remove_private_inline(
+    guard: process_module._PrivateDirectory, *, deadline: float
+) -> None:
+    if not guard._assert_identity_or_absence():
+        return
+    with _claimed_namespace(guard) as namespace:
+        guard._remove_inline(namespace=namespace, deadline=deadline)
+
+
+def _release_private_fixture(
+    guard: process_module._PrivateDirectory, root: Path
+) -> None:
+    active = process_module._active_private_directory_cleanup(guard)
+    if active is not None:
+        process_module._force_reap_private_directory_cleanup(
+            active, deadline=_process_observation.cleanup_deadline(time.monotonic() + 3)
+        )
+    if process_module._active_private_directory_cleanup(guard) is not None:
+        raise RuntimeError(
+            "Retain fixture while private cleanup ownership is unresolved"
+        )
+    state = process_module._PENDING_PRIVATE_DIRECTORIES.get(
+        process_module._private_directory_key(guard)
+    )
+    process_module._release_pending_private_directory(guard)
+    guard._retire()
+    if state is not None and state.namespace is not None:
+        state.namespace._retire()
+    shutil.rmtree(root)
+
+
 def _windows_cleanup_error(code: int) -> PermissionError:
     error = PermissionError(f"Windows cleanup error {code}")
     cast(Any, error).winerror = code
@@ -123,6 +226,30 @@ def _shutdown_controller(
 
 
 class ProcessControlProtocolTests(unittest.TestCase):
+    def test_ready_receipt_round_trips_exactly(self) -> None:
+        receipt = control_module.ReadyReceipt(101, 0, 202, 303)
+        self.assertEqual(receipt.encode(), b"hbrowser-ready-v1 101 0 202 303\n")
+        self.assertEqual(control_module.ReadyReceipt.parse(receipt.encode()), receipt)
+
+    def test_ready_receipt_rejects_unknown_legacy_and_malformed_frames(self) -> None:
+        frames = (
+            b"ready 303\n",
+            b"hbrowser-ready-v2 101 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 303",
+            b"hbrowser-ready-v1 101 0 202 303\n\n",
+            b"hbrowser-ready-v1 101 0 202 303\r\n",
+            b"hbrowser-ready-v1 0101 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 -303\n",
+            b"hbrowser-ready-v1 0 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 0\n",
+            b"hbrowser-ready-v1 101 0 202 101\n",
+            b"hbrowser-ready-v1 101 0 202 303 extra\n",
+            b"hbrowser-ready-v1 101 0 202 " + b"3" * 200 + b"\n",
+        )
+        for frame in frames:
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                control_module.ReadyReceipt.parse(frame)
+
     def test_start_request_round_trips_exactly(self) -> None:
         request = control_module.StartRequest(deadline_ns=123)
 
@@ -2493,9 +2620,2296 @@ finally:
         kill_process_group.assert_not_called()
 
 
+@unittest.skipUnless(os.name == "posix", "Late READY reconciles POSIX tree proof")
+class LateReadyReceiptTests(unittest.TestCase):
+    @contextmanager
+    def _owner(
+        self, *, returncode: int = 0
+    ) -> Iterator[tuple[process_module.OwnedProcess, Path, Mock]]:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="hbrowser-late-ready-proof-"
+            ) as directory,
+            patch.object(atexit, "register"),
+            patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
+                ),
+            ),
+        ):
+            root = Path(directory)
+            (root / "status").mkdir()
+            (root / "private").mkdir()
+            supervisor = Mock(pid=101, stdin=Mock(), stdout=None, stderr=None)
+            supervisor.wait.return_value = returncode
+            observation = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=None,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=root / "status",
+                cleanup_paths=(root / "private",),
+                observation=observation,
+            )
+            try:
+                yield owner, root, observation
+            finally:
+                # These owners contain only Mock processes. Explicit fixture
+                # rescue releases the pinned fd without inventing runtime proof.
+                for guard in [owner._status_directory, *owner._cleanup_paths]:
+                    if guard is not None:
+                        guard._retire()
+
+    def _frame(self, owner: process_module.OwnedProcess) -> bytes:
+        guard = owner._status_directory
+        assert guard is not None
+        return control_module.ReadyReceipt(
+            owner.pid, guard.device, guard.inode, 202
+        ).encode()
+
+    def test_late_ready_accepts_only_proven_supervisor_exit(self) -> None:
+        for returncode in (0, control_module.PROVEN_PROTOCOL_FAILURE_EXIT_CODE):
+            with (
+                self.subTest(returncode=returncode),
+                self._owner(returncode=returncode) as (
+                    owner,
+                    root,
+                    observation,
+                ),
+            ):
+                (root / "status/status").write_bytes(self._frame(owner))
+                with patch.object(atexit, "unregister") as unregister:
+                    self.assertEqual(owner.wait(timeout=2), returncode)
+                self.assertEqual(owner.target_pid, 202)
+                self.assertTrue(owner._closed)
+                self.assertIsNone(owner._status_directory)
+                self.assertFalse((root / "status").exists())
+                self.assertFalse((root / "private").exists())
+                observation.complete.assert_called_once()
+                unregister.assert_called_once_with(owner._atexit_cleanup)
+
+    def test_unknown_exit_cannot_borrow_a_valid_ready_receipt(self) -> None:
+        with self._owner(returncode=7) as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            with (
+                patch.object(owner, "_read_startup_status") as read_status,
+                self.assertRaises(process_module.ProcessOwnershipError),
+            ):
+                owner.wait(timeout=1)
+            read_status.assert_not_called()
+            self.assertFalse(owner._tree_reaped)
+            self.assertTrue((root / "private").exists())
+            observation.complete.assert_not_called()
+
+    def test_ready_without_supervisor_reap_never_proves_cleanup(self) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            cast(Mock, owner._supervisor.wait).side_effect = subprocess.TimeoutExpired(
+                "supervisor", 1
+            )
+            with (
+                patch.object(owner, "_read_startup_status") as read_status,
+                self.assertRaises(subprocess.TimeoutExpired),
+            ):
+                owner.wait(timeout=1)
+            read_status.assert_not_called()
+            self.assertFalse(owner._supervisor_reaped)
+            self.assertFalse(owner._tree_reaped)
+            observation.complete.assert_not_called()
+
+    def test_late_ready_past_cleanup_deadline_retains_proof_for_explicit_retry(
+        self,
+    ) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            original_read = owner._read_status_frame
+            now = [100.0]
+
+            def late_read(
+                guard: process_module._PrivateDirectory,
+                descriptor: int | None,
+                status_path: Path,
+            ) -> bytes | None:
+                frame = original_read(guard, descriptor, status_path)
+                now[0] = 101.0
+                return frame
+
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                patch.object(owner, "_read_status_frame", side_effect=late_read),
+                self.assertRaises(process_module.ProcessOwnershipError),
+            ):
+                owner.wait(timeout=1)
+            self.assertTrue(owner._supervisor_reaped)
+            self.assertFalse(owner._tree_reaped)
+            self.assertIsNone(owner.target_pid)
+            self.assertIsNotNone(owner._status_directory)
+            self.assertTrue((root / "private").exists())
+            observation.complete.assert_not_called()
+            self.assertEqual(owner.wait(timeout=2), 0)
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner._status_directory)
+            observation.complete.assert_called_once()
+
+    def test_late_ready_rejects_wrong_identity_and_malformed_receipts(self) -> None:
+        for variant in (
+            "missing",
+            "legacy",
+            "supervisor",
+            "device",
+            "inode",
+            "negative",
+            "oversized",
+            "error",
+            "symlink",
+            "fifo",
+        ):
+            with (
+                self.subTest(variant=variant),
+                self._owner() as (owner, root, observation),
+            ):
+                frame = self._frame(owner)
+                fields = frame[:-1].split(b" ")
+                match variant:
+                    case "legacy":
+                        frame = b"ready 202\n"
+                    case "supervisor" | "device" | "inode":
+                        index = {"supervisor": 1, "device": 2, "inode": 3}[variant]
+                        fields[index] = str(int(fields[index]) + 1).encode("ascii")
+                        frame = b" ".join(fields) + b"\n"
+                    case "negative":
+                        fields[4] = b"-1"
+                        frame = b" ".join(fields) + b"\n"
+                    case "oversized":
+                        frame += b"x" * control_module.MAX_STATUS_LINE_BYTES
+                    case "error":
+                        frame = b"error StartupDeadlineExpired\n"
+                status = root / "status/status"
+                if variant == "symlink":
+                    (root / "other").write_bytes(frame)
+                    status.symlink_to(root / "other")
+                elif variant == "fifo":
+                    os.mkfifo(status)
+                elif variant != "missing":
+                    status.write_bytes(frame)
+                with (
+                    patch.object(atexit, "unregister") as unregister,
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    owner.wait(timeout=1)
+                self.assertFalse(owner._tree_reaped)
+                self.assertIsNone(owner.target_pid)
+                self.assertTrue((root / "private").is_dir())
+                observation.complete.assert_not_called()
+                unregister.assert_not_called()
+
+    def test_replaced_directory_cannot_replay_the_pinned_generation(self) -> None:
+        with self._owner() as (owner, root, observation):
+            frame = self._frame(owner)
+            (root / "status").rename(root / "original")
+            (root / "status").mkdir()
+            (root / "status/status").write_bytes(frame)
+            with self.assertRaises(process_module.ProcessOwnershipError):
+                owner.wait(timeout=1)
+            observation.complete.assert_not_called()
+            self.assertFalse(owner._tree_reaped)
+            self.assertTrue((root / "private").exists())
+            guard = owner._status_directory
+            assert guard is not None
+            descriptor = guard._pin.duplicate_descriptor()
+            try:
+                self.assertEqual(
+                    os.fstat(descriptor).st_ino, (root / "original").stat().st_ino
+                )
+            finally:
+                os.close(descriptor)
+
+    def test_bound_target_cannot_accept_another_target_receipt(self) -> None:
+        with self._owner() as (owner, root, _):
+            (root / "status/status").write_bytes(self._frame(owner))
+            owner.bind_target_process_group(303)
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "identity mismatch"
+            ):
+                owner._read_startup_status(
+                    root / "status/status", deadline=time.monotonic() + 1
+                )
+
+    def test_late_ready_cleanup_failure_retains_then_releases_the_same_owner(
+        self,
+    ) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            cleanup_error = OSError("private cleanup blocked")
+            with (
+                patch.object(
+                    process_module,
+                    "_remove_private_directory_owned",
+                    side_effect=cleanup_error,
+                ),
+                self.assertRaises(OSError) as raised,
+            ):
+                owner.wait(timeout=1)
+            self.assertIs(raised.exception, cleanup_error)
+            self.assertTrue(owner._tree_reaped)
+            self.assertFalse(owner._closed)
+            self.assertIsNotNone(owner._status_directory)
+            observation.complete.assert_not_called()
+            with patch.object(
+                owner,
+                "_read_startup_status",
+                side_effect=AssertionError("tree already proven"),
+            ):
+                self.assertEqual(owner.wait(timeout=2), 0)
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner._status_directory)
+            observation.complete.assert_called_once()
+
+    def test_real_ready_timeout_reaps_target_tree_and_preserves_original_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-ready-timeout-") as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir()
+            marker = root / "target-pids"
+            original_read = process_module._read_supervisor_status
+            captured: list[process_module.OwnedProcess] = []
+            startup_error = TimeoutError("READY receipt missed startup deadline")
+            deadline = time.monotonic() + 10
+
+            def late_read(
+                owner: process_module.OwnedProcess,
+                status_path: Path,
+                *,
+                deadline: float,
+            ) -> process_module._SupervisorStatus:
+                captured.append(owner)
+                ready = original_read(owner, status_path, deadline=deadline)
+                self.assertIsInstance(ready, process_module._SupervisorReady)
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(
+                    marker.exists(), "target must actually run before READY expires"
+                )
+                time.sleep(max(0, deadline - time.monotonic()))
+                self.assertGreaterEqual(time.monotonic(), deadline)
+                self.assertIsNone(owner.target_pid)
+                raise startup_error
+
+            source = (
+                "import os, pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(marker)!r}).write_text("
+                "f'{os.getpid()} {child.pid}')\n"
+                "time.sleep(60)\n"
+            )
+            try:
+                with (
+                    patch.object(
+                        process_module, "_read_supervisor_status", side_effect=late_read
+                    ),
+                    patch.object(
+                        atexit, "unregister", wraps=atexit.unregister
+                    ) as unregister,
+                    self.assertRaises(TimeoutError) as raised,
+                ):
+                    process_module.start_owned_process(
+                        sys.executable,
+                        ["-c", source],
+                        cleanup_paths=(private,),
+                        startup_timeout=2,
+                        deadline=deadline,
+                    )
+                self.assertIs(raised.exception, startup_error)
+                owner = captured[0]
+                self.assertEqual(owner._supervisor_returncode, 0)
+                self.assertTrue(owner._tree_reaped)
+                self.assertTrue(owner._closed)
+                self.assertIsNone(owner._status_directory)
+                self.assertFalse(private.exists())
+                self.assertLess(time.monotonic(), deadline)
+                unregister.assert_any_call(owner._atexit_cleanup)
+                self.assertIsNotNone(owner._observation)
+                for raw_pid in marker.read_text().split():
+                    self.assertTrue(_wait_for_pid_exit(int(raw_pid)))
+            finally:
+                # A failed regression must still settle every real observed owner.
+                for owner in captured:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0,
+                            terminate_timeout=1,
+                            kill_timeout=2,
+                            cleanup_timeout=2,
+                        )
+
+
+class PrivateDirectoryCleanupSetTests(unittest.TestCase):
+    def test_owned_process_shares_duplicate_paths_and_supplied_guards(self) -> None:
+        for representation in ("paths", "mixed", "guards"):
+            with self.subTest(representation=representation):
+                with _private_directory_fixture() as directory:
+                    root = Path(directory)
+                    private = root / "private"
+                    private.mkdir()
+                    status = root / "status"
+                    status.mkdir()
+                    first = process_module._PrivateDirectory.capture(private)
+                    second = process_module._PrivateDirectory.capture(private)
+                    paths: tuple[Path | process_module._PrivateDirectory, ...]
+                    if representation == "paths":
+                        first._retire()
+                        second._retire()
+                        paths = (private, private)
+                    elif representation == "mixed":
+                        first._retire()
+                        paths = (private, second)
+                    else:
+                        paths = (first, second)
+                    owner = process_module.OwnedProcess(
+                        Mock(),
+                        target_process_group=None,
+                        windows_job=None,
+                        stdout_drain=None,
+                        stderr_drain=None,
+                        status_directory=status,
+                        cleanup_paths=paths,
+                    )
+                    guards = [
+                        guard for guard in owner._cleanup_paths if guard.path == private
+                    ]
+                    owner._tree_reaped = True
+                    try:
+                        self.assertEqual(len(guards), 2)
+                        self.assertIs(
+                            guards[0]._pin.authority, guards[1]._pin.authority
+                        )
+                        for supplied in paths:
+                            if isinstance(supplied, process_module._PrivateDirectory):
+                                self.assertTrue(
+                                    any(guard is supplied for guard in guards)
+                                )
+                        owner._release_ownership(deadline=time.monotonic() + 5)
+                        self.assertTrue(owner._closed)
+                        self.assertTrue(all(guard._pin.retired for guard in guards))
+                        self.assertFalse(private.exists())
+                        self.assertFalse(status.exists())
+                        private.mkdir()
+                        (private / "foreign").write_text("keep")
+                        for guard in guards:
+                            guard.remove(deadline=time.monotonic() + 1)
+                        self.assertEqual((private / "foreign").read_text(), "keep")
+                    finally:
+                        if not owner._closed:
+                            owner._release_ownership(deadline=time.monotonic() + 5)
+
+    def test_ancestor_cleanup_uses_verified_paths_in_both_orders(self) -> None:
+        for representation in ("parent-first", "child-first", "dotdot-parent"):
+            with self.subTest(representation=representation):
+                with _private_directory_fixture() as directory:
+                    root = Path(directory)
+                    parent = root / "parent"
+                    child = parent / "child"
+                    child.mkdir(parents=True)
+                    (parent / "data").write_text("owned")
+                    status = root / "status"
+                    status.mkdir()
+                    parent_input = (
+                        child / ".." if representation == "dotdot-parent" else parent
+                    )
+                    parent_guard = process_module._PrivateDirectory.capture(
+                        parent_input
+                    )
+                    child_guard = process_module._PrivateDirectory.capture(child)
+                    paths = (
+                        (child_guard, parent_guard)
+                        if representation == "child-first"
+                        else (parent_guard, child_guard)
+                    )
+                    owner = process_module.OwnedProcess(
+                        Mock(),
+                        target_process_group=None,
+                        windows_job=None,
+                        stdout_drain=None,
+                        stderr_drain=None,
+                        status_directory=status,
+                        cleanup_paths=paths,
+                    )
+                    owner._tree_reaped = True
+                    try:
+                        self.assertIs(owner._cleanup_paths[0], child_guard)
+                        self.assertEqual(parent_guard.path, parent_input.absolute())
+                        self.assertEqual(parent_guard.cleanup_path, parent.resolve())
+                        with self.assertRaises(process_module.ProcessOwnershipError):
+                            owner._release_ownership(deadline=time.monotonic() - 1)
+                        self.assertIs(owner._cleanup_paths[0], child_guard)
+                        self.assertFalse(parent_guard._pin.retired)
+                        self.assertFalse(child_guard._pin.retired)
+                        owner._release_ownership(deadline=time.monotonic() + 5)
+                        self.assertTrue(owner._closed)
+                        self.assertTrue(parent_guard._pin.retired)
+                        self.assertTrue(child_guard._pin.retired)
+                        self.assertFalse(child.exists())
+                        self.assertFalse(parent.exists())
+                    finally:
+                        if not owner._closed:
+                            owner._release_ownership(deadline=time.monotonic() + 5)
+
+    @unittest.skipUnless(os.name == "posix", "Fixture creates a parent symlink")
+    def test_parent_symlink_retarget_does_not_change_fixed_cleanup_generation(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            original = root / "original"
+            foreign = root / "foreign"
+            for fixture_parent in (original, foreign):
+                (fixture_parent / "private" / "child").mkdir(parents=True)
+            (foreign / "private" / "marker").write_text("keep")
+            alias = root / "alias"
+            alias.symlink_to(original, target_is_directory=True)
+            parent = process_module._PrivateDirectory.capture(alias / "private")
+            child = process_module._PrivateDirectory.capture(
+                alias / "private" / "child"
+            )
+            key = process_module._private_directory_key(parent)
+            alias.unlink()
+            alias.symlink_to(foreign, target_is_directory=True)
+            guards = process_module._normalize_private_directories((parent, child))
+            self.assertIs(guards[0], child)
+            self.assertEqual(process_module._private_directory_key(parent), key)
+            self.assertEqual(parent.path, alias / "private")
+            for guard in guards:
+                guard.remove(deadline=time.monotonic() + 5)
+            self.assertFalse((original / "private").exists())
+            self.assertEqual((foreign / "private" / "marker").read_text(), "keep")
+            self.assertTrue(parent._pin.retired)
+            self.assertTrue(child._pin.retired)
+
+    def test_start_success_and_failure_keep_duplicate_ancestor_cleanup_contract(
+        self,
+    ) -> None:
+        for failure in ("none", "before-spawn", "partial-capture", "constructor"):
+            with self.subTest(failure=failure):
+                with _private_directory_fixture() as directory:
+                    root = Path(directory)
+                    parent = root / "parent"
+                    child = parent / "child"
+                    child.mkdir(parents=True)
+                    first = process_module._PrivateDirectory.capture(parent)
+                    second = process_module._PrivateDirectory.capture(parent)
+                    child_guard = process_module._PrivateDirectory.capture(child)
+                    paths: list[Path | process_module._PrivateDirectory] = [
+                        first,
+                        second,
+                        child_guard,
+                    ]
+                    if failure == "partial-capture":
+                        paths.append(root / "absent")
+                    owner = None
+                    with ExitStack() as patches:
+                        if failure == "constructor":
+                            patches.enter_context(
+                                patch.object(
+                                    process_module,
+                                    "OwnedProcess",
+                                    side_effect=RuntimeError("constructor failed"),
+                                )
+                            )
+                        try:
+                            if failure == "none":
+                                owner = process_module.start_owned_process(
+                                    sys.executable, ["-c", "pass"], cleanup_paths=paths
+                                )
+                                self.assertEqual(owner.wait(timeout=5), 0)
+                                self.assertTrue(owner._closed)
+                            else:
+                                expected = (
+                                    ValueError
+                                    if failure == "before-spawn"
+                                    else FileNotFoundError
+                                    if failure == "partial-capture"
+                                    else RuntimeError
+                                )
+                                with self.assertRaises(expected):
+                                    process_module.start_owned_process(
+                                        sys.executable,
+                                        ["-c", "pass"],
+                                        cleanup_paths=paths,
+                                        environment={"INVALID=KEY": "value"}
+                                        if failure == "before-spawn"
+                                        else None,
+                                    )
+                            self.assertTrue(first._pin.retired)
+                            self.assertTrue(second._pin.retired)
+                            self.assertTrue(child_guard._pin.retired)
+                            self.assertFalse(parent.exists())
+                            self.assertFalse(child.exists())
+                            for guard in (first, second, child_guard):
+                                key = process_module._private_directory_key(guard)
+                                self.assertNotIn(
+                                    key, process_module._PENDING_PRIVATE_DIRECTORIES
+                                )
+                                self.assertIsNone(
+                                    process_module._active_private_directory_cleanup(
+                                        guard
+                                    )
+                                )
+                        finally:
+                            if owner is not None and not owner._closed:
+                                owner.shutdown(
+                                    graceful_timeout=0,
+                                    terminate_timeout=1,
+                                    kill_timeout=2,
+                                    cleanup_timeout=5,
+                                )
+
+    def test_failed_constructor_does_not_retire_supplied_shared_authority(self) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir()
+            status = root / "status"
+            status.mkdir()
+            supplied = process_module._PrivateDirectory.capture(private)
+            failure = RuntimeError("atexit registration failed")
+            with (
+                patch.object(atexit, "register", side_effect=failure),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                process_module.OwnedProcess(
+                    Mock(),
+                    target_process_group=None,
+                    windows_job=None,
+                    stdout_drain=None,
+                    stderr_drain=None,
+                    status_directory=status,
+                    cleanup_paths=(private, supplied),
+                )
+            self.assertIs(raised.exception, failure)
+            self.assertFalse(supplied._pin.retired)
+            self.assertTrue(supplied._assert_identity_or_absence())
+            supplied.remove(deadline=time.monotonic() + 5)
+            self.assertFalse(private.exists())
+
+    def test_alias_normalization_keeps_each_claim_lock_and_prior_worker(self) -> None:
+        with _private_directory_fixture() as directory:
+            private = Path(directory) / "private"
+            private.mkdir()
+            guards = tuple(
+                process_module._PrivateDirectory.capture(private) for _ in range(2)
+            )
+            claims = [
+                process_module._register_pending_private_directory(guard)
+                for guard in guards
+            ]
+            locks = [
+                process_module._private_directory_operation_lock(guard)
+                for guard in guards
+            ]
+            actives = [
+                process_module._ActivePrivateDirectoryCleanup(guard) for guard in guards
+            ]
+            for active in actives:
+                process_module._register_active_private_directory_cleanup(active)
+            normalized = process_module._normalize_private_directories(guards)
+            for index, guard in enumerate(guards):
+                self.assertIs(normalized[index], guard)
+                self.assertIs(
+                    process_module._register_pending_private_directory(guard),
+                    claims[index],
+                )
+                self.assertIs(
+                    process_module._private_directory_operation_lock(guard),
+                    locks[index],
+                )
+                self.assertIs(
+                    process_module._active_private_directory_cleanup(guard),
+                    actives[index],
+                )
+            process_module._settle_private_directory_workers(
+                normalized, deadline=time.monotonic() + 2
+            )
+            for guard in guards:
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+            for guard in normalized:
+                guard.remove(deadline=time.monotonic() + 5)
+            self.assertFalse(private.exists())
+            for guard in guards:
+                self.assertTrue(guard._pin.retired)
+                self.assertNotIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+
+    def test_ambiguous_redundant_close_keeps_failed_wrapper_and_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            first = process_module._PrivateDirectory.capture(path)
+            second = process_module._PrivateDirectory.capture(path)
+            descriptor = second._pin._descriptor
+            assert descriptor is not None
+            failure = OSError("redundant close outcome unknown")
+            try:
+                with (
+                    patch.object(os, "close", side_effect=failure) as close,
+                    self.assertRaises(OSError) as raised,
+                ):
+                    process_module._normalize_private_directories((first, second))
+                self.assertIs(raised.exception, failure)
+                close.assert_called_once_with(descriptor)
+                self.assertIsNot(first._pin.authority, second._pin.authority)
+                self.assertFalse(second._pin.retired)
+                self.assertFalse(first._pin.retired)
+                with self.assertRaises(identity_module.DirectoryIdentityError):
+                    second._pin.duplicate_descriptor()
+                for guard in (first, second):
+                    self.assertIn(
+                        process_module._private_directory_key(guard),
+                        process_module._PENDING_PRIVATE_DIRECTORIES,
+                    )
+            finally:
+                # The injected close did not touch this exact fixture-owned fd;
+                # no worker was admitted. This is rescue after the retention proof.
+                os.close(descriptor)
+                first._retire()
+                for guard in (first, second):
+                    self.assertIsNone(
+                        process_module._active_private_directory_cleanup(guard)
+                    )
+                    process_module._release_pending_private_directory(guard)
+
+
+class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin capture-time vnode deletion")
+    def test_native_delete_event_is_distinct_from_rename_and_stays_proven(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            pin = identity_module.DirectoryPin.capture(path)
+            watch = pin._deletion_watch
+            assert watch is not None
+            descriptor = pin._descriptor
+            assert descriptor is not None
+            try:
+                self.assertFalse(os.get_inheritable(watch.fileno()))
+                self.assertFalse(pin.deleted())
+                renamed = path.with_name("renamed")
+                path.rename(renamed)
+                self.assertFalse(pin.deleted())
+                self.assertEqual(os.fstat(descriptor).st_ino, pin.inode)
+                unrelated = SimpleNamespace(
+                    ident=descriptor,
+                    filter=select.KQ_FILTER_VNODE,
+                    flags=0,
+                    fflags=select.KQ_NOTE_LINK,
+                )
+                with patch.object(
+                    pin,
+                    "_deletion_watch",
+                    Mock(control=Mock(return_value=[unrelated])),
+                ):
+                    self.assertFalse(pin.deleted())
+                renamed.rmdir()
+                # This exercises real NOTE_DELETE, including APFS where the
+                # still-open directory can retain a nonzero st_nlink.
+                self.assertTrue(pin.deleted())
+                with patch.object(pin, "_deletion_watch", Mock()) as unread:
+                    self.assertTrue(pin.deleted())
+                    unread.control.assert_not_called()
+            finally:
+                pin.retire()
+            self.assertTrue(watch.closed)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin independent vnode watches")
+    def test_native_deletion_survives_duplicate_and_alias_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            pin = identity_module.DirectoryPin.capture(path)
+            other = identity_module.DirectoryPin.inherit(pin.duplicate_descriptor())
+            first_watch, second_watch = pin._deletion_watch, other._deletion_watch
+            assert first_watch is not None and second_watch is not None
+            try:
+                self.assertNotEqual(first_watch.fileno(), second_watch.fileno())
+                self.assertFalse(os.get_inheritable(second_watch.fileno()))
+                path.rmdir()
+                self.assertTrue(other.deleted())
+                pin.share_authority(other)
+                self.assertTrue(second_watch.closed)
+                self.assertFalse(first_watch.closed)
+                self.assertIs(other.authority, pin)
+                self.assertTrue(other.deleted())
+                self.assertTrue(pin.deleted())
+            finally:
+                other.retire()
+                pin.retire()
+            self.assertTrue(first_watch.closed)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin", "Darwin late registration is not proof"
+    )
+    def test_late_native_registration_cannot_reconstruct_a_missing_delete_event(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            pin = identity_module.DirectoryPin.capture(path)
+            descriptor = pin.duplicate_descriptor()
+            late = None
+            try:
+                path.rmdir()
+                self.assertTrue(pin.deleted())
+                late = identity_module.DirectoryPin.inherit(descriptor)
+                descriptor = -1
+                self.assertFalse(late.deleted())
+                guard = process_module._PrivateDirectory.from_pin(
+                    path, late, platform_name="posix"
+                )
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "native deletion proof"
+                ):
+                    guard._assert_identity_or_absence()
+                self.assertFalse(late.retired)
+                self.assertTrue(pin.deleted())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if late is not None:
+                    late.retire()
+                pin.retire()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin event error boundary")
+    def test_native_watch_errors_and_revoke_remain_unproven(self) -> None:
+        for fault in (
+            "read",
+            "revoke",
+            "revoke-delete",
+            "wrong-descriptor",
+            "event-error",
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                pin = identity_module.DirectoryPin.capture(Path(directory))
+                watch = pin._deletion_watch
+                assert watch is not None
+                descriptor = pin._descriptor
+                assert descriptor is not None
+                fake = Mock(wraps=watch)
+                event = SimpleNamespace(
+                    ident=descriptor + (1 if fault == "wrong-descriptor" else 0),
+                    filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ERROR if fault == "event-error" else 0,
+                    fflags=(select.KQ_NOTE_REVOKE if fault.startswith("revoke") else 0)
+                    | (select.KQ_NOTE_DELETE if fault != "revoke" else 0),
+                )
+                if fault == "read":
+                    fake.control.side_effect = OSError("vnode watch read failed")
+                else:
+                    fake.control.return_value = [event]
+                try:
+                    with patch.object(pin, "_deletion_watch", fake):
+                        with self.assertRaises(identity_module.DirectoryIdentityError):
+                            pin.deleted()
+                        fake.control.assert_called_once_with(None, 1, 0)
+                    # Consuming a bad event cannot turn the next empty poll into
+                    # authority to adopt a path or silently retry the failure.
+                    with self.assertRaisesRegex(
+                        identity_module.DirectoryIdentityError, "unproven"
+                    ):
+                        pin.deleted()
+                    self.assertFalse(pin.retired)
+                finally:
+                    pin.retire()
+                self.assertTrue(watch.closed)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin acquisition cleanup")
+    def test_native_watch_registration_failure_closes_queue_and_descriptor(
+        self,
+    ) -> None:
+        for fault in ("create", "inheritability", "register"):
+            with self.subTest(fault=fault):
+                self._assert_native_watch_registration_failure(fault)
+
+    def _assert_native_watch_registration_failure(self, fault: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            acquired: list[int] = []
+            queues: list[Any] = []
+            original_open, original_queue = os.open, select.kqueue
+            original_inheritable = os.set_inheritable
+            failure = OSError(f"watch {fault} failed")
+
+            def open_directory(*args: Any, **kwargs: Any) -> int:
+                descriptor = original_open(*args, **kwargs)
+                acquired.append(descriptor)
+                return descriptor
+
+            def create_queue() -> Any:
+                if fault == "create":
+                    raise failure
+                queue = original_queue()
+                queues.append(queue)
+                wrapped = Mock(wraps=queue)
+                if fault == "register":
+                    wrapped.control.side_effect = failure
+                return wrapped
+
+            def inheritable(descriptor: int, value: bool) -> None:
+                if (
+                    fault == "inheritability"
+                    and queues
+                    and descriptor == queues[0].fileno()
+                ):
+                    raise failure
+                original_inheritable(descriptor, value)
+
+            with (
+                patch.object(os, "open", side_effect=open_directory),
+                patch.object(select, "kqueue", side_effect=create_queue),
+                patch.object(os, "set_inheritable", side_effect=inheritable),
+                self.assertRaises(OSError) as raised,
+            ):
+                identity_module.DirectoryPin.capture(Path(directory))
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(len(acquired), 1)
+            with self.assertRaises(OSError):
+                os.fstat(acquired[0])
+            self.assertTrue(all(queue.closed for queue in queues))
+            replacement = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(replacement, acquired[0])
+                failure.__traceback__ = None
+                gc.collect()
+                self.assertTrue(stat.S_ISDIR(os.fstat(replacement).st_mode))
+            finally:
+                os.close(replacement)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin detached close ownership")
+    def test_native_watch_close_failure_does_not_skip_or_repeat_other_closes(
+        self,
+    ) -> None:
+        for operation in ("retire", "share"):
+            with self.subTest(operation=operation):
+                self._assert_native_watch_close_failure(operation)
+
+    def _assert_native_watch_close_failure(self, operation: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            authority = identity_module.DirectoryPin.capture(Path(directory))
+            pin = (
+                identity_module.DirectoryPin.inherit(authority.duplicate_descriptor())
+                if operation == "share"
+                else authority
+            )
+            watch = pin._deletion_watch
+            descriptor = pin._descriptor
+            assert watch is not None and descriptor is not None
+            failure = OSError("queue close outcome is unknown")
+            wrapped = Mock(wraps=watch)
+
+            def close_after_effect() -> None:
+                watch.close()
+                raise failure
+
+            wrapped.close.side_effect = close_after_effect
+            pin._deletion_watch = wrapped
+            replacement = None
+            try:
+                with self.assertRaises(OSError) as raised:
+                    if operation == "share":
+                        authority.share_authority(pin)
+                    else:
+                        pin.retire()
+                self.assertIs(raised.exception, failure)
+                self.assertTrue(watch.closed)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+                self.assertFalse(pin.retired)
+                self.assertIs(pin.authority, pin)
+                replacement = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                self.assertEqual(replacement, descriptor)
+                with self.assertRaises(identity_module.DirectoryIdentityError):
+                    pin.retire()
+                pin.__del__()
+                wrapped.close.assert_called_once_with()
+                self.assertTrue(stat.S_ISDIR(os.fstat(replacement).st_mode))
+                if operation == "share":
+                    self.assertFalse(authority.retired)
+                    self.assertFalse(authority.deleted())
+            finally:
+                if replacement is not None:
+                    os.close(replacement)
+                if operation == "share":
+                    authority.retire()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin completed-root handoff")
+    def test_retry_transfers_prior_native_delete_proof_to_late_cleanup_worker(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            claim = process_module._register_pending_private_directory(guard)
+            claim.path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(claim.path)
+            claim.namespace = namespace
+            guard._claim_inline(
+                namespace, confirmed=False, deadline=time.monotonic() + 2
+            )
+            claim.confirmed = True
+            claim.started = True
+            (namespace.path / "tree").rmdir()
+            self.assertTrue(guard._pin.deleted())
+            original_spawn = process_module._spawn_private_directory_cleanup
+            with patch.object(
+                process_module, "_spawn_private_directory_cleanup", wraps=original_spawn
+            ) as spawned:
+                guard.remove(deadline=time.monotonic() + 5)
+            spawned.assert_called_once()
+            self.assertTrue(guard._pin.retired)
+            self.assertTrue(namespace._pin.retired)
+            self.assertFalse(namespace.path.exists())
+            self.assertNotIn(
+                process_module._private_directory_key(guard),
+                process_module._PENDING_PRIVATE_DIRECTORIES,
+            )
+
+    def test_renamed_live_generation_keeps_its_exact_cleanup_claim(self) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            renamed = Path(directory) / "renamed"
+            path.mkdir()
+            (path / "secret").write_bytes(b"private material")
+            guard = process_module._PrivateDirectory.capture(path)
+            key = process_module._private_directory_key(guard)
+            path.rename(renamed)
+            try:
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "native deletion proof"
+                ):
+                    guard.remove(deadline=time.monotonic() + 3)
+                self.assertEqual((renamed / "secret").read_bytes(), b"private material")
+                self.assertFalse(guard._pin.retired)
+                self.assertFalse(guard._pin.deleted())
+                claim = process_module._PENDING_PRIVATE_DIRECTORIES[key]
+                self.assertIs(claim.guard, guard)
+                self.assertFalse(claim.started)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+            finally:
+                # Restore this test's exact generation; no path is recaptured.
+                renamed.rename(path)
+                guard.remove(deadline=time.monotonic() + 5)
+            self.assertTrue(guard._pin.retired)
+            self.assertNotIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+            self.assertFalse(path.exists())
+
+    def test_renamed_claim_or_namespace_cannot_supply_deletion_proof(self) -> None:
+        for moved in ("root", "namespace", "root-and-deleted-namespace"):
+            with self.subTest(moved=moved), _private_directory_fixture() as directory:
+                base = Path(directory)
+                path = base / "private"
+                path.mkdir()
+                (path / "secret").write_bytes(b"retained")
+                guard = process_module._PrivateDirectory.capture(path)
+                with _claimed_namespace(guard) as namespace:
+                    claim = process_module._PrivateDirectoryClaim(
+                        guard, namespace.path, namespace, confirmed=True, started=True
+                    )
+                    displaced = base / "displaced"
+                    retained_root = base / "retained-root"
+                    root_moved = False
+                    namespace_moved = False
+                    try:
+                        if moved == "namespace":
+                            # Windows rejects ancestor renames with an open
+                            # descendant. Keep both pins alive, but first move
+                            # the root out so the namespace rename is possible.
+                            (namespace.path / "tree").rename(retained_root)
+                            root_moved = True
+                            namespace.path.rename(displaced)
+                            namespace_moved = True
+                        else:
+                            (namespace.path / "tree").rename(displaced)
+                            if moved == "root-and-deleted-namespace":
+                                namespace.path.rmdir()
+                        with self.assertRaises(
+                            process_module.ProcessOwnershipError
+                        ) as raised:
+                            if moved == "root":
+                                guard._remove_inline(
+                                    namespace=namespace, deadline=time.monotonic() + 2
+                                )
+                            else:
+                                claim.complete()
+                        root_path = retained_root if moved == "namespace" else displaced
+                        self.assertEqual(
+                            (root_path / "secret").read_bytes(), b"retained"
+                        )
+                        metadata = root_path.stat()
+                        self.assertEqual(
+                            (metadata.st_dev, metadata.st_ino),
+                            (guard.device, guard.inode),
+                        )
+                        self.assertFalse(guard._pin.retired)
+                        self.assertFalse(guard._pin.deleted())
+                        if moved == "namespace":
+                            self.assertIn(
+                                "native deletion proof", str(raised.exception)
+                            )
+                            metadata = displaced.stat()
+                            self.assertEqual(
+                                (metadata.st_dev, metadata.st_ino),
+                                (namespace.device, namespace.inode),
+                            )
+                            self.assertFalse(namespace._pin.retired)
+                            self.assertFalse(namespace._pin.deleted())
+                    finally:
+                        if moved == "namespace":
+                            if namespace_moved:
+                                displaced.rename(namespace.path)
+                            if root_moved:
+                                retained_root.rename(namespace.path / "tree")
+                        elif moved == "root":
+                            displaced.rename(namespace.path / "tree")
+                        # A genuinely removed namespace cannot be recaptured as
+                        # its old identity. The fixture owns the displaced tree.
+
+    @unittest.skipUnless(os.name == "posix", "POSIX unlinked directory pin")
+    def test_unlinked_generation_cannot_reclaim_reused_file_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "private"
+            path.mkdir()
+            original_metadata = path.lstat()
+            original_identity = (original_metadata.st_dev, original_metadata.st_ino)
+            actual_open = os.open
+            actual_fstat = os.fstat
+            actual_lstat = Path.lstat
+            acquired: list[int] = []
+
+            def capture_open(*args: Any, **kwargs: Any) -> int:
+                descriptor = actual_open(*args, **kwargs)
+                metadata = actual_fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == original_identity:
+                    acquired.append(descriptor)
+                return descriptor
+
+            def still_pinned() -> bool:
+                for descriptor in acquired:
+                    try:
+                        metadata = actual_fstat(descriptor)
+                    except OSError:
+                        continue
+                    if (metadata.st_dev, metadata.st_ino) == original_identity:
+                        return True
+                return False
+
+            with patch.object(os, "open", side_effect=capture_open):
+                guard = process_module._PrivateDirectory.capture(path)
+            path.rmdir()
+            path.mkdir()
+            foreign = path / "foreign"
+            foreign.write_bytes(b"preserve")
+            held_during_replacement = still_pinned()
+            if held_during_replacement:
+                self.assertNotEqual(path.lstat().st_ino, original_metadata.st_ino)
+
+            def recycled_numbers(
+                target: Path, *args: Any, **kwargs: Any
+            ) -> os.stat_result:
+                # Recycling is possible only after every capture fd for the old
+                # object has gone. A live candidate pin receives real metadata;
+                # old stat-only code gets the reachable recycled-number model.
+                if target == path and not still_pinned():
+                    return original_metadata
+                return actual_lstat(target, *args, **kwargs)
+
+            refused = False
+            try:
+                with (
+                    patch.object(Path, "lstat", recycled_numbers),
+                    patch.object(
+                        process_module,
+                        "_spawn_private_directory_cleanup",
+                        side_effect=AssertionError("recycled identity admitted"),
+                    ) as spawn,
+                ):
+                    try:
+                        guard.remove(deadline=time.monotonic() + 2)
+                    except process_module.ProcessOwnershipError as error:
+                        self.assertIn("directory identity changed", str(error))
+                        refused = True
+                spawn.assert_not_called()
+                self.assertTrue(held_during_replacement)
+                self.assertEqual(foreign.read_bytes(), b"preserve")
+                key = process_module._private_directory_key(guard)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                if refused:
+                    # APFS may retain nlink=2 after rmdir. Refusal preserves the
+                    # exact pin and pending claim; it is not successful cleanup.
+                    self.assertTrue(still_pinned())
+                    self.assertIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+                else:
+                    self.assertFalse(still_pinned())
+                    self.assertNotIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+                    guard.remove(deadline=time.monotonic() + 2)
+                    self.assertEqual(foreign.read_bytes(), b"preserve")
+            finally:
+                process_module._release_pending_private_directory(guard)
+                # The test itself removed the empty original and no worker was
+                # admitted. Release only that fixture authority after the oracle.
+                release_pin = getattr(guard, "_retire", None)
+                if callable(release_pin):
+                    release_pin()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX native directory descriptors")
+    def test_native_pin_survives_unlink_and_is_not_inherited_by_default(self) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            descriptor = guard._pin.duplicate_descriptor()
+            try:
+                self.assertTrue(guard._assert_identity_or_absence())
+                self.assertFalse(os.get_inheritable(descriptor))
+                path.rmdir()
+                path.mkdir()
+                foreign = path / "foreign"
+                foreign.write_bytes(b"preserve")
+                metadata = os.fstat(descriptor)
+                self.assertEqual(
+                    (metadata.st_dev, metadata.st_ino), (guard.device, guard.inode)
+                )
+                self.assertNotEqual(path.stat().st_ino, guard.inode)
+                try:
+                    self.assertFalse(guard._assert_identity_or_absence())
+                except process_module.ProcessOwnershipError as error:
+                    self.assertIn("directory identity changed", str(error))
+                self.assertFalse(guard._pin.retired)
+                self.assertEqual(foreign.read_bytes(), b"preserve")
+            finally:
+                os.close(descriptor)
+                guard._retire()
+
+    def test_capture_failure_closes_only_its_acquired_descriptor(self) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory)
+            pin = identity_module.DirectoryPin.capture(path)
+            descriptor = pin.duplicate_descriptor()
+            failure = OSError("fstat failed")
+            with (
+                patch.object(os, "fstat", side_effect=failure),
+                self.assertRaises(OSError) as raised,
+            ):
+                identity_module.DirectoryPin._adopt_descriptor(descriptor)
+            self.assertIs(raised.exception, failure)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            self.assertFalse(pin.retired)
+            pin.retire()
+
+    @unittest.skipUnless(os.name == "posix", "Host descriptor failure injection")
+    def test_failed_pin_construction_closes_handoff_before_traceback_release(
+        self,
+    ) -> None:
+        for entry in ("capture", "inherit", "receive", "from-worker"):
+            for phase in ("allocate", "lock"):
+                with self.subTest(entry=entry, phase=phase):
+                    self._assert_failed_pin_construction(entry, phase)
+
+    def _assert_failed_pin_construction(self, entry: str, phase: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            pin = identity_module.DirectoryPin.capture(path)
+            acquired: list[int] = []
+            original_open = os.open
+            failure = MemoryError(f"{entry} {phase} failed")
+            caught: BaseException | None = None
+            replacement: int | None = None
+
+            def acquire(*args: Any, **kwargs: Any) -> int:
+                descriptor = original_open(*args, **kwargs)
+                acquired.append(descriptor)
+                return descriptor
+
+            try:
+                with ExitStack() as stack:
+                    close = stack.enter_context(
+                        patch.object(os, "close", wraps=os.close)
+                    )
+                    if entry == "capture":
+                        stack.enter_context(
+                            patch.object(os, "open", side_effect=acquire)
+                        )
+                        invoke = partial(identity_module.DirectoryPin.capture, path)
+                    else:
+                        descriptor = pin.duplicate_descriptor()
+                        acquired.append(descriptor)
+                        if entry == "inherit":
+                            invoke = partial(
+                                identity_module.DirectoryPin.inherit, descriptor
+                            )
+                        elif entry == "receive":
+                            channel = Mock()
+                            channel.recvmsg.return_value = (
+                                b"P",
+                                [
+                                    (
+                                        socket.SOL_SOCKET,
+                                        socket.SCM_RIGHTS,
+                                        array.array("i", [descriptor]).tobytes(),
+                                    )
+                                ],
+                                0,
+                                None,
+                            )
+                            invoke = partial(identity_module.receive_pin, channel)
+                        else:
+                            api = Mock()
+                            api.duplicate.return_value = 123
+                            stack.enter_context(
+                                patch.object(
+                                    identity_module,
+                                    "os",
+                                    SimpleNamespace(**dict(vars(os), name="nt")),
+                                )
+                            )
+                            stack.enter_context(
+                                patch.object(
+                                    identity_module,
+                                    "_WindowsDirectoryApi",
+                                    return_value=api,
+                                )
+                            )
+                            stack.enter_context(
+                                patch.object(
+                                    identity_module,
+                                    "_windows_descriptor",
+                                    return_value=descriptor,
+                                )
+                            )
+                            invoke = partial(
+                                identity_module.DirectoryPin.from_worker, 123, 456
+                            )
+                    if phase == "allocate":
+                        stack.enter_context(
+                            patch.object(
+                                identity_module.DirectoryPin,
+                                "__new__",
+                                side_effect=failure,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            patch.object(threading, "RLock", side_effect=failure)
+                        )
+                    try:
+                        invoke()
+                    except MemoryError as error:
+                        caught = error
+                    self.assertIs(caught, failure)
+                    self.assertIsNotNone(failure.__traceback__)
+                    self.assertEqual(len(acquired), 1)
+                    close.assert_called_once_with(acquired[0])
+                # Keep the failing constructor's traceback alive while checking
+                # immediate closure, then recycle that exact test-owned fd.
+                with self.assertRaises(OSError):
+                    os.fstat(acquired[0])
+                replacement = pin.duplicate_descriptor()
+                self.assertEqual(replacement, acquired[0])
+                failure.__traceback__ = None
+                caught = None
+                gc.collect()
+                self.assertEqual(os.fstat(replacement).st_ino, pin.inode)
+                self.assertFalse(pin.retired)
+            finally:
+                if replacement is not None:
+                    os.close(replacement)
+                pin.retire()
+
+    def test_windows_conversion_import_failure_closes_already_acquired_handle(
+        self,
+    ) -> None:
+        api = Mock()
+        with (
+            patch.dict(sys.modules, {"msvcrt": None}),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            identity_module._windows_descriptor(123, api)
+        api.close.assert_called_once_with(123)
+
+    def test_windows_api_preparation_precedes_native_acquisition(self) -> None:
+        failure = RuntimeError("Windows API preparation failed")
+        windows_os = SimpleNamespace(**dict(vars(os), name="nt"))
+        with (
+            patch.object(identity_module, "os", windows_os),
+            patch.object(identity_module, "_WindowsDirectoryApi", side_effect=failure),
+            patch.object(identity_module, "_windows_descriptor") as convert,
+        ):
+            attempts: tuple[Callable[[], identity_module.DirectoryPin], ...] = (
+                partial(identity_module.DirectoryPin.capture, Path("private")),
+                partial(identity_module.DirectoryPin.from_worker, 123, 456),
+            )
+            for invoke in attempts:
+                with (
+                    self.subTest(invoke=invoke),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    invoke()
+                self.assertIs(raised.exception, failure)
+            convert.assert_not_called()
+
+    def test_capture_rejects_directory_replacement_after_native_open(self) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            path = root / "private"
+            path.mkdir()
+            original_capture = identity_module.DirectoryPin.capture
+            opened: list[identity_module.DirectoryPin] = []
+
+            def replace(target: Path) -> identity_module.DirectoryPin:
+                pin = original_capture(target)
+                opened.append(pin)
+                target.rename(root / "original")
+                target.mkdir()
+                (target / "foreign").write_text("keep")
+                return pin
+
+            with (
+                patch.object(
+                    identity_module.DirectoryPin, "capture", side_effect=replace
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "identity changed"
+                ),
+            ):
+                process_module._PrivateDirectory.capture(path)
+            self.assertTrue(opened[0].retired)
+            self.assertEqual((path / "foreign").read_text(), "keep")
+            self.assertTrue((root / "original").is_dir())
+
+    def test_claim_alias_and_cleanup_retry_share_one_native_generation(self) -> None:
+        with _private_directory_fixture(delete=False) as directory:
+            root = Path(directory)
+            path = root / "private"
+            path.mkdir()
+            (path / "owned").write_text("retained until cleanup")
+            guard = process_module._PrivateDirectory.capture(path)
+            state = process_module._register_pending_private_directory(guard)
+            state.path.mkdir(mode=0o700)
+            state.namespace = process_module._PrivateDirectory.capture(state.path)
+            try:
+                guard._claim_inline(
+                    state.namespace, confirmed=False, deadline=time.monotonic() + 2
+                )
+                state.confirmed = True
+                state.started = True
+                claimed = guard._claimed_directory(state.namespace)
+                self.assertIs(claimed._pin, guard._pin)
+                self.assertTrue(claimed._assert_identity_or_absence())
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    guard._assert_identity_or_absence()
+                self.assertFalse(guard._pin.deleted())
+                self.assertEqual(
+                    (claimed.path / "owned").read_text(), "retained until cleanup"
+                )
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    guard.remove(deadline=time.monotonic() - 1)
+                self.assertFalse(guard._pin.retired)
+                self.assertFalse(state.namespace._pin.retired)
+                self.assertIs(
+                    process_module._PENDING_PRIVATE_DIRECTORIES[
+                        process_module._private_directory_key(guard)
+                    ],
+                    state,
+                )
+                self.assertEqual(
+                    (claimed.path / "owned").read_text(), "retained until cleanup"
+                )
+                guard.remove(deadline=time.monotonic() + 3)
+                self.assertTrue(guard._pin.retired)
+                self.assertTrue(claimed._pin.retired)
+                self.assertTrue(state.namespace._pin.retired)
+                self.assertFalse(state.path.exists())
+                self.assertNotIn(
+                    process_module._private_directory_key(guard),
+                    process_module._PENDING_PRIVATE_DIRECTORIES,
+                )
+                path.mkdir()
+                (path / "foreign").write_text("keep")
+                guard.remove(deadline=time.monotonic() + 1)
+                self.assertEqual((path / "foreign").read_text(), "keep")
+            finally:
+                _release_private_fixture(guard, root)
+
+    @unittest.skipUnless(os.name == "posix", "SCM_RIGHTS is POSIX-only")
+    def test_namespace_transfer_pins_identity_after_sender_releases_handles(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "namespace"
+            path.mkdir()
+            pin = identity_module.DirectoryPin.capture(path)
+            sender, receiver = socket.socketpair(type=socket.SOCK_DGRAM)
+            received = None
+            try:
+                identity_module.send_pin(sender, pin)
+                sender.close()
+                pin.retire()
+                path.rmdir()
+                path.mkdir()
+                marker = path / "foreign"
+                marker.write_bytes(b"preserve")
+                received = identity_module.receive_pin(receiver)
+                self.assertEqual(
+                    (received.device, received.inode), (pin.device, pin.inode)
+                )
+                self.assertNotEqual(path.stat().st_ino, pin.inode)
+                duplicate = received.duplicate_descriptor()
+                try:
+                    metadata = os.fstat(duplicate)
+                    self.assertEqual(
+                        (metadata.st_dev, metadata.st_ino), (pin.device, pin.inode)
+                    )
+                    self.assertFalse(os.get_inheritable(duplicate))
+                    self.assertFalse(received.retired)
+                finally:
+                    os.close(duplicate)
+                self.assertEqual(marker.read_bytes(), b"preserve")
+                received.retire()
+                self.assertTrue(received.retired)
+                with self.assertRaises(identity_module.DirectoryIdentityError):
+                    received.duplicate_descriptor()
+            finally:
+                sender.close()
+                receiver.close()
+                pin.retire()
+                if received is not None:
+                    received.retire()
+
+    @unittest.skipUnless(os.name == "posix", "SCM_RIGHTS is POSIX-only")
+    def test_malformed_native_transfer_closes_every_received_descriptor(self) -> None:
+        with _private_directory_fixture() as directory:
+            pin = identity_module.DirectoryPin.capture(Path(directory))
+            for data, flags in ((b"X", 0), (b"P", socket.MSG_CTRUNC)):
+                with self.subTest(data=data, flags=flags):
+                    duplicate = pin.duplicate_descriptor()
+                    payload = array.array("i", [duplicate]).tobytes()
+                    channel = Mock()
+                    channel.recvmsg.return_value = (
+                        data,
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, payload)],
+                        flags,
+                        None,
+                    )
+                    with self.assertRaises(identity_module.DirectoryIdentityError):
+                        identity_module.receive_pin(channel)
+                    with self.assertRaises(OSError):
+                        os.fstat(duplicate)
+            pin.retire()
+
+    def test_constructor_failure_releases_new_pins_but_not_supplied_authority(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            status = root / "status"
+            private = root / "private"
+            status.mkdir()
+            private.mkdir()
+            captured: list[process_module._PrivateDirectory] = []
+            capture = process_module._PrivateDirectory.capture
+
+            def observe(path: Path) -> process_module._PrivateDirectory:
+                guard = capture(path)
+                captured.append(guard)
+                return guard
+
+            failure = RuntimeError("atexit registration failed")
+            with (
+                patch.object(
+                    process_module._PrivateDirectory, "capture", side_effect=observe
+                ),
+                patch.object(atexit, "register", side_effect=failure),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                process_module.OwnedProcess(
+                    Mock(),
+                    target_process_group=None,
+                    windows_job=None,
+                    stdout_drain=None,
+                    stderr_drain=None,
+                    status_directory=status,
+                    cleanup_paths=(private,),
+                )
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(len(captured), 2)
+            self.assertTrue(all(guard._pin.retired for guard in captured))
+            self.assertTrue(status.is_dir())
+            self.assertTrue(private.is_dir())
+            supplied = capture(status)
+            try:
+                with (
+                    patch.object(atexit, "register", side_effect=failure),
+                    self.assertRaises(RuntimeError),
+                ):
+                    process_module.OwnedProcess(
+                        Mock(),
+                        target_process_group=None,
+                        windows_job=None,
+                        stdout_drain=None,
+                        stderr_drain=None,
+                        status_directory=supplied,
+                        cleanup_paths=(),
+                    )
+                self.assertFalse(supplied._pin.retired)
+                self.assertTrue(supplied._assert_identity_or_absence())
+            finally:
+                supplied._retire()
+
+    def test_ambiguous_close_never_retries_a_recyclable_descriptor(self) -> None:
+        with _private_directory_fixture() as directory:
+            pin = identity_module.DirectoryPin.capture(Path(directory))
+            descriptor = pin._descriptor
+            assert descriptor is not None
+            failure = OSError("close outcome unknown")
+            try:
+                with patch.object(os, "close", side_effect=failure) as close:
+                    with self.assertRaises(OSError) as raised:
+                        pin.retire()
+                    self.assertIs(raised.exception, failure)
+                    self.assertFalse(pin.retired)
+                    with self.assertRaises(identity_module.DirectoryIdentityError):
+                        pin.retire()
+                    with self.assertRaises(identity_module.DirectoryIdentityError):
+                        pin.duplicate_descriptor()
+                    close.assert_called_once_with(descriptor)
+            finally:
+                # The injected close never touched this exact test descriptor.
+                os.close(descriptor)
+
+    def test_windows_conversion_closes_handle_only_when_transfer_fails(self) -> None:
+        failure = OSError("CRT conversion failed")
+        convert = Mock(side_effect=failure)
+        api = Mock()
+        fake_crt = SimpleNamespace(open_osfhandle=convert)
+        windows_os = SimpleNamespace(O_RDONLY=os.O_RDONLY, O_NOINHERIT=0x80)
+        with (
+            patch.dict(sys.modules, {"msvcrt": fake_crt}),
+            patch.object(identity_module, "os", windows_os),
+            patch.object(
+                identity_module,
+                "_WindowsDirectoryApi",
+                side_effect=AssertionError("must reuse prepared Windows API"),
+            ),
+        ):
+            with self.assertRaises(OSError) as raised:
+                identity_module._windows_descriptor(123, api)
+            self.assertIs(raised.exception, failure)
+            api.close.assert_called_once_with(123)
+            convert.side_effect = None
+            convert.return_value = 321
+            api.close.reset_mock()
+            self.assertEqual(identity_module._windows_descriptor(123, api), 321)
+            api.close.assert_not_called()
+            convert.assert_called_with(123, os.O_RDONLY | 0x80)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX inherited descriptor validation")
+    def test_worker_rejects_wrong_native_pin_and_closes_only_its_copy(self) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            pin = identity_module.DirectoryPin.capture(path)
+            duplicate = pin.duplicate_descriptor()
+            sender, receiver = socket.socketpair(type=socket.SOCK_DGRAM)
+            channel = os.dup(sender.fileno())
+            try:
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "Inherited private root identity",
+                ):
+                    cleanup_worker_module._parse_arguments(
+                        (
+                            str(path),
+                            str(pin.device),
+                            str(pin.inode + 1),
+                            "posix",
+                            repr(time.monotonic() + 1),
+                            str(path.parent / ".hbrowser-cleanup-test"),
+                            "-1",
+                            "-1",
+                            "0",
+                            str(duplicate),
+                            "-1",
+                            str(channel),
+                        )
+                    )
+                with self.assertRaises(OSError):
+                    os.fstat(duplicate)
+                self.assertFalse(pin.retired)
+                self.assertFalse(pin.deleted())
+            finally:
+                sender.close()
+                receiver.close()
+                pin.retire()
+
+    def test_failed_worker_keeps_published_pins_until_process_exit(self) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            path = root / "private"
+            path.mkdir()
+            namespace_path = root / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            retained: list[identity_module.DirectoryPin] = []
+            output = io.BytesIO()
+            stdout = io.TextIOWrapper(output, encoding="ascii", newline="\r\n")
+            failure = RuntimeError("failed after ready")
+            incoming = None
+            sender = receiver = None
+            channel = -1
+            if os.name == "posix":
+                sender, receiver = socket.socketpair(type=socket.SOCK_DGRAM)
+                channel = os.dup(sender.fileno())
+            try:
+                with (
+                    patch.object(
+                        cleanup_worker_module, "_PROCESS_LIFETIME_PINS", retained
+                    ),
+                    patch.object(
+                        cleanup_worker_module,
+                        "_parse_arguments",
+                        return_value=(
+                            guard,
+                            time.monotonic() + 2,
+                            namespace_path,
+                            namespace,
+                            False,
+                            channel,
+                        ),
+                    ),
+                    patch.object(
+                        cleanup_worker_module,
+                        "_read_start_gate",
+                        return_value=b"start\n",
+                    ),
+                    patch.object(
+                        cleanup_worker_module,
+                        "_wait_permission",
+                        side_effect=failure,
+                    ),
+                    patch.object(cleanup_worker_module, "_report_failure") as report,
+                    patch.object(threading, "Thread"),
+                    patch.object(sys, "stdin", Mock(fileno=Mock(return_value=0))),
+                    patch.object(sys, "stdout", stdout),
+                ):
+                    self.assertEqual(cleanup_worker_module.main(()), 1)
+                self.assertTrue(output.getvalue().startswith(b"ready "))
+                report.assert_called_once()
+                self.assertIs(report.call_args.args[1], failure)
+                self.assertEqual(retained, [guard._pin, namespace._pin])
+                self.assertFalse(guard._pin.retired)
+                self.assertFalse(namespace._pin.retired)
+                if receiver is not None:
+                    incoming = identity_module.receive_pin(receiver)
+                else:
+                    incoming = identity_module.DirectoryPin.from_worker(
+                        namespace._pin.native_handle(), -1
+                    )
+                self.assertEqual(
+                    (incoming.device, incoming.inode),
+                    (namespace.device, namespace.inode),
+                )
+                self.assertTrue(path.is_dir())
+            finally:
+                stdout.close()
+                if sender is not None:
+                    sender.close()
+                if receiver is not None:
+                    receiver.close()
+                if incoming is not None:
+                    incoming.retire()
+                guard._retire()
+                namespace._retire()
+
+    def test_late_native_release_retains_terminal_claim_for_explicit_retry(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            path.rmdir()
+            now = [0.0]
+            retire = guard._pin.retire
+
+            def late_release() -> None:
+                retire()
+                now[0] = 1.0
+
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                patch.object(guard._pin, "retire", side_effect=late_release),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError,
+                    "native release completed after",
+                ),
+            ):
+                guard.remove(deadline=1.0)
+            self.assertTrue(guard._pin.retired)
+            key = process_module._private_directory_key(guard)
+            self.assertIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+            with patch.object(
+                process_module, "_spawn_private_directory_cleanup"
+            ) as spawn:
+                guard.remove(deadline=time.monotonic() + 1)
+            spawn.assert_not_called()
+            self.assertNotIn(key, process_module._PENDING_PRIVATE_DIRECTORIES)
+
+    def test_windows_identity_requires_full_file_id_without_64_bit_fallback(
+        self,
+    ) -> None:
+        kernel = Mock()
+        with patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+            api = identity_module._WindowsDirectoryApi()
+        kernel.GetFileInformationByHandleEx.return_value = False
+        with self.assertRaisesRegex(OSError, "full directory identity"):
+            api.identity(123)
+        identifier = (1 << 100) + 7
+
+        def full_identity(_handle: int, kind: int, output: Any, _size: int) -> bool:
+            self.assertEqual(kind, 18)
+            output._obj.VolumeSerialNumber = 55
+            output._obj.FileId[:] = identifier.to_bytes(16, "little")
+            return True
+
+        kernel.GetFileInformationByHandleEx.side_effect = full_identity
+        self.assertEqual(api.identity(123), (55, identifier))
+
+    def test_windows_deletion_proof_requires_success_and_directory_flag(self) -> None:
+        kernel = Mock()
+        with patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+            api = identity_module._WindowsDirectoryApi()
+        kernel.GetFileInformationByHandleEx.return_value = False
+        with self.assertRaisesRegex(OSError, "directory deletion"):
+            api.deleted(123)
+
+        def not_a_directory(_handle: int, kind: int, output: Any, _size: int) -> bool:
+            self.assertEqual(kind, 1)
+            output._obj.Directory = 0
+            output._obj.DeletePending = 1
+            return True
+
+        kernel.GetFileInformationByHandleEx.side_effect = not_a_directory
+        with self.assertRaisesRegex(
+            identity_module.DirectoryIdentityError, "not a directory"
+        ):
+            api.deleted(123)
+
+    @unittest.skipUnless(os.name == "nt", "Native Windows delete-pending contract")
+    def test_windows_pin_retains_deleted_generation_until_explicit_release(
+        self,
+    ) -> None:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            try:
+                path.rmdir()
+                self.assertTrue(guard._pin.deleted())
+                self.assertFalse(guard._assert_identity_or_absence())
+                self.assertFalse(guard._pin.retired)
+                recreated_while_pinned = True
+                try:
+                    path.mkdir()
+                except OSError:
+                    self.assertTrue(guard._pin.deleted())
+                    self.assertFalse(guard._pin.retired)
+                    recreated_while_pinned = False
+                    guard._retire()
+                    path.mkdir()
+                replacement = process_module._PrivateDirectory.capture(path)
+                if recreated_while_pinned:
+                    self.assertNotEqual(
+                        (replacement.device, replacement.inode),
+                        (guard.device, guard.inode),
+                    )
+                    self.assertTrue(guard._pin.deleted())
+                    self.assertFalse(guard._assert_identity_or_absence())
+                    self.assertFalse(guard._pin.retired)
+                (path / "foreign").write_text("keep")
+                guard._retire()
+                self.assertTrue(guard._pin.retired)
+                guard.remove(deadline=time.monotonic() + 1)
+                self.assertTrue(replacement._assert_identity_or_absence())
+                self.assertEqual((path / "foreign").read_text(), "keep")
+            finally:
+                guard._retire()
+
+    def test_windows_release_handshake_requires_both_native_deletion_proofs(
+        self,
+    ) -> None:
+        for outcome in ("complete", "root-not-deleted", "namespace-not-deleted"):
+            with self.subTest(outcome=outcome):
+                self._assert_windows_release_handshake(outcome)
+
+    def _assert_windows_release_handshake(self, outcome: str) -> None:
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            path = root / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = root / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            state = process_module._PrivateDirectoryClaim(guard, namespace_path)
+            received_pin = identity_module.DirectoryPin._adopt_descriptor(
+                namespace._pin.duplicate_descriptor()
+            )
+            read_fd, write_fd = os.pipe()
+            commands: list[bytes] = []
+            delete_pending = {"root": False, "namespace": False}
+            handles = {
+                guard._pin._descriptor: "root",
+                namespace._pin._descriptor: "namespace",
+                received_pin._descriptor: "namespace",
+            }
+            kernel = Mock()
+            with patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+                api = identity_module._WindowsDirectoryApi()
+
+            def standard_info(handle: int, kind: int, output: Any, _size: int) -> bool:
+                self.assertEqual(kind, 1)
+                output._obj.Directory = 1
+                output._obj.DeletePending = delete_pending[handles[handle]]
+                return True
+
+            kernel.GetFileInformationByHandleEx.side_effect = standard_info
+
+            def command(frame: bytes) -> int:
+                commands.append(frame)
+                if frame == b"claim\n":
+                    guard._claim_inline(
+                        namespace, confirmed=False, deadline=time.monotonic() + 1
+                    )
+                    os.write(write_fd, b"claimed\n")
+                elif frame == b"remove\n":
+                    if outcome != "root-not-deleted":
+                        shutil.rmtree(namespace.path / "tree")
+                        delete_pending["root"] = True
+                    os.write(write_fd, b"removed\n")
+                elif frame == b"release-root\n":
+                    if outcome != "namespace-not-deleted":
+                        namespace.path.rmdir()
+                        delete_pending["namespace"] = True
+                    os.write(write_fd, b"finished\n")
+                return len(frame)
+
+            try:
+                os.write(
+                    write_fd,
+                    f"ready {namespace.device} {namespace.inode} 123\n".encode(),
+                )
+                with os.fdopen(read_fd, "rb") as output:
+                    child = Mock(
+                        args=["worker"], stdout=output, stdin=Mock(), _handle=456
+                    )
+                    child.stdin.write.side_effect = command
+                    active = process_module._ActivePrivateDirectoryCleanup(
+                        guard=guard, process=child
+                    )
+                    # Test only the protocol's release ordering on this host;
+                    # the native Windows DeletePending API is exercised on CI.
+                    windows_os = SimpleNamespace(**dict(vars(os), name="nt"))
+                    with (
+                        patch.object(process_module, "os", windows_os),
+                        patch.object(identity_module, "os", windows_os),
+                        patch.object(
+                            identity_module, "_WindowsDirectoryApi", return_value=api
+                        ),
+                        patch.object(
+                            identity_module,
+                            "_windows_handle",
+                            side_effect=lambda descriptor: descriptor,
+                        ),
+                        patch.object(
+                            identity_module.DirectoryPin,
+                            "from_worker",
+                            return_value=received_pin,
+                        ),
+                    ):
+                        if outcome == "complete":
+                            process_module._acknowledge_private_directory_claim(
+                                active, state, deadline=time.monotonic() + 1
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                process_module.ProcessOwnershipError,
+                                "native deletion proof",
+                            ):
+                                process_module._acknowledge_private_directory_claim(
+                                    active, state, deadline=time.monotonic() + 1
+                                )
+                self.assertEqual(guard._pin.retired, outcome != "root-not-deleted")
+                self.assertEqual(received_pin.retired, outcome == "complete")
+                if outcome == "root-not-deleted":
+                    self.assertEqual(commands, [b"claim\n", b"remove\n"])
+                    self.assertTrue((namespace.path / "tree").is_dir())
+                elif outcome == "namespace-not-deleted":
+                    self.assertEqual(commands[-1], b"release-root\n")
+                    self.assertTrue(namespace.path.is_dir())
+                else:
+                    self.assertEqual(
+                        commands,
+                        [
+                            b"claim\n",
+                            b"remove\n",
+                            b"release-root\n",
+                            b"release-namespace\n",
+                        ],
+                    )
+            finally:
+                os.close(write_fd)
+                guard._retire()
+                namespace._retire()
+                received_pin.retire()
+
+
+class PinnedPrivateFileCreationTests(unittest.TestCase):
+    @contextmanager
+    def _directory(self) -> Iterator[process_module._PrivateDirectory]:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            try:
+                yield guard
+            finally:
+                guard.remove(deadline=time.monotonic() + 5)
+
+    def test_new_file_completes_partial_writes_and_is_not_inherited(self) -> None:
+        with self._directory() as guard:
+            original_write = os.write
+            descriptors: list[int] = []
+
+            def write(descriptor: int, data: bytes) -> int:
+                self.assertFalse(os.get_inheritable(descriptor))
+                descriptors.append(descriptor)
+                return original_write(descriptor, data[:2])
+
+            with patch.object(os, "write", write):
+                guard.create_file("private-data", b"abcdefg")
+            self.assertEqual((guard.path / "private-data").read_bytes(), b"abcdefg")
+            self.assertEqual(len(descriptors), 4)
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+            if os.name == "posix":
+                self.assertEqual(
+                    (guard.path / "private-data").stat().st_mode & 0o777, 0o600
+                )
+
+    def test_existing_file_directory_and_symlink_are_not_overwritten(self) -> None:
+        with self._directory() as guard:
+            target = guard.path / "private-data"
+            target.write_bytes(b"keep")
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertEqual(target.read_bytes(), b"keep")
+            target.unlink()
+            target.mkdir()
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertTrue(target.is_dir())
+            target.rmdir()
+            outside = guard.path.parent / "outside"
+            outside.write_bytes(b"untouched")
+            target.symlink_to(outside)
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"untouched")
+            # Cleanup has its own no-follow policy; this test owns this link.
+            target.unlink()
+
+    def test_names_cannot_escape_the_pinned_directory(self) -> None:
+        with self._directory() as guard:
+            with patch.object(os, "open", side_effect=AssertionError("must not open")):
+                for name in (
+                    "",
+                    ".",
+                    "..",
+                    "../x",
+                    "x/y",
+                    "x\\y",
+                    "/x",
+                    "C:x",
+                    "x\0y",
+                    "x.",
+                    "x ",
+                ):
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        guard.create_file(name, b"secret")
+            self.assertEqual(list(guard.path.iterdir()), [])
+
+    def test_replacement_at_native_create_still_targets_the_original_generation(
+        self,
+    ) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_replacement_at_native_create(symlink)
+
+    def _assert_replacement_at_native_create(self, symlink: bool) -> None:
+        with self._directory() as guard:
+            original = guard.path.with_name("original")
+            replacement = guard.path.with_name("replacement")
+            replacement.mkdir()
+            (replacement / "keep").write_bytes(b"unrelated")
+
+            def replace() -> None:
+                guard.path.rename(original)
+                if symlink:
+                    guard.path.symlink_to(replacement, target_is_directory=True)
+                else:
+                    replacement.rename(guard.path)
+
+            original_open = os.open
+            original_create = identity_module._WindowsDirectoryApi.create_file
+
+            def posix_create(*args: Any, **kwargs: Any) -> int:
+                replace()
+                return original_open(*args, **kwargs)
+
+            def windows_create(
+                api: identity_module._WindowsDirectoryApi, native: int, name: str
+            ) -> int:
+                replace()
+                return original_create(api, native, name)
+
+            try:
+                with (
+                    patch.object(os, "open", posix_create)
+                    if os.name == "posix"
+                    else patch.object(
+                        identity_module._WindowsDirectoryApi,
+                        "create_file",
+                        windows_create,
+                    )
+                ):
+                    guard.create_file("private-data", b"secret")
+                self.assertEqual((original / "private-data").read_bytes(), b"secret")
+                self.assertFalse((guard.path / "private-data").exists())
+                self.assertEqual((guard.path / "keep").read_bytes(), b"unrelated")
+            finally:
+                if original.exists():
+                    if symlink:
+                        guard.path.unlink()
+                    else:
+                        guard.path.rename(replacement)
+                    original.rename(guard.path)
+
+    def test_partial_write_error_closes_once_and_preserves_original_failure(
+        self,
+    ) -> None:
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails):
+                self._assert_partial_write_failure(close_fails)
+
+    def _assert_partial_write_failure(self, close_fails: bool) -> None:
+        with self._directory() as guard:
+            original_write, original_close = os.write, os.close
+            failure = OSError("synthetic partial write failure")
+            calls: list[int] = []
+            closed: list[int] = []
+
+            def write(descriptor: int, data: bytes) -> int:
+                calls.append(descriptor)
+                if len(calls) == 1:
+                    return original_write(descriptor, data[:2])
+                raise failure
+
+            def close(descriptor: int) -> None:
+                closed.append(descriptor)
+                original_close(descriptor)
+                if close_fails:
+                    raise OSError("synthetic close failure")
+
+            with (
+                patch.object(os, "write", write),
+                patch.object(os, "close", close),
+                self.assertRaises(OSError) as raised,
+            ):
+                guard.create_file("partial", b"secret")
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(closed, [calls[0]])
+            self.assertEqual((guard.path / "partial").read_bytes(), b"se")
+            with self.assertRaises(OSError):
+                os.fstat(calls[0])
+            if close_fails:
+                self.assertIn(
+                    "Private file close also failed: OSError", failure.__notes__
+                )
+
+    def test_zero_write_fails_and_releases_the_file_descriptor(self) -> None:
+        with self._directory() as guard:
+            descriptors: list[int] = []
+
+            def no_progress(descriptor: int, _data: bytes) -> int:
+                descriptors.append(descriptor)
+                return 0
+
+            with patch.object(os, "write", no_progress), self.assertRaises(OSError):
+                guard.create_file("empty", b"secret")
+            self.assertEqual((guard.path / "empty").read_bytes(), b"")
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
+    def test_close_error_does_not_retry_a_reused_descriptor(self) -> None:
+        with self._directory() as guard:
+            original_close = os.close
+            reused: list[int] = []
+            closed: list[int] = []
+            failure = OSError("synthetic ambiguous close")
+
+            def close(descriptor: int) -> None:
+                original_close(descriptor)
+                closed.append(descriptor)
+                reused.append(os.open(guard.path / "private-data", os.O_RDONLY))
+                raise failure
+
+            try:
+                with (
+                    patch.object(os, "close", close),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    guard.create_file("private-data", b"secret")
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(len(closed), 1)
+                self.assertEqual(os.read(reused[0], 6), b"secret")
+            finally:
+                for descriptor in reused:
+                    original_close(descriptor)
+
+    def test_delegated_pin_creates_once_and_retired_pin_cannot_create(self) -> None:
+        with self._directory() as guard:
+            alias = identity_module.DirectoryPin.capture(guard.path)
+            try:
+                guard._pin.share_authority(alias)
+                alias.create_file("from-alias", b"shared authority")
+                self.assertEqual(
+                    (guard.path / "from-alias").read_bytes(), b"shared authority"
+                )
+            finally:
+                if alias.authority is alias:
+                    alias.retire()
+        # The real guard's ordinary cleanup has now retired their shared pin.
+        for pin in (guard._pin, alias):
+            with self.assertRaises(identity_module.DirectoryIdentityError):
+                pin.create_file("too-late", b"secret")
+        self.assertFalse(guard.path.exists())
+
+    def test_windows_relative_create_uses_native_exclusive_no_reparse_contract(
+        self,
+    ) -> None:
+        kernel, native = Mock(), Mock()
+        with patch.object(ctypes, "WinDLL", side_effect=[kernel, native], create=True):
+            api = identity_module._WindowsDirectoryApi()
+        name = "private-\U0001f512"
+
+        def create(
+            output: Any,
+            access: int,
+            attributes: Any,
+            status: Any,
+            allocation: Any,
+            flags: int,
+            sharing: int,
+            disposition: int,
+            options: int,
+            ea: Any,
+            ea_length: int,
+        ) -> int:
+            value = attributes._obj
+            self.assertEqual(value.RootDirectory, 321)
+            self.assertEqual(value.Attributes, 0x1040)
+            native_name = value.ObjectName.contents
+            self.assertEqual(
+                ctypes.string_at(native_name.Buffer, native_name.Length),
+                name.encode("utf-16-le"),
+            )
+            self.assertEqual(access, 0x100002)
+            self.assertEqual(
+                (flags, sharing, disposition, options), (0x80, 0, 2, 0x200060)
+            )
+            self.assertEqual((allocation, ea, ea_length), (None, None, 0))
+            output._obj.value = 123
+            status._obj.Information = 2
+            return 0
+
+        native.NtCreateFile.side_effect = create
+        self.assertEqual(api.create_file(321, name), 123)
+        kernel.CreateFileW.assert_not_called()
+        api.close(123)
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_windows_native_failure_never_falls_back_to_path_creation(self) -> None:
+        kernel, native = Mock(), Mock()
+        with patch.object(ctypes, "WinDLL", side_effect=[kernel, native], create=True):
+            api = identity_module._WindowsDirectoryApi()
+        # Collision, reparse encountered, and unsupported-parameter status.
+        for status in (0xC0000035, 0xC000050B, 0xC000000D):
+            native.NtCreateFile.return_value = ctypes.c_int32(status).value
+            with (
+                self.subTest(status=status),
+                self.assertRaisesRegex(
+                    identity_module.DirectoryIdentityError, f"{status:#x}"
+                ),
+            ):
+                api.create_file(321, "private-data")
+        self.assertEqual(native.NtCreateFile.call_count, 3)
+        kernel.CreateFileW.assert_not_called()
+        kernel.CloseHandle.assert_not_called()
+
+    def test_windows_file_descriptor_handoff_is_writable_and_consumed_once(
+        self,
+    ) -> None:
+        convert = Mock(return_value=987)
+        api = Mock(spec=identity_module._WindowsDirectoryApi)
+        failure = OSError("synthetic fd conversion failure")
+        with (
+            patch.dict(
+                sys.modules, {"msvcrt": SimpleNamespace(open_osfhandle=convert)}
+            ),
+            patch.object(os, "O_NOINHERIT", 0x80, create=True),
+            patch.object(os, "O_BINARY", 0x8000, create=True),
+        ):
+            self.assertEqual(
+                identity_module._windows_descriptor(123, api, writable=True), 987
+            )
+            convert.assert_called_once_with(123, os.O_WRONLY | 0x8000 | 0x80)
+            api.close.assert_not_called()
+            convert.side_effect = failure
+            with self.assertRaises(OSError) as raised:
+                identity_module._windows_descriptor(456, api, writable=True)
+            self.assertIs(raised.exception, failure)
+            api.close.assert_called_once_with(456)
+
+
 class PrivateDirectoryCleanupTests(unittest.TestCase):
     def test_owned_worker_removes_exact_private_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-owned-remove-") as directory:
+        with _private_directory_fixture(prefix="hbrowser-owned-remove-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             (private_directory / "state").write_text("owned", encoding="utf-8")
@@ -2513,7 +4927,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 )
 
     def test_removed_directory_retry_must_reap_its_existing_cleanup_owner(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-removed-retry-") as directory:
+        with _private_directory_fixture(prefix="hbrowser-removed-retry-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(private_directory)
@@ -2585,7 +4999,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 ) as exit_process,
                 self.assertRaises(SystemExit),
             ):
-                cleanup_worker_module._exit_when_parent_channel_closes(read_descriptor)
+                cleanup_worker_module._watch_parent_channel(
+                    read_descriptor, threading.Event(), threading.Event()
+                )
         finally:
             os.close(read_descriptor)
 
@@ -2610,7 +5026,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
         self.assertTrue(diagnostic.isascii())
 
     def test_worker_failure_reports_stage_from_direct_script(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-worker-error-") as directory:
+        with _private_directory_fixture(prefix="hbrowser-worker-error-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(private_directory)
@@ -2633,6 +5049,13 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         return_value="posix",
                     ),
                     _mock_popen(return_value=process) as popen,
+                    patch.object(
+                        process_module,
+                        "_acknowledge_private_directory_claim",
+                        side_effect=process_module.ProcessOwnershipError(
+                            "worker failed"
+                        ),
+                    ),
                     self.assertRaises(process_module.ProcessOwnershipError) as raised,
                 ):
                     guard.remove(deadline=time.monotonic() + 2)
@@ -2652,7 +5075,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 process_module._release_pending_private_directory(guard)
 
     def test_worker_assignment_failure_kills_ungated_exact_process(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-worker-assign-") as directory:
+        with _private_directory_fixture(prefix="hbrowser-worker-assign-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(private_directory)
@@ -2689,6 +5112,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             ):
                 process_module._spawn_private_directory_cleanup(
                     guard,
+                    claim=process_module._PrivateDirectoryClaim(
+                        guard, Path(directory) / ".hbrowser-cleanup-test"
+                    ),
                     work_deadline=time.monotonic() + 1,
                     ownership_deadline=time.monotonic() + 2,
                 )
@@ -2705,7 +5131,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 )
 
     def test_worker_diagnostic_is_collected_only_after_job_release(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with _private_directory_fixture(
             prefix="hbrowser-worker-diagnostic-"
         ) as directory:
             private_directory = Path(directory) / "profile"
@@ -2760,9 +5186,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
     def test_timeout_reaps_worker_before_background_mutation_can_continue(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="hbrowser-worker-timeout-"
-        ) as directory:
+        with _private_directory_fixture(prefix="hbrowser-worker-timeout-") as directory:
             root = Path(directory)
             private_directory = root / "profile"
             private_directory.mkdir()
@@ -2794,6 +5218,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 args: ClassVar[list[str]] = ["cleanup-worker"]
                 returncode: int | None = None
                 stdin = Gate()
+                stdout = None
 
                 def poll(self) -> int | None:
                     return self.returncode
@@ -2819,6 +5244,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                         return_value="posix",
                     ),
                     _mock_popen(return_value=slow_process),
+                    patch.object(
+                        process_module, "_acknowledge_private_directory_claim"
+                    ),
                     self.assertRaisesRegex(
                         process_module.ProcessOwnershipError,
                         "exceeded its work deadline during filesystem cleanup",
@@ -2849,36 +5277,38 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     mutation_thread.join(timeout=1)
                 process_module._release_pending_private_directory(guard)
 
-    def test_windows_sharing_violation_retries_and_removes_same_directory(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory(prefix="hbrowser-private-retry-") as directory:
+    def test_windows_sharing_violation_retries_and_removes_same_directory(self) -> None:
+        with _private_directory_fixture(prefix="hbrowser-private-retry-") as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
-            original_rmtree = shutil.rmtree
+            original = process_module._PrivateDirectory._remove_claimed_contents
             attempts = 0
 
-            def transient_rmtree(path: Path) -> None:
+            def transient(
+                instance: process_module._PrivateDirectory,
+                namespace: process_module._PrivateDirectory,
+                *,
+                deadline: float,
+            ) -> None:
                 nonlocal attempts
                 attempts += 1
                 if attempts == 1:
                     raise _windows_cleanup_error(32)
-                original_rmtree(path)
+                original(instance, namespace, deadline=deadline)
 
             with (
+                _claimed_namespace(guard) as namespace,
                 patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=transient_rmtree,
+                    process_module._PrivateDirectory,
+                    "_remove_claimed_contents",
+                    transient,
                 ),
                 patch.object(time, "sleep") as sleep,
             ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
-
+                guard._remove_inline(namespace=namespace, deadline=time.monotonic() + 1)
             self.assertEqual(attempts, 2)
             sleep.assert_called_once_with(
                 process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
@@ -2886,147 +5316,597 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             self.assertFalse(private_directory.exists())
 
     def test_persistent_windows_sharing_violation_stops_at_deadline(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with _private_directory_fixture(
             prefix="hbrowser-private-deadline-"
         ) as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
             cleanup_error = _windows_cleanup_error(33)
-
-            with (
-                patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=cleanup_error,
-                ) as rmtree,
-                patch.object(
-                    time,
-                    "monotonic",
-                    side_effect=[0.0, 0.0, 0.1, 0.3],
-                ),
-                patch.object(time, "sleep") as sleep,
-                self.assertRaises(process_module.ProcessOwnershipError) as raised,
-            ):
-                guard._remove_inline(deadline=0.25)
-
-            self.assertIs(raised.exception.__cause__, cleanup_error)
-            self.assertIn(
-                "winerror=33 attempts=1",
-                "\n".join(raised.exception.__notes__),
-            )
-            rmtree.assert_called_once_with(private_directory)
-            sleep.assert_called_once_with(
-                process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
-            )
-            self.assertTrue(private_directory.is_dir())
+            with _claimed_namespace(guard) as namespace:
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        side_effect=cleanup_error,
+                    ) as remove,
+                    patch.object(time, "monotonic", side_effect=[0.0, 0.1, 0.3]),
+                    patch.object(time, "sleep") as sleep,
+                    self.assertRaises(process_module.ProcessOwnershipError) as raised,
+                ):
+                    guard._remove_inline(namespace=namespace, deadline=0.25)
+                self.assertIs(raised.exception.__cause__, cleanup_error)
+                self.assertIn(
+                    "winerror=33 attempts=1", "\n".join(raised.exception.__notes__)
+                )
+                remove.assert_called_once_with(namespace, deadline=0.25)
+                sleep.assert_called_once_with(
+                    process_module._PRIVATE_CLEANUP_RETRY_INITIAL_SECONDS
+                )
+                self.assertTrue((namespace.path / "tree").is_dir())
 
     def test_non_windows_or_non_sharing_errors_fail_without_retry(self) -> None:
-        cases = (("posix", 32), ("nt", 5))
-        for platform_name, error_code in cases:
-            with self.subTest(platform_name=platform_name, error_code=error_code):
-                with tempfile.TemporaryDirectory(
+        for platform_name, error_code in (("posix", 32), ("nt", 5)):
+            with (
+                self.subTest(platform=platform_name, code=error_code),
+                _private_directory_fixture(
                     prefix="hbrowser-private-policy-"
-                ) as directory:
-                    private_directory = Path(directory) / "profile"
-                    private_directory.mkdir()
-                    guard = process_module._PrivateDirectory.capture(
-                        private_directory,
-                        platform_name=platform_name,
-                    )
-                    cleanup_error = _windows_cleanup_error(error_code)
-
+                ) as directory,
+            ):
+                private_directory = Path(directory) / "profile"
+                private_directory.mkdir()
+                guard = process_module._PrivateDirectory.capture(
+                    private_directory, platform_name=platform_name
+                )
+                cleanup_error = _windows_cleanup_error(error_code)
+                with _claimed_namespace(guard) as namespace:
                     with (
                         patch.object(
-                            shutil,
-                            "rmtree",
+                            process_module._PrivateDirectory,
+                            "_remove_claimed_contents",
                             side_effect=cleanup_error,
-                        ) as rmtree,
+                        ) as remove,
                         patch.object(time, "sleep") as sleep,
                         self.assertRaises(PermissionError) as raised,
                     ):
-                        guard._remove_inline(deadline=time.monotonic() + 1)
-
-                    self.assertIs(raised.exception, cleanup_error)
-                    rmtree.assert_called_once_with(private_directory)
-                    sleep.assert_not_called()
-                    self.assertTrue(private_directory.is_dir())
+                        guard._remove_inline(
+                            namespace=namespace, deadline=time.monotonic() + 1
+                        )
+                    self.assertTrue((namespace.path / "tree").is_dir())
+                self.assertIs(raised.exception, cleanup_error)
+                remove.assert_called_once()
+                sleep.assert_not_called()
 
     def test_retry_revalidates_identity_before_deleting_replacement(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with _private_directory_fixture(
             prefix="hbrowser-private-identity-"
         ) as directory:
             root = Path(directory)
             private_directory = root / "profile"
-            displaced_directory = root / "original-profile"
-            replacement_marker = private_directory / "replacement"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
+            original = process_module._PrivateDirectory._remove_claimed_contents
+            calls = 0
+            with _claimed_namespace(guard) as namespace:
+                claimed = namespace.path / "tree"
 
-            def replace_during_backoff(_: float) -> None:
-                private_directory.rename(displaced_directory)
-                private_directory.mkdir()
-                replacement_marker.write_text("keep", encoding="utf-8")
+                def transient(
+                    instance: process_module._PrivateDirectory,
+                    target: process_module._PrivateDirectory,
+                    *,
+                    deadline: float,
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise _windows_cleanup_error(32)
+                    original(instance, target, deadline=deadline)
 
-            with (
-                patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=_windows_cleanup_error(32),
-                ) as rmtree,
-                patch.object(
-                    time,
-                    "sleep",
-                    side_effect=replace_during_backoff,
-                ),
-                self.assertRaisesRegex(
-                    process_module.ProcessOwnershipError,
-                    "identity changed",
-                ),
-            ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
+                def replace(_: float) -> None:
+                    claimed.rename(root / "displaced")
+                    claimed.mkdir()
+                    (claimed / "foreign").write_text("preserve", encoding="utf-8")
 
-            rmtree.assert_called_once_with(private_directory)
-            self.assertEqual(
-                replacement_marker.read_text(encoding="utf-8"),
-                "keep",
-            )
-            self.assertTrue(displaced_directory.is_dir())
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        transient,
+                    ),
+                    patch.object(time, "sleep", side_effect=replace),
+                    self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError, "identity changed"
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertEqual(
+                    (claimed / "foreign").read_text(encoding="utf-8"), "preserve"
+                )
+                self.assertTrue((root / "displaced").is_dir())
+
+    def test_namespace_retry_revalidates_before_root_removal(self) -> None:
+        self._assert_namespace_retry_revalidates(parent_alias=False)
+
+    @unittest.skipUnless(os.name == "posix", "Fixture creates a parent symlink")
+    def test_namespace_retry_revalidates_with_parent_alias(self) -> None:
+        self._assert_namespace_retry_revalidates(parent_alias=True)
+
+    def _assert_namespace_retry_revalidates(self, *, parent_alias: bool) -> None:
+        with _private_directory_fixture(
+            prefix="hbrowser-namespace-retry-"
+        ) as directory:
+            root = Path(directory).resolve()
+            parent = root / "parent"
+            parent.mkdir()
+            if parent_alias:
+                alias = root / "alias"
+                alias.symlink_to(parent, target_is_directory=True)
+                parent = alias
+            path = parent / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path, platform_name="nt")
+            with _claimed_namespace(guard) as namespace:
+                canonical_namespace = namespace.cleanup_path
+                if parent_alias:
+                    self.assertNotEqual(namespace.path, canonical_namespace)
+                    self.assertTrue(namespace.path.samefile(canonical_namespace))
+                else:
+                    self.assertEqual(namespace.path, canonical_namespace)
+                original_rmdir = Path.rmdir
+                removal_attempts: list[Path] = []
+                replacements = 0
+
+                def locked_namespace(target: Path) -> None:
+                    if target == canonical_namespace:
+                        removal_attempts.append(target)
+                        raise _windows_cleanup_error(32)
+                    original_rmdir(target)
+
+                def replace(_: float) -> None:
+                    nonlocal replacements
+                    replacements += 1
+                    self.assertEqual(replacements, 1)
+                    canonical_namespace.rename(root / "displaced-namespace")
+                    canonical_namespace.mkdir()
+                    (canonical_namespace / "foreign").write_text(
+                        "keep", encoding="utf-8"
+                    )
+
+                with (
+                    patch.object(Path, "rmdir", locked_namespace),
+                    patch.object(time, "sleep", side_effect=replace) as sleep,
+                    self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError, "identity changed"
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertEqual(removal_attempts, [canonical_namespace])
+                sleep.assert_called_once_with(ANY)
+                self.assertEqual(replacements, 1)
+                self.assertEqual(
+                    (canonical_namespace / "foreign").read_text(encoding="utf-8"),
+                    "keep",
+                )
+                displaced = (root / "displaced-namespace").stat()
+                self.assertEqual(
+                    (displaced.st_dev, displaced.st_ino),
+                    (namespace.device, namespace.inode),
+                )
 
     def test_directory_removed_during_backoff_is_idempotent_success(self) -> None:
-        with tempfile.TemporaryDirectory(
+        with _private_directory_fixture(
             prefix="hbrowser-private-absence-"
         ) as directory:
             private_directory = Path(directory) / "profile"
             private_directory.mkdir()
             guard = process_module._PrivateDirectory.capture(
-                private_directory,
-                platform_name="nt",
+                private_directory, platform_name="nt"
             )
-            original_rmtree = shutil.rmtree
+            original = process_module._PrivateDirectory._remove_claimed_contents
+            calls = 0
+            with _claimed_namespace(guard) as namespace:
+
+                def transient(
+                    instance: process_module._PrivateDirectory,
+                    target: process_module._PrivateDirectory,
+                    *,
+                    deadline: float,
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise _windows_cleanup_error(32)
+                    original(instance, target, deadline=deadline)
+
+                with (
+                    patch.object(
+                        process_module._PrivateDirectory,
+                        "_remove_claimed_contents",
+                        transient,
+                    ),
+                    patch.object(
+                        time,
+                        "sleep",
+                        side_effect=lambda _: shutil.rmtree(namespace.path / "tree"),
+                    ),
+                ):
+                    guard._remove_inline(
+                        namespace=namespace, deadline=time.monotonic() + 1
+                    )
+                self.assertFalse(namespace.path.exists())
+
+    def test_replacement_after_check_is_claimed_but_never_deleted(self) -> None:
+        with _private_directory_fixture(prefix="hbrowser-claim-race-") as directory:
+            root = Path(directory)
+            path = root / "profile"
+            path.mkdir()
+            (path / "owned").write_text("original", encoding="utf-8")
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = root / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            original_check = (
+                process_module._PrivateDirectory._assert_identity_or_absence
+            )
+            injected = False
+
+            def replace(instance: process_module._PrivateDirectory) -> bool:
+                nonlocal injected
+                present = original_check(instance)
+                if instance is guard and present and not injected:
+                    injected = True
+                    path.rename(root / "original")
+                    path.mkdir()
+                    (path / "foreign").write_text("keep", encoding="utf-8")
+                return present
 
             with (
                 patch.object(
-                    shutil,
-                    "rmtree",
-                    side_effect=_windows_cleanup_error(32),
-                ) as rmtree,
+                    process_module._PrivateDirectory,
+                    "_assert_identity_or_absence",
+                    replace,
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "identity changed"
+                ) as raised,
+            ):
+                guard._claim_inline(
+                    namespace, confirmed=False, deadline=time.monotonic() + 1
+                )
+            self.assertTrue(injected)
+            self.assertEqual(
+                (namespace.path / "tree/foreign").read_text(encoding="utf-8"), "keep"
+            )
+            self.assertEqual(
+                (root / "original/owned").read_text(encoding="utf-8"), "original"
+            )
+            self.assertIn(
+                str(namespace.cleanup_path / "tree"),
+                "\n".join(raised.exception.__notes__),
+            )
+
+    def test_original_path_replacement_is_untouched_after_claim(self) -> None:
+        with _private_directory_fixture(
+            prefix="hbrowser-claimed-replacement-"
+        ) as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            with _claimed_namespace(guard) as namespace:
+                path.mkdir()
+                (path / "foreign").write_text("keep", encoding="utf-8")
+                guard._remove_inline(namespace=namespace, deadline=time.monotonic() + 1)
+            self.assertEqual((path / "foreign").read_text(encoding="utf-8"), "keep")
+
+    def test_unconfirmed_missing_claim_never_counts_as_complete(self) -> None:
+        with _private_directory_fixture(prefix="hbrowser-missing-claim-") as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = Path(directory) / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            state = process_module._PrivateDirectoryClaim(
+                guard, namespace_path, namespace, started=True
+            )
+            path.rmdir()
+            self.assertFalse(state.complete())
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "lost both"
+            ):
+                guard._claim_inline(
+                    namespace, confirmed=False, deadline=time.monotonic() + 1
+                )
+            namespace_path.rmdir()
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "Unconfirmed"
+            ):
+                state.complete()
+
+    def test_malformed_or_missing_handshake_never_authorizes_deletion(self) -> None:
+        frames = (b"", b"wrong\n", b"ready -1 2\n", b"ready 1 2 extra\n", b"x" * 129)
+        with _private_directory_fixture(prefix="hbrowser-handshake-") as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            for frame in frames:
+                with self.subTest(frame=frame):
+                    state = process_module._PrivateDirectoryClaim(
+                        guard, Path(directory) / ".hbrowser-cleanup-test"
+                    )
+                    read_fd, write_fd = os.pipe()
+                    try:
+                        os.write(write_fd, frame)
+                    finally:
+                        os.close(write_fd)
+                    with os.fdopen(read_fd, "rb") as output:
+                        child = Mock(args=["worker"], stdout=output, stdin=Mock())
+                        active = process_module._ActivePrivateDirectoryCleanup(
+                            guard=guard, process=child
+                        )
+                        with self.assertRaises(process_module.ProcessOwnershipError):
+                            process_module._acknowledge_private_directory_claim(
+                                active, state, deadline=time.monotonic() + 1
+                            )
+                        child.stdin.write.assert_not_called()
+                    self.assertFalse(state.confirmed)
+                    self.assertIsNone(state.namespace)
+                    self.assertTrue(path.is_dir())
+
+    def test_claimed_frame_without_matching_root_never_authorizes_deletion(
+        self,
+    ) -> None:
+        with _private_directory_fixture(
+            prefix="hbrowser-handshake-missing-"
+        ) as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            (path / "owned").write_text("retain original")
+            guard = process_module._PrivateDirectory.capture(path)
+            namespace_path = Path(directory) / ".hbrowser-cleanup-test"
+            namespace_path.mkdir()
+            (namespace_path / "foreign").write_text("retain namespace")
+            namespace = process_module._PrivateDirectory.capture(namespace_path)
+            state = process_module._PrivateDirectoryClaim(guard, namespace_path)
+            read_fd, write_fd = os.pipe()
+            try:
+                with ExitStack() as resources:
+                    channel = None
+                    native_suffix = ""
+                    if os.name == "posix":
+                        sender, channel = socket.socketpair(type=socket.SOCK_DGRAM)
+                        resources.callback(sender.close)
+                        resources.callback(channel.close)
+                        identity_module.send_pin(sender, namespace._pin)
+                    else:
+                        native_suffix = f" {namespace._pin.native_handle()}"
+                    os.write(
+                        write_fd,
+                        (
+                            f"ready {namespace.device} {namespace.inode}"
+                            f"{native_suffix}\n"
+                        ).encode(),
+                    )
+                    with os.fdopen(read_fd, "rb") as output:
+                        # -1 is the current-process pseudo HANDLE on Windows.
+                        child = Mock(
+                            args=["worker"], stdout=output, stdin=Mock(), _handle=-1
+                        )
+                        child.stdin.write.side_effect = lambda _: os.write(
+                            write_fd, b"claimed\n"
+                        )
+                        active = process_module._ActivePrivateDirectoryCleanup(
+                            guard=guard, process=child, identity_channel=channel
+                        )
+                        with self.assertRaises(process_module.ProcessOwnershipError):
+                            process_module._acknowledge_private_directory_claim(
+                                active, state, deadline=time.monotonic() + 1
+                            )
+                        child.stdin.write.assert_called_once_with(b"claim\n")
+                    self.assertFalse(state.confirmed)
+                    self.assertTrue(path.is_dir())
+                    self.assertEqual((path / "owned").read_text(), "retain original")
+                    self.assertEqual(
+                        (namespace_path / "foreign").read_text(), "retain namespace"
+                    )
+                    self.assertTrue(guard._assert_identity_or_absence())
+                    self.assertFalse(guard._pin.retired)
+                    self.assertFalse(namespace._pin.retired)
+                    self.assertIsNotNone(state.namespace)
+                    assert state.namespace is not None
+                    self.assertTrue(state.namespace._assert_identity_or_absence())
+                    self.assertFalse(state.namespace._pin.retired)
+            finally:
+                os.close(write_fd)
+                guard._retire()
+                namespace._retire()
+                if state.namespace is not None:
+                    state.namespace._retire()
+
+    def test_failed_worker_does_not_publish_success_after_material_removal(
+        self,
+    ) -> None:
+        with _private_directory_fixture(prefix="hbrowser-failed-removed-") as directory:
+            path = Path(directory) / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            child = Mock(
+                args=["worker"], stdin=Mock(), stdout=Mock(), stderr=None, returncode=1
+            )
+            child.poll.return_value = 1
+            child.wait.return_value = 1
+            job = Mock(spec=process_module._WindowsJob)
+
+            def acknowledge(
+                active: process_module._ActivePrivateDirectoryCleanup,
+                state: process_module._PrivateDirectoryClaim,
+                *,
+                deadline: float,
+            ) -> None:
+                state.path.mkdir()
+                state.namespace = process_module._PrivateDirectory.capture(state.path)
+                guard._claim_inline(state.namespace, confirmed=False, deadline=deadline)
+                state.confirmed = True
+                guard._remove_inline(namespace=state.namespace, deadline=deadline)
+
+            with (
+                _mock_popen(return_value=child),
                 patch.object(
-                    time,
-                    "sleep",
-                    side_effect=lambda _: original_rmtree(private_directory),
+                    process_module._WindowsJob, "create", return_value=job
+                ) as create_job,
+                patch.object(
+                    process_module, "_acknowledge_private_directory_claim", acknowledge
+                ),
+                self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "exit_code=1"
                 ),
             ):
-                guard._remove_inline(deadline=time.monotonic() + 1)
+                guard.remove(deadline=time.monotonic() + 2)
+            if os.name == "nt":
+                create_job.assert_called_once_with()
+                job.assign.assert_called_once_with(child)
+                job.wait_empty.assert_called_once_with(timeout=ANY)
+                job.close.assert_called_once_with()
+                job.terminate.assert_not_called()
+            else:
+                create_job.assert_not_called()
+            self.assertFalse(path.exists())
+            self.assertIsNone(process_module._active_private_directory_cleanup(guard))
+            self.assertNotIn(
+                process_module._private_directory_key(guard),
+                process_module._PENDING_PRIVATE_DIRECTORIES,
+            )
 
-            rmtree.assert_called_once_with(private_directory)
-            self.assertFalse(private_directory.exists())
+    def test_worker_interruption_preserves_claim_and_public_replacement(
+        self,
+    ) -> None:
+        for phase in ("after-claim", "before-delete", "after-delete"):
+            with (
+                self.subTest(phase=phase),
+                _private_directory_fixture(
+                    prefix="hbrowser-worker-phase-", delete=False
+                ) as directory,
+            ):
+                root = Path(directory)
+                path = root / "profile"
+                path.mkdir()
+                (path / "owned").write_text("original", encoding="utf-8")
+                guard = process_module._PrivateDirectory.capture(path)
+                marker = root / "phase"
+                worker = root / "worker.py"
+                runtime_worker = process_module._PRIVATE_CLEANUP_WORKER_PATH
+                target = (
+                    "_claim_inline"
+                    if phase == "after-claim"
+                    else "_remove_claimed_contents"
+                )
+                worker.write_text(
+                    "import sys, runpy, time\nfrom pathlib import Path\n"
+                    f"sys.path.insert(0, {str(runtime_worker.parent)!r})\n"
+                    "import process\n"
+                    f"original = process._PrivateDirectory.{target}\n"
+                    "def interrupted(self, *args, **kwargs):\n"
+                    + (
+                        "    original(self, *args, **kwargs)\n"
+                        if phase != "before-delete"
+                        else ""
+                    )
+                    + f"    Path({str(marker)!r}).write_text('entered')\n"
+                    "    time.sleep(30)\n"
+                    f"process._PrivateDirectory.{target} = interrupted\n"
+                    f"runpy.run_path({str(runtime_worker)!r}, run_name='__main__')\n",
+                    encoding="utf-8",
+                )
+                try:
+                    with (
+                        patch.object(
+                            process_module, "_PRIVATE_CLEANUP_WORKER_PATH", worker
+                        ),
+                        self.assertRaises(process_module.ProcessOwnershipError),
+                    ):
+                        guard.remove(deadline=time.monotonic() + 1)
+                    self.assertTrue(
+                        marker.is_file(),
+                        "worker must reach the intended interruption boundary",
+                    )
+                    self.assertIsNone(
+                        process_module._active_private_directory_cleanup(guard)
+                    )
+                    state = process_module._PENDING_PRIVATE_DIRECTORIES[
+                        process_module._private_directory_key(guard)
+                    ]
+                    self.assertIsNotNone(state.namespace)
+                    self.assertEqual(state.confirmed, phase != "after-claim")
+                    path.mkdir()
+                    (path / "foreign").write_text("keep", encoding="utf-8")
+                    guard.remove(deadline=time.monotonic() + 3)
+                    self.assertEqual(
+                        (path / "foreign").read_text(encoding="utf-8"), "keep"
+                    )
+                    self.assertFalse(state.path.exists())
+                    self.assertNotIn(
+                        process_module._private_directory_key(guard),
+                        process_module._PENDING_PRIVATE_DIRECTORIES,
+                    )
+                finally:
+                    _release_private_fixture(guard, root)
+
+    def test_interrupted_setup_without_identity_is_not_adopted_on_retry(self) -> None:
+        with _private_directory_fixture(
+            prefix="hbrowser-worker-setup-", delete=False
+        ) as directory:
+            root = Path(directory)
+            path = root / "profile"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            worker = root / "worker.py"
+            runtime_worker = process_module._PRIVATE_CLEANUP_WORKER_PATH
+            marker = root / "setup"
+            worker.write_text(
+                "import sys, runpy, time\nfrom pathlib import Path\n"
+                f"sys.path.insert(0, {str(runtime_worker.parent)!r})\n"
+                "original = Path.mkdir\n"
+                "def stalled(path, *args, **kwargs):\n"
+                "    original(path, *args, **kwargs)\n"
+                f"    Path({str(marker)!r}).write_text('entered')\n"
+                "    time.sleep(30)\n"
+                "Path.mkdir = stalled\n"
+                f"runpy.run_path({str(runtime_worker)!r}, run_name='__main__')\n",
+                encoding="utf-8",
+            )
+            try:
+                with (
+                    patch.object(
+                        process_module, "_PRIVATE_CLEANUP_WORKER_PATH", worker
+                    ),
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    guard.remove(deadline=time.monotonic() + 1)
+                self.assertTrue(marker.is_file())
+                state = process_module._PENDING_PRIVATE_DIRECTORIES[
+                    process_module._private_directory_key(guard)
+                ]
+                self.assertIsNone(state.namespace)
+                self.assertTrue(state.path.is_dir())
+                self.assertTrue(path.is_dir())
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    guard.remove(deadline=time.monotonic() + 2)
+                self.assertIsNone(state.namespace)
+                self.assertTrue(state.path.is_dir())
+                self.assertTrue(path.is_dir())
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+            finally:
+                _release_private_fixture(guard, root)
 
 
 class ProcessPolicyTests(unittest.TestCase):
@@ -3447,20 +6327,20 @@ class ProcessPolicyTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-late-ready-") as directory:
             status_path = Path(directory) / "status"
-            status_path.write_text("ready 123", encoding="utf-8")
             now = [100.0]
 
-            def late_read(*_: object, **__: object) -> str:
+            def late_read(*_: object, **__: object) -> process_module._SupervisorReady:
                 now[0] = 101.0
-                return "ready 123"
+                return process_module._SupervisorReady(123)
 
+            owner = Mock(spec=process_module.OwnedProcess)
+            owner._read_startup_status.side_effect = late_read
             with (
                 patch.object(time, "monotonic", side_effect=lambda: now[0]),
-                patch.object(Path, "read_text", side_effect=late_read),
                 self.assertRaisesRegex(TimeoutError, "READY deadline"),
             ):
                 process_module._read_supervisor_status(
-                    Mock(spec=process_module.OwnedProcess),
+                    owner,
                     status_path,
                     deadline=101.0,
                 )
@@ -3544,8 +6424,8 @@ class ProcessPolicyTests(unittest.TestCase):
             with patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ):
                 owner.wait(timeout=1)
@@ -3820,8 +6700,8 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ),
         ):
@@ -3882,8 +6762,8 @@ class ProcessPolicyTests(unittest.TestCase):
             patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ),
             self.assertRaisesRegex(OSError, "assignment failed"),
@@ -3991,8 +6871,8 @@ class ProcessPolicyTests(unittest.TestCase):
                 patch.object(
                     process_module,
                     "_remove_private_directory_owned",
-                    side_effect=lambda guard, *, deadline: guard._remove_inline(
-                        deadline=deadline
+                    side_effect=lambda guard, *, deadline: _remove_private_inline(
+                        guard, deadline=deadline
                     ),
                 ),
                 self.assertRaises(TimeoutError) as raised,
@@ -4052,31 +6932,38 @@ class ProcessPolicyTests(unittest.TestCase):
                     process_module._PROVISIONAL_OWNERS.clear()
 
     def test_provisional_cleanup_cannot_borrow_a_long_caller_deadline(self) -> None:
-        supervisor = Mock(pid=101, stdin=Mock(), stdout=None, stderr=None)
-        supervisor.poll.side_effect = (None, 0)
-        supervisor.wait.side_effect = (
-            subprocess.TimeoutExpired("supervisor", 5),
-            0,
-        )
-        guard = Mock()
-        owner = process_module._ProvisionalProcessOwner(
-            supervisor=supervisor,
-            status_guard=guard,
-            cleanup_guards=(),
-        )
-        process_module._register_provisional_owner(owner)
-        try:
-            process_module._cleanup_provisional_owner(
-                owner,
-                deadline=time.monotonic() + 120,
+        with _private_directory_fixture() as directory:
+            guard = process_module._PrivateDirectory.capture(Path(directory))
+            supervisor = Mock(pid=101, stdin=Mock(), stdout=None, stderr=None)
+            supervisor.poll.side_effect = (None, 0)
+            supervisor.wait.side_effect = (
+                subprocess.TimeoutExpired("supervisor", 5),
+                0,
             )
-        finally:
-            process_module._release_provisional_owner(owner)
-
-        for wait_call in supervisor.wait.call_args_list:
-            self.assertLessEqual(wait_call.kwargs["timeout"], 5.0)
-        cleanup_deadline = guard.remove.call_args.kwargs["deadline"]
-        self.assertLessEqual(cleanup_deadline - time.monotonic(), 5.0)
+            owner = process_module._ProvisionalProcessOwner(
+                supervisor=supervisor,
+                status_guard=guard,
+                cleanup_guards=(),
+            )
+            process_module._register_provisional_owner(owner)
+            try:
+                with patch.object(
+                    process_module._PrivateDirectory, "remove", autospec=True
+                ) as remove:
+                    process_module._cleanup_provisional_owner(
+                        owner, deadline=time.monotonic() + 120
+                    )
+                remove.assert_called_once()
+                self.assertIs(remove.call_args.args[0], guard)
+                for wait_call in supervisor.wait.call_args_list:
+                    self.assertLessEqual(wait_call.kwargs["timeout"], 5.0)
+                cleanup_deadline = remove.call_args.kwargs["deadline"]
+                self.assertLessEqual(cleanup_deadline - time.monotonic(), 5.0)
+                # Only the remover was mocked. The fixture still owns this pin.
+                self.assertFalse(guard._pin.retired)
+            finally:
+                process_module._release_provisional_owner(owner)
+                guard._retire()
 
     def test_windows_job_termination_and_close_failures_retain_handle(self) -> None:
         accounting_type = type(
@@ -4133,8 +7020,8 @@ class ProcessPolicyTests(unittest.TestCase):
             with patch.object(
                 process_module,
                 "_remove_private_directory_owned",
-                side_effect=lambda guard, *, deadline: guard._remove_inline(
-                    deadline=deadline
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
                 ),
             ):
                 owner.wait(timeout=1)
@@ -4385,7 +7272,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     raise process_module.ProcessOwnershipError(
                         "private cleanup timed out"
                     ) from cleanup_error
-                guard._remove_inline(deadline=deadline)
+                _remove_private_inline(guard, deadline=deadline)
 
             with (
                 patch.object(
@@ -4459,7 +7346,7 @@ class ProcessPolicyTests(unittest.TestCase):
                     release_started.set()
                     if not allow_release.wait(timeout=2):
                         raise TimeoutError("test did not release private cleanup")
-                guard._remove_inline(deadline=deadline)
+                _remove_private_inline(guard, deadline=deadline)
 
             def shutdown_owner() -> None:
                 try:
@@ -4831,3 +7718,651 @@ assert not pathlib.Path(sys.argv[2]).exists()
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrivateCleanupSpawnHandoffTests(unittest.TestCase):
+    def test_pre_spawn_registration_failure_completes_original_observation(
+        self,
+    ) -> None:
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                self._assert_registration_failure(registered=registered)
+
+    def _assert_registration_failure(self, *, registered: bool) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        captured: list[process_module._ActivePrivateDirectoryCleanup] = []
+        actual_register = process_module._register_active_private_directory_cleanup
+
+        def fail_registration(
+            active: process_module._ActivePrivateDirectoryCleanup,
+        ) -> None:
+            captured.append(active)
+            observation = active.observation
+            assert isinstance(observation, runtime_test_owner._Observation)
+            self.assertIn(observation, registry.observations)
+            self.assertTrue(observation.starting)
+            self.assertIsNotNone(observation.callback)
+            self.assertFalse(active.spawn_attempted)
+            if registered:
+                actual_register(active)
+            raise OSError("registration interrupted")
+
+        with tempfile.TemporaryDirectory(prefix="hbrowser-cleanup-admission-") as name:
+            private = Path(name) / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            claim = process_module._register_pending_private_directory(guard)
+            deadline = time.monotonic() + 10
+            try:
+                with (
+                    patch.object(
+                        process_module,
+                        "_register_active_private_directory_cleanup",
+                        side_effect=fail_registration,
+                    ),
+                    patch.object(subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(OSError, "registration interrupted"),
+                ):
+                    process_module._spawn_private_directory_cleanup(
+                        guard,
+                        claim=claim,
+                        work_deadline=deadline,
+                        ownership_deadline=deadline,
+                    )
+                popen.assert_not_called()
+                self.assertEqual(len(captured), 1)
+                self.assertIsNone(
+                    process_module._active_private_directory_cleanup(guard)
+                )
+                self.assertTrue(private.exists())
+                self.assertEqual(set(registry.observations), observations_before)
+            finally:
+                guard.remove(deadline=deadline)
+
+    def test_unknown_private_spawn_retains_exact_owner_and_foreign_directory(
+        self,
+    ) -> None:
+        for fault in ("popen return", "handle assignment"):
+            with self.subTest(fault=fault):
+                self._assert_unknown_private_spawn(fault)
+
+    def _assert_unknown_private_spawn(self, fault: str) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        actual_popen = subprocess.Popen
+        active_type = process_module._ActivePrivateDirectoryCleanup
+        actual_setattr = active_type.__setattr__
+        children: list[subprocess.Popen[bytes]] = []
+        captured: list[process_module._ActivePrivateDirectoryCleanup] = []
+        actual_register = process_module._register_active_private_directory_cleanup
+        failure = OSError("private worker handle handoff interrupted")
+
+        def record_original_owner(
+            active: process_module._ActivePrivateDirectoryCleanup,
+        ) -> None:
+            captured.append(active)
+            actual_register(active)
+
+        def lose_returned_handle(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            child = actual_popen(*args, **kwargs)
+            children.append(child)
+            raise failure
+
+        def lose_assigned_handle(
+            active: process_module._ActivePrivateDirectoryCleanup,
+            name: str,
+            value: Any,
+        ) -> None:
+            if name == "process" and value is not None:
+                children.append(value)
+                raise failure
+            actual_setattr(active, name, value)
+
+        with tempfile.TemporaryDirectory(prefix="hbrowser-cleanup-handoff-") as name:
+            root = Path(name)
+            private = root / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            claim = process_module._register_pending_private_directory(guard)
+            deadline = time.monotonic() + 10
+            original = root / "original"
+            foreign = root / "foreign"
+            retained = None
+            try:
+                with ExitStack() as patches:
+                    patches.enter_context(
+                        patch.object(
+                            process_module,
+                            "_register_active_private_directory_cleanup",
+                            side_effect=record_original_owner,
+                        )
+                    )
+                    patches.enter_context(
+                        patch.object(
+                            subprocess, "Popen", side_effect=lose_returned_handle
+                        )
+                        if fault == "popen return"
+                        else patch.object(
+                            active_type, "__setattr__", new=lose_assigned_handle
+                        )
+                    )
+                    with self.assertRaises(process_module.ProcessOwnershipError):
+                        process_module._spawn_private_directory_cleanup(
+                            guard,
+                            claim=claim,
+                            work_deadline=deadline,
+                            ownership_deadline=deadline,
+                        )
+                self.assertEqual(len(children), 1)
+                retained = process_module._active_private_directory_cleanup(guard)
+                self.assertIsNotNone(retained)
+                assert retained is not None
+                self.assertTrue(retained.spawn_attempted)
+                self.assertIsNone(retained.process)
+                observation = retained.observation
+                assert isinstance(observation, runtime_test_owner._Observation)
+                self.assertFalse(observation.starting)
+                self.assertFalse(observation.completed)
+                assert observation.callback is not None
+                private.rename(original)
+                private.mkdir()
+                (private / "marker").write_text("preserve", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    process_module.ProcessOwnershipError, "spawn outcome is unknown"
+                ):
+                    observation.callback(deadline)
+                self.assertIn(observation, registry.observations)
+                self.assertIsNone(children[0].poll())
+                self.assertEqual((private / "marker").read_text(), "preserve")
+                self.assertFalse(guard._pin.retired)
+                if os.name == "posix":
+                    assert retained.identity_channel is not None
+                    self.assertGreaterEqual(retained.identity_channel.fileno(), 0)
+            finally:
+                # This controlled injector alone retained the actual handle.
+                # Production may not rediscover authority from a PID or path.
+                if children:
+                    # Keep the test safe even when a regression incorrectly
+                    # erased the registry entry before this assertion failed.
+                    retained = captured[0]
+                    retained.process = children[0]
+                    observation = retained.observation
+                    assert isinstance(observation, runtime_test_owner._Observation)
+                    if observation.callback is not None:
+                        observation.callback(deadline)
+                    else:
+                        process_module._force_reap_private_directory_cleanup(
+                            retained, deadline=deadline
+                        )
+                if original.exists():
+                    private.rename(foreign)
+                    original.rename(private)
+                guard.remove(deadline=deadline)
+            self.assertIsNotNone(children[0].poll())
+            self.assertEqual((foreign / "marker").read_text(), "preserve")
+            self.assertFalse(private.exists())
+            self.assertEqual(set(registry.observations), observations_before)
+
+
+class CapturedPrivatePathLaunchTests(unittest.TestCase):
+    def test_allocated_private_startup_keeps_one_provisional_owner(self) -> None:
+        for fault in (
+            "allocation",
+            "capture",
+            "parameters",
+            "late-parameters",
+            "late-parameters-return",
+            "spawn",
+        ):
+            with self.subTest(fault=fault):
+                self._assert_allocated_startup_failure(fault)
+
+    def _assert_allocated_startup_failure(self, fault: str) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        owners_before = set(process_module._PROVISIONAL_OWNERS)
+        guards: list[process_module._PrivateDirectory] = []
+        owners: list[process_module._ProvisionalProcessOwner] = []
+        children: list[subprocess.Popen[bytes]] = []
+        original_mkdtemp = tempfile.mkdtemp
+        original_capture = process_module._PrivateDirectory.capture
+        original_register = process_module._register_provisional_owner
+        original_popen = subprocess.Popen
+        failure = OSError(f"private launch {fault} failed")
+        deadline = time.monotonic() + (0.3 if fault.startswith("late-") else 5)
+        prefix = "hbrowser-owned-additional-"
+
+        def register(owner: process_module._ProvisionalProcessOwner) -> None:
+            owners.append(owner)
+            original_register(owner)
+
+        def allocate(*args: Any, **kwargs: Any) -> str:
+            value = original_mkdtemp(*args, **kwargs)
+            assert isinstance(value, str)
+            if kwargs.get("prefix") == prefix and fault == "allocation":
+                # This fault injector alone keeps the exact native identity
+                # when allocation fails before returning its path to runtime.
+                guards.append(original_capture(Path(value)))
+                raise failure
+            return value
+
+        def capture(
+            path: Path, *, platform_name: str | None = None
+        ) -> process_module._PrivateDirectory:
+            guard = original_capture(path, platform_name=platform_name)
+            if path.name.startswith(prefix):
+                guards.append(guard)
+                if fault == "capture":
+                    raise failure
+            return guard
+
+        def parameters(path: Path) -> list[str]:
+            self.assertEqual(len(owners), 1)
+            owner = owners[0]
+            self.assertIs(owner.private_guard, guards[0])
+            self.assertIn(guards[0], owner.cleanup_guards)
+            self.assertIn(id(owner), process_module._PROVISIONAL_OWNERS)
+            self.assertFalse(owner.spawn_attempted)
+            (path / "private").write_bytes(b"launch material")
+            if fault.startswith("late-"):
+                time.sleep(max(0, deadline - time.monotonic()) + 0.01)
+            if fault in ("parameters", "late-parameters"):
+                raise failure
+            return ["-c", "pass"]
+
+        def spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            self.assertFalse(
+                fault.startswith("late-"), "late startup launched a process"
+            )
+            child = original_popen(*args, **kwargs)
+            if fault == "spawn" and not children:
+                children.append(child)
+                raise failure
+            return child
+
+        try:
+            with (
+                patch.object(tempfile, "mkdtemp", side_effect=allocate),
+                patch.object(
+                    process_module._PrivateDirectory, "capture", side_effect=capture
+                ),
+                patch.object(
+                    process_module, "_register_provisional_owner", side_effect=register
+                ),
+                patch.object(subprocess, "Popen", side_effect=spawn),
+                self.assertRaises(
+                    OSError
+                    if fault == "parameters"
+                    else process_module.ProcessOwnershipError
+                ),
+            ):
+                process_module._start_owned_process_with_private_directory(
+                    sys.executable,
+                    parameters,
+                    directory_prefix=prefix,
+                    deadline=deadline,
+                )
+            self.assertEqual(len(owners), 1)
+            self.assertEqual(len(guards), 1)
+            owner = owners[0]
+            guard = guards[0]
+            if fault == "parameters":
+                self.assertTrue(guard._pin.retired)
+                self.assertFalse(guard.path.exists())
+                self.assertNotIn(id(owner), process_module._PROVISIONAL_OWNERS)
+            else:
+                self.assertIs(self._retained_owner(owners_before), owner)
+                observation = owner.observation
+                assert isinstance(observation, runtime_test_owner._Observation)
+                assert observation.callback is not None
+                self.assertFalse(observation.starting)
+                self.assertFalse(observation.completed)
+                self.assertFalse(guard._pin.retired)
+                self.assertTrue(guard.path.exists())
+                if fault in ("allocation", "capture", "spawn"):
+                    with self.assertRaisesRegex(
+                        process_module.ProcessOwnershipError,
+                        "spawn outcome is unknown"
+                        if fault == "spawn"
+                        else "no captured native identity",
+                    ):
+                        observation.callback(time.monotonic() + 3)
+                    self.assertIn(observation, registry.observations)
+                    self.assertFalse(guard._pin.retired)
+                if fault == "spawn":
+                    self.assertTrue(owner.spawn_attempted)
+                    self.assertIsNone(owner.supervisor)
+                    self.assertIsNone(children[0].poll())
+                elif fault.startswith("late-"):
+                    self.assertFalse(owner.spawn_attempted)
+                    self.assertIsNone(owner.supervisor)
+        finally:
+            for owner in owners:
+                if id(owner) not in process_module._PROVISIONAL_OWNERS:
+                    continue
+                # Only controlled injectors restore their exact lost authority;
+                # runtime must never rediscover it by numeric identity or path.
+                if guards and owner.private_guard is None:
+                    owner.private_guard = guards[0]
+                    owner.private_directory = guards[0].path
+                    owner.cleanup_guards = (guards[0],)
+                if children and owner.supervisor is None:
+                    owner.supervisor = children[0]
+                process_module._cleanup_provisional_owner(
+                    owner, deadline=time.monotonic() + 5
+                )
+        self.assertEqual(set(process_module._PROVISIONAL_OWNERS), owners_before)
+        self.assertEqual(set(registry.observations), observations_before)
+        self.assertTrue(all(guard._pin.retired for guard in guards))
+        self.assertTrue(all(child.poll() is not None for child in children))
+
+    def test_replaced_captured_directory_is_rejected_before_target_launch(self) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        owners_before = set(process_module._PROVISIONAL_OWNERS)
+        with _private_directory_fixture() as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir()
+            guard = process_module._PrivateDirectory.capture(private)
+            original = root / "original"
+            foreign = root / "foreign"
+            private.rename(original)
+            private.mkdir()
+            marker = private / "marker"
+            marker.write_text("preserve", encoding="utf-8")
+            target_marker = root / "launched"
+            deadline = time.monotonic() + 10
+            started = None
+            try:
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    started = process_module.start_owned_process(
+                        sys.executable,
+                        [
+                            "-c",
+                            "from pathlib import Path; import sys; "
+                            "Path(sys.argv[1]).touch()",
+                            str(target_marker),
+                        ],
+                        cleanup_paths=(guard,),
+                        deadline=deadline,
+                    )
+                self.assertEqual(marker.read_text(), "preserve")
+                self.assertFalse(target_marker.exists())
+                retained = self._retained_owner(owners_before)
+                self.assertFalse(retained.spawn_attempted)
+                self.assertIsNone(retained.supervisor)
+                self.assertIn(guard, retained.cleanup_guards)
+                observation = retained.observation
+                self.assertIsNotNone(observation)
+                self.assertIn(observation, registry.observations)
+                assert isinstance(observation, runtime_test_owner._Observation)
+                self.assertFalse(observation.starting)
+                self.assertFalse(observation.completed)
+                self.assertIsNotNone(observation.callback)
+                # The same owner refuses the foreign generation on a retry too.
+                assert observation.callback is not None
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    observation.callback(deadline)
+                self.assertEqual(marker.read_text(), "preserve")
+            finally:
+                if started is not None:
+                    started.shutdown(
+                        graceful_timeout=0,
+                        terminate_timeout=1,
+                        kill_timeout=2,
+                        deadline=deadline,
+                    )
+                # Restore the exact fixture-owned generation before asking the
+                # original callback to retry. No replacement guard is captured.
+                if original.exists():
+                    private.rename(foreign)
+                    original.rename(private)
+                self._finish_retained(owners_before, deadline=deadline)
+            self.assertEqual((foreign / "marker").read_text(), "preserve")
+            self.assertFalse(private.exists())
+            self.assertTrue(guard._pin.retired)
+            self.assertEqual(set(registry.observations), observations_before)
+            self.assertEqual(set(process_module._PROVISIONAL_OWNERS), owners_before)
+
+    def test_unknown_spawn_retains_obligation_until_exact_handle_is_recovered(
+        self,
+    ) -> None:
+        for fault in ("popen return", "handle assignment"):
+            with self.subTest(fault=fault):
+                self._assert_unknown_spawn_retained(fault)
+
+    def _assert_unknown_spawn_retained(self, fault: str) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        owners_before = set(process_module._PROVISIONAL_OWNERS)
+        actual_popen = subprocess.Popen
+        children: list[subprocess.Popen[bytes]] = []
+        failure = OSError("launch returned an unknown outcome")
+        deadline = time.monotonic() + 10
+        owner_type = process_module._ProvisionalProcessOwner
+        actual_setattr = owner_type.__setattr__
+
+        def lose_returned_handle(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            # The fault injector retains the actual Popen object. Production
+            # never receives it, so None cannot prove that no child was launched.
+            child = actual_popen(*args, **kwargs)
+            children.append(child)
+            raise failure
+
+        def lose_assigned_handle(
+            owner: process_module._ProvisionalProcessOwner, name: str, value: Any
+        ) -> None:
+            if name == "supervisor" and value is not None:
+                children.append(value)
+                raise failure
+            actual_setattr(owner, name, value)
+
+        try:
+            with (
+                (
+                    patch.object(subprocess, "Popen", side_effect=lose_returned_handle)
+                    if fault == "popen return"
+                    else patch.object(
+                        owner_type, "__setattr__", new=lose_assigned_handle
+                    )
+                ),
+                self.assertRaises(process_module.ProcessOwnershipError),
+            ):
+                process_module.start_owned_process(
+                    sys.executable, ["-c", "pass"], deadline=deadline
+                )
+            self.assertEqual(len(children), 1)
+            retained = self._retained_owner(owners_before)
+            self.assertTrue(retained.spawn_attempted)
+            self.assertIsNone(retained.supervisor)
+            observation = retained.observation
+            assert isinstance(observation, runtime_test_owner._Observation)
+            self.assertFalse(observation.starting)
+            self.assertFalse(observation.completed)
+            assert observation.callback is not None
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "spawn outcome is unknown"
+            ):
+                observation.callback(deadline)
+            self.assertIn(observation, registry.observations)
+            self.assertIsNone(children[0].poll())
+            assert retained.status_directory is not None
+            self.assertTrue(retained.status_directory.exists())
+        finally:
+            # Recover only the exact handle retained by this controlled fault.
+            # Never discover a replacement owner from its numeric PID or path.
+            if children:
+                retained = self._retained_owner(owners_before)
+                retained.supervisor = children[0]
+                self._finish_retained(owners_before, deadline=deadline)
+        self.assertIsNotNone(children[0].poll())
+        self.assertEqual(set(registry.observations), observations_before)
+        self.assertEqual(set(process_module._PROVISIONAL_OWNERS), owners_before)
+
+    def test_status_acquisition_failure_keeps_original_provisional_authority(
+        self,
+    ) -> None:
+        for phase in ("creation", "capture"):
+            with self.subTest(phase=phase):
+                self._assert_failed_status_handoff(phase)
+
+    def _assert_failed_status_handoff(self, phase: str) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        owners_before = set(process_module._PROVISIONAL_OWNERS)
+        acquired: list[process_module._PrivateDirectory] = []
+        actual_mkdtemp = tempfile.mkdtemp
+        actual_capture = process_module._PrivateDirectory.capture
+        deadline = time.monotonic() + 10
+        failure = OSError("status acquisition handoff failed")
+
+        def check_pre_effect_owner() -> None:
+            retained = self._retained_owner(owners_before)
+            observation = retained.observation
+            assert isinstance(observation, runtime_test_owner._Observation)
+            self.assertIn(observation, registry.observations)
+            self.assertTrue(observation.starting)
+            self.assertIsNotNone(observation.callback)
+            self.assertFalse(retained.spawn_attempted)
+
+        def lose_created_path(*args: Any, **kwargs: Any) -> str:
+            check_pre_effect_owner()
+            path = actual_mkdtemp(*args, **kwargs)
+            acquired.append(actual_capture(Path(path)))
+            raise failure
+
+        def lose_captured_guard(path: Path) -> process_module._PrivateDirectory:
+            check_pre_effect_owner()
+            acquired.append(actual_capture(path))
+            raise failure
+
+        try:
+            with ExitStack() as patches:
+                patches.enter_context(
+                    patch.object(tempfile, "mkdtemp", side_effect=lose_created_path)
+                    if phase == "creation"
+                    else patch.object(
+                        process_module._PrivateDirectory,
+                        "capture",
+                        side_effect=lose_captured_guard,
+                    )
+                )
+                with self.assertRaises(process_module.ProcessOwnershipError):
+                    process_module.start_owned_process(
+                        sys.executable, ["-c", "pass"], deadline=deadline
+                    )
+            self.assertEqual(len(acquired), 1)
+            retained = self._retained_owner(owners_before)
+            self.assertFalse(retained.spawn_attempted)
+            self.assertIsNone(retained.status_guard)
+            self.assertTrue(retained.status_creation_attempted)
+            observation = retained.observation
+            assert isinstance(observation, runtime_test_owner._Observation)
+            assert observation.callback is not None
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError,
+                "no captured native identity",
+            ):
+                observation.callback(deadline)
+            self.assertFalse(observation.completed)
+            self.assertTrue(acquired[0]._assert_identity_or_absence())
+        finally:
+            if acquired:
+                retained = self._retained_owner(owners_before)
+                # The controlled failure retained this exact native pin;
+                # cleanup must not recapture a path after failed handoff.
+                retained.status_guard = acquired[0]
+                retained.status_directory = acquired[0].path
+                self._finish_retained(owners_before, deadline=deadline)
+        self.assertTrue(acquired[0]._pin.retired)
+        self.assertEqual(set(registry.observations), observations_before)
+        self.assertEqual(set(process_module._PROVISIONAL_OWNERS), owners_before)
+
+    def test_provisional_cleanup_cannot_extend_current_invocation_deadline(
+        self,
+    ) -> None:
+        observation = Mock()
+        retained = process_module._ProvisionalProcessOwner(observation=observation)
+        with self.assertRaisesRegex(
+            process_module.ProcessOwnershipError, "cleanup deadline expired"
+        ):
+            process_module._cleanup_provisional_owner(
+                retained, deadline=time.monotonic() - 1
+            )
+        observation.complete.assert_not_called()
+
+    def test_independent_exit_cleanup_retries_same_owner_after_startup_deadline(
+        self,
+    ) -> None:
+        registry = runtime_test_owner._current()
+        observations_before = set(registry.observations)
+        owners_before = set(process_module._PROVISIONAL_OWNERS)
+        self.assertFalse(owners_before)
+        deadline = time.monotonic() + 1
+        captured: list[process_module._ProvisionalProcessOwner] = []
+        failure = RuntimeError("constructor failed after the original deadline")
+
+        def fail_late(*_args: Any, **_kwargs: Any) -> None:
+            retained = self._retained_owner(owners_before)
+            captured.append(retained)
+            self.assertIsNotNone(retained.supervisor)
+            self.assertIsNotNone(retained.status_guard)
+            time.sleep(max(0, deadline - time.monotonic()) + 0.01)
+            raise failure
+
+        try:
+            with (
+                patch.object(process_module, "OwnedProcess", side_effect=fail_late),
+                self.assertRaises((TimeoutError, process_module.ProcessOwnershipError)),
+            ):
+                process_module.start_owned_process(
+                    sys.executable, ["-c", "pass"], deadline=deadline
+                )
+            self.assertGreaterEqual(time.monotonic(), deadline)
+            self.assertEqual(len(captured), 1)
+            retained = self._retained_owner(owners_before)
+            self.assertIs(retained, captured[0])
+            supervisor = retained.supervisor
+            guard = retained.status_guard
+            assert supervisor is not None
+            assert guard is not None
+            self.assertIsNone(supervisor.poll())
+            self.assertFalse(guard._pin.retired)
+            self.assertIn(retained.observation, registry.observations)
+            # This is the existing independent exit-cleanup invocation. It gets
+            # its own 15-second total budget; it does not extend the failed call.
+            process_module._cleanup_provisional_owners_at_exit()
+            self.assertIs(retained.supervisor, supervisor)
+            self.assertIs(retained.status_guard, guard)
+            self.assertIsNotNone(supervisor.poll())
+            self.assertTrue(guard._pin.retired)
+            self.assertNotIn(id(retained), process_module._PROVISIONAL_OWNERS)
+            self.assertEqual(set(registry.observations), observations_before)
+        finally:
+            # Retain the failed assertion, but rescue only this test's known
+            # supervisor/pins under an explicit separate fixture cleanup budget.
+            for retained in captured:
+                if id(retained) in process_module._PROVISIONAL_OWNERS:
+                    process_module._cleanup_provisional_owner(
+                        retained, deadline=time.monotonic() + 5
+                    )
+
+    def _retained_owner(
+        self, owners_before: set[int]
+    ) -> process_module._ProvisionalProcessOwner:
+        retained = [
+            owner
+            for identity, owner in process_module._PROVISIONAL_OWNERS.items()
+            if identity not in owners_before
+        ]
+        self.assertEqual(len(retained), 1)
+        return retained[0]
+
+    def _finish_retained(self, owners_before: set[int], *, deadline: float) -> None:
+        retained = self._retained_owner(owners_before)
+        observation = retained.observation
+        assert isinstance(observation, runtime_test_owner._Observation)
+        assert observation.callback is not None
+        observation.callback(deadline)

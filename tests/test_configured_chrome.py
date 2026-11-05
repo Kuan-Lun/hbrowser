@@ -7,7 +7,7 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hbrowser.gallery.browser import factory
 from hbrowser.gallery.browser.chrome_manager import ChromePaths
-from hbrowser.gallery.browser.process import OwnedProcess
+from hbrowser.gallery.browser.process import OwnedProcess, _PrivateDirectory
 from hbrowser.gallery.driver_base import Driver
 
 _ENVIRONMENT_VARIABLE = "HBROWSER_CHROME_EXECUTABLE"
@@ -152,9 +152,20 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
                 return_value=str(self.profile),
             )
         )
+
+        def retain_fixture_guards(*_arguments: object, **keywords: object) -> Mock:
+            guards = keywords.get("cleanup_paths", ())
+            assert isinstance(guards, tuple)
+            for guard in guards:
+                assert isinstance(guard, _PrivateDirectory)
+                self.addCleanup(guard._retire)
+            return self.owner
+
         self.launch = self.enterContext(
             patch.object(
-                factory, "start_owned_browser_process", return_value=self.owner
+                factory,
+                "start_owned_browser_process",
+                side_effect=retain_fixture_guards,
             )
         )
         self.enterContext(
@@ -208,7 +219,8 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
 
     async def _assert_configured_success(self, *, headless: bool, proxy: bool) -> None:
         os.environ[_ENVIRONMENT_VARIABLE] = str(self.executable)
-        self.proxy.return_value = str(self.extension) if proxy else None
+        extension_guard = _PrivateDirectory.capture(self.extension) if proxy else None
+        self.proxy.return_value = extension_guard
 
         result = await factory.create_browser(headless=headless)
 
@@ -227,9 +239,14 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
         cleanup_paths = (
             (str(self.profile), str(self.extension)) if proxy else (str(self.profile),)
         )
-        self.assertEqual(self.launch.call_args.kwargs["cleanup_paths"], cleanup_paths)
+        guards = self.launch.call_args.kwargs["cleanup_paths"]
+        self.assertEqual(tuple(str(guard.path) for guard in guards), cleanup_paths)
+        for guard in guards:
+            self.assertTrue(guard._assert_identity_or_absence())
+            # Native pins remain live until the Mock owner's fixture cleanup.
         self.assertNotIn(str(self.executable), cleanup_paths)
         if proxy:
+            self.assertIs(guards[-1], extension_guard)
             self.assertIn(f"--load-extension={self.extension}", parameters)
         else:
             self.assertIn("--disable-extensions", parameters)

@@ -7,7 +7,6 @@ import os
 import platform
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -17,7 +16,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..utils import Deadline
-from .process import OwnedProcess, ProcessOwnershipError, start_owned_process
+from .process import (
+    OwnedProcess,
+    ProcessOwnershipError,
+    _start_owned_process_with_private_directory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,24 @@ def terminate_tor_process(
     _terminate_tor_process(tor_process, deadline=deadline)
 
 
+def _cleanup_failed_tor_startup(
+    tor_process: OwnedProcess,
+    startup_error: BaseException,
+    *,
+    deadline: Deadline,
+) -> None:
+    try:
+        terminate_tor_process(tor_process, deadline=deadline)
+    except BaseException as cleanup_error:
+        ownership_error = _TorProcessCleanupError(
+            "Tor bootstrap failed and its process could not be reaped"
+        )
+        ownership_error.add_note(
+            f"Bootstrap failure type: {type(startup_error).__name__}"
+        )
+        raise ownership_error from cleanup_error
+
+
 def _find_tor_binary() -> str:
     """找到系統上的 tor 執行檔
 
@@ -200,12 +221,10 @@ def _start_tor_process(
     process_startup_timeout = min(10.0, bootstrap_deadline.remaining())
     if process_startup_timeout <= 0:
         raise RuntimeError("Tor startup exceeded the shared browser deadline")
-    data_dir = Path(tempfile.mkdtemp(prefix="tor_data_"))
-
     logger.info(f"Starting Tor process on SOCKS port {socks_port}...")
-    tor_process = start_owned_process(
+    tor_process = _start_owned_process_with_private_directory(
         tor_binary,
-        [
+        lambda data_dir: [
             "--SocksPort",
             str(socks_port),
             "--DataDirectory",
@@ -213,11 +232,10 @@ def _start_tor_process(
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        cleanup_paths=(data_dir,),
+        directory_prefix="tor_data_",
         startup_timeout=process_startup_timeout,
         deadline=bootstrap_deadline.expires_at,
     )
-    process_cleanup: _TorProcessAtexitCleanup | None = None
     try:
         process_cleanup = _TorProcessAtexitCleanup(tor_process)
         setattr(tor_process, _TOR_PROCESS_CLEANUP_ATTRIBUTE, process_cleanup)
@@ -274,8 +292,11 @@ def _start_tor_process(
                 )
                 last_status_time = now
 
-            # 處理佇列中的所有行
-            while line_queue:
+            # Bound each batch even when the reader continuously refills it, so
+            # process exit and the shared deadline are observed between batches.
+            for _ in range(len(line_queue)):
+                if bootstrap_deadline.remaining() <= 0:
+                    break
                 line = line_queue.popleft()
                 if not line:
                     continue
@@ -283,6 +304,10 @@ def _start_tor_process(
                 if "Bootstrapped 100%" in line:
                     elapsed = int(time.monotonic() - start_time)
                     logger.info(f"Tor bootstrap completed successfully ({elapsed}s)")
+                    # Logging may consume the remaining bootstrap time. A late
+                    # success must still use the original reserved cleanup time.
+                    if bootstrap_deadline.remaining() <= 0:
+                        break
                     return tor_process
 
                 if "Bootstrapped " in line:
@@ -305,21 +330,9 @@ def _start_tor_process(
             f"{_TOR_BOOTSTRAP_TIMEOUT_SECONDS:g}-second deadline"
         )
     except BaseException as startup_error:
-        try:
-            if process_cleanup is not None:
-                process_cleanup.cleanup(deadline=operation_deadline)
-            else:
-                # Cleanup construction is the only point before a retryable
-                # callable retains the owner. Shut it down directly if that fails.
-                _terminate_tor_process(tor_process, deadline=operation_deadline)
-        except BaseException as cleanup_error:
-            ownership_error = _TorProcessCleanupError(
-                "Tor bootstrap failed and its process could not be reaped"
-            )
-            ownership_error.add_note(
-                f"Bootstrap failure type: {type(startup_error).__name__}"
-            )
-            raise ownership_error from cleanup_error
+        _cleanup_failed_tor_startup(
+            tor_process, startup_error, deadline=operation_deadline
+        )
         raise
 
 
@@ -382,6 +395,14 @@ def start_tor_with_retry(
                 socks_port,
                 deadline=operation_deadline,
             )
+            if operation_deadline.remaining() <= 0:
+                startup_error = RuntimeError(
+                    "Tor startup exceeded the shared browser deadline"
+                )
+                _cleanup_failed_tor_startup(
+                    tor_process, startup_error, deadline=operation_deadline
+                )
+                raise startup_error
             break
         except ProcessOwnershipError:
             raise

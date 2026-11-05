@@ -4,6 +4,7 @@ import unittest
 from html import escape
 from os import environ
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -57,6 +58,34 @@ class RandomEncounterURLTests(unittest.TestCase):
             parse_qs(parsed.query, keep_blank_values=True),
             {"s": ["Battle"], "ss": ["ba"], "encounter": [ENCOUNTER]},
         )
+
+    def test_accepts_query_keys_after_one_url_decoding_pass(self) -> None:
+        for key in (
+            "%65ncounter",
+            "encoun%74er",
+            "%65%6E%63%6f%75%6e%74%65%72",
+            "en\tcou\r\nnter",
+        ):
+            with self.subTest(key=key):
+                result = _normalize_random_encounter_url(
+                    f"https://hentaiverse.org/?s=Battle&ss=ba&{key}={ENCOUNTER}"
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    parse_qs(urlsplit(result).query),
+                    {"s": ["Battle"], "ss": ["ba"], "encounter": [ENCOUNTER]},
+                )
+
+    def test_rejects_keys_requiring_extra_decoding_or_space_removal(self) -> None:
+        for key in ("%2565ncounter", "en+counter", "encounter+", "en%09counter"):
+            with self.subTest(key=key):
+                self.assertIsNone(
+                    _normalize_random_encounter_url(
+                        f"https://hentaiverse.org/?s=Battle&ss=ba&{key}={ENCOUNTER}"
+                    )
+                )
 
     def test_rejects_untrusted_or_malformed_urls(self) -> None:
         invalid_urls = {
@@ -142,6 +171,23 @@ class PunchInDocumentTests(unittest.TestCase):
         )
 
         self.assertEqual(_parse_punch_in_result(html_content), PunchInComplete())
+
+    def test_html_entity_encoded_keys_produce_the_expected_encounter(self) -> None:
+        for key in ("&#101;ncounter", "en&#x63;ounter", "&#x25;65ncounter"):
+            with self.subTest(key=key):
+                html_content = _news_page(
+                    '<div id="eventpane"><a href="https://hentaiverse.org/'
+                    f'?s=Battle&amp;ss=ba&amp;{key}={ENCOUNTER}">'
+                    "Encounter</a></div>"
+                )
+
+                result = _parse_punch_in_result(html_content)
+
+                self.assertIsInstance(result, RandomEncounterFound)
+                assert isinstance(result, RandomEncounterFound)
+                self.assertEqual(
+                    parse_qs(urlsplit(result.url).query)["encounter"], [ENCOUNTER]
+                )
 
     def test_rejects_ambiguous_event_documents(self) -> None:
         documents = {
@@ -296,6 +342,66 @@ class EHDriverPunchInTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call("punchin_reloaded", reloaded_content),
             ],
         )
+
+    async def test_opt_in_capture_redacts_encoded_key_but_returns_real_encounter(
+        self,
+    ) -> None:
+        cases = (
+            ("%65ncounter", ENCOUNTER, ENCOUNTER),
+            ("&#x25;65ncounter", ENCOUNTER, ENCOUNTER),
+            ("%65ncounter", "SPACE-PREFIX SPACE-TAIL", "SPACE-PREFIX SPACE-TAIL"),
+            (
+                "&#101;ncounter",
+                "QUOTE-PREFIX&quot;QUOTE-TAIL",
+                'QUOTE-PREFIX"QUOTE-TAIL',
+            ),
+        )
+        for key, html_value, capability in cases:
+            with self.subTest(key=key, html_value=html_value):
+                content = _news_page(
+                    '<div id="eventpane"><a href="https://hentaiverse.org/'
+                    f'?s=Battle&amp;ss=ba&amp;{key}={html_value}">'
+                    "Encounter</a></div>"
+                )
+                driver = EHDriver(headless=True)
+                driver.page = SimpleNamespace(reload=AsyncMock())
+                driver.logger = Mock()
+                with (
+                    TemporaryDirectory() as directory_name,
+                    patch.dict(environ, {"HBROWSER_CAPTURE_PUNCHIN_PAGES": "1"}),
+                    patch.object(driver, "get", new=AsyncMock()),
+                    patch.object(
+                        driver,
+                        "_read_stable_punchin_document",
+                        new=AsyncMock(return_value=content),
+                    ),
+                    patch(
+                        "hbrowser.gallery.browser.page_diagnostic."
+                        "_page_diagnostic_directory_hint",
+                        return_value=Path(directory_name),
+                    ),
+                ):
+                    result = await driver.punchin()
+                    paths = list(Path(directory_name).glob("punchin_initial_*.html"))
+                    self.assertEqual(len(paths), 1)
+                    persisted = paths[0].read_text()
+
+                self.assertIsInstance(result, RandomEncounterFound)
+                assert isinstance(result, RandomEncounterFound)
+                self.assertEqual(
+                    parse_qs(urlsplit(result.url).query)["encounter"], [capability]
+                )
+                for fragment in capability.replace('"', " ").split():
+                    self.assertNotIn(fragment, persisted)
+                    self.assertNotIn(fragment, repr(driver.logger.mock_calls))
+                saved_result = _parse_punch_in_result(persisted)
+                self.assertIsInstance(saved_result, RandomEncounterFound)
+                assert isinstance(saved_result, RandomEncounterFound)
+                self.assertEqual(
+                    parse_qs(urlsplit(saved_result.url).query)["encounter"],
+                    ["REDACTED"],
+                )
+                driver.page.reload.assert_not_awaited()
 
     async def test_no_event_returns_a_typed_completed_outcome(self) -> None:
         driver = EHDriver(headless=True)

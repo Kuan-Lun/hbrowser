@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from bs4 import BeautifulSoup
+from bs4.element import Comment, Doctype, NavigableString, Tag
+
 from ..utils import (
     Deadline,
     navigate_and_wait,
@@ -18,6 +21,34 @@ from ..utils import (
 logger = logging.getLogger(__name__)
 
 _BAN_MESSAGE = "Your IP address has been temporarily banned"
+_BAN_NOTICE_PATTERN = re.compile(
+    rf"^{re.escape(_BAN_MESSAGE)}(?:[\s.!?:,;()]|$)", re.IGNORECASE
+)
+_DURATION_UNIT = r"[0-9]+\s+(?:days?|hours?|minutes?)\b"
+_NOTICE_DURATION = rf"({_DURATION_UNIT}(?:\s*(?:,\s*|and\s+)?{_DURATION_UNIT})*)"
+# A ban replaces the normal page with a standalone text response. These tags
+# only lay out that response; named/interactive/user-content regions are not
+# authority, regardless of their particular CSS class or position on a page.
+_NOTICE_LAYOUT_TAGS = frozenset(
+    {
+        "div",
+        "main",
+        "section",
+        "p",
+        "br",
+        "span",
+        "b",
+        "strong",
+        "i",
+        "em",
+        "small",
+        "center",
+        "pre",
+        "h1",
+        "h2",
+    }
+)
+_NOTICE_LAYOUT_ATTRIBUTES = frozenset({"style", "align", "lang", "dir"})
 _BLANK_PAGE = "<html><head></head><body></body></html>"
 _HOUR_SECONDS = 60 * 60
 _BLANK_PAGE_QUICK_RETRIES = 3
@@ -95,9 +126,60 @@ class BanStatus:
 def check_ban_status(source: str) -> BanStatus:
     """從頁面原始碼判斷目前是否處於 IP ban 或空白頁狀態。"""
     return BanStatus(
-        is_banned=_BAN_MESSAGE in source,
+        is_banned=_ban_notice_document(source) is not None,
         is_blank_page=source == _BLANK_PAGE,
     )
+
+
+def _ban_notice_document(source: str) -> str | None:
+    """Recognize a dedicated ban response, never a notice found inside a page.
+
+    The accepted contract is plain/body text with optional presentational
+    markup. A general div/p/role is not a server-notice identity. In particular,
+    do not remove normal page regions and reinterpret the remainder as a ban.
+    """
+
+    document = BeautifulSoup(source, "html.parser")
+    if any(len(document.find_all(name)) > 1 for name in ("html", "head", "body")):
+        return None
+    head = document.head
+    if head is not None:
+        if head.parent is not document and head.parent is not document.html:
+            return None
+        head.decompose()
+    root = document.body or document.html or document
+    child: Tag = root
+    for parent in root.parents:
+        if parent is not document and parent.name != "html":
+            return None
+        for sibling in parent.contents:
+            if sibling is child or isinstance(sibling, Comment | Doctype):
+                continue
+            if isinstance(sibling, NavigableString) and not sibling.strip():
+                continue
+            return None
+        child = parent
+    if root.name == "body" and set(root.attrs) - _NOTICE_LAYOUT_ATTRIBUTES:
+        return None
+    for element in root.find_all(True):
+        if (
+            element.name not in _NOTICE_LAYOUT_TAGS
+            or set(element.attrs) - _NOTICE_LAYOUT_ATTRIBUTES
+        ):
+            return None
+    visible_text = " ".join(root.get_text(" ", strip=True).split())
+    return visible_text if _BAN_NOTICE_PATTERN.match(visible_text) else None
+
+
+def _notice_wait_seconds(notice: str) -> int:
+    # A duration elsewhere on the page is not authority to sleep. Preserve the
+    # standalone "banned for ..." form and the server's explicit expiry clause;
+    # consume only their adjacent duration units, not arbitrary trailing prose.
+    for prefix in (r"\bban expires in\s+", rf"{re.escape(_BAN_MESSAGE)}\s+for\s+"):
+        match = re.search(prefix + _NOTICE_DURATION, notice, re.IGNORECASE)
+        if match is not None:
+            return parse_ban_time(match.group(1).lower())
+    return 0
 
 
 def format_wait_message(wait_seconds: int, wait_until: datetime) -> str:
@@ -147,7 +229,9 @@ async def _retry_until_unbanned(
         if not is_first:
             logger.warning("Banned again")
 
-        wait_seconds = parse_ban_time(source)
+        notice = _ban_notice_document(source)
+        assert notice is not None
+        wait_seconds = _notice_wait_seconds(notice)
         if wait_seconds <= 0:
             raise RuntimeError("IP ban page did not contain a positive wait duration")
         wait_until = datetime.now() + timedelta(seconds=wait_seconds)

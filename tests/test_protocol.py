@@ -602,6 +602,173 @@ class ZendriverTimeoutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         finally:
             loop.set_task_factory(original_factory)
 
+    async def test_eager_operation_retirement_keeps_running_work_owned(self) -> None:
+        async def exercise(opaque: bool) -> None:
+            browser = SimpleNamespace()
+            entered = asyncio.Event()
+            stopped = asyncio.Event()
+            running: asyncio.Task[Any] | None = None
+
+            async def operation() -> None:
+                nonlocal running
+                running = asyncio.current_task()
+                _begin_zendriver_retirement(browser)
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            class OpaqueOperation:
+                def __await__(self) -> Generator[None]:
+                    return operation().__await__()
+
+            watchdog = asyncio.create_task(
+                wait_for_zendriver(
+                    OpaqueOperation() if opaque else operation(),
+                    timeout=1,
+                    owner=browser,
+                ),
+                eager_start=False,
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                self.assertIsNotNone(running)
+                lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+                self.assertIn(running, lifecycle.operations)
+                retirement = _begin_zendriver_retirement(browser)
+                await retirement.retire_operations(quiescent_connections=())
+                self.assertTrue(stopped.is_set())
+                self.assertTrue(retirement.protocol_is_retired())
+                self.assertEqual(lifecycle.operations, {})
+                with self.assertRaises(ZendriverOwnerRetiredError):
+                    await watchdog
+            finally:
+                if running is not None:
+                    running.cancel()
+                    await asyncio.gather(running, return_exceptions=True)
+                watchdog.cancel()
+                await asyncio.gather(watchdog, return_exceptions=True)
+
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        loop.set_task_factory(asyncio.eager_task_factory)
+        try:
+            for opaque in (False, True):
+                with self.subTest(opaque=opaque):
+                    await exercise(opaque)
+        finally:
+            loop.set_task_factory(original_factory)
+
+    async def test_opaque_retirement_cancels_already_running_work(self) -> None:
+        async def exercise(*, eager: bool, verifiable: bool, copies: int) -> None:
+            loop = asyncio.get_running_loop()
+            browser = SimpleNamespace()
+            entered = asyncio.Event()
+            stopped = asyncio.Event()
+            retirement_started = asyncio.Event()
+
+            async def pending() -> None:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            running = asyncio.create_task(pending())
+
+            class RunningOperation:
+                def __await__(self) -> Generator[None]:
+                    return running.__await__()
+
+            class ManagedOperation(RunningOperation):
+                def cancel(self) -> None:
+                    running.cancel()
+
+                def close(self) -> None:
+                    pass
+
+                def done(self) -> bool:
+                    return running.done()
+
+                def exception(self) -> BaseException | None:
+                    return running.exception()
+
+            retirement_task: asyncio.Task[None] | None = None
+            retirement_start: asyncio.Handle | None = None
+            watchdogs: list[asyncio.Task[None]] = []
+            opaque = ManagedOperation() if verifiable else RunningOperation()
+
+            async def retire() -> None:
+                retirement = _begin_zendriver_retirement(browser)
+                await retirement.retire_operations(quiescent_connections=())
+                self.assertTrue(retirement.protocol_is_retired())
+
+            def start_retirement() -> None:
+                nonlocal retirement_task
+                retirement_task = asyncio.create_task(retire())
+                retirement_started.set()
+
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                retirement_start = loop.call_soon(start_retirement)
+                watchdogs = [
+                    asyncio.create_task(
+                        wait_for_zendriver(opaque, timeout=1, owner=browser)
+                    )
+                    for _ in range(copies)
+                ]
+                await asyncio.wait_for(retirement_started.wait(), timeout=1)
+                self.assertIsNotNone(retirement_task)
+                assert retirement_task is not None
+                if not eager and not verifiable:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "no verifiable completion state"
+                    ):
+                        await asyncio.wait_for(retirement_task, timeout=1)
+                    lifecycle = vars(browser)[_LIFECYCLE_ATTRIBUTE]
+                    self.assertFalse(lifecycle.protocol_retirement_complete)
+                    self.assertEqual(lifecycle.rejected_awaitables, [opaque])
+                    self.assertFalse(running.done())
+                else:
+                    await asyncio.wait_for(retirement_task, timeout=1)
+                    self.assertTrue(
+                        running.done(), "Opaque operation survived retirement"
+                    )
+                    self.assertTrue(stopped.is_set())
+                for watchdog in watchdogs:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await watchdog
+            finally:
+                if retirement_start is not None:
+                    retirement_start.cancel()
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+                for watchdog in watchdogs:
+                    watchdog.cancel()
+                await asyncio.gather(*watchdogs, return_exceptions=True)
+                if retirement_task is not None:
+                    retirement_task.cancel()
+                    await asyncio.gather(retirement_task, return_exceptions=True)
+
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        try:
+            for eager in (False, True):
+                for verifiable in (False, True):
+                    for copies in (1, 2):
+                        with self.subTest(
+                            eager=eager, verifiable=verifiable, copies=copies
+                        ):
+                            loop.set_task_factory(
+                                asyncio.eager_task_factory if eager else None
+                            )
+                            await exercise(
+                                eager=eager, verifiable=verifiable, copies=copies
+                            )
+        finally:
+            loop.set_task_factory(original_factory)
+
     async def test_finalized_late_custom_task_can_finish_after_old_deadline(
         self,
     ) -> None:

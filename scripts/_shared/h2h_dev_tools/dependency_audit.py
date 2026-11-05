@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -114,12 +115,48 @@ def _audit_python(group: str, declared: str) -> dict[str, Any]:
     }
 
 
-def _npm_view_version(specification: str) -> str | list[str]:
+def _npm_command() -> tuple[str, ...]:
+    launcher = shutil.which("npm")
+    if launcher is None:
+        raise FileNotFoundError("dependency audit requires npm on PATH")
+    if Path(launcher).suffix.lower() not in {".cmd", ".bat"}:
+        return (launcher,)
+    # Standard npm Windows launchers delegate to these JS entries. Invoke Node
+    # directly so semver ranges and package names never pass through cmd.exe.
+    directory = Path(launcher).parent
+    local_node = directory / "node.exe"
+    node = str(local_node) if local_node.is_file() else shutil.which("node")
+    if node is None:
+        raise FileNotFoundError("dependency audit requires Node for the npm launcher")
+    cli = directory / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    prefix = cli.with_name("npm-prefix.js")
+    if not cli.is_file() or not prefix.is_file():
+        raise FileNotFoundError(
+            f"npm launcher lacks its standard JS entries: {launcher}"
+        )
     completed = subprocess.run(
-        ("npm", "view", specification, "version", "--json"),
+        (node, str(prefix)),
         check=True,
         stdout=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+    )
+    prefix_path = completed.stdout.strip()
+    if not prefix_path or "\n" in prefix_path or "\r" in prefix_path:
+        raise ValueError("npm prefix probe returned an invalid path")
+    selected = Path(prefix_path) / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    if selected.is_file():
+        cli = selected
+    return (node, str(cli))
+
+
+def _npm_view_version(specification: str) -> str | list[str]:
+    completed = subprocess.run(
+        (*_npm_command(), "view", specification, "version", "--json"),
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
     )
     value = json.loads(completed.stdout)
     if not isinstance(value, (str, list)) or (
@@ -163,7 +200,7 @@ def main() -> int:
 
     with Path("pyproject.toml").open("rb") as stream:
         document = tomllib.load(stream)
-    package = json.loads(Path("package.json").read_text())
+    package = json.loads(Path("package.json").read_bytes())
     python_audit = [
         _audit_python(group, requirement)
         for group, requirement in _python_requirements(document)
@@ -188,7 +225,8 @@ def main() -> int:
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return 0
 

@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
+from uuid import uuid4
 
 from ...exceptions import (
     BrowserIdentityApplyException,
@@ -115,6 +116,10 @@ class LoginChallengeHandler:
         spec: _ChallengeSpec,
         solver: TurnstileSolver,
     ) -> bool:
+        document_nonce = uuid4().hex
+        await self._capture_response_field(
+            page, spec.response_selector, url, document_nonce
+        )
         self._logger.info("Trying FlareSolverr for login Turnstile")
         try:
             token = await solver.solve_turnstile(
@@ -141,6 +146,7 @@ class LoginChallengeHandler:
             page,
             spec.response_selector,
             token,
+            document_nonce=document_nonce,
         ):
             self._logger.warning(
                 "Login Turnstile response field disappeared before token injection"
@@ -208,21 +214,68 @@ class LoginChallengeHandler:
         return value if isinstance(value, str) else ""
 
     @staticmethod
+    async def _capture_response_field(
+        page: Any, selector: str, url: str, document_nonce: str
+    ) -> None:
+        """Bind one solve attempt to this trusted document and exact field."""
+
+        arguments = json.dumps([selector, url, document_nonce])
+        script = (
+            """((selector, url, nonce) => {
+            if (window !== window.top ||
+                window.location.origin !== 'https://forums.e-hentai.org' ||
+                window.location.href !== url) return false;
+            const element = document.querySelector(selector);
+            if (!element) return false;
+            const key = Symbol.for('hbrowser.login.challenge');
+            Object.defineProperty(document, key, {
+                configurable: true,
+                value: Object.freeze({nonce, element, url})
+            });
+            return true;
+        })(..."""
+            + arguments
+            + ")"
+        )
+        accepted = await wait_for_zendriver_mutation(
+            page.evaluate(script),
+            timeout=_TOKEN_MUTATION_TIMEOUT_SECONDS,
+            owner=page,
+            operation="Login challenge document binding",
+        )
+        if accepted is not True:
+            raise LoginFailedException(
+                "Login challenge is not in the expected trusted Forums document"
+            )
+
+    @staticmethod
     async def _write_response_token(
         page: Any,
         selector: str,
         token: str,
+        *,
+        document_nonce: str,
     ) -> bool:
         selector_json = json.dumps(selector)
         token_json = json.dumps(token)
+        nonce_json = json.dumps(document_nonce)
         result: Any = None
         injection_failed = False
         try:
             result = await wait_for_zendriver_mutation(
                 page.evaluate(
                     "(() => {"
+                    "const key = Symbol.for('hbrowser.login.challenge');"
+                    "const binding = document[key];"
+                    "if (window !== window.top || "
+                    "window.location.origin !== 'https://forums.e-hentai.org' || "
+                    "!binding || "
+                    f"binding.nonce !== {nonce_json} || "
+                    "binding.url !== window.location.href) return 'document-changed';"
                     f"const element = document.querySelector({selector_json});"
-                    "if (!element) return false;"
+                    "delete document[key];"
+                    "if (!element || element !== binding.element) "
+                    "return 'document-changed';"
                     f"element.value = {token_json};"
                     "element.dispatchEvent(new Event('input', { bubbles: true }));"
                     "element.dispatchEvent(new Event('change', { bubbles: true }));"
@@ -240,5 +293,9 @@ class LoginChallengeHandler:
         if injection_failed:
             raise LoginTokenInjectionOutcomeUnknownError(
                 "Login challenge token injection outcome is unknown"
+            )
+        if result == "document-changed":
+            raise LoginFailedException(
+                "Login challenge document or response field changed during solving"
             )
         return result is True

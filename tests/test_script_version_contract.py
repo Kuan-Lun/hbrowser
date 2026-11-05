@@ -37,10 +37,22 @@ def _git(repository: Path, environment: dict[str, str], *arguments: str) -> str:
 
 @pytest.mark.parametrize("stale_bytecode", [False, True])
 @pytest.mark.parametrize(
-    "runtime_change", [False, True], ids=["development", "runtime"]
+    ("runtime_change", "none_impact", "reason", "version_bump"),
+    [
+        pytest.param(False, False, False, False, id="development"),
+        pytest.param(True, False, False, False, id="runtime"),
+        pytest.param(False, True, True, False, id="reasoned-development"),
+        pytest.param(False, True, False, False, id="missing-reason"),
+        pytest.param(False, True, True, True, id="none-with-version-bump"),
+    ],
 )
 def test_local_version_entry_checks_the_exact_merge_candidate(
-    tmp_path: Path, runtime_change: bool, stale_bytecode: bool
+    tmp_path: Path,
+    runtime_change: bool,
+    none_impact: bool,
+    reason: bool,
+    version_bump: bool,
+    stale_bytecode: bool,
 ) -> None:
     repository = tmp_path / "repository"
     scripts = repository / "scripts"
@@ -89,8 +101,21 @@ def test_local_version_entry_checks_the_exact_merge_candidate(
     (tests / "test_probe.py").write_text("def test_probe(): pass\n", encoding="utf-8")
     if runtime_change:
         runtime.write_text("value = 2\n", encoding="utf-8")
+    if version_bump:
+        metadata = repository / "pyproject.toml"
+        metadata.write_text(
+            metadata.read_text(encoding="utf-8").replace(
+                'version = "0.1.0"', 'version = "0.1.1"'
+            ),
+            encoding="utf-8",
+        )
+    message = "fix: exercise local release paths"
+    if none_impact:
+        message += "\n\nVersion-Impact: none"
+        if reason:
+            message += "\nVersion-Reason: Only a development test fixture changed."
     _git(repository, environment, "add", ".")
-    _git(repository, environment, "commit", "-m", "fix: exercise local release paths")
+    _git(repository, environment, "commit", "-m", message)
     task_oid = _git(repository, environment, "rev-parse", "HEAD")
     _git(repository, environment, "switch", "main")
     _git(repository, environment, "merge", "--no-ff", "--no-commit", task_oid)
@@ -141,11 +166,19 @@ def test_local_version_entry_checks_the_exact_merge_candidate(
     )
 
     assert "STALE SNAPSHOT EXECUTED" not in result.stdout + result.stderr
-    if runtime_change:
-        assert result.returncode != 0
-        assert "release surface changed without a project version bump" in result.stderr
+    if none_impact and not reason:
+        expected_error = "a nonempty Version-Reason"
+    elif none_impact and version_bump:
+        expected_error = "Version-Impact: none cannot accompany a version bump"
+    elif runtime_change:
+        expected_error = "release surface changed without a project version bump"
     else:
+        expected_error = None
+    if expected_error is None:
         assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+        assert expected_error in result.stderr
     assert _git(repository, environment, "write-tree") == candidate_tree
     assert _git(repository, environment, "rev-parse", "MERGE_HEAD") == task_oid
     assert runtime.read_text(encoding="utf-8") == "value = 3\n"

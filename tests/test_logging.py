@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hmac
 import io
 import json
 import logging
 import os
+import secrets
 import socket
 import stat
 import struct
@@ -26,6 +28,7 @@ from unittest.mock import Mock, patch
 from hbrowser.gallery.browser.process import start_owned_process
 from hbrowser.gallery.utils import log as log_module
 from hbrowser.gallery.utils._log_forwarding import (
+    ForwardedRecord,
     ForwardingDrainError,
     ForwardingHandler,
 )
@@ -119,6 +122,57 @@ def _raw_forwarding_frame(value: dict[str, object]) -> bytes:
         separators=(",", ":"),
     ).encode("utf-8")
     return struct.pack(">I", len(payload)) + payload
+
+
+def _receive_forwarding_frame(connection: socket.socket) -> dict[str, Any]:
+    def receive(size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            chunk = connection.recv(size - len(result))
+            if not chunk:
+                raise AssertionError("peer closed before the expected frame")
+            result.extend(chunk)
+        return bytes(result)
+
+    size = struct.unpack(">I", receive(4))[0]
+    if not 0 < size <= 32 * 1024:
+        raise AssertionError("peer returned an unbounded frame")
+    decoded = json.loads(receive(size))
+    if not isinstance(decoded, dict):
+        raise AssertionError("peer returned a non-object frame")
+    return decoded
+
+
+def _authenticate_forwarding(connection: socket.socket, token: str) -> None:
+    client_nonce = secrets.token_hex(32)
+    connection.sendall(
+        _raw_forwarding_frame({"nonce": client_nonce, "type": "hello", "version": 2})
+    )
+    challenge = _receive_forwarding_frame(connection)
+    server_nonce = challenge["nonce"]
+
+    def proof(role: bytes) -> str:
+        return hmac.digest(
+            bytes.fromhex(token),
+            b"hbrowser-log-forwarding-v2\0"
+            + role
+            + b"\0"
+            + bytes.fromhex(client_nonce)
+            + bytes.fromhex(server_nonce),
+            "sha256",
+        ).hex()
+
+    if challenge != {
+        "type": "challenge",
+        "nonce": server_nonce,
+        "proof": proof(b"receiver"),
+    }:
+        raise AssertionError("receiver did not prove possession of the capability")
+    connection.sendall(
+        _raw_forwarding_frame({"type": "authenticate", "proof": proof(b"sender")})
+    )
+    if _receive_forwarding_frame(connection) != {"type": "ready"}:
+        raise AssertionError("receiver did not acknowledge authentication")
 
 
 class SemanticLogContextTests(unittest.TestCase):
@@ -361,6 +415,108 @@ class LoggerConfigurationTests(IsolatedLoggingTestCase):
 
         self.assertFalse(log_module._LOGGING_CONFIGURED)
         self.assertIsNone(log_module._PROCESS_LOG_HANDLER)
+
+    def test_sink_allocation_failure_preserves_global_logging_shutdown(self) -> None:
+        # Retain the real configure failure and its constructor traceback in a
+        # child, without closing pytest's unrelated handlers in this process.
+        child = """
+import json, logging, os, sys
+from unittest.mock import patch
+from hbrowser import LogPersistenceError, configure_logging, logging_health
+from hbrowser.gallery.utils import log as log_module
+
+closed = []
+class OtherHandler(logging.Handler):
+    def flush(self):
+        closed.append('flush')
+    def close(self):
+        closed.append('close')
+        super().close()
+other = OtherHandler()
+logging.raiseExceptions = True
+os.environ['HBROWSER_LOG_DIR'] = sys.argv[1]
+stage, occurrence = sys.argv[2], int(sys.argv[3])
+owner, name = {
+    'queue': (log_module.queue, 'Queue'),
+    'event': (log_module, 'Event'),
+    'lock': (log_module, 'Lock'),
+    'thread': (log_module, 'Thread'),
+    'base-lock': (logging.Handler, 'createLock'),
+    'context': (log_module, '_configure_handler_context'),
+}[stage]
+original = getattr(owner, name)
+injected = MemoryError('synthetic sink allocation failure')
+calls = 0
+def allocate(*args, **kwargs):
+    global calls
+    calls += 1
+    if calls == occurrence:
+        raise injected
+    return original(*args, **kwargs)
+with patch.object(owner, name, side_effect=allocate):
+    try:
+        configure_logging(require_file_sink=True)
+    except LogPersistenceError as error:
+        assert error.__cause__ is injected
+    else:
+        raise AssertionError('allocation failure was not surfaced')
+assert log_module._LOG_PERSISTENCE_FAILURE.__cause__ is injected
+assert log_module._PROCESS_LOG_HANDLER is None
+assert logging_health().trace_degraded
+registered_sinks = [ref() for ref in logging._handlerList
+                    if isinstance(ref(), log_module._AppendOnlyJsonlHandler)]
+shutdown_error = None
+try:
+    logging.shutdown()
+except BaseException as error:
+    shutdown_error = type(error).__name__ + ': ' + str(error)
+print(json.dumps({'registered_sinks': len(registered_sinks),
+                  'shutdown_error': shutdown_error,
+                  'other_closed': other._closed, 'operations': closed}))
+"""
+        for stage, occurrences in (
+            ("queue", 1),
+            ("event", 3),
+            ("lock", 3),
+            ("thread", 1),
+            ("base-lock", 1),
+            ("context", 1),
+        ):
+            for occurrence in range(1, occurrences + 1):
+                with (
+                    self.subTest(stage=stage, occurrence=occurrence),
+                    TemporaryDirectory() as directory_name,
+                ):
+                    root = Path(__file__).resolve().parents[1]
+                    result = subprocess.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            child,
+                            directory_name,
+                            stage,
+                            str(occurrence),
+                        ),
+                        cwd=root,
+                        env=os.environ | {"PYTHONPATH": str(root)},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    evidence = json.loads(result.stdout)
+                    self.assertIsNone(evidence["shutdown_error"], evidence)
+                    self.assertTrue(evidence["other_closed"], evidence)
+                    self.assertEqual(evidence["operations"], ["flush", "close"])
+                    self.assertEqual(
+                        evidence["registered_sinks"],
+                        int(stage in {"base-lock", "context"}),
+                        evidence,
+                    )
+                    self.assertNotIn("Exception ignored", result.stderr)
 
     def _assert_directory_failure_is_latched(self, *, required: bool) -> None:
         for operation, error in (
@@ -684,19 +840,12 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
     def test_child_send_and_close_failures_never_escape_handler_boundary(
         self,
     ) -> None:
-        ready_payload = b'{"type":"ready"}'
-
         @contextmanager
         def connected_handler() -> Iterator[tuple[ForwardingHandler, Mock, Mock]]:
             connection = Mock()
-            connection.recv.side_effect = [
-                struct.pack(">I", len(ready_payload)),
-                ready_payload,
-            ]
             connection_started = Event()
             connection_allowed = Event()
             handshake_complete = Event()
-            receive_ready = ForwardingHandler._receive_ready
             failure_callback = Mock()
 
             def connect(*_args: object, **_kwargs: object) -> Mock:
@@ -705,8 +854,8 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     raise TimeoutError("test did not release the pending connection")
                 return connection
 
-            def complete_handshake(peer: socket.socket) -> None:
-                receive_ready(peer)
+            def complete_handshake(peer: socket.socket, _token: str) -> None:
+                self.assertIs(peer, connection)
                 handshake_complete.set()
 
             with (
@@ -715,7 +864,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     side_effect=connect,
                 ),
                 patch.object(
-                    ForwardingHandler, "_receive_ready", side_effect=complete_handshake
+                    ForwardingHandler, "_authenticate", side_effect=complete_handshake
                 ),
             ):
                 handler = ForwardingHandler(
@@ -728,7 +877,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
                     connection.sendall.assert_not_called()
                     connection_allowed.set()
                     self.assertTrue(handshake_complete.wait(timeout=2))
-                    connection.sendall.assert_called_once()
+                    connection.sendall.assert_not_called()
                     failure_callback.assert_not_called()
                     yield handler, connection, failure_callback
                 finally:
@@ -814,6 +963,7 @@ class NamespaceAndForwardingTests(IsolatedLoggingTestCase):
         child = """
 import logging
 import os
+import secrets
 from hbrowser import close_forwarded_logging, configure_forwarded_logging
 from hbrowser.gallery.utils import log_context
 
@@ -957,10 +1107,17 @@ close_forwarded_logging()
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode("utf-8")
-                _send_raw_forwarding_frame(
-                    capability["HBROWSER_LOG_FORWARD_ENDPOINT"],
-                    malformed,
+                host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(
+                    ":", 1
                 )
+                with socket.create_connection(
+                    (host, int(raw_port)), timeout=2
+                ) as connection:
+                    _authenticate_forwarding(
+                        connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
+                    )
+                    connection.sendall(struct.pack(">I", len(malformed)) + malformed)
+                    self.assertEqual(connection.recv(1), b"")
                 self.assertTrue(
                     _wait_until(lambda: logging_health().forwarding_degraded)
                 )
@@ -976,11 +1133,12 @@ close_forwarded_logging()
                 "invalid-utf8",
                 "invalid-json",
                 "nonobject",
-                "missing-token",
-                "wrong-token",
-                "nonascii-token",
+                "missing-type",
+                "unknown-type",
+                "legacy-token",
                 "deep-json",
                 "oversized-integer",
+                "overflowing-timestamp",
             ):
                 with self.subTest(authenticated=authenticated, malformed=malformed):
                     self._assert_invalid_frame_health(authenticated, malformed)
@@ -1002,11 +1160,33 @@ close_forwarded_logging()
                 "invalid-utf8": b"\xff",
                 "invalid-json": b"{",
                 "nonobject": b"[]",
-                "missing-token": b'{"type":"close"}',
-                "wrong-token": json.dumps({"token": wrong_token}).encode(),
-                "nonascii-token": json.dumps({"token": "非ASCII"}).encode(),
+                "missing-type": b"{}",
+                "unknown-type": b'{"type":"unknown"}',
+                "legacy-token": json.dumps(
+                    {"token": wrong_token, "type": "close"}
+                ).encode(),
                 "deep-json": b"[" * 2000 + b"0" + b"]" * 2000,
                 "oversized-integer": b"1" * 5000,
+                "overflowing-timestamp": _raw_forwarding_frame(
+                    {
+                        "type": "record",
+                        "record": {
+                            "logger": "hbrowser.tests.overflow",
+                            "level": "INFO",
+                            "message": "invalid timestamp",
+                            "created": 10**400,
+                            "account": None,
+                            "realm": None,
+                            "tab_role": None,
+                            "activity": None,
+                            "scope": None,
+                            "process_id": 1,
+                            "thread_id": 1,
+                            "exception": None,
+                            "stack": None,
+                        },
+                    }
+                )[4:],
             }
             client_thread: Thread | None = None
 
@@ -1025,13 +1205,7 @@ close_forwarded_logging()
                 self.assertTrue(_wait_until(client_started))
                 with connection.makefile("rb") as stream:
                     if authenticated:
-                        connection.sendall(
-                            _raw_forwarding_frame({"token": token, "type": "hello"})
-                        )
-                        header = stream.read(4)
-                        self.assertEqual(len(header), 4)
-                        size = struct.unpack(">I", header)[0]
-                        self.assertEqual(stream.read(size), b'{"type":"ready"}')
+                        _authenticate_forwarding(connection, token)
                     payload = payloads[malformed]
                     connection.sendall(struct.pack(">I", len(payload)) + payload)
                     # EOF is emitted by the real receiver after rejecting this
@@ -1087,26 +1261,18 @@ close_forwarded_logging()
                 with socket.create_connection(
                     (host, int(raw_port)), timeout=2
                 ) as connection:
-                    connection.sendall(
-                        _raw_forwarding_frame(
-                            {
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
-                                "type": "hello",
-                            }
-                        )
+                    _authenticate_forwarding(
+                        connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
                     )
-                    ForwardingHandler._receive_ready(connection)
                     connection.sendall(
                         _raw_forwarding_frame(
                             {
                                 "record": record,
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "record",
                             }
                         )
                         + _raw_forwarding_frame(
                             {
-                                "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                                 "type": "close",
                             }
                         )
@@ -1217,6 +1383,7 @@ close_forwarded_logging()
 import json, logging, os, sys
 from unittest.mock import patch
 from hbrowser.gallery.utils import log as log_module
+from hbrowser.gallery.utils._log_forwarding import ForwardingHandler
 from hbrowser import configure_forwarded_logging, logging_health
 
 closed = []
@@ -1230,10 +1397,17 @@ other = OtherHandler()
 registered_before = len(logging._handlerList)
 os.environ['HBROWSER_LOG_FORWARD_ENDPOINT'] = sys.argv[1]
 os.environ['HBROWSER_LOG_FORWARD_TOKEN'] = sys.argv[2]
-injected = RuntimeError('sender initialization failed')
-if sys.argv[3] in ('queue', 'thread'):
-    target = ('hbrowser.gallery.utils._log_forwarding.queue.Queue'
-              if sys.argv[3] == 'queue' else 'threading.Thread.start')
+injected = (MemoryError('sender allocation failed')
+            if sys.argv[3] in ('base-lock', 'thread-constructor')
+            else RuntimeError('sender initialization failed'))
+failure_targets = {
+    'queue': 'hbrowser.gallery.utils._log_forwarding.queue.Queue',
+    'base-lock': 'logging.Handler.createLock',
+    'thread-constructor': 'hbrowser.gallery.utils._log_forwarding.threading.Thread',
+    'thread': 'threading.Thread.start',
+}
+if sys.argv[3] in failure_targets:
+    target = failure_targets[sys.argv[3]]
     with patch(target, side_effect=injected):
         configure_forwarded_logging()
 else:
@@ -1245,13 +1419,17 @@ assert log_module._FORWARDING_HANDLER is None
 assert log_module._LOG_FORWARDING_FAILURE is not None
 cause = log_module._LOG_FORWARDING_FAILURE.__cause__
 assert cause is not None
-if sys.argv[3] in ('queue', 'thread'):
+if sys.argv[3] in failure_targets:
     assert cause is injected
 else:
     assert type(cause).__name__ == 'ForwardingConfigurationError'
     assert str(cause) == ('forwarding token is invalid' if sys.argv[2] == 'invalid'
                           else 'forwarding endpoint is invalid')
 registered_after = len(logging._handlerList)
+partial_senders = [ref() for ref in logging._handlerList
+                   if isinstance(ref(), ForwardingHandler)]
+closed_before_shutdown = [sender._closed for sender in partial_senders]
+stopped_before_shutdown = [sender._stopped.is_set() for sender in partial_senders]
 shutdown_error = None
 try:
     logging.shutdown()
@@ -1259,6 +1437,8 @@ except BaseException as error:
     shutdown_error = type(error).__name__ + ': ' + str(error)
 print(json.dumps({'registered_before': registered_before,
                   'registered_after': registered_after,
+                  'closed_before_shutdown': closed_before_shutdown,
+                  'stopped_before_shutdown': stopped_before_shutdown,
                   'shutdown_error': shutdown_error,
                   'other_closed': other._closed, 'operations': closed}))
 """
@@ -1285,10 +1465,18 @@ print(json.dumps({'registered_before': registered_before,
         self.assertTrue(evidence["other_closed"], evidence)
         self.assertEqual(evidence["operations"], ["flush", "close"], evidence)
         self.assertEqual(
-            evidence["registered_before"] + (failure_stage == "thread"),
+            evidence["registered_before"]
+            + (failure_stage in {"base-lock", "thread-constructor", "thread"}),
             evidence["registered_after"],
             evidence,
         )
+        expected_partial_senders = (
+            [True]
+            if failure_stage in {"base-lock", "thread-constructor", "thread"}
+            else []
+        )
+        self.assertEqual(evidence["closed_before_shutdown"], expected_partial_senders)
+        self.assertEqual(evidence["stopped_before_shutdown"], expected_partial_senders)
         self.assertNotIn("Exception ignored", result.stderr)
 
     def test_invalid_token_does_not_register_a_partial_sender(self) -> None:
@@ -1309,6 +1497,20 @@ print(json.dumps({'registered_before': registered_before,
     ) -> None:
         self._assert_failed_sender_preserves_logging_shutdown(
             "127.0.0.1:1", "1" * 64, failure_stage="thread"
+        )
+
+    def test_sender_base_lock_failure_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="base-lock"
+        )
+
+    def test_sender_thread_allocation_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="thread-constructor"
         )
 
     def test_sender_constructor_thread_failure_can_close_partial_handler(self) -> None:
@@ -1394,18 +1596,9 @@ print(json.dumps({'registered_before': registered_before,
         host, raw_port = capability["HBROWSER_LOG_FORWARD_ENDPOINT"].split(":", 1)
         connection = socket.create_connection((host, int(raw_port)), timeout=2)
         try:
-            connection.sendall(
-                _raw_forwarding_frame(
-                    {
-                        "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
-                        "type": "hello",
-                    }
-                )
+            _authenticate_forwarding(
+                connection, capability["HBROWSER_LOG_FORWARD_TOKEN"]
             )
-            header = connection.recv(4)
-            self.assertEqual(len(header), 4)
-            ready_size = struct.unpack(">I", header)[0]
-            self.assertEqual(connection.recv(ready_size), b'{"type":"ready"}')
             connection.sendall(
                 _raw_forwarding_frame(
                     {
@@ -1424,7 +1617,6 @@ print(json.dumps({'registered_before': registered_before,
                             "tab_role": None,
                             "thread_id": 456,
                         },
-                        "token": capability["HBROWSER_LOG_FORWARD_TOKEN"],
                         "type": "record",
                     }
                 )
@@ -1435,6 +1627,12 @@ print(json.dumps({'registered_before': registered_before,
             with self.assertRaises(ForwardingDrainError):
                 receiver.close(drain_timeout=0.05)
             self.assertLess(time.monotonic() - started, 0.5)
+            self.assertFalse(receiver._stopped)
+            original_deadline = receiver._drain_deadline
+            with self.assertRaises(ForwardingDrainError):
+                receiver.close(drain_timeout=0.05)
+            self.assertFalse(receiver._stopped)
+            self.assertEqual(receiver._drain_deadline, original_deadline)
             self.assertTrue(failure_entered.wait(timeout=0.5))
             self.assertEqual(failure_stages, ["forward-drain"])
         finally:
@@ -1442,6 +1640,87 @@ print(json.dumps({'registered_before': registered_before,
             failure_release.set()
             connection.close()
         self.assertTrue(_wait_until(lambda: not receiver._clients))
+        receiver.close(drain_timeout=1)
+        self.assertTrue(receiver._stopped)
+
+    def test_receiver_close_rechecks_unsettled_accept_thread(self) -> None:
+        entered = Event()
+        release = Event()
+
+        def blocked_accept() -> None:
+            entered.set()
+            release.wait()
+
+        with patch.object(
+            LogForwardingReceiver, "_accept_connections", side_effect=blocked_accept
+        ):
+            receiver = LogForwardingReceiver(delivery_callback=lambda _record: True)
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                for _ in range(2):
+                    with self.assertRaises(ForwardingDrainError):
+                        receiver.close(drain_timeout=0.02)
+                    self.assertFalse(receiver._stopped)
+                    self.assertTrue(receiver._accept_thread.is_alive())
+                    with self.assertRaisesRegex(RuntimeError, "stopping"):
+                        receiver.child_environment()
+            finally:
+                release.set()
+                receiver._accept_thread.join(timeout=2)
+                receiver.close(drain_timeout=1)
+        self.assertFalse(receiver._accept_thread.is_alive())
+        self.assertTrue(receiver._stopped)
+
+    def test_failed_receiver_close_preserves_parent_abandonment(self) -> None:
+        entered = Event()
+        release = Event()
+
+        def blocked_accept() -> None:
+            entered.set()
+            release.wait()
+
+        with TemporaryDirectory() as directory_name:
+            with (
+                patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+                patch.object(
+                    LogForwardingReceiver,
+                    "_accept_connections",
+                    side_effect=blocked_accept,
+                ),
+            ):
+                configure_logging(console_level=LogLevel.CRITICAL)
+                receiver = start_log_forwarding_receiver()
+                handler = log_module._PROCESS_LOG_HANDLER
+                assert receiver is not None
+                assert handler is not None
+                try:
+                    self.assertTrue(entered.wait(timeout=2))
+                    with self.assertRaises(ForwardingDrainError):
+                        receiver.close(drain_timeout=0.02)
+                    original_close = receiver.close
+                    with (
+                        patch.object(
+                            receiver,
+                            "close",
+                            side_effect=lambda: original_close(drain_timeout=0.02),
+                        ),
+                        patch.object(
+                            handler, "close_sink", wraps=handler.close_sink
+                        ) as close_sink,
+                    ):
+                        close_logging()
+                        close_sink.assert_not_called()
+                    self.assertTrue(handler._abandoned_until_process_exit)
+                    self.assertFalse(receiver._stopped)
+                    self.assertTrue(receiver._accept_thread.is_alive())
+                    self.assertTrue(logging_health().forwarding_degraded)
+                finally:
+                    release.set()
+                    receiver._accept_thread.join(timeout=2)
+                    receiver.close(drain_timeout=1)
+                    self.assertTrue(handler._stopped.wait(timeout=2))
+                    handler.close_sink()
+        self.assertTrue(receiver._stopped)
 
     def test_receiver_drain_failure_is_secondary_to_segment_close(self) -> None:
         with TemporaryDirectory() as directory_name:
@@ -1470,7 +1749,9 @@ print(json.dumps({'registered_before': registered_before,
         self.assertEqual(health.forwarding_operation, "forward-drain")
         raise_for_log_persistence_failure()
 
-    def test_receiver_sink_failure_latches_parent_sink_health(self) -> None:
+    def _assert_receiver_sink_failure_order(
+        self, *, fail_before_delivery_return: bool
+    ) -> None:
         child = """
 import logging
 from hbrowser import close_forwarded_logging, configure_forwarded_logging
@@ -1478,20 +1759,51 @@ configure_forwarded_logging()
 logging.getLogger("hbrowser.child.failure").error("cannot persist")
 close_forwarded_logging()
 """
-        with TemporaryDirectory() as directory_name:
-            with patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}):
-                configure_logging(console_level=LogLevel.CRITICAL)
-                receiver = start_log_forwarding_receiver()
-                handler = log_module._PROCESS_LOG_HANDLER
-                self.assertIsNotNone(receiver)
-                self.assertIsNotNone(handler)
-                assert receiver is not None
-                assert handler is not None
-                with patch.object(
-                    handler,
-                    "_write_bytes",
-                    side_effect=OSError(errno.ENOSPC, "private sink path"),
-                ):
+        with (
+            TemporaryDirectory() as directory_name,
+            patch.dict(os.environ, {"HBROWSER_LOG_DIR": directory_name}),
+        ):
+            configure_logging(console_level=LogLevel.CRITICAL)
+            receiver = start_log_forwarding_receiver()
+            handler = log_module._PROCESS_LOG_HANDLER
+            self.assertIsNotNone(receiver)
+            self.assertIsNotNone(handler)
+            assert receiver is not None
+            assert handler is not None
+            write_entered = Event()
+            release_failure = Event()
+            delivery_returned = Event()
+            delivered: list[bool] = []
+            original_handle = handler.handle
+            original_delivery = receiver._delivery_callback
+
+            def fail_write(_data: bytes) -> None:
+                write_entered.set()
+                if not release_failure.wait(timeout=3):
+                    raise AssertionError("writer release barrier was not reached")
+                raise OSError(errno.ENOSPC, "private sink path")
+
+            def controlled_handle(record: logging.LogRecord) -> None:
+                original_handle(record)
+                if fail_before_delivery_return and not handler._stopped.wait(timeout=3):
+                    raise AssertionError("writer failure barrier was not reached")
+
+            def observe_delivery(record: ForwardedRecord) -> bool:
+                accepted = original_delivery(record)
+                delivered.append(accepted)
+                delivery_returned.set()
+                return accepted
+
+            if fail_before_delivery_return:
+                release_failure.set()
+            with (
+                patch.object(handler, "_write_bytes", side_effect=fail_write),
+                patch.object(handler, "handle", side_effect=controlled_handle),
+                patch.object(
+                    receiver, "_delivery_callback", side_effect=observe_delivery
+                ),
+            ):
+                try:
                     result = subprocess.run(
                         [sys.executable, "-c", child],
                         check=False,
@@ -1500,14 +1812,30 @@ close_forwarded_logging()
                         env=self._child_environment(receiver),
                         timeout=10,
                     )
-                    self.assertTrue(
-                        _wait_until(lambda: logging_health().trace_degraded)
-                    )
-                health = logging_health()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(write_entered.wait(timeout=2))
+                    self.assertTrue(delivery_returned.wait(timeout=2))
+                    self.assertEqual(delivered, [not fail_before_delivery_return])
+                    release_failure.set()
+                    self.assertTrue(handler._stopped.wait(timeout=2))
+                    if fail_before_delivery_return:
+                        self.assertTrue(
+                            _wait_until(lambda: logging_health().forwarding_degraded)
+                        )
+                finally:
+                    release_failure.set()
+            health = logging_health()
+            self.assertTrue(health.trace_degraded)
+            self.assertEqual(health.errno, errno.ENOSPC)
+            self.assertEqual(health.forwarding_degraded, fail_before_delivery_return)
+            if fail_before_delivery_return:
+                self.assertEqual(health.forwarding_operation, "forward-sink")
 
-        self.assertEqual(result.returncode, 0)
-        self.assertTrue(health.trace_degraded)
-        self.assertFalse(health.forwarding_degraded)
+    def test_receiver_sink_failure_after_delivery_acceptance(self) -> None:
+        self._assert_receiver_sink_failure_order(fail_before_delivery_return=False)
+
+    def test_receiver_sink_failure_before_delivery_acceptance(self) -> None:
+        self._assert_receiver_sink_failure_order(fail_before_delivery_return=True)
 
     def test_optional_sink_and_receiver_bind_failure_are_non_blocking(self) -> None:
         with TemporaryDirectory() as directory_name:

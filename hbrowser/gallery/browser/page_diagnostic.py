@@ -80,7 +80,7 @@ def _shutdown_owned_worker(
     )
     process_timeout = max(0.0, remaining - cleanup_timeout)
     if force:
-        owner.kill()
+        owner.kill(deadline=deadline.expires_at)
         return owner.shutdown(
             graceful_timeout=0,
             terminate_timeout=0,

@@ -1,1 +1,3 @@
 scripts/check-process-ownership.sh text eol=lf
+# Generated snapshot hashes bind raw bytes, including their original newlines.
+scripts/_shared/** -text

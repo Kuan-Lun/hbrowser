@@ -17,6 +17,7 @@ from zendriver import cdp
 
 from ..challenge_policy import validate_turnstile_tabs
 from ..utils import Deadline
+from ._task_settlement import wait_owned_task_completion
 from .proxy import has_residential_proxy
 from .tor import should_use_tor
 
@@ -121,6 +122,10 @@ class FlareSolverrSessionOwnershipError(FlareSolverrError):
         super().__init__("FlareSolverr session ownership remains unresolved")
 
 
+class _FlareSolverrSessionAdmissionError(FlareSolverrSessionOwnershipError):
+    """Existing client work blocks creation without allocating a caller's ID."""
+
+
 class FlareSolverrTransportOwnershipError(FlareSolverrError):
     """The HTTP transport did not provide a completed cleanup receipt."""
 
@@ -201,6 +206,7 @@ class FlareSolverrSolveReceipt:
 
     result: FlareSolverrResult = field(repr=False)
     session_generation: int
+    _scope_identity: object = field(default_factory=object, repr=False, compare=False)
 
 
 class FlareSolverrSession:
@@ -313,9 +319,12 @@ class FlareSolverrSessionScope:
         self._attempts_used = 0
         self._session: FlareSolverrSession | None = None
         self._session_generation = 0
+        self._receipt_identity = object()
         self._identity_generation: int | None = None
         self._closed = False
         self._unavailable = False
+        self._operation_lock = asyncio.Lock()
+        self._creation_unresolved = False
 
     async def solve_managed(
         self,
@@ -363,8 +372,10 @@ class FlareSolverrSessionScope:
         """Anchor only a receipt issued for the current session generation."""
         if self._closed:
             raise ValueError("FlareSolverr session scope is closed")
-        if self._session is None or (
-            receipt.session_generation != self._session_generation
+        if (
+            self._session is None
+            or receipt._scope_identity is not self._receipt_identity
+            or receipt.session_generation != self._session_generation
         ):
             raise ValueError(
                 "FlareSolverr solve receipt is not from the current session generation"
@@ -372,24 +383,36 @@ class FlareSolverrSessionScope:
         self._identity_generation = self._session_generation
 
     async def close(self) -> None:
-        """Best-effort cleanup of the currently owned session."""
-        if self._closed and self._session is None:
-            return
+        """Close admission and settle admitted work before releasing ownership."""
         self._closed = True
-        await self._discard_current_session()
+        deadline = Deadline.after(_SESSION_LIFECYCLE_TIMEOUT_SECONDS)
+        async with self._own_operation(deadline=deadline):
+            if self._creation_unresolved:
+                raise FlareSolverrSessionUnavailable(
+                    "Cancelled session creation remains owned by the client"
+                )
+            await self._discard_current_session(deadline=deadline)
 
     async def retire(self) -> None:
         """Make this scope terminal and discard its current solver session."""
-        if (self._closed or self._unavailable) and self._session is None:
-            return
-        await self._quarantine()
+        self._unavailable = True
+        await self.close()
 
-    async def _solve(
-        self,
-        operation: Callable[[FlareSolverrSession], Awaitable[FlareSolverrResult]],
-        *,
-        deadline: Deadline,
-    ) -> FlareSolverrSolveReceipt:
+    @asynccontextmanager
+    async def _own_operation(self, *, deadline: Deadline) -> AsyncIterator[None]:
+        try:
+            async with asyncio.timeout(deadline.remaining()):
+                await self._operation_lock.acquire()
+        except TimeoutError:
+            raise FlareSolverrSessionUnavailable(
+                "FlareSolverr scope still owns an operation after its deadline"
+            ) from None
+        try:
+            yield
+        finally:
+            self._operation_lock.release()
+
+    def _require_available(self) -> None:
         if self._closed:
             raise FlareSolverrSessionUnavailable("FlareSolverr session scope is closed")
         if self._unavailable:
@@ -397,14 +420,34 @@ class FlareSolverrSessionScope:
                 "FlareSolverr session scope is unavailable"
             )
 
+    async def _solve(
+        self,
+        operation: Callable[[FlareSolverrSession], Awaitable[FlareSolverrResult]],
+        *,
+        deadline: Deadline,
+    ) -> FlareSolverrSolveReceipt:
+        self._require_available()
+        async with self._own_operation(deadline=deadline):
+            return await self._solve_owned(operation, deadline=deadline)
+
+    async def _solve_owned(
+        self,
+        operation: Callable[[FlareSolverrSession], Awaitable[FlareSolverrResult]],
+        *,
+        deadline: Deadline,
+    ) -> FlareSolverrSolveReceipt:
         while True:
+            self._require_available()
             session = await self._ensure_session(deadline=deadline)
+            self._require_available()
             generation = self._session_generation
             try:
                 result = await operation(session)
+                self._require_available()
                 receipt = FlareSolverrSolveReceipt(
                     result=result,
                     session_generation=generation,
+                    _scope_identity=self._receipt_identity,
                 )
                 _require_flaresolverr_deadline(deadline)
                 return receipt
@@ -464,6 +507,10 @@ class FlareSolverrSessionScope:
                     raise FlareSolverrSessionUnavailable(
                         "FlareSolverr session attempts were exhausted"
                     ) from error
+                if self._closed:
+                    raise FlareSolverrSessionUnavailable(
+                        "FlareSolverr session scope is closed"
+                    ) from error
                 self._unavailable = False
                 continue
 
@@ -472,12 +519,27 @@ class FlareSolverrSessionScope:
             return self._session
 
         while self._attempts_used < self._max_attempts:
+            self._require_available()
             self._attempts_used += 1
+            creation = asyncio.create_task(
+                self._client.create_session(deadline=deadline), eager_start=False
+            )
+            # The client owns a bounded lifecycle deadline. Caller cancellation
+            # cannot detach creation before its identity is adopted for cleanup.
+            cancellation = await wait_owned_task_completion(creation)
             try:
-                session = await self._client.create_session(deadline=deadline)
+                session = creation.result()
             except asyncio.CancelledError:
                 self._unavailable = True
+                self._creation_unresolved = True
                 raise
+            except _FlareSolverrSessionAdmissionError as error:
+                # The blocking identity belongs to existing client work, not
+                # this scope. Rejection transfers no cleanup responsibility.
+                self._unavailable = True
+                raise FlareSolverrSessionUnavailable(
+                    "FlareSolverr session creation is blocked by unresolved client work"
+                ) from error
             except FlareSolverrSessionOwnershipError as error:
                 logger.warning(
                     "FlareSolverr session creation outcome is unknown; "
@@ -485,8 +547,9 @@ class FlareSolverrSessionScope:
                     self._attempts_used,
                     self._max_attempts,
                 )
-                # Retain the deterministic identity so scope/client cleanup can
-                # poll for positive creation evidence before destroying it.
+                # This invocation allocated the retained nonce before create
+                # I/O. Scope/client cleanup can poll for positive creation
+                # evidence before destroying that identity.
                 self._session = FlareSolverrSession(self._client, error.session_id)
                 self._unavailable = True
                 raise FlareSolverrSessionUnavailable(
@@ -501,6 +564,9 @@ class FlareSolverrSessionScope:
                 self._unavailable = True
                 raise
             except FlareSolverrRequestError as error:
+                if cancellation is not None:
+                    self._unavailable = True
+                    raise cancellation from error
                 retry = self._attempts_used < self._max_attempts
                 logger.warning(
                     "FlareSolverr session creation failed: "
@@ -522,6 +588,9 @@ class FlareSolverrSessionScope:
 
             self._session_generation += 1
             self._session = session
+            if cancellation is not None:
+                self._unavailable = True
+                raise cancellation
             if deadline.remaining() <= 0:
                 self._unavailable = True
                 raise FlareSolverrSessionUnavailable(
@@ -693,8 +762,8 @@ class FlareSolverrClient:
         )
         if unresolved_ids:
             # A prior lifecycle mutation remains unresolved.  No new identity
-            # may overlap that browser generation.
-            raise FlareSolverrSessionOwnershipError(min(unresolved_ids))
+            # may overlap that browser generation or adopt its cleanup duty.
+            raise _FlareSolverrSessionAdmissionError(min(unresolved_ids))
         session_id = secrets.token_hex(16)
         self._owned_session_ids.add(session_id)
         self._uncertain_create_ids.add(session_id)
@@ -838,6 +907,8 @@ class FlareSolverrClient:
         """Destroy one identity and release it only after an ownership receipt."""
         if self._http is None:
             raise RuntimeError("FlareSolverrClient must be used as an async context")
+        if session._client is not self:
+            raise FlareSolverrSessionOwnershipError(session._session_id)
         parent_deadline = (
             Deadline.after(_SESSION_LIFECYCLE_TIMEOUT_SECONDS)
             if deadline is None
@@ -855,7 +926,8 @@ class FlareSolverrClient:
         *,
         deadline: Deadline,
     ) -> None:
-        self._owned_session_ids.add(session_id)
+        if session_id not in self._owned_session_ids:
+            raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_destroy_ids:
             # FlareSolverr pops the registry entry before driver.quit().  A
             # timed-out destroy may therefore be stuck after pop; neither list
@@ -926,6 +998,8 @@ class FlareSolverrClient:
     ) -> FlareSolverrResult:
         if self._closing:
             raise RuntimeError("FlareSolverrClient is closing or closed")
+        if session_id in self._uncertain_create_ids:
+            raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_destroy_ids:
             raise FlareSolverrSessionOwnershipError(session_id)
         if session_id in self._uncertain_request_ids:

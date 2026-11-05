@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import unittest
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from h2h_galleryinfo_parser import GalleryURLParser
 from websockets.exceptions import ConnectionClosedError
+from zendriver import cdp
 from zendriver.core.connection import ProtocolException
 
 import hbrowser
@@ -39,8 +41,10 @@ from hbrowser.gallery.browser.process import ProcessOwnershipError
 from hbrowser.gallery.eh_driver import (
     _SEARCH_PAGE_SNAPSHOT_SCRIPT,
     EHDriver,
+    _ArchivePopupIdentity,
     _NextPageState,
     _parse_search_page,
+    _SearchPageSnapshot,
     _wait_for_archive_document,
 )
 from hbrowser.gallery.exh_driver import ExHDriver
@@ -60,6 +64,37 @@ SCOPE_GALLERY = "https://exhentai.org/g/10/scope00000/"
 GID_349189_GALLERY = "https://exhentai.org/g/349189/f1bcce529e/"
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _DEFAULT_QUERY = object()
+ARCHIVE_URL = "https://exhentai.org/archiver.php?gid=7654321&token=deadbeef00"
+
+
+def _archive_control(**kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        node_id=cdp.dom.NodeId(41),
+        apply=AsyncMock(
+            side_effect=AssertionError("Archive identity must use DOM.getAttributes")
+        ),
+        **kwargs,
+    )
+
+
+def _dom_attributes(**attributes: str | None) -> list[str]:
+    return [
+        part
+        for name, value in attributes.items()
+        if value is not None
+        for part in (name, value)
+    ]
+
+
+def _archive_gallery_page(**kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        send=AsyncMock(
+            return_value=_dom_attributes(
+                href="#", onclick=f"return popUp('{ARCHIVE_URL}',480,320)"
+            )
+        ),
+        **kwargs,
+    )
 
 
 class _ScriptedDeadline:
@@ -78,12 +113,14 @@ def _popup_after_mutation(
     new_tab: object | None,
 ) -> Callable[..., Awaitable[tuple[object, object | None]]]:
     async def invoke(
-        _browser: object,
+        _browser: SimpleNamespace,
         _existing_tabs: object,
         mutation: Callable[[], Awaitable[object]],
         **_kwargs: object,
     ) -> tuple[object, object | None]:
         result = await mutation()
+        if new_tab is not None and new_tab not in _browser.tabs:
+            _browser.tabs.append(new_tab)
         return result, new_tab
 
     return invoke
@@ -1183,6 +1220,173 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error_type=error_type.__name__):
                 await self._assert_scope_error(document, error_type)
 
+    async def test_search_data_cannot_impersonate_blocking_pages(
+        self,
+    ) -> None:
+        reflected_values = (
+            "g-recaptcha",
+            "cf-turnstile",
+            "cf-chl-widget",
+            "_cf_chl_opt",
+            "you are not logged in",
+            "kokomade.jpg",
+            '<div id="challenge-form">you are not logged in</div>',
+            '<input name="username"><input name="password">',
+            "Your IP address has been temporarily banned",
+            "Your IP address has been temporarily banned for 30 days",
+        )
+        for query in reflected_values:
+            for empty in (False, True):
+                with self.subTest(query=query, empty=empty):
+                    driver = _HarnessExHDriver()
+                    scope = _result_page("", SCOPE_GALLERY).replace(
+                        ">Gallery<", f">{escape(query)}<"
+                    )
+                    driver.add_route(
+                        EXH_HOME, _Document(url=EXH_HOME, html_reads=(scope,))
+                    )
+                    url = _search_url(query)
+                    html = (
+                        _no_results_page(query)
+                        if empty
+                        else _result_page(query, GID_349189_GALLERY).replace(
+                            ">Gallery<", f">{escape(query)}<"
+                        )
+                    )
+                    driver.add_route(url, _Document(url=url, html_reads=(html,)))
+
+                    result = await driver.search(SearchRequest(EXH_HOME, query))
+
+                    self.assertEqual(result.pages_visited, 1)
+                    self.assertEqual(
+                        [gallery.gid for gallery in result.galleries],
+                        [] if empty else [349189],
+                    )
+                    self.assertEqual(driver.get_urls, [EXH_HOME, url])
+
+    async def test_standalone_ban_responses_reject_search(self) -> None:
+        for notice in (
+            "<p>Your IP address has been temporarily banned.</p>",
+            '<div style="text-align:center">'
+            "Your IP address has been temporarily banned "
+            "for 1 minute.</div>",
+            "<main>Your IP&nbsp;address has been <b>temporarily</b> banned.</main>",
+        ):
+            with self.subTest(notice=notice):
+                html = "<html><body>" + notice + "</body></html>"
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)), SearchRateLimitError
+                )
+
+    async def test_embedded_ban_text_does_not_override_normal_search_results(
+        self,
+    ) -> None:
+        query = "Your IP address has been temporarily banned for 30 days"
+        for region in (
+            '<div class="c6">{text}</div>',
+            '<div class="unknown-content">{text}</div>',
+            "<p>{text}</p>",
+            '<main><div role="alert">{text}</div></main>',
+        ):
+            with self.subTest(region=region):
+                driver = _HarnessExHDriver()
+                driver.add_route(EXH_HOME, _scope_document())
+                url = _search_url(query)
+                html = _result_page(query, GID_349189_GALLERY).replace(
+                    "</body>", region.format(text=escape(query)) + "</body>"
+                )
+                driver.add_route(url, _Document(url=url, html_reads=(html,)))
+                result = await driver.search(SearchRequest(EXH_HOME, query))
+                self.assertEqual(
+                    [gallery.gid for gallery in result.galleries], [349189]
+                )
+                self.assertEqual(driver.get_urls, [EXH_HOME, url])
+
+    async def test_search_data_scripts_and_unrelated_controls_are_not_authority(
+        self,
+    ) -> None:
+        query = "gid:349189"
+        ordinary_markup = (
+            '<!-- <div id="challenge-form">cf-turnstile</div> -->',
+            '<script type="application/json">'
+            '{"query":"window._cf_chl_opt = {}"}</script>',
+            '<script>const query = "_cf_chl_opt";</script>',
+            '<script>const query = ";window._cf_chl_opt = {";</script>',
+            '<form><input name="username"></form><form><input name="password"></form>',
+            '<img src="/covers/ordinary.jpg" alt="kokomade.jpg">',
+        )
+        for markup in ordinary_markup:
+            with self.subTest(markup=markup):
+                driver = _HarnessExHDriver()
+                driver.add_route(EXH_HOME, _scope_document())
+                url = _search_url(query)
+                html = _result_page(query, GID_349189_GALLERY).replace(
+                    "</body>", markup + "</body>"
+                )
+                driver.add_route(url, _Document(url=url, html_reads=(html,)))
+
+                result = await driver.search(SearchRequest(EXH_HOME, query))
+
+                self.assertEqual(
+                    [gallery.gid for gallery in result.galleries], [349189]
+                )
+
+    async def test_structural_challenges_override_an_apparent_result_page(self) -> None:
+        challenges = (
+            '<div class="g-recaptcha" data-sitekey="synthetic"></div>',
+            '<div class="cf-turnstile" data-sitekey="synthetic"></div>',
+            '<iframe id="cf-chl-widget-example"></iframe>',
+            "<div id='challenge-form'></div>",
+            "<div id='cf-challenge-running'></div>",
+            "<div id='challenge-running'></div>",
+            "<div id='challenge-stage'></div>",
+            '<input type="hidden" name="cf-turnstile-response">',
+            '<textarea name="g-recaptcha-response"></textarea>',
+            '<script>window._cf_chl_opt = {cType: "managed"};</script>',
+            '<script>var _cf_chl_opt = {cType: "managed"};</script>',
+            '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1">'
+            "</script>",
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js">'
+            "</script>",
+            '<script src="https://www.google.com/recaptcha/api.js"></script>',
+            '<iframe src="https://www.recaptcha.net/recaptcha/api2/anchor"></iframe>',
+        )
+        for challenge in challenges:
+            with self.subTest(challenge=challenge):
+                html = _result_page("", SCOPE_GALLERY).replace(
+                    "</body>", challenge + "</body>"
+                )
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)), SearchChallengeError
+                )
+
+    async def test_authentication_controls_and_notices_override_apparent_results(
+        self,
+    ) -> None:
+        authentication = (
+            '<form><input name="UserName"><input name="PassWord"></form>',
+            '<img src="/img/kokomade.jpg?cache=1">',
+            "<p>You are not logged in.</p>",
+            '<div role="alert">You are not logged in: please sign in.</div>',
+            "<nav>News</nav><main>You are not logged in.</main>",
+        )
+        for notice in authentication:
+            with self.subTest(notice=notice):
+                html = _result_page("", SCOPE_GALLERY).replace(
+                    "</body>", notice + "</body>"
+                )
+                await self._assert_scope_error(
+                    _Document(url=EXH_HOME, html_reads=(html,)),
+                    SearchAuthenticationError,
+                )
+        await self._assert_scope_error(
+            _Document(
+                url=EXH_HOME,
+                html_reads=("<html><body>You are not logged in.</body></html>",),
+            ),
+            SearchAuthenticationError,
+        )
+
     async def test_missing_or_invalid_next_control_fails_closed(self) -> None:
         query = "gid:1"
         url = _search_url(query)
@@ -1217,6 +1421,8 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
         query = "artist:test"
         first_url = _search_url(query)
         unsafe_urls = (
+            "https://[",
+            "https://[invalid/",
             "https://e-hentai.org/?f_search=artist%3Atest&f_cats=0&next=2",
             "https://evil.example/?f_search=artist%3Atest&next=2",
             "https://exhentai.org/gallery?f_search=artist%3Atest&next=2",
@@ -1251,11 +1457,12 @@ class SearchValidationTests(unittest.IsolatedAsyncioTestCase):
                     driver,
                     "_save_search_diagnostic",
                     new=AsyncMock(return_value=None),
-                ),
+                ) as diagnostic,
                 self.assertRaises(SearchPaginationError),
             ):
                 await driver.search(SearchRequest(EXH_HOME, query))
             self.assertEqual(driver.get_urls, [EXH_HOME, first_url])
+            diagnostic.assert_awaited_once()
 
     async def test_pagination_cycle_fails_before_another_get(self) -> None:
         query = "artist:test"
@@ -1391,6 +1598,128 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.sleep_patch.stop()
 
+    async def test_lookup_rejects_results_that_finish_after_the_shared_deadline(
+        self,
+    ) -> None:
+        for stage, found, expected_gets in (
+            ("validation", True, 2),
+            ("validation", False, 4),
+            ("search-result", True, 2),
+            ("search-result", False, 4),
+            ("search-log", True, 2),
+            ("search-log", False, 4),
+            ("found-result", True, 2),
+            ("first-empty-log", False, 2),
+            ("missing-result", False, 4),
+            ("missing-log", False, 4),
+        ):
+            with self.subTest(stage=stage, found=found):
+                await self._assert_late_lookup_rejected(stage, found, expected_gets)
+
+    async def _assert_late_lookup_rejected(
+        self, stage: str, found: bool, expected_gets: int
+    ) -> None:
+        gid = 349189
+        query = f"gid:{gid}"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        driver.logger = Mock()
+        driver.add_route(EXH_HOME, _scope_document(), _scope_document())
+        html = (
+            _result_page(query, GID_349189_GALLERY)
+            if found
+            else _no_results_page(query)
+        )
+        driver.add_route(
+            search_url,
+            _Document(url=search_url, html_reads=(html,)),
+            _Document(url=search_url, html_reads=(html,)),
+        )
+        now = time.monotonic()
+        expired_at = now + 20
+        reached = False
+        original_validate = driver._validate_search_page
+
+        def expire_at(point: str) -> None:
+            nonlocal now, reached
+            if point == stage and (
+                found
+                or point == "first-empty-log"
+                or driver.get_urls.count(search_url) == 2
+            ):
+                reached = True
+                now = expired_at
+
+        async def validate(
+            snapshot: _SearchPageSnapshot,
+            *,
+            expected_origin: tuple[str, str],
+            expected_query: str | None,
+            expected_context: tuple[tuple[str, str], ...] | None = None,
+            diagnostic_query: str,
+        ) -> None:
+            await original_validate(
+                snapshot,
+                expected_origin=expected_origin,
+                expected_query=expected_query,
+                expected_context=expected_context,
+                diagnostic_query=diagnostic_query,
+            )
+            if expected_query is not None:
+                expire_at("validation")
+
+        def search_result(
+            *,
+            request: SearchRequest,
+            galleries: tuple[GalleryURLParser, ...],
+            pages_visited: int,
+        ) -> GallerySearchResult:
+            result = GallerySearchResult(request, galleries, pages_visited)
+            expire_at("search-result")
+            return result
+
+        def found_result(
+            *, requested_gid: int, gallery: GalleryURLParser
+        ) -> GalleryFound:
+            result = GalleryFound(requested_gid, gallery)
+            expire_at("found-result")
+            return result
+
+        def missing_result(*, gid: int, confirmations: int) -> ConfirmedGalleryMissing:
+            result = ConfirmedGalleryMissing(gid, confirmations)
+            expire_at("missing-result")
+            return result
+
+        def log(message: str, *_arguments: object) -> None:
+            if message.startswith("Gallery search completed"):
+                expire_at("search-log")
+            elif message.startswith("Exact gallery lookup was empty"):
+                expire_at("first-empty-log")
+            elif message.startswith("Gallery absence confirmed"):
+                expire_at("missing-log")
+
+        driver.logger.debug.side_effect = log
+        driver.logger.info.side_effect = log
+        with (
+            patch.object(time, "monotonic", side_effect=lambda: now),
+            patch.object(driver, "_validate_search_page", new=validate),
+            patch("hbrowser.gallery.eh_driver.GallerySearchResult", new=search_result),
+            patch("hbrowser.gallery.eh_driver.GalleryFound", new=found_result),
+            patch(
+                "hbrowser.gallery.eh_driver.ConfirmedGalleryMissing", new=missing_result
+            ),
+            self.assertRaises(SearchNavigationError),
+        ):
+            await driver.lookup_gid(gid)
+        self.assertTrue(reached, "the intended completion boundary was not exercised")
+        self.assertEqual(len(driver.get_urls), expected_gets)
+        expirations = {
+            deadline.expires_at
+            for deadline in driver.get_deadlines
+            if deadline is not None
+        }
+        self.assertEqual(len(expirations), 1)
+
     async def test_two_empty_confirmations_use_two_independent_result_gets(
         self,
     ) -> None:
@@ -1459,6 +1788,43 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Gallery search started", info_text)
         self.assertNotIn("Gallery search completed", info_text)
         driver.logger.warning.assert_not_called()
+
+    async def test_standalone_search_keeps_its_per_document_time_budget(self) -> None:
+        query = "gid:349189"
+        search_url = _search_url(query)
+        driver = _HarnessExHDriver()
+        driver.logger = Mock()
+        driver.add_route(EXH_HOME, _scope_document())
+        driver.add_route(
+            search_url,
+            _Document(
+                url=search_url,
+                html_reads=(_result_page(query, GID_349189_GALLERY),),
+            ),
+        )
+        start = time.monotonic()
+        now = start
+
+        def log(message: str, *_arguments: object) -> None:
+            nonlocal now
+            if message.startswith(
+                ("Gallery search started", "Gallery search completed")
+            ):
+                now += 6
+
+        driver.logger.debug.side_effect = log
+        with patch.object(time, "monotonic", side_effect=lambda: now):
+            result = await driver.search(SearchRequest(EXH_HOME, query))
+
+        self.assertEqual(now - start, 12)
+        self.assertEqual(len(result.galleries), 1)
+        document_deadlines = [
+            deadline for deadline in driver.get_deadlines if deadline is not None
+        ]
+        self.assertEqual(len(document_deadlines), 2)
+        self.assertGreater(
+            document_deadlines[1].expires_at, document_deadlines[0].expires_at
+        )
 
     async def test_empty_then_found_is_not_misclassified_as_missing(self) -> None:
         gid = 349189
@@ -1548,6 +1914,288 @@ class GalleryLookupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(driver.get_urls, [])
 
 
+class ArchivePopupOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    def make_download(
+        self,
+    ) -> tuple[EHDriver, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+        self.gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
+        self.archive_url = (
+            "https://exhentai.org/archiver.php?gid=7654321&token=deadbeef00"
+        )
+        link = _archive_control(click=AsyncMock())
+        gallery = _archive_gallery_page(
+            target=SimpleNamespace(target_id="gallery"),
+            xpath=AsyncMock(side_effect=[[], [link]]),
+            activate=AsyncMock(),
+            close=AsyncMock(),
+        )
+        popup = self.make_popup("archive")
+        browser = SimpleNamespace(connection=None, tabs=[gallery])
+        gallery.browser = browser
+        popup.browser = browser
+
+        async def click() -> None:
+            browser.tabs.append(popup)
+
+        link.click.side_effect = click
+        driver = EHDriver(headless=True)
+        driver.logger = Mock()
+        driver.browser = browser
+        driver.page = gallery
+        driver.get = AsyncMock()  # type: ignore[method-assign]
+        return driver, gallery, popup, link
+
+    def make_popup(self, target_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            target=SimpleNamespace(target_id=target_id, opener_id="gallery"),
+            evaluate=AsyncMock(
+                return_value={"url": self.archive_url, "readyState": "complete"}
+            ),
+            xpath=AsyncMock(return_value=[]),
+            get_content=AsyncMock(
+                return_value=(
+                    "Downloads should start processing within a couple of minutes."
+                )
+            ),
+            activate=AsyncMock(),
+            close=AsyncMock(),
+        )
+
+    async def test_archive_identity_reads_only_the_current_gallery_dom(self) -> None:
+        driver, gallery, popup, link = self.make_download()
+
+        self.assertTrue(await driver.download(self.gallery))
+
+        link.apply.assert_not_awaited()
+        gallery.send.assert_awaited_once()
+        command = gallery.send.await_args.args[0]
+        try:
+            self.assertEqual(
+                next(command),
+                {"method": "DOM.getAttributes", "params": {"nodeId": 41}},
+            )
+        finally:
+            command.close()
+        link.click.assert_awaited_once()
+        popup.close.assert_awaited_once()
+
+    async def test_malformed_dom_attributes_are_rejected_before_click(self) -> None:
+        for attributes in (
+            None,
+            {"href": ARCHIVE_URL},
+            ["href"],
+            ["href", 41],
+            ["href", ARCHIVE_URL, "href", ARCHIVE_URL],
+            ["", "value", "href", ARCHIVE_URL],
+        ):
+            with self.subTest(attributes=attributes):
+                driver, gallery, popup, link = self.make_download()
+                gallery.send.return_value = attributes
+                with self.assertRaisesRegex(ValueError, "malformed"):
+                    await driver.download(self.gallery)
+                link.click.assert_not_awaited()
+                popup.activate.assert_not_awaited()
+                popup.close.assert_not_awaited()
+
+    async def test_pre_click_foreign_tab_is_never_adopted(self) -> None:
+        driver, gallery, popup, link = self.make_download()
+        foreign = self.make_popup("foreign")
+
+        async def ready(*_args: object, **_kwargs: object) -> object:
+            driver.browser.tabs.append(foreign)
+            return link
+
+        with patch("hbrowser.gallery.eh_driver.wait_for_xpath", side_effect=ready):
+            self.assertTrue(await driver.download(self.gallery))
+        link.click.assert_awaited_once()
+        popup.activate.assert_awaited_once()
+        popup.close.assert_awaited_once()
+        foreign.activate.assert_not_awaited()
+        foreign.xpath.assert_not_awaited()
+        foreign.close.assert_not_awaited()
+        self.assertIs(driver.page, gallery)
+
+    async def test_other_opener_after_click_does_not_steal_archive_target(self) -> None:
+        driver, _gallery, popup, link = self.make_download()
+        foreign = self.make_popup("foreign")
+        foreign.target.opener_id = "elsewhere"
+
+        async def click() -> None:
+            driver.browser.tabs.extend([foreign, popup])
+
+        link.click.side_effect = click
+        self.assertTrue(await driver.download(self.gallery))
+        link.click.assert_awaited_once()
+        popup.activate.assert_awaited_once()
+        popup.close.assert_awaited_once()
+        foreign.activate.assert_not_awaited()
+        foreign.xpath.assert_not_awaited()
+        foreign.close.assert_not_awaited()
+
+    async def test_selected_popup_losing_target_is_outcome_unknown(self) -> None:
+        driver, _gallery, popup, link = self.make_download()
+
+        async def selected(*_args: object, **_kwargs: object) -> tuple[None, object]:
+            await link.click()
+            popup.target = None
+            return None, popup
+
+        with (
+            patch("hbrowser.gallery.eh_driver.mutate_and_wait_for_new_tab", selected),
+            self.assertRaises(ArchiveDownloadOutcomeUnknownError),
+        ):
+            await driver.download(self.gallery)
+        link.click.assert_awaited_once()
+        popup.activate.assert_not_awaited()
+        popup.xpath.assert_not_awaited()
+        popup.close.assert_not_awaited()
+        self.assertTrue(vars(driver.browser)[_LIFECYCLE_ATTRIBUTE].retired)
+
+    async def test_unowned_or_wrong_identity_popup_never_receives_mutations(
+        self,
+    ) -> None:
+        for fault in (
+            "missing-opener",
+            "wrong-opener",
+            "wrong-gallery",
+            "wrong-origin",
+            "ambiguous",
+        ):
+            with self.subTest(fault=fault):
+                driver, _gallery, popup, link = self.make_download()
+                other = self.make_popup("other")
+                if fault == "missing-opener":
+                    del popup.target.opener_id
+                elif fault == "wrong-opener":
+                    popup.target.opener_id = "elsewhere"
+                elif fault == "wrong-gallery":
+                    popup.evaluate.return_value["url"] = self.archive_url.replace(
+                        "7654321", "7654322"
+                    )
+                elif fault == "wrong-origin":
+                    popup.evaluate.return_value["url"] = self.archive_url.replace(
+                        "exhentai.org", "foreign.test"
+                    )
+                else:
+
+                    async def ambiguous(
+                        driver: EHDriver = driver,
+                        popup: SimpleNamespace = popup,
+                        other: SimpleNamespace = other,
+                    ) -> None:
+                        driver.browser.tabs.extend([popup, other])
+
+                    link.click.side_effect = ambiguous
+                with (
+                    patch("hbrowser.gallery.eh_driver._ELEMENT_DEADLINE_SECONDS", 0.03),
+                    self.assertRaises(ArchiveDownloadOutcomeUnknownError),
+                ):
+                    await driver.download(self.gallery)
+                link.click.assert_awaited_once()
+                for tab in (popup, other):
+                    tab.activate.assert_not_awaited()
+                    tab.xpath.assert_not_awaited()
+                    tab.close.assert_not_awaited()
+
+    async def test_explicit_control_forms_preserve_the_one_click_flow(self) -> None:
+        for form in ("href", "relative-href", "onclick", "matching-both"):
+            with self.subTest(form=form):
+                driver, gallery, popup, link = self.make_download()
+                href = self.archive_url
+                onclick = None
+                if form == "relative-href":
+                    href = self.archive_url.removeprefix("https://exhentai.org")
+                elif form == "onclick":
+                    href = "#"
+                    onclick = f'window.open("{self.archive_url}")'
+                elif form == "matching-both":
+                    onclick = f"return popUp('{self.archive_url}',480,320)"
+                gallery.send.return_value = _dom_attributes(href=href, onclick=onclick)
+                self.assertTrue(await driver.download(self.gallery))
+                link.click.assert_awaited_once()
+                popup.close.assert_awaited_once()
+
+    async def test_ambiguous_or_dynamic_control_is_rejected_before_click(self) -> None:
+        for attributes in (
+            {"href": "#", "onclick": "return popUp(destination,480,320)"},
+            {"href": "#", "onclick": f"return popUp('{ARCHIVE_URL}' + suffix,480,320)"},
+            {"href": "#", "onclick": f"const hint='{ARCHIVE_URL}'; open(dynamic)"},
+            {"href": ARCHIVE_URL, "onclick": "return popUp(destination)"},
+            {"href": "#", "onclick": None},
+            {"href": "https://exhentai.org/archiver.php", "onclick": None},
+            {"href": "https://foreign.test/?gid=1", "onclick": None},
+            {
+                "href": "https://foreign.test/?gid=1",
+                "onclick": f"popUp('{ARCHIVE_URL}')",
+            },
+            {"href": ARCHIVE_URL, "onclick": f"popUp('{ARCHIVE_URL}&other=1')"},
+        ):
+            with self.subTest(attributes=attributes):
+                driver, gallery, popup, link = self.make_download()
+                gallery.send.return_value = _dom_attributes(**attributes)
+                with self.assertRaises(ValueError):
+                    await driver.download(self.gallery)
+                link.click.assert_not_awaited()
+                popup.activate.assert_not_awaited()
+                popup.close.assert_not_awaited()
+
+    async def test_blank_popup_is_read_without_activation_until_identity_is_ready(
+        self,
+    ) -> None:
+        driver, _gallery, popup, link = self.make_download()
+        pending = True
+
+        async def snapshot(_script: str) -> dict[str, str]:
+            nonlocal pending
+            if pending:
+                pending = False
+                popup.activate.assert_not_awaited()
+                return {"url": "about:blank", "readyState": "complete"}
+            return {
+                "url": self.archive_url + "&server=ready",
+                "readyState": "interactive",
+            }
+
+        popup.evaluate.side_effect = snapshot
+        self.assertTrue(await driver.download(self.gallery))
+        link.click.assert_awaited_once()
+        popup.activate.assert_awaited_once()
+        popup.close.assert_awaited_once()
+
+    async def test_navigation_before_original_click_or_close_blocks_mutation(
+        self,
+    ) -> None:
+        for stage in ("original", "close"):
+            with self.subTest(stage=stage):
+                driver, _gallery, popup, link = self.make_download()
+                original = SimpleNamespace(click=AsyncMock())
+
+                async def links(
+                    *_args: object,
+                    popup: SimpleNamespace = popup,
+                    original: SimpleNamespace = original,
+                    **_kwargs: object,
+                ) -> list[object]:
+                    popup.evaluate.return_value["url"] = "https://foreign.test/"
+                    return [original]
+
+                async def status(popup: SimpleNamespace = popup) -> str:
+                    popup.target.opener_id = "elsewhere"
+                    return (
+                        "Downloads should start processing within a couple of minutes."
+                    )
+
+                if stage == "original":
+                    popup.xpath.side_effect = links
+                else:
+                    popup.get_content.side_effect = status
+                with self.assertRaises(ArchiveDownloadOutcomeUnknownError):
+                    await driver.download(self.gallery)
+                link.click.assert_awaited_once()
+                original.click.assert_not_awaited()
+                popup.close.assert_not_awaited()
+
+
 class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_unready_archive_document_retires_generation_at_deadline(
         self,
@@ -1555,6 +2203,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         page = SimpleNamespace(
             websocket=object(),
             mapper={},
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
                     "url": "about:blank",
@@ -1565,7 +2214,13 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         browser = SimpleNamespace(connection=None, tabs=[page])
         page.browser = browser
         with self.assertRaises(ArchiveDownloadOutcomeUnknownError):
-            await _wait_for_archive_document(page, deadline=Deadline.after(0.02))
+            await _wait_for_archive_document(
+                page,
+                identity=_ArchivePopupIdentity(
+                    "gallery", "archive", ARCHIVE_URL, frozenset({"gallery"})
+                ),
+                deadline=Deadline.after(0.02),
+            )
         await _assert_generation_rejects_new_work(
             self,
             browser=browser,
@@ -1577,14 +2232,14 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
         driver = EHDriver(headless=True)
         driver.logger = Mock()
-        archive_link = SimpleNamespace(click=AsyncMock())
+        archive_link = _archive_control(click=AsyncMock())
         original = SimpleNamespace(click=AsyncMock())
         snapshots = iter(
             (
                 {"url": "about:blank", "readyState": "complete"},
-                {"url": "https://exhentai.org/archiver.php", "readyState": "loading"},
+                {"url": ARCHIVE_URL, "readyState": "loading"},
                 {
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "interactive",
                 },
             )
@@ -1599,7 +2254,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 raise ProtocolException(
                     {"message": "Cannot find context with specified id"}
                 )
-            value = next(snapshots)
+            value = next(snapshots, {"url": ARCHIVE_URL, "readyState": "interactive"})
             document_ready = value["readyState"] == "interactive"
             return value
 
@@ -1610,14 +2265,14 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(original.click.await_count, 1)
             return "Downloads should start processing within a couple of minutes."
 
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
             close=AsyncMock(),
             activate=AsyncMock(),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             activate=AsyncMock(),
             evaluate=AsyncMock(side_effect=snapshot),
             xpath=AsyncMock(side_effect=original_links),
@@ -1625,7 +2280,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         driver.page = gallery_page
-        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.browser = SimpleNamespace(tabs=[gallery_page])
         driver.get = AsyncMock()  # type: ignore[method-assign]
         with (
             patch(
@@ -1635,7 +2290,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(driver, "_close_archive_tab_and_restore", new=AsyncMock()),
         ):
             self.assertTrue(await driver.download(gallery))
-        self.assertEqual(archive_page.evaluate.await_count, 4)
+        self.assertEqual(archive_page.evaluate.await_count, 5)
         archive_page.xpath.assert_awaited_once()
         original.click.assert_awaited_once()
         archive_link.click.assert_awaited_once()
@@ -1661,8 +2316,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             nonlocal gallery_closed
             gallery_closed = True
 
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -1672,10 +2327,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -1733,9 +2388,9 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 return "about:blank"
             return gallery.url
 
-        first_link = SimpleNamespace(click=AsyncMock())
-        second_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        first_link = _archive_control(click=AsyncMock())
+        second_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -1747,10 +2402,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         first_archive_page = SimpleNamespace(
             websocket=object(),
             mapper={},
-            target=SimpleNamespace(target_id="archive-1"),
+            target=SimpleNamespace(target_id="archive-1", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -1762,10 +2417,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         second_archive_page = SimpleNamespace(
             websocket=object(),
             mapper={},
-            target=SimpleNamespace(target_id="archive-2"),
+            target=SimpleNamespace(target_id="archive-2", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -1856,8 +2511,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
         driver = EHDriver(headless=True)
         driver.logger = Mock()
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -1865,10 +2520,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         archive_page = SimpleNamespace(
             websocket=object(),
             mapper={},
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -1881,7 +2536,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             ),
             close=AsyncMock(),
         )
-        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        browser = SimpleNamespace(tabs=[gallery_page])
         gallery_page.browser = browser
         archive_page.browser = browser
         driver.browser = browser
@@ -1920,8 +2575,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
                 driver = EHDriver(headless=True)
                 driver.logger = Mock()
-                archive_link = SimpleNamespace(click=AsyncMock())
-                gallery_page = SimpleNamespace(
+                archive_link = _archive_control(click=AsyncMock())
+                gallery_page = _archive_gallery_page(
                     mapper={},
                     target=SimpleNamespace(target_id="gallery"),
                     xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -1929,10 +2584,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 archive_page = SimpleNamespace(
                     websocket=object(),
                     mapper={},
-                    target=SimpleNamespace(target_id="archive"),
+                    target=SimpleNamespace(target_id="archive", opener_id="gallery"),
                     evaluate=AsyncMock(
                         return_value={
-                            "url": "https://exhentai.org/archiver.php",
+                            "url": ARCHIVE_URL,
                             "readyState": "complete",
                         }
                     ),
@@ -1941,7 +2596,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                     get_content=AsyncMock(side_effect=TimeoutError),
                     close=AsyncMock(),
                 )
-                browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+                browser = SimpleNamespace(tabs=[gallery_page])
                 gallery_page.browser = browser
                 archive_page.browser = browser
                 driver.browser = browser
@@ -1991,8 +2646,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         gallery = GalleryURLParser("https://exhentai.org/g/7654321/deadbeef00/")
         driver = EHDriver(headless=True)
         driver.logger = Mock()
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2000,10 +2655,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         archive_page = SimpleNamespace(
             websocket=object(),
             mapper={},
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2012,7 +2667,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             get_content=AsyncMock(return_value="Still preparing archive"),
             close=AsyncMock(),
         )
-        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        browser = SimpleNamespace(tabs=[gallery_page])
         gallery_page.browser = browser
         archive_page.browser = browser
         driver.browser = browser
@@ -2065,17 +2720,17 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver = EHDriver(headless=True)
         driver.logger = Mock()
         timeout = ZendriverOperationTimeout(timeout_seconds=5)
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2085,7 +2740,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         driver.page = gallery_page
-        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.browser = SimpleNamespace(tabs=[gallery_page])
         driver.get = AsyncMock()  # type: ignore[method-assign]
 
         with (
@@ -2123,8 +2778,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver = EHDriver(headless=True)
         driver.logger = Mock()
         activation_error = RuntimeError("activation dispatch failed")
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2132,10 +2787,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2145,7 +2800,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         driver.page = gallery_page
-        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.browser = SimpleNamespace(tabs=[gallery_page])
         driver.get = AsyncMock()  # type: ignore[method-assign]
 
         with (
@@ -2178,9 +2833,9 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
         driver = EHDriver(headless=True)
         driver.logger = Mock()
         click_error = RuntimeError("Original click dispatch failed")
-        archive_link = SimpleNamespace(click=AsyncMock())
+        archive_link = _archive_control(click=AsyncMock())
         original_link = SimpleNamespace(click=AsyncMock(side_effect=click_error))
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             xpath=AsyncMock(side_effect=[[], [archive_link]]),
@@ -2188,10 +2843,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2201,7 +2856,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         driver.page = gallery_page
-        driver.browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        driver.browser = SimpleNamespace(tabs=[gallery_page])
         driver.get = AsyncMock()  # type: ignore[method-assign]
 
         with (
@@ -2242,10 +2897,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 return "about:blank"
             return gallery.url
 
-        archive_link = SimpleNamespace(
+        archive_link = _archive_control(
             click=AsyncMock(side_effect=ZendriverOperationTimeout(timeout_seconds=5.0))
         )
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2285,10 +2940,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             return gallery.url
 
         click_error = RuntimeError("click dispatch failed")
-        archive_link = SimpleNamespace(
+        archive_link = _archive_control(
             click=AsyncMock(side_effect=click_error),
         )
-        gallery_page = SimpleNamespace(
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),
@@ -2325,8 +2980,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 return "about:blank"
             return gallery.url
 
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             websocket=object(),
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
@@ -2375,8 +3030,8 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
                 return "about:blank"
             return gallery.url
 
-        archive_link = SimpleNamespace(click=AsyncMock())
-        gallery_page = SimpleNamespace(
+        archive_link = _archive_control(click=AsyncMock())
+        gallery_page = _archive_gallery_page(
             mapper={},
             target=SimpleNamespace(target_id="gallery"),
             evaluate=AsyncMock(side_effect=navigation_url),
@@ -2385,10 +3040,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(side_effect=RuntimeError("activation failed")),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2399,7 +3054,7 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
             activate=AsyncMock(),
         )
-        browser = SimpleNamespace(tabs=[gallery_page, archive_page])
+        browser = SimpleNamespace(tabs=[gallery_page])
         driver.page = gallery_page
         driver.browser = browser
         driver.myget = AsyncMock()
@@ -2436,10 +3091,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             activate=AsyncMock(),
         )
         archive_page = SimpleNamespace(
-            target=SimpleNamespace(target_id="archive"),
+            target=SimpleNamespace(target_id="archive", opener_id="gallery"),
             evaluate=AsyncMock(
                 return_value={
-                    "url": "https://exhentai.org/archiver.php",
+                    "url": ARCHIVE_URL,
                     "readyState": "complete",
                 }
             ),
@@ -2452,6 +3107,10 @@ class GalleryDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
             await driver._close_archive_tab_and_restore(
                 gallery_page,
                 archive_page,
+                identity=_ArchivePopupIdentity(
+                    "gallery", "archive", ARCHIVE_URL, frozenset({"gallery"})
+                ),
+                deadline=Deadline.after(1),
             )
 
         self.assertIsNone(raised.exception.__cause__)

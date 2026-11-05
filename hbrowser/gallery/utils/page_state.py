@@ -34,14 +34,18 @@ DEFAULT_NAVIGATION_DEADLINE_SECONDS = 10.0
 _READY_LIFECYCLE_NAMES = frozenset({"DOMContentLoaded", "load"})
 _READY_DOCUMENT_STATES = frozenset({"interactive", "complete"})
 _DOM_RECONCILIATION_SECONDS = 0.25
-_DOCUMENT_SNAPSHOT_SCRIPT = """(() => ({
-    url: window.location.href,
-    readyState: document.readyState
-}))()"""
+_DOCUMENT_SNAPSHOT_SCRIPT = """function () { return {
+    url: this.URL,
+    readyState: this.readyState
+}; }"""
 
 
 class PageStateTimeout(TimeoutError):
     """A healthy transport did not expose the requested semantic page state."""
+
+
+class PageElementNotFound(PageStateTimeout):
+    """A timely negative DOM query was followed by an empty observation window."""
 
 
 @contextmanager
@@ -110,12 +114,40 @@ def _command_timeout(
 
 
 async def _read_document_snapshot(page: Any, deadline: Deadline) -> tuple[str, str]:
-    command_timeout = _command_timeout(deadline)
-    value = await wait_for_zendriver(
-        page.evaluate(_DOCUMENT_SNAPSHOT_SCRIPT),
-        timeout=command_timeout,
+    # Hold the actual Document object, not a reusable numeric context ID or a
+    # later default-context evaluation. Frame generation checks surround this
+    # operation; the remote object keeps its two fields on the same document.
+    result, error = await wait_for_zendriver(
+        page.send(cdp.runtime.evaluate("document", return_by_value=False)),
+        timeout=_command_timeout(deadline),
         owner=page,
     )
+    if error is not None:
+        raise ProtocolException(error)
+    object_id = result.object_id
+    if object_id is None:
+        raise TypeError("document snapshot did not acquire a remote Document")
+    try:
+        result, error = await wait_for_zendriver(
+            page.send(
+                cdp.runtime.call_function_on(
+                    _DOCUMENT_SNAPSHOT_SCRIPT,
+                    object_id=object_id,
+                    return_by_value=True,
+                )
+            ),
+            timeout=_command_timeout(deadline),
+            owner=page,
+        )
+        if error is not None:
+            raise ProtocolException(error)
+        value = result.value
+    finally:
+        await wait_for_zendriver(
+            page.send(cdp.runtime.release_object(object_id)),
+            timeout=_command_timeout(deadline),
+            owner=page,
+        )
     _require_deadline(deadline, "Document snapshot")
     if not isinstance(value, dict):
         raise TypeError("document snapshot was not an object")
@@ -163,6 +195,9 @@ class _NavigationObserver:
         self._ready_lifecycles: set[tuple[str, str]] = set()
         self._same_document_urls: list[str] = []
         self._expected_same_document_url: str | None = None
+        self._frame_navigations: list[str] = []
+        self._completion_events: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._same_document_completion = False
         self._armed = False
         self._future = asyncio.get_running_loop().create_future()
 
@@ -174,6 +209,9 @@ class _NavigationObserver:
         loader_id = str(frame.loader_id)
         if frame_id != self._main_frame_id:
             return
+        # Keep observing after readiness, including a reused loader ID. A ->
+        # B -> A (for example BFCache) must not look like an unchanged document.
+        self._frame_navigations.append(loader_id)
         if (
             self._previous_loader_id is not None
             and loader_id == self._previous_loader_id
@@ -218,7 +256,7 @@ class _NavigationObserver:
 
     @property
     def loader_id(self) -> str | None:
-        return self._expected_loader_id
+        return None if self._same_document_completion else self._expected_loader_id
 
     @property
     def main_frame_id(self) -> str:
@@ -230,21 +268,63 @@ class _NavigationObserver:
         self._expected_loader_id = None
         self._ready_lifecycles.clear()
         self._same_document_urls.clear()
+        self._frame_navigations.clear()
+        self._completion_events = None
+        self._same_document_completion = False
         self._armed = True
+
+    def validate_document(self, frame_id: str, loader_id: str | None) -> None:
+        expected_loader = (
+            self._previous_loader_id
+            if self._same_document_completion
+            else self._expected_loader_id
+        )
+        expected_navigations = (
+            [] if self._same_document_completion else [expected_loader]
+        )
+        events = (tuple(self._frame_navigations), tuple(self._same_document_urls))
+        if (
+            frame_id != self._main_frame_id
+            or loader_id != expected_loader
+            or self._frame_navigations != expected_navigations
+            or events != self._completion_events
+        ):
+            raise PageStateTimeout("Navigation document changed before its receipt")
+
+    def validate_url(self, url: str) -> None:
+        expected_url = self._expected_same_document_url
+        if self._same_document_completion and (
+            url != self._same_document_urls[-1]
+            or (expected_url is not None and url != expected_url)
+        ):
+            raise PageStateTimeout(
+                "Same-document navigation URL changed before receipt"
+            )
+
+    def _complete(self, *, same_document: bool) -> None:
+        self._same_document_completion = same_document
+        self._completion_events = (
+            tuple(self._frame_navigations),
+            tuple(self._same_document_urls),
+        )
+        self._future.set_result(None)
 
     def _complete_if_ready(self) -> None:
         if self._future.done():
             return
         if self._expects_same_document and self._same_document_urls:
             expected_url = self._expected_same_document_url
-            if expected_url is None or expected_url in self._same_document_urls:
-                self._future.set_result(None)
+            if expected_url is None or expected_url == self._same_document_urls[-1]:
+                self._complete(same_document=True)
                 return
         loader_id = self._expected_loader_id
         if loader_id is None:
             return
-        if (self._main_frame_id, loader_id) in self._ready_lifecycles:
-            self._future.set_result(None)
+        if (
+            loader_id in self._frame_navigations
+            and (self._main_frame_id, loader_id) in self._ready_lifecycles
+        ):
+            self._complete(same_document=False)
 
     async def wait(self, deadline: Deadline, *, description: str) -> None:
         await _wait_for_future(self._future, deadline, description=description)
@@ -298,7 +378,15 @@ async def _finish_navigation(
     description: str,
 ) -> NavigationReceipt:
     await observer.wait(deadline, description=description)
+    observer.validate_document(*await _main_frame_identity(page, deadline))
     url, ready_state = await _read_document_snapshot(page, deadline)
+    identity = await _main_frame_identity(page, deadline)
+    # Zendriver dispatches event handlers as tasks. Drain callbacks queued ahead
+    # of the final command response before inspecting the complete event epoch.
+    await asyncio.sleep(0)
+    observer.validate_document(*identity)
+    observer.validate_url(url)
+    _require_deadline(deadline, description)
     if ready_state not in _READY_DOCUMENT_STATES:
         raise PageStateTimeout(
             f"{description} produced document.readyState={ready_state!r}"
@@ -694,7 +782,9 @@ async def _wait_for_dom_change(
     while True:
         remaining = deadline.remaining()
         if remaining <= 0:
-            raise PageStateTimeout(f"{description} did not appear before its deadline")
+            raise PageElementNotFound(
+                f"{description} did not appear before its deadline"
+            )
         wait_seconds = min(_DOM_RECONCILIATION_SECONDS, remaining)
         wait_reaches_deadline = remaining <= _DOM_RECONCILIATION_SECONDS
         change_task = asyncio.create_task(changed.wait())
@@ -752,7 +842,7 @@ async def _wait_for_dom_query(
 
             remaining = deadline.remaining()
             if remaining <= 0:
-                raise PageStateTimeout(
+                raise PageElementNotFound(
                     f"{description} did not appear before its deadline"
                 )
             if supports_events and not observing:
@@ -829,6 +919,7 @@ __all__ = [
     "DEFAULT_NAVIGATION_DEADLINE_SECONDS",
     "ZENDRIVER_COMMAND_TIMEOUT_SECONDS",
     "NavigationReceipt",
+    "PageElementNotFound",
     "PageStateTimeout",
     "mutate_and_wait_for_navigation",
     "navigate_and_wait",

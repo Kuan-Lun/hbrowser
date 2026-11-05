@@ -17,9 +17,11 @@ from uuid import uuid4
 
 from ..utils import (
     Deadline,
+    is_browser_generation_error,
     navigate_and_wait,
     open_tab_and_wait,
 )
+from ..utils.protocol import _is_zendriver_owner_retired
 from .factory import create_browser, stop_browser
 
 _TAB_OPEN_DEADLINE_SECONDS = 10.0
@@ -114,9 +116,11 @@ class TabTransport[TabT]:
 
     __slots__ = (
         "_command_lock",
+        "_generation_retired",
         "_handle",
         "_is_owner_open",
         "_navigate_tab",
+        "_retire_owner",
         "_tab",
     )
 
@@ -133,6 +137,8 @@ class TabTransport[TabT]:
         self._navigate_tab = navigate_tab
         self._is_owner_open = is_owner_open
         self._command_lock = asyncio.Lock()
+        self._generation_retired = False
+        self._retire_owner: Callable[[], None] | None = None
 
     @property
     def handle(self) -> TabHandle:
@@ -150,13 +156,28 @@ class TabTransport[TabT]:
     def is_available(self) -> bool:
         """Whether the owner still accepts new commands."""
 
-        return self._is_owner_open()
+        self._synchronize_protocol_retirement()
+        return not self._generation_retired and self._is_owner_open()
+
+    def _retire_generation(self) -> None:
+        self._generation_retired = True
+        if self._retire_owner is not None:
+            self._retire_owner()
+
+    def _synchronize_protocol_retirement(self) -> None:
+        # Cancellation keeps its original exception type. The concrete
+        # protocol tombstone, rather than CancelledError alone, closes admission.
+        if _is_zendriver_owner_retired(self._tab):
+            self._retire_generation()
+        # The owner also checks its original browser, even if a callback changed
+        # the mutable tab's browser relationship while its operation was active.
+        self._is_owner_open()
 
     def _require_available(self) -> None:
-        if not self._is_owner_open():
+        if not self.is_available:
             raise TabTransportUnavailableError(
                 f"tab role {self.role!r} is unavailable because its browser "
-                "owner is not open"
+                "generation no longer accepts commands"
             )
 
     async def execute[ResultT](
@@ -170,7 +191,18 @@ class TabTransport[TabT]:
             # Closing may have started while this command waited for an earlier
             # operation on the same tab.
             self._require_available()
-            return await command(self._tab)
+            try:
+                return await command(self._tab)
+            except BaseException as error:
+                if is_browser_generation_error(error):
+                    # Seal admission before releasing this command's lock, so
+                    # queued commands and every sibling transport fail closed.
+                    self._retire_generation()
+                raise
+            finally:
+                # This also catches callbacks which handle protocol cancellation
+                # themselves. Seal admission before the command lock is released.
+                self._synchronize_protocol_retirement()
 
     async def navigate(self, url: str) -> None:
         """Navigate the fixed tab through its injected navigation adapter."""
@@ -192,8 +224,9 @@ class BrowserOwner[BrowserT, TabT]:
 
     The default adapters launch Zendriver through the existing browser factory.
     Tests and higher layers may inject fakes without importing or starting a real
-    browser.  A close operation is represented by one shared task, so concurrent
-    or repeated callers can never invoke the browser closer more than once.
+    browser. Concurrent callers share each close attempt. Once the closer proves
+    browser release, retries only drain remaining commands; the owner is closed
+    only after both responsibilities are complete.
     """
 
     def __init__(
@@ -257,10 +290,20 @@ class BrowserOwner[BrowserT, TabT]:
 
     @property
     def state(self) -> BrowserOwnerState:
+        self._generation_is_open()
         return self._state
 
     @property
     def is_open(self) -> bool:
+        return self._generation_is_open()
+
+    def _generation_is_open(self) -> bool:
+        if (
+            self._state is BrowserOwnerState.OPEN
+            and self._browser is not None
+            and _is_zendriver_owner_retired(self._browser)
+        ):
+            self._retire_generation()
         return self._state is BrowserOwnerState.OPEN
 
     @property
@@ -307,11 +350,16 @@ class BrowserOwner[BrowserT, TabT]:
             handle=handle,
             tab=tab,
             navigate_tab=self._navigate_owned_tab,
-            is_owner_open=lambda: self._state is BrowserOwnerState.OPEN,
+            is_owner_open=self._generation_is_open,
         )
+        transport._retire_owner = self._retire_generation
         self._tabs_by_role[role] = transport
         self._tabs_by_target[target_id] = transport
         return transport
+
+    def _retire_generation(self) -> None:
+        if self._state is BrowserOwnerState.OPEN:
+            self._state = BrowserOwnerState.CLOSING
 
     async def _navigate_owned_tab(self, tab: TabT, url: str) -> None:
         try:
@@ -319,14 +367,14 @@ class BrowserOwner[BrowserT, TabT]:
         except BaseException:
             # Keep every transport and the browser for controlled shutdown,
             # but reject commands against this uncertain generation.
-            self._state = BrowserOwnerState.CLOSING
+            self._retire_generation()
             raise
 
     async def start(self) -> Self:
         """Launch and bind the browser factory's main tab exactly once."""
 
         async with self._lifecycle_lock:
-            if self._state is BrowserOwnerState.OPEN:
+            if self._generation_is_open():
                 return self
             if self._state is not BrowserOwnerState.NEW:
                 raise BrowserOwnerStateError(
@@ -349,6 +397,8 @@ class BrowserOwner[BrowserT, TabT]:
                             "browser cleanup after startup failure also failed: "
                             f"{type(cleanup_error).__name__}"
                         )
+                        if self._browser is None:
+                            self._state = BrowserOwnerState.CLOSED
                     else:
                         self._browser = None
                         self._state = BrowserOwnerState.CLOSED
@@ -375,7 +425,7 @@ class BrowserOwner[BrowserT, TabT]:
 
         self._validate_role(role)
         async with self._lifecycle_lock:
-            if self._state is not BrowserOwnerState.OPEN:
+            if not self._generation_is_open():
                 raise BrowserOwnerStateError(
                     f"cannot open tab while browser owner is {self._state.value!r}"
                 )
@@ -435,6 +485,7 @@ class BrowserOwner[BrowserT, TabT]:
             except BaseException:
                 task = None
             else:
+                self._browser = None
                 if deadline.expired:
                     raise _BrowserCloserCompletedAfterDeadline(
                         "Browser closer completed after its shared ownership deadline"
@@ -475,6 +526,9 @@ class BrowserOwner[BrowserT, TabT]:
             raise BrowserOwnershipError(
                 "Browser closer was cancelled before ownership was released"
             ) from error
+        # Record positive release before reporting lateness or awaiting a drain.
+        # Neither a timed-out nor a cancelled drain may cause a second close.
+        self._browser = None
         if deadline.expired:
             raise _BrowserCloserCompletedAfterDeadline(
                 "Browser closer completed after its shared ownership deadline"
@@ -482,7 +536,6 @@ class BrowserOwner[BrowserT, TabT]:
 
     async def _finish_close(self, close_deadline: Deadline) -> None:
         errors: list[BaseException] = []
-        browser_closed = self._browser is None
         browser = self._browser
         if browser is not None:
             try:
@@ -490,24 +543,21 @@ class BrowserOwner[BrowserT, TabT]:
                 # locks. Closing the transports is what wakes a stuck CDP
                 # command; draining first can deadlock forever.
                 await self._run_browser_closer(browser, close_deadline)
-            except _BrowserCloserCompletedAfterDeadline as error:
-                browser_closed = True
-                errors.append(error)
             except BaseException as error:
                 errors.append(error)
-            else:
-                browser_closed = True
 
+        commands_drained = not self._tabs_by_role
         if self._tabs_by_role:
             drain_timeout = min(
                 _COMMAND_DRAIN_TIMEOUT_SECONDS,
                 close_deadline.remaining(),
             )
             if drain_timeout <= 0:
-                if any(
+                commands_drained = not any(
                     transport._command_lock.locked()
                     for transport in self._tabs_by_role.values()
-                ):
+                )
+                if not commands_drained:
                     errors.append(
                         TimeoutError(
                             "Browser-owner close deadline expired before tab drain"
@@ -531,9 +581,10 @@ class BrowserOwner[BrowserT, TabT]:
                             f"{_OWNER_CLOSE_DEADLINE_SECONDS:g}-second close deadline"
                         )
                     )
+                else:
+                    commands_drained = True
 
-        if browser_closed:
-            self._browser = None
+        if self._browser is None and commands_drained:
             self._state = BrowserOwnerState.CLOSED
         else:
             self._state = BrowserOwnerState.CLOSING
@@ -585,12 +636,14 @@ class BrowserOwner[BrowserT, TabT]:
                     None if completed_task.cancelled() else completed_task.exception()
                 )
                 self._close_task = None
-                if self._state is not BrowserOwnerState.CLOSED and (
-                    completed_task.cancelled() or completed_error is not None
+                if (
+                    self._state is not BrowserOwnerState.CLOSED
+                    and (completed_task.cancelled() or completed_error is not None)
+                    and self._browser_closer_task is None
                 ):
-                    # A completed failed cleanup is a finished attempt. An
-                    # explicit later close may use a new caller-owned deadline;
-                    # calls that overlap the same live task never reset it.
+                    # A finished outer attempt cannot extend an unresolved
+                    # inner closer. Reconcile that task against its original
+                    # deadline, even if it completed since the outer timeout.
                     self._close_deadline = None
             if self._close_task is not None:
                 close_task = self._close_task

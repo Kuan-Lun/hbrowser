@@ -6,13 +6,27 @@ resource_dir="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CDPATH= cd "$repo_root"
 repo_root=$PWD
 
-existing_hooks_path="$(git config --get core.hooksPath || true)"
-if [[ -n "$existing_hooks_path" && "$existing_hooks_path" != ".githooks" ]]; then
-    echo "Refusing to replace existing core.hooksPath: $existing_hooks_path" >&2
+# Preserve all value bytes: command substitution otherwise strips trailing LFs.
+configuration_status=0
+existing_hooks_path="$(
+    git config --get core.hooksPath
+    status=$?
+    printf '.'
+    exit "$status"
+)" || configuration_status=$?
+if [[ "$configuration_status" == 0 ]]; then
+    existing_hooks_path=${existing_hooks_path%.}
+    existing_hooks_path=${existing_hooks_path%$'\n'}
+    if [[ "$existing_hooks_path" != ".githooks" ]]; then
+        printf 'Refusing to replace existing core.hooksPath: %s\n' "$existing_hooks_path" >&2
+        exit 1
+    fi
+elif [[ "$configuration_status" != 1 ]]; then
+    printf 'Could not inspect existing core.hooksPath (Git exit %s)\n' "$configuration_status" >&2
     exit 1
 fi
 
-if [[ -z "$existing_hooks_path" ]]; then
+if [[ "$configuration_status" == 1 ]]; then
     default_hooks_directory="$(git rev-parse --git-path hooks)"
     shopt -s nullglob
     for existing_hook in "$default_hooks_directory"/*; do

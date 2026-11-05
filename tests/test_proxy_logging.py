@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError, ProcessOwnershipError
 from hbrowser.gallery.browser import proxy
+from hbrowser.gallery.browser.process import _PrivateDirectory
 from hbrowser.gallery.utils import Deadline
 
 
@@ -44,8 +44,9 @@ process.stdout.write(JSON.stringify(cases.map(details => {
             {"challenger": {"host": "proxy.example", "port": 8443}},
             {"isProxy": True, "challenger": {"host": "PROXY.EXAMPLE", "port": 8443}},
         ]
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         result = subprocess.run(
             ["node", "-e", harness, str(directory / "background.js")],
             input=json.dumps(details),
@@ -108,8 +109,9 @@ async function probe(change) {
     'other-extension', 'no-listener', 'wrong-token'
 ].map(probe)))))();
 """
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         manifest = json.loads((directory / "manifest.json").read_text())
         self.assertEqual(manifest["manifest_version"], 3)
         self.assertIn("webRequestAuthProvider", manifest["permissions"])
@@ -145,12 +147,12 @@ async function probe(change) {
             patch.object(
                 proxy,
                 "_create_proxy_extension",
-                return_value="proxy-extension.zip",
+                return_value=Mock(spec=_PrivateDirectory),
             ),
         ):
             result = proxy.configure_proxy()
 
-        self.assertEqual(result, "proxy-extension.zip")
+        self.assertIsInstance(result, _PrivateDirectory)
         logger.debug.assert_any_call("Using authenticated residential proxy")
         rendered_arguments = repr(logger.method_calls)
         self.assertNotIn("secret-user", rendered_arguments)
@@ -179,34 +181,213 @@ async function probe(change) {
                     proxy_password,
                 )
 
-            background = (Path(result) / "background.js").read_text(encoding="utf-8")
-            self.assertIn(f"host: {json.dumps(proxy_host)}", background)
-            self.assertIn(f"username: {json.dumps(proxy_user)}", background)
-            self.assertIn(f"password: {json.dumps(proxy_password)}", background)
+            try:
+                background = (result.path / "background.js").read_text(encoding="utf-8")
+                self.assertIn(f"host: {json.dumps(proxy_host)}", background)
+                self.assertIn(f"username: {json.dumps(proxy_user)}", background)
+                self.assertIn(f"password: {json.dumps(proxy_password)}", background)
+            finally:
+                result.remove(deadline=Deadline.after(5).expires_at)
 
     def test_proxy_extension_cleanup_failure_is_an_ownership_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as directory:
             plugin_directory = Path(directory) / "plugin"
             plugin_directory.mkdir()
+            guard = _PrivateDirectory.capture(plugin_directory)
             creation_error = OSError("write failed")
             cleanup_error = OSError("remove failed")
+            try:
+                with (
+                    patch.object(
+                        tempfile,
+                        "mkdtemp",
+                        return_value=str(plugin_directory),
+                    ),
+                    patch.object(
+                        _PrivateDirectory, "capture", return_value=guard
+                    ) as capture,
+                    patch.object(
+                        _PrivateDirectory, "create_file", side_effect=creation_error
+                    ),
+                    patch.object(
+                        _PrivateDirectory, "remove", side_effect=cleanup_error
+                    ) as remove,
+                    self.assertRaises(ProcessOwnershipError) as raised,
+                ):
+                    deadline = Deadline.after(1)
+                    proxy._create_proxy_extension(
+                        "host", 8080, "user", "password", cleanup_deadline=deadline
+                    )
+
+                capture.assert_called_once_with(plugin_directory)
+                self.assertIs(raised.exception.__cause__, cleanup_error)
+                self.assertLessEqual(
+                    remove.call_args.kwargs["deadline"], deadline.expires_at
+                )
+                self.assertIn(
+                    "Creation failure type: OSError",
+                    raised.exception.__notes__,
+                )
+            finally:
+                # The failed remove was a Mock; the fixture still owns this pin.
+                guard.remove(deadline=Deadline.after(5).expires_at)
+
+    def test_extension_write_failure_removes_only_its_captured_directory(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_extension_cleanup_preserves_replacement(
+                    symlink, final_write_succeeds=False
+                )
+
+    def test_successful_final_write_does_not_transfer_replaced_directory(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_extension_cleanup_preserves_replacement(
+                    symlink, final_write_succeeds=True
+                )
+
+    def _assert_extension_cleanup_preserves_replacement(
+        self, replace_with_symlink: bool, *, final_write_succeeds: bool
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as root:
+            parent = Path(root)
+            plugin = parent / "plugin"
+            plugin.mkdir()
+            guard = _PrivateDirectory.capture(plugin)
+            original = parent / "original"
+            unrelated = parent / "unrelated"
+            unrelated.mkdir()
+            marker = unrelated / "keep"
+            marker.write_text("unrelated material", encoding="utf-8")
+            original_write = _PrivateDirectory.create_file
+            failure = OSError("synthetic extension write failure")
+
+            def replace_during_write(
+                directory: _PrivateDirectory, name: str, content: bytes
+            ) -> None:
+                target = (
+                    "verification-token" if final_write_succeeds else "background.js"
+                )
+                if name != target:
+                    original_write(directory, name, content)
+                    return
+                if final_write_succeeds:
+                    original_write(directory, name, content)
+                plugin.rename(original)
+                if replace_with_symlink:
+                    plugin.symlink_to(unrelated, target_is_directory=True)
+                else:
+                    unrelated.rename(plugin)
+                if not final_write_succeeds:
+                    raise failure
+
+            try:
+                with (
+                    patch.object(tempfile, "mkdtemp", return_value=str(plugin)),
+                    patch.object(
+                        _PrivateDirectory, "capture", return_value=guard
+                    ) as capture,
+                    patch.object(
+                        _PrivateDirectory, "create_file", replace_during_write
+                    ),
+                    self.assertRaises(ProcessOwnershipError) as caught,
+                ):
+                    proxy._create_proxy_extension("host", 8080, "user", "password")
+                capture.assert_called_once_with(plugin)
+                self.assertIsInstance(caught.exception.__cause__, ProcessOwnershipError)
+                self.assertEqual((plugin / "keep").read_text(), "unrelated material")
+                self.assertTrue((original / "manifest.json").is_file())
+            finally:
+                # Restore the exact captured inode so the retained cleanup
+                # obligation can finish without deleting the replacement.
+                if original.exists():
+                    if replace_with_symlink:
+                        plugin.unlink()
+                    else:
+                        plugin.rename(unrelated)
+                    original.rename(plugin)
+                guard.remove(deadline=Deadline.after(5).expires_at)
+
+    def test_extension_write_failure_reaps_owned_cleanup_and_preserves_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as root:
+            plugin = Path(root) / "plugin"
+            plugin.mkdir()
+            failure = OSError("synthetic write failure")
             with (
-                patch.object(
-                    tempfile,
-                    "mkdtemp",
-                    return_value=str(plugin_directory),
-                ),
-                patch.object(Path, "write_text", side_effect=creation_error),
-                patch.object(shutil, "rmtree", side_effect=cleanup_error),
-                self.assertRaises(ProcessOwnershipError) as raised,
+                patch.object(tempfile, "mkdtemp", return_value=str(plugin)),
+                patch.object(_PrivateDirectory, "create_file", side_effect=failure),
+                self.assertRaises(OSError) as caught,
             ):
                 proxy._create_proxy_extension("host", 8080, "user", "password")
+            self.assertIs(caught.exception, failure)
+            self.assertFalse(plugin.exists())
 
-            self.assertIs(raised.exception.__cause__, cleanup_error)
-            self.assertIn(
-                "Creation failure type: OSError",
-                raised.exception.__notes__,
+    def test_manifest_directory_replacement_never_receives_proxy_secrets(self) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_manifest_replacement_is_not_written(symlink)
+
+    def _assert_manifest_replacement_is_not_written(self, symlink: bool) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-proxy-test-") as root:
+            parent = Path(root)
+            plugin, original, unrelated = (
+                parent / name for name in ("plugin", "original", "unrelated")
             )
+            plugin.mkdir()
+            unrelated.mkdir()
+            (unrelated / "keep").write_bytes(b"unrelated material")
+            guard = _PrivateDirectory.capture(plugin)
+            original_create = getattr(_PrivateDirectory, "create_file", None)
+            original_write_text = Path.write_text
+
+            def replace_after_manifest(name: str) -> None:
+                if name != "manifest.json":
+                    return
+                plugin.rename(original)
+                if symlink:
+                    plugin.symlink_to(unrelated, target_is_directory=True)
+                else:
+                    unrelated.rename(plugin)
+
+            def pinned_write(
+                directory: _PrivateDirectory, name: str, data: bytes
+            ) -> None:
+                assert callable(original_create)
+                original_create(directory, name, data)
+                replace_after_manifest(name)
+
+            def path_write(path: Path, data: str, *, encoding: str) -> int:
+                # Keep the old pathname implementation's exact race observable
+                # for the negative control, rather than failing on a missing API.
+                count = original_write_text(path, data, encoding=encoding)
+                replace_after_manifest(path.name)
+                return count
+
+            try:
+                with (
+                    patch.object(tempfile, "mkdtemp", return_value=str(plugin)),
+                    patch.object(_PrivateDirectory, "capture", return_value=guard),
+                    patch.object(
+                        _PrivateDirectory, "create_file", pinned_write, create=True
+                    ),
+                    patch.object(Path, "write_text", path_write),
+                    self.assertRaises(ProcessOwnershipError),
+                ):
+                    proxy._create_proxy_extension("host", 8080, "user", "password")
+                self.assertTrue((original / "manifest.json").is_file())
+                self.assertEqual((plugin / "keep").read_bytes(), b"unrelated material")
+                self.assertFalse((plugin / "background.js").exists())
+                self.assertFalse((plugin / "verification-token").exists())
+            finally:
+                if original.exists():
+                    if symlink:
+                        plugin.unlink()
+                    else:
+                        plugin.rename(unrelated)
+                    original.rename(plugin)
+                guard.remove(deadline=Deadline.after(5).expires_at)
 
     def test_invalid_proxy_port_does_not_echo_configuration(self) -> None:
         secret_port = "SECRET-INVALID-PORT"
@@ -238,8 +419,9 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_residential_extension_missing_or_failed_never_navigates(
         self,
     ) -> None:
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         for state in ("missing", "rejected", "script-error"):
             with self.subTest(state=state):
                 target = SimpleNamespace(
@@ -269,8 +451,9 @@ class ProxyVerificationLoggingTests(unittest.IsolatedAsyncioTestCase):
                 navigate.assert_not_awaited()
 
     async def test_residential_extension_accepts_only_boolean_receipt(self) -> None:
-        directory = Path(proxy._create_proxy_extension("proxy.example", 8443, "u", "p"))
-        self.addCleanup(shutil.rmtree, directory)
+        guard = proxy._create_proxy_extension("proxy.example", 8443, "u", "p")
+        directory = guard.path
+        self.addCleanup(lambda: guard.remove(deadline=Deadline.after(5).expires_at))
         target = SimpleNamespace(
             type_="service_worker",
             url="chrome-extension://owned/background.js",

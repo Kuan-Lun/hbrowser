@@ -11,10 +11,14 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock
 from typing import Any, cast
+from urllib.parse import unquote_plus
 from uuid import uuid4
+
+from bs4 import BeautifulSoup
 
 _PAGE_DIAGNOSTIC_FILE_LIMIT = 20
 _PAGE_DIAGNOSTIC_MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -28,15 +32,20 @@ _PAGE_DIAGNOSTIC_FILENAME_PATTERN = re.compile(
     r"(?P<nonce>[0-9a-f]{32})\.html\Z"
 )
 _PAGE_DIAGNOSTIC_PARTIAL_FILENAME = ".hbrowser-page-diagnostic.partial"
-_ENCOUNTER_QUERY_SECRET_PATTERN = re.compile(
+_ENCOUNTER_QUERY_KEY_PATTERN = re.compile(
     r"(?P<prefix>"
     r"(?:\?|&(?:amp;|#0*38;|#x0*26;)?)"
-    r"encounter="
-    r")"
-    r"[^&#\s\"'<>]*",
+    r"(?P<key>[A-Za-z%0-9+\t\r\n]+)="
+    r")",
     flags=re.IGNORECASE,
 )
+_ENCOUNTER_ATTRIBUTE_SECRET_PATTERN = re.compile(
+    _ENCOUNTER_QUERY_KEY_PATTERN.pattern + r"[^&#]*", flags=re.IGNORECASE
+)
 _REDACTED_QUERY_VALUE = "REDACTED"
+_CAPTCHA_RESPONSE_FIELDS = frozenset(
+    ("cf-turnstile-response", "g-recaptcha-response", "h-captcha-response")
+)
 _PAGE_DIAGNOSTIC_LOCK_FILENAME = ".hbrowser-page-diagnostics.lock"
 _PAGE_DIAGNOSTIC_MAX_SEQUENCE = (1 << 64) - 1
 _PAGE_DIAGNOSTIC_THREAD_LOCK = Lock()
@@ -169,12 +178,83 @@ def _locked_page_diagnostic_directory(
         _PAGE_DIAGNOSTIC_THREAD_LOCK.release()
 
 
+def _is_encounter_query_key(match: re.Match[str]) -> bool:
+    # Match urlsplit's removal of literal ASCII tabs/newlines followed by
+    # parse_qsl's single percent/plus decode. Values are never decoded here.
+    key = match.group("key").translate({9: None, 10: None, 13: None})
+    return unquote_plus(key).casefold() == "encounter"
+
+
+def _redact_encounter_attribute(content: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        if not _is_encounter_query_key(match):
+            return match.group(0)
+        return f"{match.group('prefix')}{_REDACTED_QUERY_VALUE}"
+
+    return _ENCOUNTER_ATTRIBUTE_SECRET_PATTERN.sub(replace, content)
+
+
 def _redact_page_diagnostic_secrets(content: str) -> str:
-    """Hide short-lived encounter query values while retaining HTML context."""
-    return _ENCOUNTER_QUERY_SECRET_PATTERN.sub(
-        lambda match: f"{match.group('prefix')}{_REDACTED_QUERY_VALUE}",
-        content,
-    )
+    """Remove transient credentials before HTML crosses the worker boundary."""
+    # The parent bounds input before redaction. Never retain an unfinished tag:
+    # truncation may leave a value before the name identifying its secret field.
+    parser = HTMLParser(convert_charrefs=False)
+    parser.feed(content)
+    complete_content = content[: len(content) - len(parser.rawdata)]
+    document = BeautifulSoup(complete_content, "html.parser")
+    changed = False
+    # Attribute entities are decoded before the encounter URL parser sees the
+    # link. HTML supplies the complete attribute boundary, so quotes or spaces
+    # inside its decoded value must not leave an unredacted capability suffix.
+    for element in document.find_all(True):
+        for name, value in tuple(element.attrs.items()):
+            if isinstance(value, list):
+                # Multivalued attributes can otherwise split one value at its
+                # whitespace before the redactor sees the complete attribute.
+                original = " ".join(value)
+            else:
+                original = value
+            redacted = _redact_encounter_attribute(original)
+            if redacted != original:
+                element[name] = redacted
+                changed = True
+    # Script/text/comment fragments have no trustworthy URL-value boundary:
+    # whitespace is valid URL input, and quotes may be escaped or concatenated.
+    # Retain unrelated fragments, but redact the entire matching text node
+    # instead of guessing JavaScript syntax and exposing a credential suffix.
+    for fragment in document.find_all(string=True):
+        if any(
+            _is_encounter_query_key(match)
+            for match in _ENCOUNTER_QUERY_KEY_PATTERN.finditer(str(fragment))
+        ):
+            fragment.replace_with(_REDACTED_QUERY_VALUE)
+            changed = True
+    for field in document.find_all(("input", "textarea")):
+        identifiers = (field.get("name"), field.get("id"))
+        secret_field = any(
+            isinstance(identifier, str)
+            and (
+                identifier in _CAPTCHA_RESPONSE_FIELDS
+                or any(
+                    identifier.startswith(f"{name}-")
+                    for name in _CAPTCHA_RESPONSE_FIELDS
+                )
+                or (
+                    identifier.startswith("cf-chl-widget-")
+                    and identifier.endswith("_response")
+                )
+            )
+            for identifier in identifiers
+        )
+        if not secret_field:
+            continue
+        if "value" in field.attrs:
+            field["value"] = _REDACTED_QUERY_VALUE
+        if field.name == "textarea":
+            field.clear()
+            field.append(_REDACTED_QUERY_VALUE)
+        changed = True
+    return str(document) if changed else complete_content
 
 
 def _bounded_page_diagnostic_content(content: str) -> bytes:

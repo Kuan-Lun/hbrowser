@@ -3,6 +3,7 @@
 
 import runpy
 import sys
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 
@@ -25,4 +26,12 @@ sys.modules[adapter.__name__] = adapter
 exec(compile(adapter_path.read_bytes(), str(adapter_path), "exec"), adapter.__dict__)
 
 if __name__ == "__main__":
-    adapter.run(main, pytest_entry=True)
+    adapter.run(
+        partial(
+            main,
+            runtime_sources={
+                "hbrowser": Path(__file__).resolve().parents[1] / "hbrowser"
+            },
+        ),
+        pytest_entry=True,
+    )
