@@ -1905,6 +1905,25 @@ async def _await_cleanup_deferring_caller_cancellation(
         )
 
 
+def _shutdown_cleanup_is_pending(retirement: _ZendriverRetirement) -> bool:
+    """Keep a live cleanup operation on its existing attempt's deadline."""
+
+    tasks = [
+        retirement.existing_browser_stop_task(),
+        retirement.existing_tor_stop_task(),
+        *retirement.lifecycle.rejected_disposal_tasks.values(),
+    ]
+    for connection in retirement.captured_connections():
+        tasks.append(_connection_listener_task(connection))
+        try:
+            close_task = vars(connection).get(_CONNECTION_CLOSE_TASK_ATTRIBUTE)
+        except TypeError:
+            continue
+        if isinstance(close_task, asyncio.Future):
+            tasks.append(close_task)
+    return any(task is not None and not task.done() for task in tasks)
+
+
 async def _stop_browser(
     browser: Any,
     *,
@@ -1927,15 +1946,25 @@ async def _stop_browser(
         else deadline.bounded(_BROWSER_SHUTDOWN_DEADLINE_SECONDS)
     )
     bound_expires_at = retirement.bind_shutdown_deadline(proposed_deadline.expires_at)
+    terminal_failure = (
+        not renew_expired_atexit_attempt
+        and cleanup_task is not None
+        and cleanup_task.done()
+        and (cleanup_task.cancelled() or cleanup_task.exception() is not None)
+        and not _shutdown_cleanup_is_pending(retirement)
+    )
     if (
-        renew_expired_atexit_attempt
-        and (cleanup_task is None or cleanup_task.done())
-        and Deadline(bound_expires_at).expired
-        and not retirement.is_complete()
-    ):
-        # Normal/concurrent close callers cannot reset a generation's budget.
-        # asyncio-atexit owns one explicit terminal attempt when cleanup never
-        # started or the previous task definitively stopped. No work may overlap.
+        terminal_failure
+        or (
+            renew_expired_atexit_attempt
+            and (cleanup_task is None or cleanup_task.done())
+            and Deadline(bound_expires_at).expired
+        )
+    ) and not retirement.is_complete():
+        # A new explicit caller can retry an entirely settled failed attempt.
+        # Retained inner cleanup keeps its task identity and original budget.
+        # asyncio-atexit retains its separate terminal fallback policy, including
+        # cleanup that expired before its task was first created.
         bound_expires_at = retirement.replace_shutdown_deadline(
             proposed_deadline.expires_at
         )

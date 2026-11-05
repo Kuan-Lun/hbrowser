@@ -938,6 +938,167 @@ class BrowserOwnerTests(unittest.IsolatedAsyncioTestCase):
             supplied_deadline.expires_at,
         )
 
+    async def test_terminal_timed_out_closer_can_be_retried_by_next_call(self) -> None:
+        for fail_on_cancel in (False, True):
+            with self.subTest(fail_on_cancel=fail_on_cancel):
+                await self._assert_terminal_closer_retry("concurrent", fail_on_cancel)
+
+    async def test_terminal_startup_cleanup_can_be_retried_by_next_call(self) -> None:
+        for fail_on_cancel in (False, True):
+            with self.subTest(fail_on_cancel=fail_on_cancel):
+                await self._assert_terminal_closer_retry("startup", fail_on_cancel)
+
+    async def test_terminal_closer_after_cancelled_caller_retries_on_next_call(
+        self,
+    ) -> None:
+        for fail_on_cancel in (False, True):
+            with self.subTest(fail_on_cancel=fail_on_cancel):
+                await self._assert_terminal_closer_retry("cancelled", fail_on_cancel)
+
+    async def _assert_terminal_closer_retry(
+        self, mode: str, fail_on_cancel: bool
+    ) -> None:
+        owner, browser, closer, _ = self._owner(
+            main_tab=_FakeTab("") if mode == "startup" else None
+        )
+        if mode != "startup":
+            await owner.start()
+        closer_started = asyncio.Event()
+        release_closer = asyncio.Event()
+        expire_closer = asyncio.Event()
+        overlapping_callers = asyncio.Event()
+        terminal_error = RuntimeError("closer failed while handling cancellation")
+        now = 0.0
+        caller_waits = 0
+        original_wait = asyncio.wait
+        deadlines: list[Deadline] = []
+        callers: list[asyncio.Task[BrowserOwner[_FakeBrowser, _FakeTab] | None]] = []
+
+        async def cancellable_close(
+            observed_browser: _FakeBrowser, deadline: Deadline
+        ) -> None:
+            self.assertIs(observed_browser, browser)
+            deadlines.append(deadline)
+            closer_started.set()
+            try:
+                await release_closer.wait()
+            except asyncio.CancelledError:
+                if fail_on_cancel:
+                    raise terminal_error
+                raise
+
+        async def ordered_wait(
+            tasks: tuple[asyncio.Task[None], ...], *, timeout: float
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            nonlocal now, caller_waits
+            (task,) = tasks
+            if task is owner._browser_closer_task and not release_closer.is_set():
+                await closer_started.wait()
+                self.assertEqual(timeout, deadlines[0].remaining())
+                await expire_closer.wait()
+                now = deadlines[0].expires_at
+                return set(), {task}
+            if task is owner._close_task:
+                caller_waits += 1
+                if caller_waits == 2:
+                    overlapping_callers.set()
+            # Deliver the exact inner timeout first, independently of host speed.
+            return await original_wait(tasks)
+
+        closer.side_effect = cancellable_close
+        with (
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ),
+            patch.object(
+                owner_module,
+                "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": ordered_wait})),
+            ),
+        ):
+            inner: asyncio.Task[None] | None = None
+            try:
+                callers.append(
+                    asyncio.create_task(
+                        owner.start() if mode == "startup" else owner.close()
+                    )
+                )
+                await asyncio.wait_for(closer_started.wait(), timeout=1)
+                inner = owner._browser_closer_task
+                assert inner is not None
+                first_deadline = owner._close_deadline
+                if mode == "concurrent":
+                    callers.append(asyncio.create_task(owner.close()))
+                    await asyncio.wait_for(overlapping_callers.wait(), timeout=1)
+                elif mode == "cancelled":
+                    callers[0].cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await callers[0]
+                    self.assertFalse(inner.done())
+                    self.assertIs(owner._close_deadline, first_deadline)
+                expire_closer.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*callers, return_exceptions=True), timeout=1
+                )
+                if mode == "startup":
+                    self.assertIsInstance(results[0], TabBindingError)
+                    assert isinstance(results[0], TabBindingError)
+                    self.assertIn(
+                        "BrowserOwnershipError", " ".join(results[0].__notes__)
+                    )
+                else:
+                    shared_task = owner._close_task
+                    assert shared_task is not None
+                    (failure,) = await asyncio.wait_for(
+                        asyncio.gather(shared_task, return_exceptions=True), timeout=1
+                    )
+                    self.assertIsInstance(failure, owner_module.BrowserOwnershipError)
+                    if mode == "concurrent":
+                        self.assertIs(results[0], failure)
+                        self.assertIs(results[1], failure)
+                (terminal,) = await asyncio.wait_for(
+                    asyncio.gather(inner, return_exceptions=True), timeout=1
+                )
+                if fail_on_cancel:
+                    self.assertIs(terminal, terminal_error)
+                else:
+                    self.assertTrue(inner.cancelled())
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSING)
+                closer.assert_awaited_once()
+                self.assertIs(owner._close_deadline, first_deadline)
+
+                release_closer.set()
+                fresh_deadline = Deadline.after(1)
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        owner.close(deadline=fresh_deadline),
+                        owner.close(deadline=fresh_deadline),
+                    ),
+                    timeout=1,
+                )
+                self.assertEqual(owner.state, BrowserOwnerState.CLOSED)
+                self.assertEqual(closer.await_count, 2)
+                self.assertIsNot(deadlines[1], first_deadline)
+                self.assertEqual(deadlines[1].expires_at, fresh_deadline.expires_at)
+                self.assertTrue(inner.done())
+                self.assertIsNone(owner._browser_closer_task)
+            finally:
+                expire_closer.set()
+                release_closer.set()
+                pending = [
+                    *callers,
+                    inner,
+                    owner._close_task,
+                    owner._browser_closer_task,
+                ]
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(task for task in pending if task is not None),
+                        return_exceptions=True,
+                    ),
+                    timeout=1,
+                )
+
     async def test_expired_first_close_never_starts_browser_closer(self) -> None:
         owner, _, browser_closer, _ = self._owner()
         await owner.start()
