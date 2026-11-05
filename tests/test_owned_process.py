@@ -4148,6 +4148,325 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
                 received_pin.retire()
 
 
+class PinnedPrivateFileCreationTests(unittest.TestCase):
+    @contextmanager
+    def _directory(self) -> Iterator[process_module._PrivateDirectory]:
+        with _private_directory_fixture() as directory:
+            path = Path(directory) / "private"
+            path.mkdir()
+            guard = process_module._PrivateDirectory.capture(path)
+            try:
+                yield guard
+            finally:
+                guard.remove(deadline=time.monotonic() + 5)
+
+    def test_new_file_completes_partial_writes_and_is_not_inherited(self) -> None:
+        with self._directory() as guard:
+            original_write = os.write
+            descriptors: list[int] = []
+
+            def write(descriptor: int, data: bytes) -> int:
+                self.assertFalse(os.get_inheritable(descriptor))
+                descriptors.append(descriptor)
+                return original_write(descriptor, data[:2])
+
+            with patch.object(os, "write", write):
+                guard.create_file("private-data", b"abcdefg")
+            self.assertEqual((guard.path / "private-data").read_bytes(), b"abcdefg")
+            self.assertEqual(len(descriptors), 4)
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+            if os.name == "posix":
+                self.assertEqual(
+                    (guard.path / "private-data").stat().st_mode & 0o777, 0o600
+                )
+
+    def test_existing_file_directory_and_symlink_are_not_overwritten(self) -> None:
+        with self._directory() as guard:
+            target = guard.path / "private-data"
+            target.write_bytes(b"keep")
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertEqual(target.read_bytes(), b"keep")
+            target.unlink()
+            target.mkdir()
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertTrue(target.is_dir())
+            target.rmdir()
+            outside = guard.path.parent / "outside"
+            outside.write_bytes(b"untouched")
+            target.symlink_to(outside)
+            with self.assertRaises((OSError, identity_module.DirectoryIdentityError)):
+                guard._pin.create_file(target.name, b"secret")
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"untouched")
+            # Cleanup has its own no-follow policy; this test owns this link.
+            target.unlink()
+
+    def test_names_cannot_escape_the_pinned_directory(self) -> None:
+        with self._directory() as guard:
+            with patch.object(os, "open", side_effect=AssertionError("must not open")):
+                for name in (
+                    "",
+                    ".",
+                    "..",
+                    "../x",
+                    "x/y",
+                    "x\\y",
+                    "/x",
+                    "C:x",
+                    "x\0y",
+                    "x.",
+                    "x ",
+                ):
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        guard.create_file(name, b"secret")
+            self.assertEqual(list(guard.path.iterdir()), [])
+
+    def test_replacement_at_native_create_still_targets_the_original_generation(
+        self,
+    ) -> None:
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self._assert_replacement_at_native_create(symlink)
+
+    def _assert_replacement_at_native_create(self, symlink: bool) -> None:
+        with self._directory() as guard:
+            original = guard.path.with_name("original")
+            replacement = guard.path.with_name("replacement")
+            replacement.mkdir()
+            (replacement / "keep").write_bytes(b"unrelated")
+
+            def replace() -> None:
+                guard.path.rename(original)
+                if symlink:
+                    guard.path.symlink_to(replacement, target_is_directory=True)
+                else:
+                    replacement.rename(guard.path)
+
+            original_open = os.open
+            original_create = identity_module._WindowsDirectoryApi.create_file
+
+            def posix_create(*args: Any, **kwargs: Any) -> int:
+                replace()
+                return original_open(*args, **kwargs)
+
+            def windows_create(
+                api: identity_module._WindowsDirectoryApi, native: int, name: str
+            ) -> int:
+                replace()
+                return original_create(api, native, name)
+
+            try:
+                with (
+                    patch.object(os, "open", posix_create)
+                    if os.name == "posix"
+                    else patch.object(
+                        identity_module._WindowsDirectoryApi,
+                        "create_file",
+                        windows_create,
+                    )
+                ):
+                    guard.create_file("private-data", b"secret")
+                self.assertEqual((original / "private-data").read_bytes(), b"secret")
+                self.assertFalse((guard.path / "private-data").exists())
+                self.assertEqual((guard.path / "keep").read_bytes(), b"unrelated")
+            finally:
+                if original.exists():
+                    if symlink:
+                        guard.path.unlink()
+                    else:
+                        guard.path.rename(replacement)
+                    original.rename(guard.path)
+
+    def test_partial_write_error_closes_once_and_preserves_original_failure(
+        self,
+    ) -> None:
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails):
+                self._assert_partial_write_failure(close_fails)
+
+    def _assert_partial_write_failure(self, close_fails: bool) -> None:
+        with self._directory() as guard:
+            original_write, original_close = os.write, os.close
+            failure = OSError("synthetic partial write failure")
+            calls: list[int] = []
+            closed: list[int] = []
+
+            def write(descriptor: int, data: bytes) -> int:
+                calls.append(descriptor)
+                if len(calls) == 1:
+                    return original_write(descriptor, data[:2])
+                raise failure
+
+            def close(descriptor: int) -> None:
+                closed.append(descriptor)
+                original_close(descriptor)
+                if close_fails:
+                    raise OSError("synthetic close failure")
+
+            with (
+                patch.object(os, "write", write),
+                patch.object(os, "close", close),
+                self.assertRaises(OSError) as raised,
+            ):
+                guard.create_file("partial", b"secret")
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(closed, [calls[0]])
+            self.assertEqual((guard.path / "partial").read_bytes(), b"se")
+            with self.assertRaises(OSError):
+                os.fstat(calls[0])
+            if close_fails:
+                self.assertIn(
+                    "Private file close also failed: OSError", failure.__notes__
+                )
+
+    def test_zero_write_fails_and_releases_the_file_descriptor(self) -> None:
+        with self._directory() as guard:
+            descriptors: list[int] = []
+
+            def no_progress(descriptor: int, _data: bytes) -> int:
+                descriptors.append(descriptor)
+                return 0
+
+            with patch.object(os, "write", no_progress), self.assertRaises(OSError):
+                guard.create_file("empty", b"secret")
+            self.assertEqual((guard.path / "empty").read_bytes(), b"")
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
+    def test_close_error_does_not_retry_a_reused_descriptor(self) -> None:
+        with self._directory() as guard:
+            original_close = os.close
+            reused: list[int] = []
+            closed: list[int] = []
+            failure = OSError("synthetic ambiguous close")
+
+            def close(descriptor: int) -> None:
+                original_close(descriptor)
+                closed.append(descriptor)
+                reused.append(os.open(guard.path / "private-data", os.O_RDONLY))
+                raise failure
+
+            try:
+                with (
+                    patch.object(os, "close", close),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    guard.create_file("private-data", b"secret")
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(len(closed), 1)
+                self.assertEqual(os.read(reused[0], 6), b"secret")
+            finally:
+                for descriptor in reused:
+                    original_close(descriptor)
+
+    def test_delegated_pin_creates_once_and_retired_pin_cannot_create(self) -> None:
+        with self._directory() as guard:
+            alias = identity_module.DirectoryPin.capture(guard.path)
+            try:
+                guard._pin.share_authority(alias)
+                alias.create_file("from-alias", b"shared authority")
+                self.assertEqual(
+                    (guard.path / "from-alias").read_bytes(), b"shared authority"
+                )
+            finally:
+                if alias.authority is alias:
+                    alias.retire()
+        # The real guard's ordinary cleanup has now retired their shared pin.
+        for pin in (guard._pin, alias):
+            with self.assertRaises(identity_module.DirectoryIdentityError):
+                pin.create_file("too-late", b"secret")
+        self.assertFalse(guard.path.exists())
+
+    def test_windows_relative_create_uses_native_exclusive_no_reparse_contract(
+        self,
+    ) -> None:
+        kernel, native = Mock(), Mock()
+        with patch.object(ctypes, "WinDLL", side_effect=[kernel, native], create=True):
+            api = identity_module._WindowsDirectoryApi()
+        name = "private-\U0001f512"
+
+        def create(
+            output: Any,
+            access: int,
+            attributes: Any,
+            status: Any,
+            allocation: Any,
+            flags: int,
+            sharing: int,
+            disposition: int,
+            options: int,
+            ea: Any,
+            ea_length: int,
+        ) -> int:
+            value = attributes._obj
+            self.assertEqual(value.RootDirectory, 321)
+            self.assertEqual(value.Attributes, 0x1040)
+            native_name = value.ObjectName.contents
+            self.assertEqual(
+                ctypes.string_at(native_name.Buffer, native_name.Length),
+                name.encode("utf-16-le"),
+            )
+            self.assertEqual(access, 0x100002)
+            self.assertEqual(
+                (flags, sharing, disposition, options), (0x80, 0, 2, 0x200060)
+            )
+            self.assertEqual((allocation, ea, ea_length), (None, None, 0))
+            output._obj.value = 123
+            status._obj.Information = 2
+            return 0
+
+        native.NtCreateFile.side_effect = create
+        self.assertEqual(api.create_file(321, name), 123)
+        kernel.CreateFileW.assert_not_called()
+        api.close(123)
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_windows_native_failure_never_falls_back_to_path_creation(self) -> None:
+        kernel, native = Mock(), Mock()
+        with patch.object(ctypes, "WinDLL", side_effect=[kernel, native], create=True):
+            api = identity_module._WindowsDirectoryApi()
+        # Collision, reparse encountered, and unsupported-parameter status.
+        for status in (0xC0000035, 0xC000050B, 0xC000000D):
+            native.NtCreateFile.return_value = ctypes.c_int32(status).value
+            with (
+                self.subTest(status=status),
+                self.assertRaisesRegex(
+                    identity_module.DirectoryIdentityError, f"{status:#x}"
+                ),
+            ):
+                api.create_file(321, "private-data")
+        self.assertEqual(native.NtCreateFile.call_count, 3)
+        kernel.CreateFileW.assert_not_called()
+        kernel.CloseHandle.assert_not_called()
+
+    def test_windows_file_descriptor_handoff_is_writable_and_consumed_once(
+        self,
+    ) -> None:
+        convert = Mock(return_value=987)
+        api = Mock(spec=identity_module._WindowsDirectoryApi)
+        failure = OSError("synthetic fd conversion failure")
+        with (
+            patch.dict(
+                sys.modules, {"msvcrt": SimpleNamespace(open_osfhandle=convert)}
+            ),
+            patch.object(os, "O_NOINHERIT", 0x80, create=True),
+            patch.object(os, "O_BINARY", 0x8000, create=True),
+        ):
+            self.assertEqual(
+                identity_module._windows_descriptor(123, api, writable=True), 987
+            )
+            convert.assert_called_once_with(123, os.O_WRONLY | 0x8000 | 0x80)
+            api.close.assert_not_called()
+            convert.side_effect = failure
+            with self.assertRaises(OSError) as raised:
+                identity_module._windows_descriptor(456, api, writable=True)
+            self.assertIs(raised.exception, failure)
+            api.close.assert_called_once_with(456)
+
+
 class PrivateDirectoryCleanupTests(unittest.TestCase):
     def test_owned_worker_removes_exact_private_directory(self) -> None:
         with _private_directory_fixture(prefix="hbrowser-owned-remove-") as directory:

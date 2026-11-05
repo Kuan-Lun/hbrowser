@@ -194,13 +194,10 @@ globalThis.hbrowserProxyReady = async token => {{
     private_directory = _PrivateDirectory.capture(plugin_dir)
 
     try:
-        manifest_path = plugin_dir / "manifest.json"
-        manifest_path.write_text(manifest_json, encoding="utf-8")
-
-        background_path = plugin_dir / "background.js"
-        background_path.write_text(background_js, encoding="utf-8")
-        (plugin_dir / "verification-token").write_text(
-            verification_token, encoding="ascii"
+        private_directory.create_file("manifest.json", manifest_json.encode("utf-8"))
+        private_directory.create_file("background.js", background_js.encode("utf-8"))
+        private_directory.create_file(
+            "verification-token", verification_token.encode("ascii")
         )
         if not private_directory._assert_identity_or_absence():
             raise ProcessOwnershipError("Proxy extension disappeared during creation")

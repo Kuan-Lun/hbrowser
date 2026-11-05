@@ -217,6 +217,13 @@ class _PrivateDirectory:
     def cleanup_path(self) -> Path:
         return self.path if self._resolved_path is None else self._resolved_path
 
+    def create_file(self, name: str, data: bytes) -> None:
+        """Create private contents in the captured native directory generation."""
+        try:
+            self._pin.create_file(name, data)
+        except DirectoryIdentityError as error:
+            raise ProcessOwnershipError(str(error)) from error
+
     @classmethod
     def capture(
         cls,

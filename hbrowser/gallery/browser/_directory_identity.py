@@ -26,6 +26,15 @@ class _WindowsDirectoryApi:
     _DUPLICATE_SAME_ACCESS = 2
     _FILE_STANDARD_INFO = 1
     _FILE_ID_INFO = 18
+    _FILE_WRITE_DATA = 0x2
+    _SYNCHRONIZE = 0x100000
+    _FILE_CREATE = 2
+    _FILE_CREATED = 2
+    _FILE_NON_DIRECTORY_FILE = 0x40
+    _FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+    _FILE_OPEN_REPARSE_POINT = 0x200000
+    _OBJ_CASE_INSENSITIVE = 0x40
+    _OBJ_DONT_REPARSE = 0x1000
 
     def __init__(self) -> None:
         from ctypes import wintypes
@@ -45,12 +54,53 @@ class _WindowsDirectoryApi:
                 ("FileId", ctypes.c_ubyte * 16),
             ]
 
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [
+                ("Length", ctypes.c_uint16),
+                ("MaximumLength", ctypes.c_uint16),
+                ("Buffer", ctypes.c_void_p),
+            ]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [
+                ("Length", ctypes.c_uint32),
+                ("RootDirectory", ctypes.c_void_p),
+                ("ObjectName", ctypes.POINTER(UnicodeString)),
+                ("Attributes", ctypes.c_uint32),
+                ("SecurityDescriptor", ctypes.c_void_p),
+                ("SecurityQualityOfService", ctypes.c_void_p),
+            ]
+
+        class IoStatusValue(ctypes.Union):
+            _fields_ = [("Status", ctypes.c_int32), ("Pointer", ctypes.c_void_p)]
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [("Result", IoStatusValue), ("Information", ctypes.c_size_t)]
+
         loader = getattr(ctypes, "WinDLL", None)
         if loader is None:
             raise DirectoryIdentityError("Native Windows directory APIs unavailable")
         self.kernel32: Any = loader("kernel32", use_last_error=True)
+        self.ntdll: Any = loader("ntdll")
         self.standard_info_type = FileStandardInfo
         self.file_id_type = FileIdInfo
+        self.unicode_string_type = UnicodeString
+        self.object_attributes_type = ObjectAttributes
+        self.io_status_type = IoStatusBlock
+        self.ntdll.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            ctypes.c_uint32,
+            ctypes.POINTER(ObjectAttributes),
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        self.ntdll.NtCreateFile.restype = ctypes.c_int32
         self.kernel32.CreateFileW.argtypes = [
             wintypes.LPCWSTR,
             wintypes.DWORD,
@@ -107,6 +157,60 @@ class _WindowsDirectoryApi:
         if not self.kernel32.CloseHandle(handle):
             raise self.error("CloseHandle directory pin")
 
+    def create_file(self, directory: int, name: str) -> int:
+        """Create one exclusive child relative to the held native generation."""
+        from ctypes import wintypes
+
+        # Byte lengths, not Python character counts, define UNICODE_STRING.
+        encoded = name.encode("utf-16-le")
+        if len(encoded) > 65532:
+            raise ValueError("Private file name is too long")
+        buffer = ctypes.create_string_buffer(encoded + b"\0\0")
+        native_name = self.unicode_string_type(
+            len(encoded), len(encoded) + 2, ctypes.addressof(buffer)
+        )
+        attributes = self.object_attributes_type(
+            ctypes.sizeof(self.object_attributes_type),
+            directory,
+            ctypes.pointer(native_name),
+            self._OBJ_CASE_INSENSITIVE | self._OBJ_DONT_REPARSE,
+            None,
+            None,
+        )
+        result = wintypes.HANDLE()
+        status_block = self.io_status_type()
+        status = int(
+            self.ntdll.NtCreateFile(
+                ctypes.byref(result),
+                self._FILE_WRITE_DATA | self._SYNCHRONIZE,
+                ctypes.byref(attributes),
+                ctypes.byref(status_block),
+                None,
+                0x80,  # FILE_ATTRIBUTE_NORMAL
+                0,  # No concurrent access while the private contents are written.
+                self._FILE_CREATE,
+                self._FILE_NON_DIRECTORY_FILE
+                | self._FILE_OPEN_REPARSE_POINT
+                | self._FILE_SYNCHRONOUS_IO_NONALERT,
+                None,
+                0,
+            )
+        )
+        if status < 0:
+            # Native NTSTATUS is not GetLastError. Never retry without the
+            # reparse protection or reopen the directory through its pathname.
+            raise DirectoryIdentityError(
+                "Native private file creation failed: "
+                f"NTSTATUS {status & 0xFFFFFFFF:#x}"
+            )
+        handle = result.value
+        if handle is None or handle == ctypes.c_void_p(-1).value:
+            raise DirectoryIdentityError("Native private file creation has no HANDLE")
+        if status != 0 or status_block.Information != self._FILE_CREATED:
+            self.close(int(handle))
+            raise DirectoryIdentityError("Native private file was not newly created")
+        return int(handle)
+
     def duplicate(
         self, handle: int, *, source: int | None = None, inheritable: bool = False
     ) -> int:
@@ -156,7 +260,9 @@ class _WindowsDirectoryApi:
         )
 
 
-def _windows_descriptor(handle: int, api: _WindowsDirectoryApi) -> int:
+def _windows_descriptor(
+    handle: int, api: _WindowsDirectoryApi, *, writable: bool = False
+) -> int:
     try:
         import msvcrt
 
@@ -166,7 +272,13 @@ def _windows_descriptor(handle: int, api: _WindowsDirectoryApi) -> int:
             raise DirectoryIdentityError(
                 "Non-inheritable Windows fd conversion unavailable"
             )
-        return cast(Callable[[int, int], int], convert)(handle, os.O_RDONLY | noinherit)
+        flags = os.O_RDONLY
+        if writable:
+            binary = getattr(os, "O_BINARY", None)
+            if binary is None:
+                raise DirectoryIdentityError("Binary Windows fd conversion unavailable")
+            flags = os.O_WRONLY | binary
+        return cast(Callable[[int, int], int], convert)(handle, flags | noinherit)
     except BaseException:
         api.close(handle)
         raise
@@ -354,6 +466,60 @@ class DirectoryPin:
 
                 return fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 3)
             return os.dup(descriptor)
+
+    def create_file(self, name: str, data: bytes) -> None:
+        """Write a new plain child without resolving this directory's path again.
+
+        A renamed directory stays the target; a retired pin, existing child or
+        reparse point is rejected. A failed write remains this generation's
+        cleanup responsibility. Neither write nor close failure retries a path.
+        """
+        if (
+            not name
+            or name in {".", ".."}
+            or any(character in name for character in ("/", "\\", ":", "\0"))
+            or name.endswith((".", " "))
+        ):
+            raise ValueError("Private file name must be one plain path component")
+        authority = self.authority
+        if authority is not self:
+            authority.create_file(name, data)
+            return
+        # Retire/share cannot close the root descriptor during creation or write.
+        with self._lock:
+            directory = self._require_descriptor()
+            if os.name == "nt":
+                api = _WindowsDirectoryApi()
+                descriptor = _windows_descriptor(
+                    api.create_file(_windows_handle(directory), name),
+                    api,
+                    writable=True,
+                )
+            else:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=directory,
+                )
+            try:
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("Private file write made no progress")
+                    remaining = remaining[written:]
+            except BaseException as write_error:
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:
+                    write_error.add_note(
+                        f"Private file close also failed: {type(close_error).__name__}"
+                    )
+                raise
+            else:
+                # A close error is ambiguous; never retry against a reused fd.
+                os.close(descriptor)
 
     @contextmanager
     def exported(self) -> Iterator[int]:
