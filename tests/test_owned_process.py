@@ -3626,29 +3626,59 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
                         guard, namespace.path, namespace, confirmed=True, started=True
                     )
                     displaced = base / "displaced"
-                    if moved == "namespace":
-                        namespace.path.rename(displaced)
-                    else:
-                        (namespace.path / "tree").rename(displaced)
-                        if moved == "root-and-deleted-namespace":
-                            namespace.path.rmdir()
+                    retained_root = base / "retained-root"
+                    root_moved = False
+                    namespace_moved = False
                     try:
-                        with self.assertRaises(process_module.ProcessOwnershipError):
+                        if moved == "namespace":
+                            # Windows rejects ancestor renames with an open
+                            # descendant. Keep both pins alive, but first move
+                            # the root out so the namespace rename is possible.
+                            (namespace.path / "tree").rename(retained_root)
+                            root_moved = True
+                            namespace.path.rename(displaced)
+                            namespace_moved = True
+                        else:
+                            (namespace.path / "tree").rename(displaced)
+                            if moved == "root-and-deleted-namespace":
+                                namespace.path.rmdir()
+                        with self.assertRaises(
+                            process_module.ProcessOwnershipError
+                        ) as raised:
                             if moved == "root":
                                 guard._remove_inline(
                                     namespace=namespace, deadline=time.monotonic() + 2
                                 )
                             else:
                                 claim.complete()
-                        secret = displaced / (
-                            "tree/secret" if moved == "namespace" else "secret"
+                        root_path = retained_root if moved == "namespace" else displaced
+                        self.assertEqual(
+                            (root_path / "secret").read_bytes(), b"retained"
                         )
-                        self.assertEqual(secret.read_bytes(), b"retained")
+                        metadata = root_path.stat()
+                        self.assertEqual(
+                            (metadata.st_dev, metadata.st_ino),
+                            (guard.device, guard.inode),
+                        )
                         self.assertFalse(guard._pin.retired)
                         self.assertFalse(guard._pin.deleted())
+                        if moved == "namespace":
+                            self.assertIn(
+                                "native deletion proof", str(raised.exception)
+                            )
+                            metadata = displaced.stat()
+                            self.assertEqual(
+                                (metadata.st_dev, metadata.st_ino),
+                                (namespace.device, namespace.inode),
+                            )
+                            self.assertFalse(namespace._pin.retired)
+                            self.assertFalse(namespace._pin.deleted())
                     finally:
                         if moved == "namespace":
-                            displaced.rename(namespace.path)
+                            if namespace_moved:
+                                displaced.rename(namespace.path)
+                            if root_moved:
+                                retained_root.rename(namespace.path / "tree")
                         elif moved == "root":
                             displaced.rename(namespace.path / "tree")
                         # A genuinely removed namespace cannot be recaptured as
