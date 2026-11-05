@@ -208,7 +208,8 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
 
     async def _assert_configured_success(self, *, headless: bool, proxy: bool) -> None:
         os.environ[_ENVIRONMENT_VARIABLE] = str(self.executable)
-        self.proxy.return_value = str(self.extension) if proxy else None
+        extension_guard = _PrivateDirectory.capture(self.extension) if proxy else None
+        self.proxy.return_value = extension_guard
 
         result = await factory.create_browser(headless=headless)
 
@@ -233,6 +234,7 @@ class ConfiguredChromeStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(guard, _PrivateDirectory.capture(guard.path))
         self.assertNotIn(str(self.executable), cleanup_paths)
         if proxy:
+            self.assertIs(guards[-1], extension_guard)
             self.assertIn(f"--load-extension={self.extension}", parameters)
         else:
             self.assertIn("--disable-extensions", parameters)
