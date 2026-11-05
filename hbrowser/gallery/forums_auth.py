@@ -77,11 +77,16 @@ async def fill_forums_login_form(
     timeout = min(5.0, deadline.remaining())
     if timeout <= 0:
         raise TimeoutError("Login-form deadline expired before credential input")
-    arguments = json.dumps([username, password], ensure_ascii=True)
     script = (
-        """((username, password) => {
+        """(() => {
         if (window !== window.top ||
             window.location.origin !== 'https://forums.e-hentai.org') return false;
+        """
+        # No spread/iterator or credential-bearing page call may precede origin
+        # validation: a replacement document controls its own Array prototype.
+        + f"const username = {json.dumps(username, ensure_ascii=True)};\n"
+        + f"const password = {json.dumps(password, ensure_ascii=True)};\n"
+        + """
         const user = document.querySelector('[name="UserName"]');
         const pass = document.querySelector('[name="PassWord"]');
         if (!(user instanceof HTMLInputElement) ||
@@ -93,9 +98,7 @@ async def fill_forums_login_form(
         user.dispatchEvent(new Event('input', {bubbles: true}));
         pass.dispatchEvent(new Event('input', {bubbles: true}));
         return true;
-    })(..."""
-        + arguments
-        + ")"
+    })()"""
     )
     accepted = await wait_for_zendriver_mutation(
         page.evaluate(script),

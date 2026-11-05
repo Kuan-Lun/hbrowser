@@ -86,6 +86,7 @@ class ForumsCredentialTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(origin=origin, top_frame=top_frame, fields=fields):
                 writes: list[object] = []
+                leaked: list[object] = []
 
                 async def evaluate(
                     expression: str,
@@ -93,6 +94,7 @@ class ForumsCredentialTests(unittest.IsolatedAsyncioTestCase):
                     top_frame: bool = top_frame,
                     fields: bool = fields,
                     writes: list[object] = writes,
+                    leaked: list[object] = leaked,
                 ) -> object:
                     program = """
 const fs = require('fs');
@@ -105,8 +107,16 @@ class HTMLInputElement {
 const window = {location: {origin: input.origin}};
 window.top = input.top ? window : {};
 const document = {querySelector: () => input.fields ? new HTMLInputElement() : null};
-const result = eval(input.expression);
-process.stdout.write(JSON.stringify({result, writes}));
+const leaked = [];
+const originalIterator = Array.prototype[Symbol.iterator];
+Array.prototype[Symbol.iterator] = function() {
+    for (let i = 0; i < this.length; ++i) leaked.push(this[i]);
+    return originalIterator.call(this);
+};
+let result;
+try { result = eval(input.expression); }
+finally { Array.prototype[Symbol.iterator] = originalIterator; }
+process.stdout.write(JSON.stringify({result, writes, leaked}));
 """
                     result = subprocess.run(
                         [node, "-e", program],
@@ -124,6 +134,7 @@ process.stdout.write(JSON.stringify({result, writes}));
                         timeout=5,
                     )
                     report = json.loads(result.stdout)
+                    leaked.extend(report["leaked"])
                     writes.extend(report["writes"])
                     return report["result"]
 
@@ -133,11 +144,14 @@ process.stdout.write(JSON.stringify({result, writes}));
                 if accepted:
                     await fill_forums_login_form(
                         page,
-                        'synthetic-"user',
-                        "synthetic-pass",
+                        'synthetic-"user\\\n例',
+                        "synthetic-pass'\\\n碼",
                         deadline=Deadline.after(5),
                     )
-                    self.assertEqual(writes, ['synthetic-"user', "synthetic-pass"])
+                    self.assertEqual(
+                        writes,
+                        ['synthetic-"user\\\n例', "synthetic-pass'\\\n碼"],
+                    )
                 else:
                     with self.assertRaises(LoginFailedException):
                         await fill_forums_login_form(
@@ -147,3 +161,6 @@ process.stdout.write(JSON.stringify({result, writes}));
                             deadline=Deadline.after(5),
                         )
                     self.assertEqual(writes, [])
+                # Assert outside the mutation callback so the public mutation
+                # error translation cannot obscure this security oracle.
+                self.assertEqual(leaked, [])
