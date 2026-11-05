@@ -417,7 +417,7 @@ def _posix_exit_receipts_supported() -> bool:
 
 def _write_status(status_path: Path, value: str) -> None:
     temporary = status_path.with_suffix(".tmp")
-    temporary.write_text(f"{value}\n", encoding="utf-8")
+    temporary.write_bytes(f"{value}\n".encode())
     os.replace(temporary, status_path)
 
 

@@ -16,6 +16,8 @@ fi
 PYTEST_ADDOPTS= "$process_python" scripts/_shared/h2h_dev_tools/git_environment.py \
     --repository "$repository_root" -- "$process_python" scripts/pytest-source.py \
     tests/test_owned_process.py \
+    tests/test_process_protocol_frames.py \
+    tests/test_proxy_logging.py::ProxyLoggingTests::test_manifest_directory_replacement_never_receives_proxy_secrets \
     tests/test_browser_factory.py \
     tests/test_runtime_test_owner.py \
     tests/test_tor_cleanup.py \

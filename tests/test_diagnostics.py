@@ -1632,7 +1632,10 @@ def test_first_diagnostic_does_not_start_a_resource_tracker(tmp_path: Path) -> N
     environment = {
         "PATH": os.defpath,
         "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
         "TMPDIR": str(tmp_path),
+        "TEMP": str(tmp_path),
+        "TMP": str(tmp_path),
         "PYTHONPATH": str(root),
         "PYTHONPYCACHEPREFIX": str(tmp_path / "bytecode"),
         "PYTHONDONTWRITEBYTECODE": "1",

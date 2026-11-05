@@ -218,6 +218,13 @@ def _wait_permission(permission: threading.Event, *, deadline: float) -> None:
         raise ProcessOwnershipError("Late private cleanup acknowledgement")
 
 
+def _write_frame(frame: bytes) -> None:
+    # The parent parses canonical LF bytes, including on Windows. Text stdout
+    # would translate the terminator and invalidate the native identity proof.
+    sys.stdout.buffer.write(frame)
+    sys.stdout.buffer.flush()
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     stage = "argument-parsing"
     guard: _PrivateDirectory | None = None
@@ -270,13 +277,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             send_pin(channel, namespace._pin)
         else:
             native_suffix = f" {namespace._pin.native_handle()}"
-        sys.stdout.write(f"ready {namespace.device} {namespace.inode}{native_suffix}\n")
-        sys.stdout.flush()
+        _write_frame(
+            f"ready {namespace.device} {namespace.inode}{native_suffix}\n".encode(
+                "ascii"
+            )
+        )
         _wait_permission(claim_allowed, deadline=deadline)
         stage = "directory-claim"
         guard._claim_inline(namespace, confirmed=confirmed, deadline=deadline)
-        sys.stdout.write("claimed\n")
-        sys.stdout.flush()
+        _write_frame(b"claimed\n")
         _wait_permission(removal_allowed, deadline=deadline)
         stage = "directory-removal"
 
@@ -284,8 +293,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             assert guard is not None and root_released is not None
             if not guard._pin.deleted():
                 raise ProcessOwnershipError("Private root lacks native deletion proof")
-            sys.stdout.write("removed\n")
-            sys.stdout.flush()
+            _write_frame(b"removed\n")
             _wait_permission(root_released, deadline=deadline)
             guard._retire()
 
@@ -295,8 +303,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 raise ProcessOwnershipError(
                     "Private namespace lacks native deletion proof"
                 )
-            sys.stdout.write("finished\n")
-            sys.stdout.flush()
+            _write_frame(b"finished\n")
             _wait_permission(namespace_released, deadline=deadline)
             namespace._retire()
 

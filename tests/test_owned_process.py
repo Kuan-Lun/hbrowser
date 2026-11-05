@@ -3858,7 +3858,9 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
             guard = process_module._PrivateDirectory.capture(path)
             namespace = process_module._PrivateDirectory.capture(namespace_path)
             retained: list[identity_module.DirectoryPin] = []
-            output = io.StringIO()
+            output = io.BytesIO()
+            stdout = io.TextIOWrapper(output, encoding="ascii", newline="\r\n")
+            failure = RuntimeError("failed after ready")
             incoming = None
             sender = receiver = None
             channel = -1
@@ -3890,15 +3892,17 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
                     patch.object(
                         cleanup_worker_module,
                         "_wait_permission",
-                        side_effect=RuntimeError("failed after ready"),
+                        side_effect=failure,
                     ),
-                    patch.object(cleanup_worker_module, "_report_failure"),
+                    patch.object(cleanup_worker_module, "_report_failure") as report,
                     patch.object(threading, "Thread"),
                     patch.object(sys, "stdin", Mock(fileno=Mock(return_value=0))),
-                    patch.object(sys, "stdout", output),
+                    patch.object(sys, "stdout", stdout),
                 ):
                     self.assertEqual(cleanup_worker_module.main(()), 1)
-                self.assertTrue(output.getvalue().startswith("ready "))
+                self.assertTrue(output.getvalue().startswith(b"ready "))
+                report.assert_called_once()
+                self.assertIs(report.call_args.args[1], failure)
                 self.assertEqual(retained, [guard._pin, namespace._pin])
                 self.assertFalse(guard._pin.retired)
                 self.assertFalse(namespace._pin.retired)
@@ -3914,6 +3918,7 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
                 )
                 self.assertTrue(path.is_dir())
             finally:
+                stdout.close()
                 if sender is not None:
                     sender.close()
                 if receiver is not None:
@@ -4009,12 +4014,30 @@ class PrivateDirectoryNativeIdentityTests(unittest.TestCase):
                 path.rmdir()
                 self.assertTrue(guard._pin.deleted())
                 self.assertFalse(guard._assert_identity_or_absence())
-                with self.assertRaises(OSError):
+                self.assertFalse(guard._pin.retired)
+                recreated_while_pinned = True
+                try:
                     path.mkdir()
-                guard._retire()
-                path.mkdir()
+                except OSError:
+                    self.assertTrue(guard._pin.deleted())
+                    self.assertFalse(guard._pin.retired)
+                    recreated_while_pinned = False
+                    guard._retire()
+                    path.mkdir()
+                replacement = process_module._PrivateDirectory.capture(path)
+                if recreated_while_pinned:
+                    self.assertNotEqual(
+                        (replacement.device, replacement.inode),
+                        (guard.device, guard.inode),
+                    )
+                    self.assertTrue(guard._pin.deleted())
+                    self.assertFalse(guard._assert_identity_or_absence())
+                    self.assertFalse(guard._pin.retired)
                 (path / "foreign").write_text("keep")
+                guard._retire()
+                self.assertTrue(guard._pin.retired)
                 guard.remove(deadline=time.monotonic() + 1)
+                self.assertTrue(replacement._assert_identity_or_absence())
                 self.assertEqual((path / "foreign").read_text(), "keep")
             finally:
                 guard._retire()
@@ -4991,29 +5014,56 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 self.assertTrue((root / "displaced").is_dir())
 
     def test_namespace_retry_revalidates_before_root_removal(self) -> None:
+        self._assert_namespace_retry_revalidates(parent_alias=False)
+
+    @unittest.skipUnless(os.name == "posix", "Fixture creates a parent symlink")
+    def test_namespace_retry_revalidates_with_parent_alias(self) -> None:
+        self._assert_namespace_retry_revalidates(parent_alias=True)
+
+    def _assert_namespace_retry_revalidates(self, *, parent_alias: bool) -> None:
         with _private_directory_fixture(
             prefix="hbrowser-namespace-retry-"
         ) as directory:
-            root = Path(directory)
-            path = root / "profile"
+            root = Path(directory).resolve()
+            parent = root / "parent"
+            parent.mkdir()
+            if parent_alias:
+                alias = root / "alias"
+                alias.symlink_to(parent, target_is_directory=True)
+                parent = alias
+            path = parent / "profile"
             path.mkdir()
             guard = process_module._PrivateDirectory.capture(path, platform_name="nt")
             with _claimed_namespace(guard) as namespace:
+                canonical_namespace = namespace.cleanup_path
+                if parent_alias:
+                    self.assertNotEqual(namespace.path, canonical_namespace)
+                    self.assertTrue(namespace.path.samefile(canonical_namespace))
+                else:
+                    self.assertEqual(namespace.path, canonical_namespace)
                 original_rmdir = Path.rmdir
+                removal_attempts: list[Path] = []
+                replacements = 0
 
                 def locked_namespace(target: Path) -> None:
-                    if target == namespace.path:
+                    if target == canonical_namespace:
+                        removal_attempts.append(target)
                         raise _windows_cleanup_error(32)
                     original_rmdir(target)
 
                 def replace(_: float) -> None:
-                    namespace.path.rename(root / "displaced-namespace")
-                    namespace.path.mkdir()
-                    (namespace.path / "foreign").write_text("keep", encoding="utf-8")
+                    nonlocal replacements
+                    replacements += 1
+                    self.assertEqual(replacements, 1)
+                    canonical_namespace.rename(root / "displaced-namespace")
+                    canonical_namespace.mkdir()
+                    (canonical_namespace / "foreign").write_text(
+                        "keep", encoding="utf-8"
+                    )
 
                 with (
                     patch.object(Path, "rmdir", locked_namespace),
-                    patch.object(time, "sleep", replace),
+                    patch.object(time, "sleep", side_effect=replace) as sleep,
                     self.assertRaisesRegex(
                         process_module.ProcessOwnershipError, "identity changed"
                     ),
@@ -5021,10 +5071,18 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                     guard._remove_inline(
                         namespace=namespace, deadline=time.monotonic() + 1
                     )
+                self.assertEqual(removal_attempts, [canonical_namespace])
+                sleep.assert_called_once_with(ANY)
+                self.assertEqual(replacements, 1)
                 self.assertEqual(
-                    (namespace.path / "foreign").read_text(encoding="utf-8"), "keep"
+                    (canonical_namespace / "foreign").read_text(encoding="utf-8"),
+                    "keep",
                 )
-                self.assertTrue((root / "displaced-namespace").is_dir())
+                displaced = (root / "displaced-namespace").stat()
+                self.assertEqual(
+                    (displaced.st_dev, displaced.st_ino),
+                    (namespace.device, namespace.inode),
+                )
 
     def test_directory_removed_during_backoff_is_idempotent_success(self) -> None:
         with _private_directory_fixture(
@@ -5114,7 +5172,8 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 (root / "original/owned").read_text(encoding="utf-8"), "original"
             )
             self.assertIn(
-                str(namespace.path / "tree"), "\n".join(raised.exception.__notes__)
+                str(namespace.cleanup_path / "tree"),
+                "\n".join(raised.exception.__notes__),
             )
 
     def test_original_path_replacement_is_untouched_after_claim(self) -> None:
@@ -5256,6 +5315,7 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             )
             child.poll.return_value = 1
             child.wait.return_value = 1
+            job = Mock(spec=process_module._WindowsJob)
 
             def acknowledge(
                 active: process_module._ActivePrivateDirectoryCleanup,
@@ -5272,6 +5332,9 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
             with (
                 _mock_popen(return_value=child),
                 patch.object(
+                    process_module._WindowsJob, "create", return_value=job
+                ) as create_job,
+                patch.object(
                     process_module, "_acknowledge_private_directory_claim", acknowledge
                 ),
                 self.assertRaisesRegex(
@@ -5279,6 +5342,14 @@ class PrivateDirectoryCleanupTests(unittest.TestCase):
                 ),
             ):
                 guard.remove(deadline=time.monotonic() + 2)
+            if os.name == "nt":
+                create_job.assert_called_once_with()
+                job.assign.assert_called_once_with(child)
+                job.wait_empty.assert_called_once_with(timeout=ANY)
+                job.close.assert_called_once_with()
+                job.terminate.assert_not_called()
+            else:
+                create_job.assert_not_called()
             self.assertFalse(path.exists())
             self.assertIsNone(process_module._active_private_directory_cleanup(guard))
             self.assertNotIn(
