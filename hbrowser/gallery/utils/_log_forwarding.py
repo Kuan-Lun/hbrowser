@@ -892,14 +892,17 @@ class LogForwardingReceiver:
             or drain_timeout <= 0
         ):
             raise ValueError("forwarding drain timeout must be finite and positive")
+        deadline = time.monotonic() + float(drain_timeout)
         with self._clients_lock:
             self._stopping.set()
-            self._drain_deadline = time.monotonic() + float(drain_timeout)
+            self._drain_deadline = (
+                deadline
+                if self._drain_deadline is None
+                else min(self._drain_deadline, deadline)
+            )
 
         def remaining_budget() -> float:
-            deadline = self._drain_deadline
-            if deadline is None:
-                return 0.0
+            # Concurrent close callers and retries must not extend this call.
             return max(0.0, deadline - time.monotonic())
 
         try:
@@ -947,13 +950,12 @@ class LogForwardingReceiver:
             )
             self._report_failure("forward-drain", drain_error)
             self._discarded = True
-            self._stopped = True
             raise drain_error
         self._discarded = True
         self._stopped = True
 
-    def _discard_after_fork(self) -> None:
-        """Close inherited descriptors in a fork child whose threads vanished."""
+    def _abandon_delivery(self) -> None:
+        """Revoke delivery and close descriptors without claiming thread exit."""
         self._discarded = True
         self._delivery_enabled = False
         try:
@@ -965,6 +967,10 @@ class LogForwardingReceiver:
                 client.connection.close()
             except OSError:
                 pass
+
+    def _discard_after_fork(self) -> None:
+        """Close inherited descriptors in a fork child whose threads vanished."""
+        self._abandon_delivery()
         self._stopped = True
 
 
