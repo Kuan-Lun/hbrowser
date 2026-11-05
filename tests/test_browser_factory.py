@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -30,6 +31,7 @@ from hbrowser.gallery.utils import (
     ZendriverOperationTimeout,
     wait_for_zendriver,
 )
+from hbrowser.gallery.utils import deadline as deadline_module
 from hbrowser.gallery.utils.protocol import (
     ZendriverOwnerRetiredError,
     _begin_zendriver_retirement,
@@ -2638,6 +2640,94 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
                     await first
                 browser.stop.assert_awaited_once()
 
+    async def test_late_waiter_rejects_completed_cleanup_without_reopening_it(
+        self,
+    ) -> None:
+        now = 0.0
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_wait = asyncio.wait
+        later: asyncio.Task[None] | None = None
+
+        async def blocking_stop() -> None:
+            started.set()
+            await release.wait()
+
+        browser = _OwnedBrowser()
+        browser.stop.side_effect = blocking_stop
+
+        async def delayed_wait(
+            tasks: tuple[asyncio.Task[None], ...], *, timeout: float
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            nonlocal now
+            if asyncio.current_task() is later:
+                self.assertIs(
+                    tasks[0],
+                    _begin_zendriver_retirement(browser).existing_shutdown_task(),
+                )
+                release.set()
+                result = await original_wait(tasks, timeout=timeout)
+                self.assertTrue(tasks[0].done())
+                # Advance only the injected deadline clock after real cleanup
+                # completed, before this waiter can inspect that completion.
+                now = 1.0
+                return result
+            return await original_wait(tasks, timeout=timeout)
+
+        with (
+            patch.object(
+                deadline_module, "time", SimpleNamespace(monotonic=lambda: now)
+            ),
+            patch.object(
+                factory,
+                "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": delayed_wait})),
+            ),
+        ):
+            first = asyncio.create_task(factory.stop_browser(browser, Deadline(5.0)))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                later = asyncio.create_task(
+                    factory.stop_browser(browser, Deadline(1.0))
+                )
+                with self.assertRaisesRegex(
+                    ProcessOwnershipError, "completed after its caller deadline"
+                ):
+                    await asyncio.wait_for(later, 1)
+                await asyncio.wait_for(first, 1)
+                retirement = _begin_zendriver_retirement(browser)
+                self.assertTrue(retirement.is_complete())
+                self.assertTrue(retirement.browser_cleanup_is_complete())
+                self.assertEqual(
+                    retirement.lifecycle.shutdown_deadline_expires_at,
+                    5.0,
+                )
+                completed_task = retirement.existing_shutdown_task()
+                await factory.stop_browser(browser, Deadline(2.0))
+                self.assertIs(retirement.existing_shutdown_task(), completed_task)
+                browser.stop.assert_awaited_once()
+                browser.process_owner.shutdown.assert_called_once()
+            finally:
+                release.set()
+                await asyncio.gather(
+                    first, *(() if later is None else (later,)), return_exceptions=True
+                )
+
+    async def test_late_cleanup_failure_keeps_its_original_precedence(self) -> None:
+        for original in (ValueError("cleanup failed"), ProcessOwnershipError("owned")):
+            with self.subTest(error=type(original).__name__):
+
+                async def failed_cleanup(error: BaseException = original) -> None:
+                    raise error
+
+                task = asyncio.create_task(failed_cleanup())
+                await asyncio.gather(task, return_exceptions=True)
+                with self.assertRaises(type(original)) as raised:
+                    await factory._await_cleanup_deferring_caller_cancellation(
+                        task, Deadline(0.0)
+                    )
+                self.assertIs(raised.exception, original)
+
     async def test_concurrent_stop_callers_share_one_cleanup(self) -> None:
         browser_stop_started = asyncio.Event()
         allow_browser_stop = asyncio.Event()
@@ -2769,6 +2859,162 @@ class CreateBrowserCleanupTests(unittest.IsolatedAsyncioTestCase):
             deadline=unittest.mock.ANY,
         )
         self.assertTrue(operation.cancelled())
+
+    async def test_pending_browser_stop_retains_ownership_until_retry_settles(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        original_wait = asyncio.wait
+        browser = _OwnedBrowser()
+        retirement = _begin_zendriver_retirement(browser)
+
+        async def stubborn_stop() -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        browser.stop.side_effect = stubborn_stop
+
+        async def expired_stop_watchdog(
+            tasks: tuple[asyncio.Task[None], ...], *, timeout: float
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            (task,) = tasks
+            if task is retirement.existing_browser_stop_task() and not task.done():
+                await started.wait()
+                if task.cancelling():
+                    await cancellation_seen.wait()
+                return set(), {task}
+            return await original_wait(tasks, timeout=timeout)
+
+        registered_instances: set[object] = {browser}
+        with (
+            patch("hbrowser.gallery.browser.factory.asyncio_atexit.register"),
+            patch(
+                "hbrowser.gallery.browser.factory.asyncio_atexit.unregister"
+            ) as unregister,
+            patch.object(
+                zd.util, "get_registered_instances", return_value=registered_instances
+            ),
+            patch.object(
+                factory,
+                "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": expired_stop_watchdog})),
+            ),
+        ):
+            factory._register_browser_atexit(cast(zd.Browser, browser))
+            cleanup = getattr(browser, factory._BROWSER_ATEXIT_CLEANUP_ATTRIBUTE)
+            deadline = Deadline.after(5)
+            try:
+                for attempt in range(2):
+                    with self.assertRaisesRegex(
+                        ProcessOwnershipError, "cleanup remains unresolved"
+                    ) as raised:
+                        await asyncio.wait_for(
+                            factory.stop_browser(browser, deadline), 1
+                        )
+                    self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+                    stop_task = retirement.existing_browser_stop_task()
+                    assert stop_task is not None
+                    self.assertFalse(stop_task.done())
+                    self.assertFalse(retirement.browser_cleanup_is_complete())
+                    self.assertFalse(retirement.is_complete())
+                    self.assertIs(cleanup.browser, browser)
+                    self.assertIn(browser, registered_instances)
+                    unregister.assert_not_called()
+                    browser.stop.assert_awaited_once()
+                    self.assertEqual(
+                        browser.process_owner.shutdown.call_count, attempt + 1
+                    )
+                    self.assertEqual(
+                        retirement.lifecycle.shutdown_deadline_expires_at,
+                        deadline.expires_at,
+                    )
+                # The assertions above precede the fixture's cooperative release.
+                # A retry may finalize only after the exact retained task exits.
+                release.set()
+                assert stop_task is not None
+                await asyncio.wait_for(asyncio.shield(stop_task), 1)
+                await factory.stop_browser(browser, deadline)
+                self.assertTrue(retirement.is_complete())
+                self.assertIs(retirement.existing_browser_stop_task(), stop_task)
+                self.assertIsNone(cleanup.browser)
+                self.assertNotIn(browser, registered_instances)
+                unregister.assert_called_once_with(cleanup, loop=cleanup.loop)
+                browser.stop.assert_awaited_once()
+            finally:
+                release.set()
+                retained = retirement.existing_browser_stop_task()
+                if retained is not None:
+                    await asyncio.wait_for(asyncio.shield(retained), 1)
+                await factory.stop_browser(browser, deadline)
+
+    async def test_browser_stop_settling_during_fallback_can_finalize(self) -> None:
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+        original_wait = asyncio.wait
+        browser = _OwnedBrowser()
+        retirement = _begin_zendriver_retirement(browser)
+
+        async def stubborn_stop() -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        browser.stop.side_effect = stubborn_stop
+
+        async def expired_stop_watchdog(
+            tasks: tuple[asyncio.Task[None], ...], *, timeout: float
+        ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+            (task,) = tasks
+            if task is retirement.existing_browser_stop_task() and not task.done():
+                await started.wait()
+                if task.cancelling():
+                    await cancellation_seen.wait()
+                return set(), {task}
+            return await original_wait(tasks, timeout=timeout)
+
+        async def cleanup_while_stop_settles(operation: Callable[[], None]) -> None:
+            stop_task = retirement.existing_browser_stop_task()
+            assert stop_task is not None
+            self.assertFalse(stop_task.done())
+            self.assertTrue(cancellation_seen.is_set())
+            operation()
+            release.set()
+            await asyncio.wait_for(asyncio.shield(stop_task), 1)
+
+        with (
+            patch.object(
+                factory,
+                "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": expired_stop_watchdog})),
+            ),
+            patch.object(
+                factory, "_run_blocking_cleanup_in_thread", cleanup_while_stop_settles
+            ),
+        ):
+            try:
+                await asyncio.wait_for(factory.stop_browser(browser), 1)
+                self.assertTrue(retirement.is_complete())
+                retained = retirement.existing_browser_stop_task()
+                assert retained is not None
+                self.assertTrue(retained.done())
+                browser.stop.assert_awaited_once()
+                browser.process_owner.shutdown.assert_called_once()
+            finally:
+                release.set()
+                retained = retirement.existing_browser_stop_task()
+                if retained is not None:
+                    await asyncio.wait_for(asyncio.shield(retained), 1)
+                await factory.stop_browser(browser)
 
     async def test_tor_termination_failure_is_retried_without_browser_replay(
         self,

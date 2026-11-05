@@ -11,9 +11,65 @@ _CONTROL_PROTOCOL_TAG = b"hbrowser-control-v1"
 _MAX_DEADLINE_NS = (1 << 63) - 1
 MAX_START_LINE_BYTES = 64
 MAX_CONTROL_LINE_BYTES = 96
+MAX_STATUS_LINE_BYTES = 192
 PROVEN_PROTOCOL_FAILURE_EXIT_CODE = 4
 PROVEN_CLEANUP_FAILURE_EXIT_CODE = 5
 PROVEN_TARGET_NOT_STARTED_EXIT_CODE = 6
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyReceipt:
+    """Bind one started target to its supervisor and pinned private generation."""
+
+    supervisor_pid: int
+    directory_device: int
+    directory_inode: int
+    target_pid: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.supervisor_pid,
+            self.directory_device,
+            self.directory_inode,
+            self.target_pid,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            raise TypeError("READY identities must be integers")
+        if (
+            min(values) < 0
+            or self.supervisor_pid == 0
+            or self.target_pid == 0
+            or self.supervisor_pid == self.target_pid
+        ):
+            raise ValueError("invalid READY identity")
+        if len(self.encode()) > MAX_STATUS_LINE_BYTES:
+            raise ValueError("READY identity exceeds its size limit")
+
+    def encode(self) -> bytes:
+        return (
+            f"hbrowser-ready-v1 {self.supervisor_pid} {self.directory_device} "
+            f"{self.directory_inode} {self.target_pid}\n"
+        ).encode("ascii")
+
+    @classmethod
+    def parse(cls, frame: bytes) -> ReadyReceipt:
+        if len(frame) > MAX_STATUS_LINE_BYTES:
+            raise ValueError("READY receipt exceeds its size limit")
+        if not frame.endswith(b"\n") or frame.count(b"\n") != 1:
+            raise ValueError("invalid READY receipt framing")
+        fields = frame[:-1].split(b" ")
+        if (
+            len(fields) != 5
+            or fields[0] != b"hbrowser-ready-v1"
+            or any(not value.isdigit() for value in fields[1:])
+        ):
+            raise ValueError("invalid READY receipt schema")
+        receipt = cls(*(int(value) for value in fields[1:]))
+        if receipt.encode() != frame:
+            raise ValueError("non-canonical READY receipt")
+        return receipt
 
 
 class ControlIntent(IntEnum):

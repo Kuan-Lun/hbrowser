@@ -164,6 +164,30 @@ def _shutdown_controller(
 
 
 class ProcessControlProtocolTests(unittest.TestCase):
+    def test_ready_receipt_round_trips_exactly(self) -> None:
+        receipt = control_module.ReadyReceipt(101, 0, 202, 303)
+        self.assertEqual(receipt.encode(), b"hbrowser-ready-v1 101 0 202 303\n")
+        self.assertEqual(control_module.ReadyReceipt.parse(receipt.encode()), receipt)
+
+    def test_ready_receipt_rejects_unknown_legacy_and_malformed_frames(self) -> None:
+        frames = (
+            b"ready 303\n",
+            b"hbrowser-ready-v2 101 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 303",
+            b"hbrowser-ready-v1 101 0 202 303\n\n",
+            b"hbrowser-ready-v1 101 0 202 303\r\n",
+            b"hbrowser-ready-v1 0101 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 -303\n",
+            b"hbrowser-ready-v1 0 0 202 303\n",
+            b"hbrowser-ready-v1 101 0 202 0\n",
+            b"hbrowser-ready-v1 101 0 202 101\n",
+            b"hbrowser-ready-v1 101 0 202 303 extra\n",
+            b"hbrowser-ready-v1 101 0 202 " + b"3" * 200 + b"\n",
+        )
+        for frame in frames:
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                control_module.ReadyReceipt.parse(frame)
+
     def test_start_request_round_trips_exactly(self) -> None:
         request = control_module.StartRequest(deadline_ns=123)
 
@@ -2534,6 +2558,333 @@ finally:
         kill_process_group.assert_not_called()
 
 
+@unittest.skipUnless(os.name == "posix", "Late READY reconciles POSIX tree proof")
+class LateReadyReceiptTests(unittest.TestCase):
+    @contextmanager
+    def _owner(
+        self, *, returncode: int = 0
+    ) -> Iterator[tuple[process_module.OwnedProcess, Path, Mock]]:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="hbrowser-late-ready-proof-"
+            ) as directory,
+            patch.object(atexit, "register"),
+            patch.object(
+                process_module,
+                "_remove_private_directory_owned",
+                side_effect=lambda guard, *, deadline: _remove_private_inline(
+                    guard, deadline=deadline
+                ),
+            ),
+        ):
+            root = Path(directory)
+            (root / "status").mkdir()
+            (root / "private").mkdir()
+            supervisor = Mock(pid=101, stdin=Mock(), stdout=None, stderr=None)
+            supervisor.wait.return_value = returncode
+            observation = Mock()
+            owner = process_module.OwnedProcess(
+                supervisor,
+                target_process_group=None,
+                windows_job=None,
+                stdout_drain=None,
+                stderr_drain=None,
+                status_directory=root / "status",
+                cleanup_paths=(root / "private",),
+                observation=observation,
+            )
+            try:
+                yield owner, root, observation
+            finally:
+                # These owners contain only Mock processes. Explicit fixture
+                # rescue releases the pinned fd without inventing runtime proof.
+                if owner._status_directory_descriptor is not None:
+                    os.close(owner._status_directory_descriptor)
+                    owner._status_directory_descriptor = None
+
+    def _frame(self, owner: process_module.OwnedProcess) -> bytes:
+        guard = owner._status_directory
+        assert guard is not None
+        return control_module.ReadyReceipt(
+            owner.pid, guard.device, guard.inode, 202
+        ).encode()
+
+    def test_late_ready_accepts_only_proven_supervisor_exit(self) -> None:
+        for returncode in (0, control_module.PROVEN_PROTOCOL_FAILURE_EXIT_CODE):
+            with (
+                self.subTest(returncode=returncode),
+                self._owner(returncode=returncode) as (
+                    owner,
+                    root,
+                    observation,
+                ),
+            ):
+                (root / "status/status").write_bytes(self._frame(owner))
+                with patch.object(atexit, "unregister") as unregister:
+                    self.assertEqual(owner.wait(timeout=2), returncode)
+                self.assertEqual(owner.target_pid, 202)
+                self.assertTrue(owner._closed)
+                self.assertIsNone(owner._status_directory_descriptor)
+                self.assertFalse((root / "status").exists())
+                self.assertFalse((root / "private").exists())
+                observation.complete.assert_called_once()
+                unregister.assert_called_once_with(owner._atexit_cleanup)
+
+    def test_unknown_exit_cannot_borrow_a_valid_ready_receipt(self) -> None:
+        with self._owner(returncode=7) as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            with (
+                patch.object(owner, "_read_startup_status") as read_status,
+                self.assertRaises(process_module.ProcessOwnershipError),
+            ):
+                owner.wait(timeout=1)
+            read_status.assert_not_called()
+            self.assertFalse(owner._tree_reaped)
+            self.assertTrue((root / "private").exists())
+            observation.complete.assert_not_called()
+
+    def test_ready_without_supervisor_reap_never_proves_cleanup(self) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            cast(Mock, owner._supervisor.wait).side_effect = subprocess.TimeoutExpired(
+                "supervisor", 1
+            )
+            with (
+                patch.object(owner, "_read_startup_status") as read_status,
+                self.assertRaises(subprocess.TimeoutExpired),
+            ):
+                owner.wait(timeout=1)
+            read_status.assert_not_called()
+            self.assertFalse(owner._supervisor_reaped)
+            self.assertFalse(owner._tree_reaped)
+            observation.complete.assert_not_called()
+
+    def test_late_ready_past_cleanup_deadline_retains_proof_for_explicit_retry(
+        self,
+    ) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            original_read = owner._read_status_frame
+            now = [100.0]
+
+            def late_read(
+                guard: process_module._PrivateDirectory,
+                descriptor: int | None,
+                status_path: Path,
+            ) -> bytes | None:
+                frame = original_read(guard, descriptor, status_path)
+                now[0] = 101.0
+                return frame
+
+            with (
+                patch.object(time, "monotonic", side_effect=lambda: now[0]),
+                patch.object(owner, "_read_status_frame", side_effect=late_read),
+                self.assertRaises(process_module.ProcessOwnershipError),
+            ):
+                owner.wait(timeout=1)
+            self.assertTrue(owner._supervisor_reaped)
+            self.assertFalse(owner._tree_reaped)
+            self.assertIsNone(owner.target_pid)
+            self.assertIsNotNone(owner._status_directory_descriptor)
+            self.assertTrue((root / "private").exists())
+            observation.complete.assert_not_called()
+            self.assertEqual(owner.wait(timeout=2), 0)
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner._status_directory_descriptor)
+            observation.complete.assert_called_once()
+
+    def test_late_ready_rejects_wrong_identity_and_malformed_receipts(self) -> None:
+        for variant in (
+            "missing",
+            "legacy",
+            "supervisor",
+            "device",
+            "inode",
+            "negative",
+            "oversized",
+            "error",
+            "symlink",
+            "fifo",
+        ):
+            with (
+                self.subTest(variant=variant),
+                self._owner() as (owner, root, observation),
+            ):
+                frame = self._frame(owner)
+                fields = frame[:-1].split(b" ")
+                match variant:
+                    case "legacy":
+                        frame = b"ready 202\n"
+                    case "supervisor" | "device" | "inode":
+                        index = {"supervisor": 1, "device": 2, "inode": 3}[variant]
+                        fields[index] = str(int(fields[index]) + 1).encode("ascii")
+                        frame = b" ".join(fields) + b"\n"
+                    case "negative":
+                        fields[4] = b"-1"
+                        frame = b" ".join(fields) + b"\n"
+                    case "oversized":
+                        frame += b"x" * control_module.MAX_STATUS_LINE_BYTES
+                    case "error":
+                        frame = b"error StartupDeadlineExpired\n"
+                status = root / "status/status"
+                if variant == "symlink":
+                    (root / "other").write_bytes(frame)
+                    status.symlink_to(root / "other")
+                elif variant == "fifo":
+                    os.mkfifo(status)
+                elif variant != "missing":
+                    status.write_bytes(frame)
+                with (
+                    patch.object(atexit, "unregister") as unregister,
+                    self.assertRaises(process_module.ProcessOwnershipError),
+                ):
+                    owner.wait(timeout=1)
+                self.assertFalse(owner._tree_reaped)
+                self.assertIsNone(owner.target_pid)
+                self.assertTrue((root / "private").is_dir())
+                observation.complete.assert_not_called()
+                unregister.assert_not_called()
+
+    def test_replaced_directory_cannot_replay_the_pinned_generation(self) -> None:
+        with self._owner() as (owner, root, observation):
+            frame = self._frame(owner)
+            (root / "status").rename(root / "original")
+            (root / "status").mkdir()
+            (root / "status/status").write_bytes(frame)
+            with self.assertRaises(process_module.ProcessOwnershipError):
+                owner.wait(timeout=1)
+            observation.complete.assert_not_called()
+            self.assertFalse(owner._tree_reaped)
+            self.assertTrue((root / "private").exists())
+            descriptor = owner._status_directory_descriptor
+            assert descriptor is not None
+            self.assertEqual(
+                os.fstat(descriptor).st_ino, (root / "original").stat().st_ino
+            )
+
+    def test_bound_target_cannot_accept_another_target_receipt(self) -> None:
+        with self._owner() as (owner, root, _):
+            (root / "status/status").write_bytes(self._frame(owner))
+            owner.bind_target_process_group(303)
+            with self.assertRaisesRegex(
+                process_module.ProcessOwnershipError, "identity mismatch"
+            ):
+                owner._read_startup_status(
+                    root / "status/status", deadline=time.monotonic() + 1
+                )
+
+    def test_late_ready_cleanup_failure_retains_then_releases_the_same_owner(
+        self,
+    ) -> None:
+        with self._owner() as (owner, root, observation):
+            (root / "status/status").write_bytes(self._frame(owner))
+            cleanup_error = OSError("private cleanup blocked")
+            with (
+                patch.object(
+                    process_module,
+                    "_remove_private_directory_owned",
+                    side_effect=cleanup_error,
+                ),
+                self.assertRaises(OSError) as raised,
+            ):
+                owner.wait(timeout=1)
+            self.assertIs(raised.exception, cleanup_error)
+            self.assertTrue(owner._tree_reaped)
+            self.assertFalse(owner._closed)
+            self.assertIsNotNone(owner._status_directory_descriptor)
+            observation.complete.assert_not_called()
+            with patch.object(
+                owner,
+                "_read_startup_status",
+                side_effect=AssertionError("tree already proven"),
+            ):
+                self.assertEqual(owner.wait(timeout=2), 0)
+            self.assertTrue(owner._closed)
+            self.assertIsNone(owner._status_directory_descriptor)
+            observation.complete.assert_called_once()
+
+    def test_real_ready_timeout_reaps_target_tree_and_preserves_original_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="hbrowser-ready-timeout-") as directory:
+            root = Path(directory)
+            private = root / "private"
+            private.mkdir()
+            marker = root / "target-pids"
+            original_read = process_module._read_supervisor_status
+            captured: list[process_module.OwnedProcess] = []
+            startup_error = TimeoutError("READY receipt missed startup deadline")
+            deadline = time.monotonic() + 10
+
+            def late_read(
+                owner: process_module.OwnedProcess,
+                status_path: Path,
+                *,
+                deadline: float,
+            ) -> process_module._SupervisorStatus:
+                captured.append(owner)
+                ready = original_read(owner, status_path, deadline=deadline)
+                self.assertIsInstance(ready, process_module._SupervisorReady)
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(
+                    marker.exists(), "target must actually run before READY expires"
+                )
+                time.sleep(max(0, deadline - time.monotonic()))
+                self.assertGreaterEqual(time.monotonic(), deadline)
+                self.assertIsNone(owner.target_pid)
+                raise startup_error
+
+            source = (
+                "import os, pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(marker)!r}).write_text("
+                "f'{os.getpid()} {child.pid}')\n"
+                "time.sleep(60)\n"
+            )
+            try:
+                with (
+                    patch.object(
+                        process_module, "_read_supervisor_status", side_effect=late_read
+                    ),
+                    patch.object(
+                        atexit, "unregister", wraps=atexit.unregister
+                    ) as unregister,
+                    self.assertRaises(TimeoutError) as raised,
+                ):
+                    process_module.start_owned_process(
+                        sys.executable,
+                        ["-c", source],
+                        cleanup_paths=(private,),
+                        startup_timeout=2,
+                        deadline=deadline,
+                    )
+                self.assertIs(raised.exception, startup_error)
+                owner = captured[0]
+                self.assertEqual(owner._supervisor_returncode, 0)
+                self.assertTrue(owner._tree_reaped)
+                self.assertTrue(owner._closed)
+                self.assertIsNone(owner._status_directory_descriptor)
+                self.assertIsNone(owner._status_directory)
+                self.assertFalse(private.exists())
+                self.assertLess(time.monotonic(), deadline)
+                unregister.assert_any_call(owner._atexit_cleanup)
+                self.assertIsNotNone(owner._observation)
+                for raw_pid in marker.read_text().split():
+                    self.assertTrue(_wait_for_pid_exit(int(raw_pid)))
+            finally:
+                # A failed regression must still settle every real observed owner.
+                for owner in captured:
+                    if not owner._closed:
+                        owner.shutdown(
+                            graceful_timeout=0,
+                            terminate_timeout=1,
+                            kill_timeout=2,
+                            cleanup_timeout=2,
+                        )
+
+
 class PrivateDirectoryCleanupTests(unittest.TestCase):
     def test_owned_worker_removes_exact_private_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-owned-remove-") as directory:
@@ -3878,20 +4229,20 @@ class ProcessPolicyTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="hbrowser-late-ready-") as directory:
             status_path = Path(directory) / "status"
-            status_path.write_text("ready 123", encoding="utf-8")
             now = [100.0]
 
-            def late_read(*_: object, **__: object) -> str:
+            def late_read(*_: object, **__: object) -> process_module._SupervisorReady:
                 now[0] = 101.0
-                return "ready 123"
+                return process_module._SupervisorReady(123)
 
+            owner = Mock(spec=process_module.OwnedProcess)
+            owner._read_startup_status.side_effect = late_read
             with (
                 patch.object(time, "monotonic", side_effect=lambda: now[0]),
-                patch.object(Path, "read_text", side_effect=late_read),
                 self.assertRaisesRegex(TimeoutError, "READY deadline"),
             ):
                 process_module._read_supervisor_status(
-                    Mock(spec=process_module.OwnedProcess),
+                    owner,
                     status_path,
                     deadline=101.0,
                 )

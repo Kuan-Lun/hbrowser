@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 if TYPE_CHECKING or __package__:
     from . import _process_observation
     from ._process_control import (
+        MAX_STATUS_LINE_BYTES,
         PROVEN_CLEANUP_FAILURE_EXIT_CODE,
         PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
         PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
         ControlIntent,
         ControlRequest,
+        ReadyReceipt,
         StartRequest,
         deadline_to_monotonic_ns,
     )
@@ -40,11 +42,13 @@ else:
     # Direct-script cleanup workers resolve sibling modules from this directory.
     import _process_observation  # type: ignore[import-not-found]  # Direct script sibling.
     from _process_control import (  # type: ignore[import-not-found]
+        MAX_STATUS_LINE_BYTES,
         PROVEN_CLEANUP_FAILURE_EXIT_CODE,
         PROVEN_PROTOCOL_FAILURE_EXIT_CODE,
         PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
         ControlIntent,
         ControlRequest,
+        ReadyReceipt,
         StartRequest,
         deadline_to_monotonic_ns,
     )
@@ -68,7 +72,6 @@ _PRIVATE_CLEANUP_WORKER_PATH: Final = (
 )
 _SUPERVISOR_PATH: Final = Path(__file__).with_name("_process_supervisor.py").resolve()
 _OUTPUT_RING_BYTES: Final = 256 * 1024
-_SUPERVISOR_READY_PREFIX: Final = "ready "
 _SUPERVISOR_ERROR_PREFIX: Final = "error "
 _POSIX_INHERITED_ENVIRONMENT_KEYS: Final = frozenset(
     {
@@ -761,7 +764,157 @@ class OwnedProcess:
         self._target_not_started = False
         self._tree_reaped = False
         self._closed = False
-        atexit.register(self._atexit_cleanup)
+        self._status_directory_descriptor: int | None = None
+        # Keep the POSIX generation alive until private cleanup succeeds. A
+        # pathname plus cached inode could otherwise be reused before late READY
+        # reconciliation. The supervisor never inherits this non-inheritable fd.
+        if self._status_directory.platform_name == "posix":
+            descriptor = os.open(
+                self._status_directory.path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) != (
+                    self._status_directory.device,
+                    self._status_directory.inode,
+                ):
+                    raise ProcessOwnershipError("Process status generation changed")
+                self._status_directory_descriptor = descriptor
+            except BaseException:
+                os.close(descriptor)
+                raise
+        try:
+            atexit.register(self._atexit_cleanup)
+        except BaseException:
+            if self._status_directory_descriptor is not None:
+                os.close(self._status_directory_descriptor)
+            raise
+
+    def _read_startup_status(
+        self,
+        status_path: Path,
+        *,
+        deadline: float,
+        allow_expired_immediate_check: bool = False,
+    ) -> _SupervisorStatus | None:
+        """Read one bounded status from this owner's still-pinned generation."""
+
+        with self._state_before(
+            deadline=deadline,
+            phase="status generation snapshot",
+            allow_expired_immediate_check=allow_expired_immediate_check,
+        ):
+            guard = self._status_directory
+            if guard is None or status_path != guard.path / "status":
+                raise ProcessOwnershipError("Process status has no matching generation")
+            directory_descriptor = (
+                os.dup(self._status_directory_descriptor)
+                if self._status_directory_descriptor is not None
+                else None
+            )
+        try:
+            frame = self._read_status_frame(guard, directory_descriptor, status_path)
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+        with self._state_before(
+            deadline=deadline,
+            phase="status generation receipt",
+            allow_expired_immediate_check=allow_expired_immediate_check,
+        ):
+            if self._status_directory is not guard:
+                raise ProcessOwnershipError("Process status ownership changed")
+            return self._decode_status_frame(guard, frame)
+
+    @staticmethod
+    def _read_status_frame(
+        guard: _PrivateDirectory,
+        directory_descriptor: int | None,
+        status_path: Path,
+    ) -> bytes | None:
+        if not guard._assert_identity_or_absence():
+            raise ProcessOwnershipError("Process status generation disappeared")
+        expected_file_identity: tuple[int, int] | None = None
+        try:
+            if directory_descriptor is not None:
+                descriptor = os.open(
+                    "status",
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_descriptor,
+                )
+            else:
+                # Windows ownership is established by the Job. Keep status reads
+                # bounded there too, and reject links or special files.
+                metadata = status_path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ProcessOwnershipError("Process status is not a regular file")
+                expected_file_identity = (metadata.st_dev, metadata.st_ino)
+                descriptor = os.open(
+                    status_path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                )
+        except FileNotFoundError:
+            return None
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ProcessOwnershipError("Process status is not a regular file")
+            if (
+                expected_file_identity is not None
+                and (
+                    opened.st_dev,
+                    opened.st_ino,
+                )
+                != expected_file_identity
+            ):
+                raise ProcessOwnershipError("Process status identity changed")
+            frame = os.read(descriptor, MAX_STATUS_LINE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if not guard._assert_identity_or_absence():
+            raise ProcessOwnershipError("Process status generation disappeared")
+        return frame
+
+    def _decode_status_frame(
+        self, guard: _PrivateDirectory, frame: bytes | None
+    ) -> _SupervisorStatus | None:
+        if frame is None:
+            return None
+        if len(frame) > MAX_STATUS_LINE_BYTES:
+            raise RuntimeError("Process supervisor status exceeds its size limit")
+        if frame.startswith(_SUPERVISOR_ERROR_PREFIX.encode("ascii")):
+            try:
+                error_type = (
+                    frame.decode("ascii")
+                    .removeprefix(_SUPERVISOR_ERROR_PREFIX)
+                    .removesuffix("\n")
+                )
+            except UnicodeDecodeError as error:
+                raise RuntimeError(
+                    "Process supervisor returned an invalid status"
+                ) from error
+            if not error_type.isidentifier() or frame != f"error {error_type}\n".encode(
+                "ascii"
+            ):
+                raise RuntimeError("Process supervisor returned an invalid status")
+            return _SupervisorTargetNotStarted(error_type)
+        try:
+            receipt = ReadyReceipt.parse(frame)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Process supervisor returned an invalid READY receipt"
+            ) from error
+        if (
+            receipt.supervisor_pid != self._supervisor.pid
+            or receipt.directory_device != guard.device
+            or receipt.directory_inode != guard.inode
+            or (
+                self._target_process_group is not None
+                and receipt.target_pid != self._target_process_group
+            )
+        ):
+            raise ProcessOwnershipError("Process supervisor READY identity mismatch")
+        return _SupervisorReady(receipt.target_pid)
 
     @property
     def pid(self) -> int:
@@ -1230,6 +1383,7 @@ class OwnedProcess:
             target_process_group = self._target_process_group
             target_not_started = self._target_not_started
 
+        late_target_pid: int | None = None
         if windows_job is not None:
             remaining = max(0.0, deadline - time.monotonic())
             windows_job.wait_empty(timeout=remaining)
@@ -1260,15 +1414,44 @@ class OwnedProcess:
             # never crossed even when the status file arrived too late.
             pass
         elif not target_not_started:
-            raise ProcessOwnershipError(
-                "Process supervisor exited before target cleanup was proven"
-            )
+            if returncode not in {0, PROVEN_PROTOCOL_FAILURE_EXIT_CODE}:
+                raise ProcessOwnershipError(
+                    "Process supervisor exited before target cleanup was proven"
+                )
+            # Only this exact reaped supervisor's generation-bound READY may
+            # reconcile a startup timeout. Exit 0 alone, a stale numeric PID or
+            # another generation's status cannot authorize private cleanup.
+            status_directory = self._status_directory
+            if status_directory is None or self._status_directory_descriptor is None:
+                raise ProcessOwnershipError("Late READY has no pinned generation")
+            try:
+                late_status = self._read_startup_status(
+                    status_directory.path / "status",
+                    deadline=coordination_deadline,
+                    allow_expired_immediate_check=allow_expired_immediate_check,
+                )
+            except (OSError, RuntimeError) as error:
+                raise ProcessOwnershipError(
+                    "Late READY cleanup receipt is invalid"
+                ) from error
+            if not isinstance(late_status, _SupervisorReady):
+                raise ProcessOwnershipError("Late READY cleanup receipt is missing")
+            late_target_pid = late_status.target_pid
 
         with self._state_before(
             deadline=coordination_deadline,
             phase="target-tree receipt",
             allow_expired_immediate_check=allow_expired_immediate_check,
         ):
+            if late_target_pid is not None:
+                if self._target_not_started or self._target_process_group not in {
+                    None,
+                    late_target_pid,
+                }:
+                    raise ProcessOwnershipError(
+                        "Late READY conflicts with bound target"
+                    )
+                self._target_process_group = late_target_pid
             self._tree_reaped = True
         return returncode
 
@@ -1487,6 +1670,9 @@ class OwnedProcess:
                 phase="status-directory receipt",
             ):
                 self._status_directory = None
+                if self._status_directory_descriptor is not None:
+                    os.close(self._status_directory_descriptor)
+                    self._status_directory_descriptor = None
         while True:
             with self._state_before(
                 deadline=deadline,
@@ -2242,28 +2428,14 @@ def _read_supervisor_status(
             )
 
     while time.monotonic() < _process_observation.cleanup_deadline(ready_deadline):
-        if status_path.is_file():
-            status = status_path.read_text(encoding="utf-8").strip()
+        try:
+            status = owner._read_startup_status(status_path, deadline=ready_deadline)
+        except ProcessOwnershipError:
             require_ready_budget()
-            if status.startswith(_SUPERVISOR_READY_PREFIX):
-                raw_pid = status.removeprefix(_SUPERVISOR_READY_PREFIX)
-                try:
-                    target_pid = int(raw_pid)
-                except ValueError as error:
-                    raise RuntimeError(
-                        "Process supervisor returned an invalid PID"
-                    ) from error
-                if target_pid <= 0:
-                    raise RuntimeError("Process supervisor returned an invalid PID")
-                require_ready_budget()
-                return _SupervisorReady(target_pid)
-            if status.startswith(_SUPERVISOR_ERROR_PREFIX):
-                error_type = status.removeprefix(_SUPERVISOR_ERROR_PREFIX)
-                if not error_type.isascii() or not error_type.isidentifier():
-                    raise RuntimeError("Process supervisor returned an invalid status")
-                require_ready_budget()
-                return _SupervisorTargetNotStarted(error_type)
-            raise RuntimeError("Process supervisor returned an invalid status")
+            raise
+        if status is not None:
+            require_ready_budget()
+            return status
         returncode = owner.poll()
         if returncode is not None:
             raise RuntimeError(

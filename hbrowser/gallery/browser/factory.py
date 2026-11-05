@@ -1594,11 +1594,11 @@ async def _ensure_browser_cleanup(
     )
     if fallback_errors:
         return [stop_error, *cancellation_errors, *fallback_errors]
-    if cancellation_errors:
-        logger.warning(
-            "Zendriver Browser.stop did not settle, but explicit process and "
-            "profile ownership cleanup completed"
-        )
+    if not task.done():
+        # Reaping the process does not settle the Browser.stop coroutine. Keep
+        # this exact task and the generation's atexit responsibility for retry;
+        # a late completion during explicit cleanup may satisfy both proofs.
+        return [stop_error, *cancellation_errors]
     retirement.mark_browser_cleanup_complete()
     return []
 
@@ -1896,6 +1896,13 @@ async def _await_cleanup_deferring_caller_cancellation(
             )
         raise caller_cancellation
     cleanup_task.result()
+    if deadline.expired:
+        # A shared cleanup may finish within its first caller's deadline after
+        # this waiter has expired. Keep its positive cleanup evidence, but do
+        # not turn a late observation into success for this caller.
+        raise ProcessOwnershipError(
+            "Browser shutdown completed after its caller deadline"
+        )
 
 
 async def _stop_browser(

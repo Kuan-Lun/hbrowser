@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ if TYPE_CHECKING or __package__:
         PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
         ControlIntent,
         ControlRequest,
+        ReadyReceipt,
         StartRequest,
     )
 else:
@@ -37,6 +39,7 @@ else:
         PROVEN_TARGET_NOT_STARTED_EXIT_CODE,
         ControlIntent,
         ControlRequest,
+        ReadyReceipt,
         StartRequest,
     )
 
@@ -1074,6 +1077,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         status_path, command = _parse_arguments(
             tuple(sys.argv[1:] if arguments is None else arguments)
         )
+        status_generation = status_path.parent.lstat()
+        if not stat.S_ISDIR(status_generation.st_mode):
+            raise ValueError("status generation is not a directory")
     except OSError, ValueError:
         return PROVEN_TARGET_NOT_STARTED_EXIT_CODE
 
@@ -1169,7 +1175,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return PROVEN_TARGET_NOT_STARTED_EXIT_CODE
     execution_error: BaseException | None = None
     try:
-        _write_status(status_path, f"ready {target.pid}")
+        ready = ReadyReceipt(
+            supervisor_pid=os.getpid(),
+            directory_device=status_generation.st_dev,
+            directory_inode=status_generation.st_ino,
+            target_pid=target.pid,
+        )
+        _write_status(status_path, ready.encode().decode("ascii").removesuffix("\n"))
 
         while True:
             state = controller.state()
