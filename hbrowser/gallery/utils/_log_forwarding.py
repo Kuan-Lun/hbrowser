@@ -316,8 +316,11 @@ class ForwardingHandler(logging.Handler):
         # Handler.__init__ publishes a weak reference to logging.shutdown.
         # Validate and establish all close state before that publication; a
         # retained constructor traceback must never expose a partial handler.
-        super().__init__(logging.DEBUG)
+        self.lock = None
+        self._name = None
+        self._closed = False
         try:
+            super().__init__(logging.DEBUG)
             self._worker = threading.Thread(
                 target=self._run,
                 name="hbrowser-log-forwarding-send",

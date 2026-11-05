@@ -1383,6 +1383,7 @@ close_forwarded_logging()
 import json, logging, os, sys
 from unittest.mock import patch
 from hbrowser.gallery.utils import log as log_module
+from hbrowser.gallery.utils._log_forwarding import ForwardingHandler
 from hbrowser import configure_forwarded_logging, logging_health
 
 closed = []
@@ -1396,10 +1397,17 @@ other = OtherHandler()
 registered_before = len(logging._handlerList)
 os.environ['HBROWSER_LOG_FORWARD_ENDPOINT'] = sys.argv[1]
 os.environ['HBROWSER_LOG_FORWARD_TOKEN'] = sys.argv[2]
-injected = RuntimeError('sender initialization failed')
-if sys.argv[3] in ('queue', 'thread'):
-    target = ('hbrowser.gallery.utils._log_forwarding.queue.Queue'
-              if sys.argv[3] == 'queue' else 'threading.Thread.start')
+injected = (MemoryError('sender allocation failed')
+            if sys.argv[3] in ('base-lock', 'thread-constructor')
+            else RuntimeError('sender initialization failed'))
+failure_targets = {
+    'queue': 'hbrowser.gallery.utils._log_forwarding.queue.Queue',
+    'base-lock': 'logging.Handler.createLock',
+    'thread-constructor': 'hbrowser.gallery.utils._log_forwarding.threading.Thread',
+    'thread': 'threading.Thread.start',
+}
+if sys.argv[3] in failure_targets:
+    target = failure_targets[sys.argv[3]]
     with patch(target, side_effect=injected):
         configure_forwarded_logging()
 else:
@@ -1411,13 +1419,17 @@ assert log_module._FORWARDING_HANDLER is None
 assert log_module._LOG_FORWARDING_FAILURE is not None
 cause = log_module._LOG_FORWARDING_FAILURE.__cause__
 assert cause is not None
-if sys.argv[3] in ('queue', 'thread'):
+if sys.argv[3] in failure_targets:
     assert cause is injected
 else:
     assert type(cause).__name__ == 'ForwardingConfigurationError'
     assert str(cause) == ('forwarding token is invalid' if sys.argv[2] == 'invalid'
                           else 'forwarding endpoint is invalid')
 registered_after = len(logging._handlerList)
+partial_senders = [ref() for ref in logging._handlerList
+                   if isinstance(ref(), ForwardingHandler)]
+closed_before_shutdown = [sender._closed for sender in partial_senders]
+stopped_before_shutdown = [sender._stopped.is_set() for sender in partial_senders]
 shutdown_error = None
 try:
     logging.shutdown()
@@ -1425,6 +1437,8 @@ except BaseException as error:
     shutdown_error = type(error).__name__ + ': ' + str(error)
 print(json.dumps({'registered_before': registered_before,
                   'registered_after': registered_after,
+                  'closed_before_shutdown': closed_before_shutdown,
+                  'stopped_before_shutdown': stopped_before_shutdown,
                   'shutdown_error': shutdown_error,
                   'other_closed': other._closed, 'operations': closed}))
 """
@@ -1451,10 +1465,18 @@ print(json.dumps({'registered_before': registered_before,
         self.assertTrue(evidence["other_closed"], evidence)
         self.assertEqual(evidence["operations"], ["flush", "close"], evidence)
         self.assertEqual(
-            evidence["registered_before"] + (failure_stage == "thread"),
+            evidence["registered_before"]
+            + (failure_stage in {"base-lock", "thread-constructor", "thread"}),
             evidence["registered_after"],
             evidence,
         )
+        expected_partial_senders = (
+            [True]
+            if failure_stage in {"base-lock", "thread-constructor", "thread"}
+            else []
+        )
+        self.assertEqual(evidence["closed_before_shutdown"], expected_partial_senders)
+        self.assertEqual(evidence["stopped_before_shutdown"], expected_partial_senders)
         self.assertNotIn("Exception ignored", result.stderr)
 
     def test_invalid_token_does_not_register_a_partial_sender(self) -> None:
@@ -1475,6 +1497,20 @@ print(json.dumps({'registered_before': registered_before,
     ) -> None:
         self._assert_failed_sender_preserves_logging_shutdown(
             "127.0.0.1:1", "1" * 64, failure_stage="thread"
+        )
+
+    def test_sender_base_lock_failure_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="base-lock"
+        )
+
+    def test_sender_thread_allocation_keeps_registered_handler_safe_for_shutdown(
+        self,
+    ) -> None:
+        self._assert_failed_sender_preserves_logging_shutdown(
+            "127.0.0.1:1", "1" * 64, failure_stage="thread-constructor"
         )
 
     def test_sender_constructor_thread_failure_can_close_partial_handler(self) -> None:
