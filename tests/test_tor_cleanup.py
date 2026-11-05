@@ -4,6 +4,8 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -14,6 +16,238 @@ from hbrowser.gallery.browser.process import (
     start_owned_process,
 )
 from hbrowser.gallery.utils import Deadline
+
+
+class TorBootstrapDeadlineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = 0.0
+        self.deadline = Deadline(20.0)
+        # Twenty seconds leaves the existing half-budget cleanup reserve: the
+        # bootstrap deadline is ten, and owner cleanup must keep deadline twenty.
+        self.owner = Mock(spec=OwnedProcess)
+        self.owner.stdout = [b"Bootstrapped 100%: Done\n"]
+        self.owner.poll.return_value = None
+        self.lines: deque[str] = deque(maxlen=256)
+        self.enterContext(patch.object(time, "monotonic", side_effect=lambda: self.now))
+        self.enterContext(patch.object(tor, "_find_tor_binary", return_value="/tor"))
+        self.enterContext(
+            patch.object(tempfile, "mkdtemp", return_value="/unused/mock-tor-data")
+        )
+        self.start_process = self.enterContext(
+            patch.object(tor, "start_owned_process", return_value=self.owner)
+        )
+        self.register = self.enterContext(patch.object(atexit, "register"))
+        self.unregister = self.enterContext(patch.object(atexit, "unregister"))
+        self.enterContext(patch.object(tor, "deque", return_value=self.lines))
+        self.enterContext(
+            patch.object(threading, "Thread", side_effect=self._immediate_reader)
+        )
+        self.log_info = self.enterContext(patch.object(tor.logger, "info"))
+        self.log_debug = self.enterContext(patch.object(tor.logger, "debug"))
+        self.addCleanup(self._release_mock_owner)
+
+    def _immediate_reader(self, *, target: Callable[[], None], daemon: bool) -> Mock:
+        self.assertTrue(daemon)
+        thread = Mock()
+        thread.start.side_effect = target
+        return thread
+
+    def _release_mock_owner(self) -> None:
+        # Assertions below run before this fallback. No real process is started;
+        # failed negative controls still release their mock atexit registration.
+        self.owner.shutdown.side_effect = None
+        tor.terminate_tor_process(self.owner, deadline=Deadline.after(20))
+
+    def _assert_startup_cleaned_owner(self) -> None:
+        self.owner.shutdown.assert_called_once_with(
+            graceful_timeout=0,
+            terminate_timeout=5,
+            kill_timeout=5,
+            deadline=self.deadline.expires_at,
+        )
+        cleanup = getattr(self.owner, tor._TOR_PROCESS_CLEANUP_ATTRIBUTE)
+        self.assertIsNone(cleanup._tor_process)
+        self.assertFalse(cleanup._registered)
+        self.unregister.assert_called_once_with(cleanup)
+
+    def test_continuous_output_checks_deadline_within_the_batch(self) -> None:
+        self.owner.stdout = [b"Bootstrapped 10%: progress\n"] * 256
+
+        def refill(_message: str) -> None:
+            self.now += 0.5
+            self.lines.append("Bootstrapped 10%: more progress")
+            if self.log_debug.call_count > 256:
+                raise AssertionError("bootstrap kept draining a replenished queue")
+
+        self.log_debug.side_effect = refill
+        with self.assertRaisesRegex(RuntimeError, "failed to bootstrap"):
+            tor._start_tor_process(9150, deadline=self.deadline)
+
+        self.assertEqual(self.log_debug.call_count, 20)
+        self.assertEqual(len(self.lines), 256)
+        self.assertEqual(self.now, 10.0)
+        self._assert_startup_cleaned_owner()
+
+    def test_continuous_output_returns_to_process_exit_observation(self) -> None:
+        self.owner.stdout = [b"progress one\n", b"progress two\n"]
+        self.owner.poll.side_effect = [None, 7]
+        self.owner.returncode = 7
+
+        def refill(_message: str) -> None:
+            self.lines.append("more progress")
+            if self.log_debug.call_count > 2:
+                raise AssertionError("bootstrap did not return to process polling")
+
+        self.log_debug.side_effect = refill
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 7"):
+            tor._start_tor_process(9150, deadline=self.deadline)
+
+        self.assertEqual(self.log_debug.call_count, 2)
+        self.assertEqual(self.owner.poll.call_count, 2)
+        self._assert_startup_cleaned_owner()
+
+    def test_blank_output_cannot_bypass_the_per_line_deadline(self) -> None:
+        case = self
+
+        class RefilledBlankLines(deque[str]):
+            def popleft(self) -> str:
+                line = super().popleft()
+                case.now += 0.5
+                self.append("")
+                if case.now > 10.0:
+                    raise AssertionError("blank output bypassed the shared deadline")
+                return line
+
+        lines = RefilledBlankLines(maxlen=256)
+        self.owner.stdout = [b"\n"] * 256
+        with (
+            patch.object(tor, "deque", return_value=lines),
+            self.assertRaisesRegex(RuntimeError, "failed to bootstrap"),
+        ):
+            tor._start_tor_process(9150, deadline=self.deadline)
+
+        self.assertEqual(self.now, 10.0)
+        self.log_debug.assert_not_called()
+        self._assert_startup_cleaned_owner()
+
+    def test_success_queued_after_slow_progress_does_not_steal_cleanup_reserve(
+        self,
+    ) -> None:
+        self.owner.stdout = [b"progress\n", b"Bootstrapped 100%: Done\n"]
+
+        def exhaust_bootstrap(_message: str) -> None:
+            self.now = 10.0
+
+        self.log_debug.side_effect = exhaust_bootstrap
+        with self.assertRaisesRegex(RuntimeError, "failed to bootstrap"):
+            tor._start_tor_process(9150, deadline=self.deadline)
+
+        self.assertEqual(list(self.lines), ["Bootstrapped 100%: Done"])
+        self.assertFalse(
+            any(
+                "completed successfully" in str(call)
+                for call in self.log_info.call_args_list
+            )
+        )
+        self._assert_startup_cleaned_owner()
+
+    def test_success_logging_at_or_after_bootstrap_deadline_is_rejected(self) -> None:
+        for completion_time in (10.0, 10.5):
+            with self.subTest(completion_time=completion_time):
+                self.now = 0.0
+                self.owner.shutdown.reset_mock()
+                self.unregister.reset_mock()
+
+                def finish_late(
+                    message: str, *, finished_at: float = completion_time
+                ) -> None:
+                    if "completed successfully" in message:
+                        self.now = finished_at
+
+                self.log_info.side_effect = finish_late
+                with self.assertRaisesRegex(RuntimeError, "failed to bootstrap"):
+                    tor.start_tor_with_retry(
+                        9150, max_retries=1, deadline=self.deadline
+                    )
+                self._assert_startup_cleaned_owner()
+
+    def test_success_before_bootstrap_deadline_retains_the_live_owner(self) -> None:
+        def finish_in_time(message: str) -> None:
+            if "completed successfully" in message:
+                self.now = 9.5
+
+        self.log_info.side_effect = finish_in_time
+        result = tor.start_tor_with_retry(9150, deadline=self.deadline)
+
+        self.assertIs(result, self.owner)
+        cleanup = getattr(self.owner, tor._TOR_PROCESS_CLEANUP_ATTRIBUTE)
+        self.assertIs(cleanup._tor_process, self.owner)
+        self.assertTrue(cleanup._registered)
+        self.owner.shutdown.assert_not_called()
+        self.unregister.assert_not_called()
+        self.assertEqual(self.start_process.call_args.kwargs["deadline"], 10.0)
+        tor.terminate_tor_process(result, deadline=self.deadline)
+        self._assert_startup_cleaned_owner()
+
+    def test_late_success_with_unproven_cleanup_retains_owner_and_stops_retries(
+        self,
+    ) -> None:
+        cleanup_error = ProcessOwnershipError("owner receipt unavailable")
+        self.owner.shutdown.side_effect = cleanup_error
+
+        def finish_late(message: str) -> None:
+            if "completed successfully" in message:
+                self.now = 10.0
+
+        self.log_info.side_effect = finish_late
+        with self.assertRaises(tor._TorProcessCleanupError) as raised:
+            tor.start_tor_with_retry(9150, max_retries=3, deadline=self.deadline)
+
+        self.assertIs(raised.exception.__cause__, cleanup_error)
+        self.assertEqual(
+            raised.exception.__notes__, ["Bootstrap failure type: RuntimeError"]
+        )
+        self.start_process.assert_called_once()
+        cleanup = getattr(self.owner, tor._TOR_PROCESS_CLEANUP_ATTRIBUTE)
+        self.assertIs(cleanup._tor_process, self.owner)
+        self.assertTrue(cleanup._registered)
+        self.unregister.assert_not_called()
+        self.owner.shutdown.side_effect = None
+        tor.terminate_tor_process(self.owner, deadline=self.deadline)
+        self.assertEqual(self.owner.shutdown.call_count, 2)
+        self.assertIsNone(cleanup._tor_process)
+        self.unregister.assert_called_once_with(cleanup)
+
+    def test_retry_entry_rejects_late_handoff_without_releasing_owner(self) -> None:
+        original_start = tor._start_tor_process
+
+        def delayed_handoff(socks_port: int, *, deadline: Deadline) -> OwnedProcess:
+            owner = original_start(socks_port, deadline=deadline)
+            self.now = deadline.expires_at
+            return owner
+
+        with (
+            patch.object(
+                tor, "_start_tor_process", side_effect=delayed_handoff
+            ) as start,
+            self.assertRaises(tor._TorProcessCleanupError) as raised,
+        ):
+            tor.start_tor_with_retry(9150, max_retries=3, deadline=self.deadline)
+
+        self.assertIsInstance(raised.exception.__cause__, ProcessOwnershipError)
+        self.assertIn("deadline expired", str(raised.exception.__cause__))
+        start.assert_called_once()
+        self.start_process.assert_called_once()
+        cleanup = getattr(self.owner, tor._TOR_PROCESS_CLEANUP_ATTRIBUTE)
+        self.assertIs(cleanup._tor_process, self.owner)
+        self.assertTrue(cleanup._registered)
+        self.owner.shutdown.assert_not_called()
+        self.unregister.assert_not_called()
+        # A later explicit cleanup has its own caller deadline; startup never
+        # extends its exhausted deadline or discards this exact retained owner.
+        tor.terminate_tor_process(self.owner, deadline=Deadline.after(1))
+        self.assertIsNone(cleanup._tor_process)
+        self.unregister.assert_called_once_with(cleanup)
 
 
 class TorCleanupDeadlineTests(unittest.TestCase):
